@@ -1,0 +1,9 @@
+.env
+keys/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pem
+*.key

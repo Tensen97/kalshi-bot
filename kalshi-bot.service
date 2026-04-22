@@ -1,0 +1,18 @@
+[Unit]
+Description=Kalshi Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__BOT_USER__
+WorkingDirectory=__BOT_DIR__
+EnvironmentFile=__BOT_DIR__/.env
+ExecStart=__BOT_DIR__/run_bot.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
