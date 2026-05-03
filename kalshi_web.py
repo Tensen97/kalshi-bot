@@ -71,6 +71,23 @@ MAX_YES_ASK_TO_ENTER = 0.92
 TAKE_PROFIT_DELTA = 0.08
 STOP_LOSS_DELTA = 0.06
 MAX_HOLD_MINUTES = 20
+FAST_TURNOVER_TAKE_PROFIT_DELTA = 0.03
+FAST_TURNOVER_STOP_LOSS_DELTA = 0.02
+FAST_TURNOVER_MAX_HOLD_SECONDS = 900
+FAST_TURNOVER_STRONG_IMPROVING_DELTA = 0.015
+FAST_TURNOVER_STRONG_IMPROVING_PNL_PERCENT = 5.0
+# Defensive live-exit guard: do not allow routine loss exits immediately after entry.
+MIN_HOLD_SECONDS = 180
+# Defensive live-exit guard: require loss exits to persist across multiple checks.
+LOSS_EXIT_CONFIRMATION_CHECKS = 2
+# Defensive live-entry guard: skip entries with immediate negative edge at the top of book.
+ENABLE_NEGATIVE_EDGE_ENTRY_GUARD = True
+# Defensive live-entry guard: re-check live quote conditions before submitting the order.
+ENABLE_STALE_SIGNAL_GUARD = True
+# Defensive retry guard: avoid hammering the same ticker after immediate negative-edge rejection.
+IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS = 15
+# Defensive edge threshold: allow normal 1-cent top-of-book entry cost, block worse starts.
+MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS = -0.01
 MAX_EXIT_SPREAD = 0.12
 LIVE_POSITION_POLL_SECONDS = 15
 ALLOW_CONTINUOUS_LIVE_EXITS = False
@@ -89,6 +106,11 @@ PHASE5_BUY_SCORE_THRESHOLD = 70.0
 ENABLE_TARGETED_SERIES_MODE = True
 TARGETED_SERIES_TICKERS = ["KXBTC15M"]
 TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS = [
+    "KXMLBSPREAD",
+    "KXMLBTOTAL",
+    "KXMLBMONEYLINE",
+    "KXATPCHALLENGERMATCH",
+    "KXTENNISMATCH",
     "KXTEMP",
     "KXRAIN",
 ]
@@ -113,6 +135,11 @@ TARGETED_SERIES_PRIORITY_WINDOWS = {
     "KXNBA1HTOTAL": {"hours_utc": (16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4), "reason": "us_basketball_game_window"},
     "KXNBA1HSPREAD": {"hours_utc": (16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4), "reason": "us_basketball_game_window"},
     "KXNBASPREAD": {"hours_utc": (16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4), "reason": "us_basketball_game_window"},
+    "KXMLBSPREAD": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXMLBTOTAL": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXMLBMONEYLINE": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXATPCHALLENGERMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXTENNISMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXTEMP": {"hours_utc": (), "reason": "weather_active_short_horizon_window"},
     "KXRAIN": {"hours_utc": (), "reason": "weather_active_short_horizon_window"},
 }
@@ -120,13 +147,37 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
     {
         "name": "nba_game_start_window",
         "hours_utc": (23, 0, 1, 2, 3),
-        "ordered": ["KXNBA1HTOTAL", "KXNBA1HSPREAD", "KXNBASPREAD", "KXBTC15M", "KXTEMP", "KXRAIN"],
+        "ordered": [
+            "KXNBA1HTOTAL",
+            "KXNBA1HSPREAD",
+            "KXNBASPREAD",
+            "KXMLBSPREAD",
+            "KXMLBTOTAL",
+            "KXMLBMONEYLINE",
+            "KXATPCHALLENGERMATCH",
+            "KXTENNISMATCH",
+            "KXBTC15M",
+            "KXTEMP",
+            "KXRAIN",
+        ],
         "reason": "nba_game_start_and_early_game_emphasis",
     },
     {
         "name": "crypto_default_window",
         "hours_utc": (),
-        "ordered": ["KXBTC15M", "KXNBA1HTOTAL", "KXNBA1HSPREAD", "KXNBASPREAD", "KXTEMP", "KXRAIN"],
+        "ordered": [
+            "KXBTC15M",
+            "KXNBA1HTOTAL",
+            "KXNBA1HSPREAD",
+            "KXNBASPREAD",
+            "KXMLBSPREAD",
+            "KXMLBTOTAL",
+            "KXMLBMONEYLINE",
+            "KXATPCHALLENGERMATCH",
+            "KXTENNISMATCH",
+            "KXTEMP",
+            "KXRAIN",
+        ],
         "reason": "outside_nba_start_window_keep_crypto_and_mainline_sports_ahead_of_weather",
     },
 )
@@ -221,12 +272,25 @@ LIVE_ARMED = False
 LIVE_ENV_CONFIRMED = False
 LIVE_ORDER_RATE_LIMIT = 3
 LIVE_ORDER_RATE_WINDOW_SEC = 60
+LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
 MAX_SIMULTANEOUS_LIVE_POSITIONS = 3
+MAX_BTC15M_LIVE_POSITIONS = 1
+MAX_SPORTS_LIVE_POSITIONS = 2
 MAX_LIVE_ORDER_SIZE = 1
-MAX_LIVE_TRADES_PER_DAY = 1
+MAX_LIVE_TRADES_PER_DAY = 20
 LIVE_TEST_TICKER = None
 LIVE_AUDIT_LOG_FILE = "live_audit_log.csv"
 DEFAULT_LIVE_PRIVATE_KEY_PATH = "/Users/Kevin/Downloads/kalshi.key.txt"
+
+
+def compute_effective_live_dry_run(live_mode=None, live_armed=None, live_env_confirmed=None):
+    if live_mode is None:
+        live_mode = bool(globals().get("LIVE_MODE", False))
+    if live_armed is None:
+        live_armed = bool(globals().get("LIVE_ARMED", False))
+    if live_env_confirmed is None:
+        live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
+    return not bool(live_mode and live_armed and live_env_confirmed)
 
 
 @dataclass
@@ -262,19 +326,33 @@ class KalshiSniperBot:
         self.cycle_count = 0
         self.live_positions = []
         self._live_order_timestamps = []
+        self.live_execution_attempt_cooldowns = {}
         self.live_trade_day = None
         self.live_trade_count_today = 0
+        self.live_perf_day = None
+        self.live_perf_trades_today = 0
+        self.live_perf_wins_today = 0
+        self.live_perf_losses_today = 0
+        self.live_realized_pnl_today = 0.0
+        self.live_realized_pnl_by_family_today = {}
         self.live_canary_submitted = False
         self.live_canary_selected_ticker = None
         self.live_canary_authorized_ticker = None
         self.live_pending_entry_ticker = None
         self.live_exit_cooldowns = {}
+        self.live_exit_pending_tickers = set()
         self.live_family_runtime_stats = {}
         self.last_live_select_summary = {}
         self.targeted_orderbook_cache = {}
+        self.targeted_family_activity = {}
         self.targeted_family_hourly_stats = {}
         self.live_family_hourly_observation_stats = {}
         self.btc15m_top_book_observation_state = {}
+        self.phase55_live_execution_gate_by_ticker = {}
+        self.live_direction_decisions_by_ticker = {}
+        self.live_position_closure_tracker = {}
+        self.live_loss_exit_confirmation_counts = {}
+        self.live_entry_block_cooldowns = {}
         self.btc15m_near_miss_persistence = {}
         self.last_safety_alert_reason = None
         self.last_telegram_heartbeat_ts = 0.0
@@ -391,6 +469,36 @@ class KalshiSniperBot:
         except OSError:
             print(f"[LIVE-STATE] warning unable_to_save path={LIVE_POSITION_STATE_FILE}")
 
+    def normalize_contract_price(self, price, ticker=None, source="unknown"):
+        if price is None:
+            print(
+                f"[LIVE-PRICE-NORMALIZE] ticker={ticker or 'UNKNOWN'} source={source} "
+                f"raw_pre=None normalized_price=None action=rejected"
+            )
+            return None
+        try:
+            numeric_price = float(price)
+        except (TypeError, ValueError):
+            print(
+                f"[LIVE-PRICE-NORMALIZE] ticker={ticker or 'UNKNOWN'} source={source} "
+                f"raw_pre={price} normalized_price=None action=rejected"
+            )
+            return None
+        if 0 < numeric_price <= 1:
+            normalized_price = round(numeric_price, 4)
+            action = "kept"
+        elif 1 < numeric_price <= 100:
+            normalized_price = round(numeric_price / 100.0, 4)
+            action = "divided_by_100"
+        else:
+            normalized_price = None
+            action = "rejected"
+        print(
+            f"[LIVE-PRICE-NORMALIZE] ticker={ticker or 'UNKNOWN'} source={source} "
+            f"raw_pre={numeric_price} normalized_price={normalized_price} action={action}"
+        )
+        return normalized_price
+
     def persist_live_entry_metadata(self, order=None, payload=None, order_id=None):
         summary = self.extract_order_execution_summary(order or {})
         ticker = (summary.get("ticker") or (payload or {}).get("ticker") or "").strip()
@@ -408,6 +516,7 @@ class KalshiSniperBot:
                 count = None
         if not ticker or not side or count in (None, 0):
             return
+        entry_price = self.normalize_contract_price(entry_price, ticker=ticker, source="persist_live_entry_metadata")
         state = self.load_live_position_state()
         state[ticker] = {
             "ticker": ticker,
@@ -452,10 +561,15 @@ class KalshiSniperBot:
             entry_ts = existing.get("entry_ts")
         elif not existing:
             print(f"[LIVE-STATE-BACKFILL] ticker={ticker} entry_ts={entry_ts} source={source}")
+        normalized_avg_price = self.normalize_contract_price(
+            position_summary.get("avg_price"),
+            ticker=ticker,
+            source="upsert_live_entry_metadata_from_position.avg_price",
+        )
         state[ticker] = {
             "ticker": ticker,
             "side": position_summary.get("side"),
-            "entry_price": position_summary.get("avg_price"),
+            "entry_price": normalized_avg_price,
             "count": count,
             "entry_ts": entry_ts,
             "last_update_ts": updated_ts if updated_ts is not None else time.time(),
@@ -487,9 +601,7 @@ class KalshiSniperBot:
 
     def print_live_startup_checklist(self, args=None):
         config_status = self.get_live_config_status()
-        effective_live_dry_run = DRY_RUN_LIVE_ORDERS or not (
-            globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
-        )
+        effective_live_dry_run = compute_effective_live_dry_run()
         canary_required = bool(args is not None and getattr(args, "run_live_canary", False))
         canary_ticker_ok = (not canary_required) or bool(
             getattr(args, "live_test_ticker", None) or globals().get("LIVE_TEST_TICKER")
@@ -515,9 +627,7 @@ class KalshiSniperBot:
     def run_live_preflight(self, args=None):
         print("[LIVE-PREFLIGHT] starting")
         config_status = self.get_live_config_status()
-        effective_live_dry_run = DRY_RUN_LIVE_ORDERS or not (
-            globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
-        )
+        effective_live_dry_run = compute_effective_live_dry_run()
         canary_required = bool(args is not None and getattr(args, "run_live_canary", False))
         canary_ticker_ok = (not canary_required) or bool(
             getattr(args, "live_test_ticker", None) or globals().get("LIVE_TEST_TICKER")
@@ -638,6 +748,16 @@ class KalshiSniperBot:
         liquidity = getattr(q, "liquidity", 0.0) or 0.0
         min_liquidity = self.get_market_min_entry_liquidity(market)
         series_ticker = self.get_targeted_series_ticker(market)
+        liquidity_priority = self.get_market_liquidity_priority(market)
+        liquidity_fix = self._resolve_effective_liquidity_signal(
+            market,
+            q=q,
+            family=family,
+            spread=spread,
+            liquidity_priority=liquidity_priority,
+            source="hard_filter",
+        )
+        effective_liquidity = liquidity_fix.get("liquidity_final") or 0.0
         strict_orderbook_details = None
         strict_orderbook_ok = None
         if self.is_targeted_series_market(market):
@@ -645,7 +765,7 @@ class KalshiSniperBot:
                 f"[LIVE-SELECT-DEBUG] targeted_liquidity ticker={ticker} "
                 f"default={MIN_ENTRY_LIQUIDITY} targeted={min_liquidity} seen={liquidity}"
             )
-        if liquidity <= min_liquidity:
+        if effective_liquidity <= min_liquidity:
             if self.is_targeted_series_market(market):
                 strict_orderbook_ok, strict_orderbook_details = self.passes_targeted_orderbook_quality(market, q)
                 field_source = "targeted_orderbook_quality"
@@ -731,6 +851,46 @@ class KalshiSniperBot:
         if event_ticker:
             return self.get_market_group(event_ticker)
         return "UNKNOWN"
+
+    def get_market_discovery_category(self, market_or_family):
+        if isinstance(market_or_family, dict):
+            family = self.get_market_family(market_or_family)
+            explicit_category = str(
+                market_or_family.get("category")
+                or market_or_family.get("market_category")
+                or market_or_family.get("event_category")
+                or ""
+            ).strip().lower()
+            haystack = " ".join(
+                str(market_or_family.get(key, "") or "")
+                for key in ("ticker", "event_ticker", "series_ticker", "title", "subtitle")
+            ).upper()
+        else:
+            family = str(market_or_family or "").strip().upper()
+            explicit_category = ""
+            haystack = family
+        if any(marker in explicit_category for marker in ("crypto", "bitcoin")) or any(marker in haystack for marker in ("BTC", "BITCOIN", "CRYPTO")):
+            return "crypto"
+        if "weather" in explicit_category or family.startswith(("KXTEMP", "KXRAIN", "KXSNOW", "KXWEATHER")):
+            return "weather"
+        if "sport" in explicit_category or family.startswith((
+            "KXNBA", "KXWNBA", "KXNHL", "KXMLB", "KXNFL", "KXNFL", "KXNCAA", "KXATP", "KXITF", "KXEPL", "KXSOCCER", "KXUFC", "KXBOX", "KXMMA", "KXGOLF", "KXCFB", "KXCBB"
+        )):
+            return "sports"
+        return "general"
+
+    def get_market_discovery_soft_boost(self, market):
+        family = self.get_market_family(market)
+        category = self.get_market_discovery_category(market)
+        category_boost = {
+            "crypto": 12.0,
+            "sports": 10.0,
+            "general": 4.0,
+            "weather": 1.0,
+        }.get(category, 0.0)
+        family_boost = 4.0 if family in HIGH_LIQUIDITY_PRIORITY_FAMILIES else 0.0
+        deprioritized_penalty = -8.0 if family in DEPRIORITIZED_MARKET_FAMILIES else 0.0
+        return round(category_boost + family_boost + deprioritized_penalty, 4)
 
     def fetch_market_batch(self, cursor=None):
         params = {
@@ -1103,15 +1263,53 @@ class KalshiSniperBot:
                 deprioritized.append(series_ticker)
             else:
                 ordered.append(series_ticker)
-        ordered = ordered + deprioritized
+        quality_inputs = {}
+        base_rank_map = {family: idx for idx, family in enumerate(base_order)}
+        for series_ticker in ordered:
+            live_stats = self.targeted_family_activity.get(series_ticker, {}) if isinstance(getattr(self, "targeted_family_activity", {}), dict) else {}
+            quality_inputs[series_ticker] = {
+                "pass_count": int(live_stats.get("targeted_orderbook_pass", 0) or 0),
+                "usable_top_book": int(live_stats.get("usable_top_book", 0) or 0),
+                "empty_top_book": int(live_stats.get("empty_top_book", 0) or 0),
+                "spread_fail": int(live_stats.get("targeted_orderbook_buckets", {}).get("spread_fail", 0) or 0),
+                "both_sides_quoted": int(live_stats.get("both_sides_quoted", 0) or 0),
+                "prefilter_survivors": int(live_stats.get("prefilter_survivors", 0) or 0),
+                "in_window": int(live_stats.get("in_window", 0) or 0),
+            }
+        quality_adjusted_order = sorted(
+            ordered,
+            key=lambda family: (
+                -quality_inputs.get(family, {}).get("prefilter_survivors", 0),
+                -quality_inputs.get(family, {}).get("pass_count", 0),
+                -quality_inputs.get(family, {}).get("usable_top_book", 0),
+                -quality_inputs.get(family, {}).get("both_sides_quoted", 0),
+                quality_inputs.get(family, {}).get("empty_top_book", 0),
+                quality_inputs.get(family, {}).get("spread_fail", 0),
+                base_rank_map.get(family, 999),
+            ),
+        )
+        ordered = quality_adjusted_order + deprioritized
         self.last_targeted_priority_adaptation = {
             "hour_utc": utc_hour,
             "base_order": base_order,
             "adapted_order": list(ordered),
+            "quality_adjusted_order": list(quality_adjusted_order),
             "suppressed_families": list(suppressed),
             "deprioritized_families": list(deprioritized),
             "details": adaptation_details,
+            "quality_inputs": quality_inputs,
         }
+        print(
+            f"[LIVE-SELECT-TARGETED-QUALITY-ORDER] hour_utc={utc_hour} old_order={base_order} "
+            f"quality_adjusted_order={quality_adjusted_order} changed={'yes' if quality_adjusted_order != [family for family in base_order if family in quality_adjusted_order] else 'no'}"
+        )
+        for series_ticker, inputs in quality_inputs.items():
+            print(
+                f"[LIVE-SELECT-TARGETED-QUALITY-INPUT] family={series_ticker} pass_count={inputs.get('pass_count', 0)} "
+                f"usable_top_book={inputs.get('usable_top_book', 0)} empty_top_book={inputs.get('empty_top_book', 0)} "
+                f"spread_fail={inputs.get('spread_fail', 0)} both_sides_quoted={inputs.get('both_sides_quoted', 0)} "
+                f"prefilter_survivors={inputs.get('prefilter_survivors', 0)} in_window={inputs.get('in_window', 0)}"
+            )
         print(
             f"[LIVE-SELECT-DEBUG] targeted_priority_order hour_utc={utc_hour} ordered={ordered} "
             f"suppressed_dead_book_families={suppressed} deprioritized_dead_book_families={deprioritized}"
@@ -1201,8 +1399,306 @@ class KalshiSniperBot:
                 return value
         return "unknown"
 
+    def _resolve_effective_liquidity_signal(self, market, q=None, family=None, spread=None, liquidity_priority=None, source="selection_scoring"):
+        market = market if isinstance(market, dict) else {}
+        family = family or self.get_market_family(market)
+        liquidity_priority = liquidity_priority or {}
+        liquidity_original = None
+        if q is not None:
+            liquidity_original = getattr(q, "liquidity", None)
+        if liquidity_original is None:
+            liquidity_original = self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0)
+        liquidity_original = self.to_float(liquidity_original, 0.0)
+        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), None)
+        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), None)
+        quote_values = self.get_market_quote_values(market) if market else {}
+        both_sides_quoted = liquidity_priority.get("both_sides_quoted")
+        if both_sides_quoted is None:
+            both_sides_quoted = self.has_complete_quote_side(quote_values.get("yes_bid"), quote_values.get("yes_ask")) and self.has_complete_quote_side(quote_values.get("no_bid"), quote_values.get("no_ask"))
+        if spread is None:
+            if q is not None:
+                yes_bid = getattr(q, "yes_bid", None)
+                yes_ask = getattr(q, "yes_ask", None)
+            else:
+                yes_bid = quote_values.get("yes_bid")
+                yes_ask = quote_values.get("yes_ask")
+            if yes_bid is not None and yes_ask is not None:
+                try:
+                    spread = float(yes_ask) - float(yes_bid)
+                except (TypeError, ValueError):
+                    spread = None
+        effective_top_size = None
+        if yes_top_size is not None and no_top_size is not None:
+            effective_top_size = min(yes_top_size, no_top_size)
+        fallback_used = bool(
+            (liquidity_original is None or liquidity_original <= 0.0)
+            and bool(both_sides_quoted)
+            and spread is not None
+            and 0.0 <= float(spread) <= 0.06
+            and yes_top_size is not None
+            and no_top_size is not None
+            and effective_top_size is not None
+            and effective_top_size > 0.0
+        )
+        liquidity_final = effective_top_size if fallback_used else liquidity_original
+        effective_source = "effective_top_size" if fallback_used else "reported_liquidity_dollars"
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        print(
+            f"[LIVE-LIQUIDITY-FIX] ticker={ticker} family={family} liquidity_original={liquidity_original} "
+            f"yes_top_size={yes_top_size} no_top_size={no_top_size} effective_top_size={effective_top_size} "
+            f"fallback_used={'yes' if fallback_used else 'no'} liquidity_final={liquidity_final} source={source}"
+        )
+        return {
+            "liquidity_original": liquidity_original,
+            "yes_top_size": yes_top_size,
+            "no_top_size": no_top_size,
+            "effective_top_size": effective_top_size,
+            "both_sides_quoted": bool(both_sides_quoted),
+            "spread": spread,
+            "fallback_used": fallback_used,
+            "liquidity_final": liquidity_final,
+            "effective_source": effective_source,
+        }
+
     def _should_trace_priority_topbook_family(self, family):
         return family in {"KXBTC15M", "KXNBA1HTOTAL", "KXNBA1HSPREAD", "KXNBASPREAD"}
+
+    def _is_balanced_sports_family(self, family):
+        return bool(family) and family != "KXBTC15M" and self.get_market_discovery_category(family) == "sports"
+
+    def _is_priority_sports_family(self, family):
+        return family in {
+            "KXNBA1HTOTAL",
+            "KXNBA1HSPREAD",
+            "KXNBASPREAD",
+            "KXMLBSPREAD",
+            "KXMLBTOTAL",
+            "KXMLBMONEYLINE",
+            "KXATPCHALLENGERMATCH",
+            "KXTENNISMATCH",
+        }
+
+    def _get_sports_priority_profile(self, market, liquidity_priority=None, spread=None):
+        family = self.get_market_family(market)
+        q = self.build_quote(market)
+        liquidity_priority = liquidity_priority or self.get_market_liquidity_priority(market)
+        min_top_size = self.get_market_min_top_of_book_size(market)
+        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
+        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0
+        if spread is None:
+            yes_bid = getattr(q, "yes_bid", 0.0) or 0.0
+            yes_ask = getattr(q, "yes_ask", 0.0) or 0.0
+            spread = (yes_ask - yes_bid) if yes_bid > 0 and yes_ask > 0 else None
+        spread_value = self.to_float(spread, None)
+        spread_tight = bool(spread_value is not None and 0.0 <= spread_value <= 0.05)
+        both_sides_quoted = bool(liquidity_priority.get("both_sides_quoted"))
+        both_sizes_meet_threshold = yes_top_size >= min_top_size and no_top_size >= min_top_size
+        larger_side_size = max(yes_top_size, no_top_size)
+        smaller_side_size = min(yes_top_size, no_top_size)
+        moderate_imbalance = (
+            both_sides_quoted
+            and spread_tight
+            and larger_side_size >= min_top_size
+            and smaller_side_size > 0.0
+            and smaller_side_size >= max(1.0, min_top_size * 0.35)
+        )
+        priority_boost_applied = bool(
+            self._is_priority_sports_family(family)
+            and both_sides_quoted
+            and spread_tight
+            and both_sizes_meet_threshold
+        )
+        if priority_boost_applied:
+            reason = "strong_two_sided_sports_liquidity"
+        elif moderate_imbalance:
+            reason = "tight_spread_moderate_liquidity_imbalance"
+        elif not self._is_priority_sports_family(family):
+            reason = "non_priority_sports_family"
+        elif not both_sides_quoted:
+            reason = "missing_two_sided_quotes"
+        elif not spread_tight:
+            reason = "spread_not_tight_enough"
+        else:
+            reason = "top_size_below_threshold"
+        return {
+            "family": family,
+            "priority_boost_applied": priority_boost_applied,
+            "moderate_imbalance": moderate_imbalance,
+            "reason": reason,
+            "spread": round(spread_value, 4) if spread_value is not None else None,
+            "spread_tight": spread_tight,
+            "both_sides_quoted": both_sides_quoted,
+            "yes_top_size": yes_top_size,
+            "no_top_size": no_top_size,
+            "min_top_size_threshold": min_top_size,
+        }
+
+    def _apply_post_strict_sports_priority(self, ranked, markets):
+        if not ranked:
+            print(
+                "[LIVE-SPORTS-PRIORITY-SUMMARY] sports_candidates_seen=0 sports_candidates_boosted=0 "
+                "btc_candidates_seen=0 final_selected_family=None"
+            )
+            return ranked, {
+                "sports_candidates_seen": 0,
+                "sports_candidates_boosted": 0,
+                "btc_candidates_seen": 0,
+                "top_family_after_priority": None,
+            }
+        market_by_ticker = {
+            str(item.get("ticker", "") or "").strip(): item
+            for item in (markets or [])
+            if isinstance(item, dict)
+        }
+        prioritized = []
+        sports_candidates_seen = 0
+        sports_candidates_boosted = 0
+        btc_candidates_seen = 0
+        for index, ranked_candidate in enumerate(ranked):
+            score, q, spread, family = ranked_candidate
+            ticker = getattr(q, "ticker", "") or ""
+            market = market_by_ticker.get(ticker)
+            if family == "KXBTC15M":
+                btc_candidates_seen += 1
+            sports_priority_rank_boost = 0.0
+            boost_applied = False
+            strict_pass = "yes"
+            reason = "non_sports_candidate"
+            yes_top_size = None
+            no_top_size = None
+            if self._is_priority_sports_family(family):
+                sports_candidates_seen += 1
+                if market is None:
+                    strict_pass = "no"
+                    reason = "market_lookup_failed"
+                else:
+                    validation_snapshot = self.get_strict_validation_snapshot(market, q)
+                    orderbook_snapshot = validation_snapshot.get("orderbook", {})
+                    yes_top_size = self.to_float(orderbook_snapshot.get("yes_top_size"), 0.0) or 0.0
+                    no_top_size = self.to_float(orderbook_snapshot.get("no_top_size"), 0.0) or 0.0
+                    quote_values = self.get_market_quote_values(market)
+                    both_sides_quoted = self.has_complete_quote_side(quote_values.get("yes_bid"), quote_values.get("yes_ask")) and self.has_complete_quote_side(quote_values.get("no_bid"), quote_values.get("no_ask"))
+                    safe_price = bool((getattr(q, "yes_ask", 0.0) or 0.0) > MIN_ENTRY_PRICE and (getattr(q, "yes_ask", 0.0) or 0.0) < MAX_ENTRY_PRICE)
+                    if not both_sides_quoted:
+                        reason = "missing_two_sided_quotes"
+                    elif spread is None or spread < 0.0 or spread > 0.05:
+                        reason = "spread_above_sports_priority_limit"
+                    elif yes_top_size < 5.0 or no_top_size < 5.0:
+                        reason = "top_size_below_priority_floor"
+                    elif not safe_price:
+                        reason = "unsafe_price"
+                    else:
+                        boost_applied = True
+                        sports_candidates_boosted += 1
+                        sports_priority_rank_boost = 1000.0
+                        reason = "strict_pass_high_quality_sports_boost"
+            print(
+                f"[LIVE-SPORTS-PRIORITY] ticker={ticker} family={family} spread={round(spread, 4) if spread is not None else None} "
+                f"yes_top_size={yes_top_size} no_top_size={no_top_size} strict_pass={strict_pass} "
+                f"boost_applied={'yes' if boost_applied else 'no'} reason={reason}"
+            )
+            prioritized.append((sports_priority_rank_boost, index, ranked_candidate))
+        prioritized.sort(
+            key=lambda item: (
+                -item[0],
+                -item[2][0],
+                item[2][2],
+                -getattr(item[2][1], "liquidity", 0.0),
+                -getattr(item[2][1], "volume", 0.0),
+                item[1],
+            )
+        )
+        prioritized_ranked = [item[2] for item in prioritized]
+        top_family_after_priority = prioritized_ranked[0][3] if prioritized_ranked else None
+        print(
+            f"[LIVE-SPORTS-PRIORITY-SUMMARY] sports_candidates_seen={sports_candidates_seen} "
+            f"sports_candidates_boosted={sports_candidates_boosted} btc_candidates_seen={btc_candidates_seen} "
+            f"final_selected_family={top_family_after_priority}"
+        )
+        return prioritized_ranked, {
+            "sports_candidates_seen": sports_candidates_seen,
+            "sports_candidates_boosted": sports_candidates_boosted,
+            "btc_candidates_seen": btc_candidates_seen,
+            "top_family_after_priority": top_family_after_priority,
+        }
+
+    def _rebalance_ranked_candidates_for_family_mix(self, ranked, prefilter_survivor_family_counts):
+        if not ranked:
+            print(
+                "[LIVE-SELECT-FAMILY-BALANCE] families_seen=[] families_with_survivors=[] "
+                "btc_candidates_count=0 sports_candidates_count=0 selected_family_mix=[] reason=no_ranked_candidates"
+            )
+            return ranked
+        families_seen = []
+        families_seen_set = set()
+        families_with_survivors = []
+        for family, count in sorted(prefilter_survivor_family_counts.items()):
+            if count > 0:
+                families_with_survivors.append(family)
+        btc_candidates = []
+        sports_candidates = []
+        best_sports_by_family = {}
+        anchored_indexes = set()
+        for index, ranked_candidate in enumerate(ranked):
+            _score, _q, _spread, family = ranked_candidate
+            if family not in families_seen_set:
+                families_seen.append(family)
+                families_seen_set.add(family)
+            if family == "KXBTC15M":
+                btc_candidates.append((index, ranked_candidate))
+                continue
+            if not self._is_balanced_sports_family(family):
+                continue
+            sports_candidates.append((index, ranked_candidate))
+            if family not in best_sports_by_family:
+                best_sports_by_family[family] = (index, ranked_candidate)
+        if not sports_candidates:
+            selected_family_mix = []
+            seen_family_mix = set()
+            for _score, _q, _spread, family in ranked:
+                if family in seen_family_mix:
+                    continue
+                selected_family_mix.append(family)
+                seen_family_mix.add(family)
+            print(
+                f"[LIVE-SELECT-FAMILY-BALANCE] families_seen={families_seen} "
+                f"families_with_survivors={families_with_survivors} "
+                f"btc_candidates_count={len(btc_candidates)} sports_candidates_count=0 "
+                f"selected_family_mix={selected_family_mix} reason=no_sports_candidates"
+            )
+            return ranked
+        anchored_candidates = []
+        if btc_candidates:
+            btc_index, btc_candidate = btc_candidates[0]
+            anchored_candidates.append((btc_index, btc_candidate))
+            anchored_indexes.add(btc_index)
+        for sports_index, sports_candidate in sorted(best_sports_by_family.values(), key=lambda item: item[0]):
+            anchored_candidates.append((sports_index, sports_candidate))
+            anchored_indexes.add(sports_index)
+        anchored_candidates.sort(key=lambda item: item[0])
+        balanced_ranked = [candidate for _index, candidate in anchored_candidates]
+        balanced_ranked.extend(
+            ranked[index]
+            for index in range(len(ranked))
+            if index not in anchored_indexes
+        )
+        selected_family_mix = []
+        seen_family_mix = set()
+        for _score, _q, _spread, family in balanced_ranked:
+            if family in seen_family_mix:
+                continue
+            selected_family_mix.append(family)
+            seen_family_mix.add(family)
+        reason = "promoted_sports_family_representatives"
+        if selected_family_mix[:1] == ["KXBTC15M"]:
+            reason = "preserved_btc_and_promoted_sports_family_representatives"
+        print(
+            f"[LIVE-SELECT-FAMILY-BALANCE] families_seen={families_seen} "
+            f"families_with_survivors={families_with_survivors} "
+            f"btc_candidates_count={len(btc_candidates)} sports_candidates_count={len(sports_candidates)} "
+            f"selected_family_mix={selected_family_mix} reason={reason}"
+        )
+        return balanced_ranked
 
     def _collect_topbook_candidate_state(self, market):
         state = {
@@ -1304,6 +1800,83 @@ class KalshiSniperBot:
         print(
             f"{prefix} ticker={ticker} family={trace_family}"
             f"{' ' + ' '.join(extra_parts) if extra_parts else ''}"
+        )
+
+    def _emit_live_select_reject_detail(self, stage, market=None, q=None, family=None, reason=None, side=None, source_path=None, validation_snapshot=None, orderbook_snapshot=None, prefilter_snapshot=None):
+        market = market if isinstance(market, dict) else {}
+        validation_snapshot = validation_snapshot if isinstance(validation_snapshot, dict) else {}
+        orderbook_snapshot = orderbook_snapshot if isinstance(orderbook_snapshot, dict) else {}
+        prefilter_snapshot = prefilter_snapshot if isinstance(prefilter_snapshot, dict) else {}
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or validation_snapshot.get("ticker", "") or prefilter_snapshot.get("ticker", "") or "").strip()
+        family = family or self.get_market_family(market)
+        quote_values = self.get_market_quote_values(market) if market else {}
+        yes_bid = validation_snapshot.get("yes_bid")
+        if yes_bid is None:
+            yes_bid = getattr(q, "yes_bid", None)
+        if yes_bid is None:
+            yes_bid = prefilter_snapshot.get("yes_bid")
+        if yes_bid is None:
+            yes_bid = quote_values.get("yes_bid")
+        yes_ask = validation_snapshot.get("yes_ask")
+        if yes_ask is None:
+            yes_ask = getattr(q, "yes_ask", None)
+        if yes_ask is None:
+            yes_ask = prefilter_snapshot.get("yes_ask")
+        if yes_ask is None:
+            yes_ask = quote_values.get("yes_ask")
+        no_bid = validation_snapshot.get("no_bid")
+        if no_bid is None:
+            no_bid = getattr(q, "no_bid", None)
+        if no_bid is None:
+            no_bid = prefilter_snapshot.get("no_bid")
+        if no_bid is None:
+            no_bid = quote_values.get("no_bid")
+        no_ask = validation_snapshot.get("no_ask")
+        if no_ask is None:
+            no_ask = getattr(q, "no_ask", None)
+        if no_ask is None:
+            no_ask = prefilter_snapshot.get("no_ask")
+        if no_ask is None:
+            no_ask = quote_values.get("no_ask")
+        spread = validation_snapshot.get("spread")
+        if spread is None:
+            spread = prefilter_snapshot.get("spread")
+        if spread is None and yes_bid not in (None, "") and yes_ask not in (None, ""):
+            try:
+                spread = round(float(yes_ask) - float(yes_bid), 4)
+            except (TypeError, ValueError):
+                spread = None
+        volume = validation_snapshot.get("volume")
+        if volume is None:
+            volume = getattr(q, "volume", None)
+        if volume is None:
+            volume = market.get("volume") if isinstance(market, dict) else None
+        liquidity_dollars = validation_snapshot.get("liquidity")
+        if liquidity_dollars is None:
+            liquidity_dollars = prefilter_snapshot.get("liquidity")
+        if liquidity_dollars is None:
+            liquidity_dollars = getattr(q, "liquidity", None)
+        if liquidity_dollars is None:
+            liquidity_dollars = market.get("liquidity") if isinstance(market, dict) else None
+        yes_top_size = orderbook_snapshot.get("yes_top_size")
+        if yes_top_size is None:
+            yes_top_size = prefilter_snapshot.get("yes_top_size")
+        no_top_size = orderbook_snapshot.get("no_top_size")
+        if no_top_size is None:
+            no_top_size = prefilter_snapshot.get("no_top_size")
+        effective_top_size = prefilter_snapshot.get("effective_top_size")
+        if effective_top_size is None:
+            top_sizes = [size for size in (yes_top_size, no_top_size) if size is not None]
+            effective_top_size = max(top_sizes) if top_sizes else None
+        orderbook_source = orderbook_snapshot.get("orderbook_source") or prefilter_snapshot.get("source_path")
+        top_book_state = orderbook_snapshot.get("top_book_bucket") or prefilter_snapshot.get("top_book_state")
+        candidate_side = side or validation_snapshot.get("target_side") or market.get("side") or "unknown"
+        print(
+            f"[LIVE-SELECT-REJECT-DETAIL] stage={stage} ticker={ticker} family={family} side={candidate_side} "
+            f"yes_bid={yes_bid} yes_ask={yes_ask} no_bid={no_bid} no_ask={no_ask} spread={spread} "
+            f"volume={volume} liquidity_dollars={liquidity_dollars} effective_top_size={effective_top_size} "
+            f"top_book_state={top_book_state} orderbook_source={orderbook_source or 'none'} "
+            f"rejection_reason={reason} source_path={source_path or 'unknown'} origin={self._get_liquidity_trace_origin(market)}"
         )
 
     def _get_raw_liquidity_candidate_fields(self, market):
@@ -1418,6 +1991,15 @@ class KalshiSniperBot:
         elif (snapshot["yes_top_size"] or 0.0) == 0.0 and (snapshot["no_top_size"] or 0.0) == 0.0:
             snapshot["failure_stage"] = "zero_sizes"
             snapshot["failure_reason"] = "mapped_sizes_zero"
+        print(
+            f"[LIVE-SELECT-TOPBOOK-NORMALIZE] ticker={str(market.get('ticker', '') or '').strip()} family={self.get_market_family(market)} "
+            f"parser_path=non_targeted_snapshot source_path={snapshot.get('source_path')} "
+            f"raw_orderbook_container_present={'yes' if snapshot.get('raw_orderbook_container_present') else 'no'} "
+            f"raw_field_names={snapshot.get('raw_field_names')} raw_yes_sizes={snapshot.get('raw_yes_sizes')} raw_no_sizes={snapshot.get('raw_no_sizes')} "
+            f"normalized_yes_top_size={snapshot.get('yes_top_size')} normalized_no_top_size={snapshot.get('no_top_size')} "
+            f"failure_stage={snapshot.get('failure_stage')} failure_reason={snapshot.get('failure_reason')} "
+            f"candidate_raw_fields={self._get_raw_liquidity_candidate_fields(market)}"
+        )
         return snapshot
 
     def _emit_strict_liquidity_trace(self, market, q, family, validation_snapshot, orderbook_snapshot, reject_reason):
@@ -1775,6 +2357,15 @@ class KalshiSniperBot:
             f"no_top_size={no_top_size} min_top_size={min_top_size} spread={spread} "
             f"bucket={top_book_bucket}"
         )
+        print(
+            f"[LIVE-SELECT-TOPBOOK-NORMALIZE] ticker={ticker} family={self.get_market_family(market)} "
+            f"parser_path=targeted_orderbook_gate source_path={cached.get('orderbook_source')} "
+            f"raw_yes_top_level={cached.get('yes_raw_top_level')} raw_no_top_level={cached.get('no_raw_top_level')} "
+            f"normalized_yes_top_price={cached.get('yes_top_price')} normalized_yes_top_size={yes_top_size} "
+            f"normalized_no_top_price={cached.get('no_top_price')} normalized_no_top_size={no_top_size} "
+            f"min_top_size={min_top_size} spread={spread} top_book_bucket={top_book_bucket} "
+            f"candidate_raw_fields={self._get_raw_liquidity_candidate_fields(market)}"
+        )
         if ticker in self.strict_validation_liquidity_trace_tickers:
             print(
                 f"[LIVE-SELECT-LIQUIDITY-TRACE] stage=orderbook_helper ticker={ticker} family={self.get_market_family(market)} "
@@ -1814,6 +2405,7 @@ class KalshiSniperBot:
 
     def get_market_liquidity_priority(self, market):
         q = self.build_quote(market)
+        family = self.get_market_family(market)
         volume = getattr(q, "volume", 0.0) or 0.0
         liquidity = getattr(q, "liquidity", 0.0) or 0.0
         quote_values = self.get_market_quote_values(market)
@@ -1822,6 +2414,7 @@ class KalshiSniperBot:
         no_bid = quote_values.get("no_bid")
         no_ask = quote_values.get("no_ask")
         both_sides_quoted = self.has_complete_quote_side(yes_bid, yes_ask) and self.has_complete_quote_side(no_bid, no_ask)
+        spread = yes_ask - yes_bid if self.has_complete_quote_side(yes_bid, yes_ask) else None
         recent_activity = volume > 0
         score = 0.0
         reasons = []
@@ -1894,13 +2487,47 @@ class KalshiSniperBot:
             reasons.append("recent_trading_activity")
         else:
             reasons.append("no_recent_activity")
-        if liquidity <= 0:
+        liquidity_fix = self._resolve_effective_liquidity_signal(
+            market,
+            q=q,
+            family=family,
+            spread=spread,
+            liquidity_priority={
+                "yes_top_size": yes_top_size,
+                "no_top_size": no_top_size,
+                "both_sides_quoted": both_sides_quoted,
+            },
+            source="selection_scoring",
+        )
+        effective_liquidity_value = liquidity_fix.get("liquidity_final")
+        if liquidity <= 0 and not liquidity_fix.get("fallback_used"):
             score -= 2.0
             reasons.append("zero_reported_liquidity")
-        elif liquidity >= self.get_market_min_entry_liquidity(market):
+        elif (effective_liquidity_value or 0.0) >= self.get_market_min_entry_liquidity(market):
             score += 2.0
             reasons.append("reported_liquidity_present")
             has_real_liquidity = True or has_real_liquidity
+        sports_priority_profile = None
+        if self.get_market_discovery_category(family) == "sports":
+            sports_priority_profile = self._get_sports_priority_profile(
+                market,
+                liquidity_priority={
+                    "yes_top_size": yes_top_size,
+                    "no_top_size": no_top_size,
+                    "both_sides_quoted": both_sides_quoted,
+                },
+                spread=spread,
+            )
+            if sports_priority_profile.get("priority_boost_applied"):
+                score += 16.0
+                reasons.append("priority_sports_two_sided_liquidity")
+                has_real_liquidity = True
+            elif sports_priority_profile.get("moderate_imbalance"):
+                score += 6.0
+                reasons.append("sports_tight_spread_moderate_imbalance")
+                has_real_liquidity = has_real_liquidity or recent_activity or liquidity > 0
+            elif sports_priority_profile.get("spread_tight") and both_sides_quoted:
+                reasons.append("sports_tight_spread_no_priority_boost")
         if not has_real_liquidity and not empty_book and liquidity <= 0 and not recent_activity:
             reasons.append("deprioritized_thin_market")
         return {
@@ -1914,6 +2541,10 @@ class KalshiSniperBot:
             "yes_top_size": yes_top_size,
             "no_top_size": no_top_size,
             "topbook_snapshot": topbook_snapshot,
+            "effective_liquidity_value": effective_liquidity_value,
+            "effective_liquidity_source": liquidity_fix.get("effective_source"),
+            "effective_liquidity_fallback_used": liquidity_fix.get("fallback_used"),
+            "effective_top_size": liquidity_fix.get("effective_top_size"),
         }
 
     def get_prefilter_liquidity_snapshot(self, market):
@@ -1922,10 +2553,15 @@ class KalshiSniperBot:
         liquidity_priority = self.get_market_liquidity_priority(market)
         yes_top_size = liquidity_priority.get("yes_top_size")
         no_top_size = liquidity_priority.get("no_top_size")
-        effective_top_size = None
-        top_sizes = [size for size in (yes_top_size, no_top_size) if size is not None]
-        if top_sizes:
-            effective_top_size = max(top_sizes)
+        liquidity_fix = self._resolve_effective_liquidity_signal(
+            market,
+            q=q,
+            family=self.get_market_family(market),
+            spread=spread,
+            liquidity_priority=liquidity_priority,
+            source="hard_filter",
+        )
+        effective_top_size = liquidity_fix.get("effective_top_size")
         return {
             "ticker": getattr(q, "ticker", "") or str(market.get("ticker", "") or "").strip(),
             "liquidity": getattr(q, "liquidity", 0.0) or 0.0,
@@ -1937,8 +2573,8 @@ class KalshiSniperBot:
             "yes_top_size": yes_top_size,
             "no_top_size": no_top_size,
             "effective_top_size": effective_top_size,
-            "effective_liquidity_metric": "reported_liquidity_dollars",
-            "effective_liquidity_value": getattr(q, "liquidity", 0.0) or 0.0,
+            "effective_liquidity_metric": liquidity_fix.get("effective_source"),
+            "effective_liquidity_value": liquidity_fix.get("liquidity_final"),
             "min_top_size_threshold": self.get_market_min_top_of_book_size(market) if self.is_targeted_series_market(market) else None,
             "spread": round(spread, 4),
             "both_sides_quoted": liquidity_priority.get("both_sides_quoted", False),
@@ -2012,7 +2648,7 @@ class KalshiSniperBot:
             "no_top_size": no_top_size,
             "both_sides_quoted": both_sides_quoted,
             "recent_activity": recent_activity,
-            "liquidity": liquidity,
+            "liquidity": effective_liquidity_value,
             "liquidity_threshold": liquidity_threshold,
             "one_sided_top_book": one_sided_top_book,
             "near_miss_reasons": [],
@@ -2058,6 +2694,93 @@ class KalshiSniperBot:
                 return False, "far_below_liquidity_threshold", metrics
         return True, None, metrics
 
+    def _get_adaptive_prefilter_thresholds(self, market):
+        original_thresholds = {
+            "max_spread": round(MAX_ENTRY_SPREAD, 4),
+            "min_top_size": round(float(self.get_market_min_top_of_book_size(market) or 0.0), 4),
+            "min_liquidity": round(float(self.get_market_min_entry_liquidity(market) or 0.0), 4),
+            "require_complete_yes_side": True,
+            "require_both_sides_quote": True,
+        }
+        adjusted_thresholds = dict(original_thresholds)
+        family = self.get_market_family(market)
+        if family != "KXBTC15M" and self.get_market_discovery_category(market) == "sports":
+            adjusted_thresholds["max_spread"] = round(MAX_ENTRY_SPREAD * 1.2, 4)
+            adjusted_thresholds["min_top_size"] = round(max(1.0, original_thresholds["min_top_size"] * 0.6), 4)
+            adjusted_thresholds["min_liquidity"] = round(max(10.0, original_thresholds["min_liquidity"] * 0.5), 4)
+            adjusted_thresholds["require_both_sides_quote"] = False
+        return original_thresholds, adjusted_thresholds
+
+    def _evaluate_adaptive_prefilter(self, market, original_reason):
+        family = self.get_market_family(market)
+        ticker = str(market.get("ticker", "") or "").strip()
+        original_thresholds, adjusted_thresholds = self._get_adaptive_prefilter_thresholds(market)
+        liquidity_priority = self.get_market_liquidity_priority(market)
+        effective_liquidity_value = liquidity_priority.get("effective_liquidity_value")
+        if effective_liquidity_value is None:
+            effective_liquidity_value = liquidity
+        market_quality = self.get_market_quality_preference(market, liquidity_priority=liquidity_priority)
+        prefilter_snapshot = self.get_prefilter_liquidity_snapshot(market)
+        quote_values = self.get_market_quote_values(market)
+        yes_bid = quote_values.get("yes_bid")
+        yes_ask = quote_values.get("yes_ask")
+        has_complete_yes_side = self.has_complete_quote_side(yes_bid, yes_ask)
+        spread = prefilter_snapshot.get("spread")
+        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
+        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0
+        max_top_size = max(yes_top_size, no_top_size)
+        top_book_state = liquidity_priority.get("top_book_state") or "unknown"
+        topbook_snapshot = liquidity_priority.get("topbook_snapshot") or {}
+        orderbook_present = False
+        if self.is_targeted_series_market(market):
+            orderbook_present = bool(self.targeted_orderbook_cache.get(ticker, {}).get("orderbook_source"))
+        else:
+            orderbook_present = bool(
+                topbook_snapshot.get("raw_orderbook_container_present")
+                or topbook_snapshot.get("raw_field_names")
+                or topbook_snapshot.get("mapped_topbook_fields_present")
+                or topbook_snapshot.get("size_fields_exist")
+                or topbook_snapshot.get("yes_no_arrays_exist")
+            )
+        adaptive_allowed = False
+        adaptive_reason = "not_eligible"
+        if family == "KXBTC15M" or self.get_market_discovery_category(market) != "sports":
+            adaptive_reason = "non_sports_or_btc_strict"
+        elif original_reason not in ("missing_quotes", "wide_spread", "low_liquidity"):
+            adaptive_reason = f"{original_reason}_not_supported"
+        elif not has_complete_yes_side:
+            adaptive_reason = "missing_yes_side"
+        elif not orderbook_present:
+            adaptive_reason = "missing_orderbook"
+        elif yes_top_size <= 0.0 and no_top_size <= 0.0:
+            adaptive_reason = "both_sizes_zero"
+        elif top_book_state not in ("both_non_zero", "one_non_zero"):
+            adaptive_reason = f"top_book_state_{top_book_state}"
+        elif spread is None or spread < 0 or spread > adjusted_thresholds["max_spread"]:
+            adaptive_reason = "spread_above_adaptive_limit"
+        elif max_top_size < adjusted_thresholds["min_top_size"]:
+            adaptive_reason = "top_size_below_adaptive_floor"
+        elif original_reason == "low_liquidity" and prefilter_snapshot.get("liquidity", 0.0) <= adjusted_thresholds["min_liquidity"] and not market_quality.get("recent_activity"):
+            adaptive_reason = "liquidity_below_adaptive_floor"
+        elif original_reason == "missing_quotes" and market_quality.get("both_sides_quoted"):
+            adaptive_allowed = True
+            adaptive_reason = "sports_quote_recovered"
+        elif original_reason == "missing_quotes":
+            adaptive_allowed = True
+            adaptive_reason = "sports_one_sided_quote_allowed"
+        elif original_reason == "wide_spread":
+            adaptive_allowed = True
+            adaptive_reason = "sports_spread_tolerance_applied"
+        elif original_reason == "low_liquidity":
+            adaptive_allowed = True
+            adaptive_reason = "sports_topbook_liquidity_override"
+        print(
+            f"[LIVE-PREFILTER-ADAPTIVE] family={family} original_thresholds={original_thresholds} "
+            f"adjusted_thresholds={adjusted_thresholds} spread={spread} yes_top_size={yes_top_size} "
+            f"no_top_size={no_top_size} pass_fail={'pass' if adaptive_allowed else 'fail'} reason={adaptive_reason}"
+        )
+        return adaptive_allowed, adaptive_reason
+
     def get_controlled_activation_status(self, market, family, prefilter_survivor_family_counts):
         q = self.build_quote(market)
         liquidity_priority = self.get_market_liquidity_priority(market)
@@ -2088,11 +2811,17 @@ class KalshiSniperBot:
 
     def _resolve_selector_family_order(self, fetched_family_counts):
         available_families = [family for family in fetched_family_counts if family not in BLOCKED_MARKET_FAMILIES]
-        if PREFERRED_MARKET_FAMILIES:
-            preferred = [family for family in PREFERRED_MARKET_FAMILIES if family in available_families]
-        else:
-            preferred = list(available_families)
-        fallback = [family for family in FALLBACK_MARKET_FAMILIES if family in available_families and family not in preferred]
+        preferred = [
+            family for family in available_families
+            if self.get_market_discovery_category(family) in ("sports", "crypto")
+        ]
+        fallback = [
+            family for family in available_families
+            if family not in preferred and (
+                self.get_market_discovery_category(family) == "weather"
+                or family in DEPRIORITIZED_MARKET_FAMILIES
+            )
+        ]
         return preferred, fallback
 
     def _get_viable_selector_families(self, family_priority, family_diagnostics):
@@ -2318,10 +3047,9 @@ class KalshiSniperBot:
                 zero_reported_liquidity_rate = 0.0
                 spread_quality_score = 0.0
                 family_quality_score = 0.0
-            if PREFERRED_MARKET_FAMILIES and family in PREFERRED_MARKET_FAMILIES:
-                score += 10.0
-            if family in DEPRIORITIZED_MARKET_FAMILIES:
-                score -= 20.0
+            category = self.get_market_discovery_category(family)
+            category_boost = self.get_market_discovery_soft_boost(markets[0] if markets else family)
+            score += category_boost
             if missing_quotes_rate >= FAMILY_MAX_MISSING_QUOTES_RATE:
                 score -= 25.0
             if wide_spread_rate >= FAMILY_MAX_WIDE_SPREAD_RATE:
@@ -2388,9 +3116,11 @@ class KalshiSniperBot:
                 "recovery_adjustment": round(recovery_adjustment, 4),
                 "recovery_reason": recovery_reason,
                 "score": round(score, 4),
+                "category": category,
+                "category_boost": round(category_boost, 4),
             }
         ranked.sort(reverse=True)
-        return [family for _, family in ranked[:MAX_FAMILIES_PER_SCAN]], diagnostics
+        return [family for _, family in ranked], diagnostics
 
     def classify_market_condition(self):
         summary = self.last_live_select_summary or {}
@@ -2432,22 +3162,38 @@ class KalshiSniperBot:
         yes_ask = quote_values.get("yes_ask")
         no_bid = quote_values.get("no_bid")
         no_ask = quote_values.get("no_ask")
-        both_sides_quoted = self.has_complete_quote_side(yes_bid, yes_ask) and self.has_complete_quote_side(no_bid, no_ask)
+        has_complete_yes_side = self.has_complete_quote_side(yes_bid, yes_ask)
         volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0)
         liquidity = self.to_float(market.get("liquidity_dollars"), 0.0)
         min_liquidity = self.get_market_min_entry_liquidity(market)
-        if not self.has_complete_quote_side(yes_bid, yes_ask):
+        spread = None
+        if not has_complete_yes_side:
+            adaptive_allowed, _adaptive_reason = self._evaluate_adaptive_prefilter(market, "missing_quotes")
+            if adaptive_allowed:
+                return True, None, family
             return False, "missing_quotes", family
         spread = yes_ask - yes_bid
         if spread < 0 or spread > MAX_ENTRY_SPREAD:
+            adaptive_allowed, _adaptive_reason = self._evaluate_adaptive_prefilter(market, "wide_spread")
+            if adaptive_allowed:
+                return True, None, family
             return False, "wide_spread", family
+        liquidity_priority = self.get_market_liquidity_priority(market)
+        liquidity_fix = self._resolve_effective_liquidity_signal(
+            market,
+            family=family,
+            spread=spread,
+            liquidity_priority=liquidity_priority,
+            source="hard_filter",
+        )
+        effective_liquidity = liquidity_fix.get("liquidity_final") or 0.0
         if series_ticker == "KXBTC15M":
             print(
                 f"[LIVE-SELECT-DEBUG] targeted_prefilter ticker={ticker} family={family} "
                 f"threshold={min_liquidity} liquidity={liquidity} "
                 f"pass={'yes' if liquidity > min_liquidity else 'no'}"
             )
-        if liquidity <= min_liquidity:
+        if effective_liquidity <= min_liquidity:
             if series_ticker == "KXBTC15M":
                 orderbook_ok, orderbook_details = self._evaluate_targeted_orderbook_gate(market, spread)
                 print(f"[LIVE-SELECT-DEBUG] targeted_btc15m_liquidity_seen={liquidity}")
@@ -2476,6 +3222,10 @@ class KalshiSniperBot:
                     f"no_top={orderbook_details.get('no_top_price')}@{orderbook_details.get('no_top_size')}"
                 )
                 print("[LIVE-SELECT-DEBUG] targeted_btc15m_final_reject_reason=low_liquidity")
+            else:
+                adaptive_allowed, _adaptive_reason = self._evaluate_adaptive_prefilter(market, "low_liquidity")
+                if adaptive_allowed:
+                    return True, None, family
             return False, "low_liquidity", family
         if volume <= MIN_ENTRY_VOLUME:
             return False, "low_volume", family
@@ -2495,19 +3245,36 @@ class KalshiSniperBot:
         if yes_bid > 0 and yes_ask > 0:
             mid_price = (yes_bid + yes_ask) / 2
         spread_component = max(0.0, MAX_ENTRY_SPREAD - spread) * 40
-        liquidity_component = min(liquidity, 500) / 25
         volume_component = min(volume, 500) / 40
         price_component = max(0.0, 0.25 - abs(mid_price - 0.5)) * 8
         family_component = 0.0
+        market_category = self.get_market_discovery_category(market)
         if PREFERRED_MARKET_FAMILIES and family in PREFERRED_MARKET_FAMILIES:
             family_component += 2.0
+        elif market_category == "sports":
+            family_component += 0.75
         if FALLBACK_MARKET_FAMILIES and family in FALLBACK_MARKET_FAMILIES:
             family_component -= 0.5
         ticker_component = max(0.0, 24 - len(ticker)) / 24
         liquidity_priority = self.get_market_liquidity_priority(market)
+        effective_liquidity_value = liquidity_priority.get("effective_liquidity_value")
+        if effective_liquidity_value is None:
+            effective_liquidity_value = liquidity
+        liquidity_component = min(effective_liquidity_value, 500) / 25
         market_quality = self.get_market_quality_preference(market, liquidity_priority=liquidity_priority)
         liquidity_priority_component = liquidity_priority.get("score", 0.0)
         market_quality_component = market_quality.get("score", 0.0)
+        sports_priority_profile = self._get_sports_priority_profile(
+            market,
+            liquidity_priority=liquidity_priority,
+            spread=spread,
+        ) if market_category == "sports" else None
+        sports_priority_component = 0.0
+        if sports_priority_profile:
+            if sports_priority_profile.get("priority_boost_applied"):
+                sports_priority_component += 28.0
+            elif sports_priority_profile.get("moderate_imbalance"):
+                sports_priority_component += 10.0
         has_top_book = bool(
             (liquidity_priority.get("yes_top_size") or 0.0) > 0
             or (liquidity_priority.get("no_top_size") or 0.0) > 0
@@ -2539,6 +3306,7 @@ class KalshiSniperBot:
             + liquidity_priority_component
             + market_quality_component
             + top_book_signal_component
+            + sports_priority_component
         )
         return {
             "score": round(score, 4),
@@ -2562,7 +3330,9 @@ class KalshiSniperBot:
                 "liquidity_priority": round(liquidity_priority_component, 4),
                 "market_quality": round(market_quality_component, 4),
                 "top_book_signal": round(top_book_signal_component, 4),
+                "sports_priority": round(sports_priority_component, 4),
             },
+            "sports_priority_profile": sports_priority_profile,
         }
 
     def get_minutes_to_event(self, market):
@@ -2917,7 +3687,7 @@ class KalshiSniperBot:
         return context
 
     def _phase55_required_history_points(self, lookback=5, d_period=3):
-        return max(lookback + d_period, lookback + 2)
+        return 6
 
     def _compute_phase55_stochastic_from_series(self, prices, lookback=5, d_period=3):
         prices = [self.to_float(price, None) for price in prices]
@@ -2938,9 +3708,11 @@ class KalshiSniperBot:
         if len(k_values) < d_period:
             return None
         d_values = []
+        aligned_k_values = []
         for idx in range(d_period - 1, len(k_values)):
             d_window = k_values[idx - d_period + 1:idx + 1]
             d_values.append(round(sum(d_window) / float(len(d_window)), 4))
+            aligned_k_values.append(k_values[idx])
         if not d_values:
             return None
         return {
@@ -2948,6 +3720,8 @@ class KalshiSniperBot:
             "stochastic_d": d_values[-1],
             "previous_stochastic_k": k_values[-2] if len(k_values) >= 2 else None,
             "previous_stochastic_d": d_values[-2] if len(d_values) >= 2 else None,
+            "stochastic_k_series": aligned_k_values[-5:],
+            "stochastic_d_series": d_values[-5:],
         }
 
     def _get_phase55_stochastic_context(self, market, q, stage_label="entry_timing", family=None):
@@ -3148,6 +3922,31 @@ class KalshiSniperBot:
         current_price = getattr(q, "yes_ask", 0.0) or 0.0
         best_bid = getattr(q, "yes_bid", 0.0) or 0.0
         last_price = getattr(q, "last_price", 0.0) or 0.0
+        spread = (current_price - best_bid) if current_price > 0 and best_bid > 0 else None
+        min_liquidity = self.get_market_min_entry_liquidity(market) if market is not None else MIN_ENTRY_LIQUIDITY
+        liquidity_priority = self.get_market_liquidity_priority(market) if market is not None else {}
+        liquidity_seen = getattr(q, "liquidity", 0.0) or 0.0
+        spread_acceptable = bool(spread is not None and 0.0 <= spread <= MAX_ENTRY_SPREAD)
+        liquidity_acceptable = bool(
+            liquidity_priority.get("top_book_state") == "both_non_zero"
+            and (
+                liquidity_seen > min_liquidity
+                or liquidity_priority.get("has_real_liquidity")
+            )
+        )
+        fallback_no_pullback_eligible = bool(
+            spread is not None
+            and 0.0 <= spread <= 0.03
+            and liquidity_priority.get("both_sides_quoted")
+        )
+        sports_stochastic_bypass_eligible = bool(
+            self._is_priority_sports_family(family)
+            and spread is not None
+            and 0.0 <= spread <= 0.03
+            and liquidity_priority.get("both_sides_quoted")
+            and (self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0) >= 5.0
+            and (self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0) >= 5.0
+        )
         stochastic_context = self._get_phase55_stochastic_context(market, q, stage_label=stage_label, family=family)
         stochastic_k = stochastic_context.get("stochastic_k")
         stochastic_d = stochastic_context.get("stochastic_d")
@@ -3162,6 +3961,10 @@ class KalshiSniperBot:
         history_append_reason = str(stochastic_context.get("history_append_reason", "not_attempted") or "not_attempted")
         cycle_id = str(stochastic_context.get("cycle_id", self._get_phase55_cycle_id()) or self._get_phase55_cycle_id())
         stochastic_inputs_available = bool(stochastic_context.get("stochastic_inputs_available")) and stochastic_k is not None and stochastic_d is not None
+        sports_stochastic_bypass_applied = bool(
+            sports_stochastic_bypass_eligible
+            and (stochastic_k is None or stochastic_d is None)
+        )
         bullish_crossover = bool(
             stochastic_inputs_available
             and previous_k is not None
@@ -3176,7 +3979,36 @@ class KalshiSniperBot:
             and previous_k >= previous_d
             and stochastic_k < stochastic_d
         )
-        crossover_detected = bool(bullish_crossover or bearish_crossover)
+        raw_crossover_detected = bool(bullish_crossover or bearish_crossover)
+        crossover_window_hit = False
+        bars_since_crossover = None
+        trigger_mode = "none"
+        recent_k_series = stochastic_context.get("stochastic_k_series") or []
+        recent_d_series = stochastic_context.get("stochastic_d_series") or []
+        if not raw_crossover_detected and stochastic_inputs_available and len(recent_k_series) >= 2 and len(recent_d_series) >= 2:
+            sticky_window = 3
+            max_offset = min(sticky_window, len(recent_k_series) - 1, len(recent_d_series) - 1)
+            for offset in range(1, max_offset + 1):
+                idx = len(recent_k_series) - 1 - offset
+                prev_idx = idx - 1
+                if prev_idx < 0:
+                    break
+                prev_k_window = recent_k_series[prev_idx]
+                prev_d_window = recent_d_series[prev_idx]
+                curr_k_window = recent_k_series[idx]
+                curr_d_window = recent_d_series[idx]
+                bullish_window = prev_k_window <= prev_d_window and curr_k_window > curr_d_window
+                bearish_window = prev_k_window >= prev_d_window and curr_k_window < curr_d_window
+                if bullish_window or bearish_window:
+                    crossover_window_hit = True
+                    bars_since_crossover = offset
+                    break
+        if raw_crossover_detected:
+            trigger_mode = "fresh_crossover"
+            bars_since_crossover = 0
+        elif crossover_window_hit:
+            trigger_mode = "sticky_recent_crossover"
+        crossover_detected = bool(raw_crossover_detected or crossover_window_hit)
         micro_pullback_detected = False
         micro_pullback_flag = None
         if market is not None and isinstance(market, dict):
@@ -3185,6 +4017,58 @@ class KalshiSniperBot:
                 micro_pullback_flag = market.get("micro_pullback_detected")
         if micro_pullback_flag is not None:
             micro_pullback_detected = bool(micro_pullback_flag)
+        pullback_rule_path = "explicit_market_flag" if micro_pullback_detected else "none"
+        if not micro_pullback_detected and crossover_detected:
+            mild_retrace_detected = bool(
+                current_price > 0
+                and last_price > 0
+                and current_price <= last_price
+                and (best_bid <= 0 or current_price <= (best_bid + 0.01))
+            )
+            flat_pause_detected = bool(
+                current_price > 0
+                and last_price > 0
+                and abs(current_price - last_price) <= 0.005
+                and (best_bid <= 0 or current_price <= (best_bid + 0.015))
+            )
+            if mild_retrace_detected:
+                micro_pullback_detected = True
+                pullback_rule_path = "mild_retrace_after_trigger"
+            elif flat_pause_detected:
+                micro_pullback_detected = True
+                pullback_rule_path = "flat_pause_after_trigger"
+        adaptive_pullback_override_applied = False
+        adaptive_pullback_reason = "not_evaluated"
+        fallback_no_pullback_applied = False
+        if crossover_detected and not micro_pullback_detected:
+            if fallback_no_pullback_eligible:
+                adaptive_pullback_override_applied = True
+                fallback_no_pullback_applied = True
+                adaptive_pullback_reason = "fallback_no_pullback"
+                pullback_rule_path = "fallback_no_pullback"
+                print(
+                    f"[LIVE-ENTRY-TIMING-FALLBACK] ticker={getattr(q, 'ticker', '')} family={family} "
+                    f"reason=fallback_no_pullback spread={round(spread, 4) if spread is not None else None} "
+                    f"both_sides_quoted={'yes' if liquidity_priority.get('both_sides_quoted') else 'no'}"
+                )
+            elif bars_since_crossover is None:
+                adaptive_pullback_reason = "missing_crossover_age"
+            elif bars_since_crossover > 2:
+                adaptive_pullback_reason = "crossover_too_old"
+            elif not spread_acceptable:
+                adaptive_pullback_reason = "spread_not_acceptable"
+            elif not liquidity_acceptable:
+                adaptive_pullback_reason = "liquidity_not_acceptable"
+            else:
+                adaptive_pullback_override_applied = True
+                adaptive_pullback_reason = "recent_crossover_momentum_override"
+                pullback_rule_path = "adaptive_recent_crossover_override"
+        elif micro_pullback_detected:
+            adaptive_pullback_reason = "micro_pullback_present"
+        elif crossover_detected:
+            adaptive_pullback_reason = "pullback_not_required"
+        else:
+            adaptive_pullback_reason = "no_crossover"
         immediate_entry_blocked = False
         immediate_entry_flag = None
         if market is not None and isinstance(market, dict):
@@ -3203,12 +4087,23 @@ class KalshiSniperBot:
                 f"cycle_id={cycle_id} timing_history_key={timing_history_key} history_points={history_points} "
                 f"appended={'yes' if history_appended else 'no'} append_reason={history_append_reason}"
             )
-        if not stochastic_inputs_available:
+        if sports_stochastic_bypass_applied:
+            print(
+                f"[LIVE-ENTRY-TIMING-SPORTS-BYPASS] ticker={trace_ticker} family={family} "
+                f"spread={round(spread, 4) if spread is not None else None} "
+                f"yes_top_size={self.to_float(liquidity_priority.get('yes_top_size'), 0.0) or 0.0} "
+                f"no_top_size={self.to_float(liquidity_priority.get('no_top_size'), 0.0) or 0.0} "
+                f"stochastic_k={stochastic_k} stochastic_d={stochastic_d} "
+                f"reason=sports_no_stochastic_bypass"
+            )
+        if sports_stochastic_bypass_applied:
+            phase55_status = "entry_ready"
+        elif not stochastic_inputs_available:
             phase55_status = "insufficient_data"
         elif immediate_entry_blocked:
             phase55_status = "immediate_reject"
         elif crossover_detected:
-            if micro_pullback_detected:
+            if micro_pullback_detected or adaptive_pullback_override_applied:
                 phase55_status = "entry_ready"
             else:
                 phase55_status = "pullback_wait"
@@ -3222,6 +4117,22 @@ class KalshiSniperBot:
             "immediate_reject": "immediate_entry_protection",
             "entry_ready": "None",
         }.get(phase55_status, phase55_status)
+        sticky_crossover_used = bool(crossover_window_hit and not raw_crossover_detected)
+        entry_ready_reason = (
+            "sports_no_stochastic_bypass" if sports_stochastic_bypass_applied else
+            ("adaptive_recent_crossover_override" if (phase55_status == "entry_ready" and adaptive_pullback_override_applied) else
+            ("sticky_crossover" if (phase55_status == "entry_ready" and sticky_crossover_used) else
+            ("mild_retrace_after_trigger" if (phase55_status == "entry_ready" and pullback_rule_path == "mild_retrace_after_trigger") else
+            ("flat_pause_after_trigger" if (phase55_status == "entry_ready" and pullback_rule_path == "flat_pause_after_trigger") else
+            ("standard_rules" if phase55_status == "entry_ready" else reject_reason)))))
+        )
+        if not fallback_no_pullback_applied:
+            print(
+                f"[LIVE-ENTRY-TIMING-ADAPTIVE-PULLBACK] ticker={trace_ticker} family={family} "
+                f"crossover_detected={'yes' if crossover_detected else 'no'} bars_since_crossover={bars_since_crossover} "
+                f"micro_pullback_detected={'yes' if micro_pullback_detected else 'no'} "
+                f"override_applied={'yes' if adaptive_pullback_override_applied else 'no'} reason={adaptive_pullback_reason}"
+            )
         if trace_live_entry:
             print(
                 f"[LIVE-ENTRY-TIMING-HISTORY] ticker={trace_ticker} family={family} "
@@ -3241,12 +4152,17 @@ class KalshiSniperBot:
                 f"stochastic_k={None if stochastic_k is None else round(stochastic_k, 4)} "
                 f"stochastic_d={None if stochastic_d is None else round(stochastic_d, 4)} "
                 f"crossover_detected={'yes' if crossover_detected else 'no'} "
+                f"crossover_window_hit={'yes' if crossover_window_hit else 'no'} "
+                f"bars_since_crossover={bars_since_crossover} trigger_mode={trigger_mode} "
+                f"sticky_crossover_used={'yes' if sticky_crossover_used else 'no'} "
                 f"final_decision={final_decision} reject_reason={reject_reason}"
             )
             print(
                 f"[LIVE-ENTRY-TIMING-PULLBACK] ticker={trace_ticker} family={family} "
                 f"history_points={history_points} required_points={required_points} "
                 f"pullback_detected={'yes' if micro_pullback_detected else 'no'} "
+                f"pullback_rule_path={pullback_rule_path} "
+                f"entry_ready_reason={entry_ready_reason} "
                 f"final_decision={final_decision} reject_reason={reject_reason}"
             )
             print(
@@ -3261,8 +4177,13 @@ class KalshiSniperBot:
                 f"stochastic_k={None if stochastic_k is None else round(stochastic_k, 4)} "
                 f"stochastic_d={None if stochastic_d is None else round(stochastic_d, 4)} "
                 f"crossover_detected={'yes' if crossover_detected else 'no'} "
+                f"crossover_window_hit={'yes' if crossover_window_hit else 'no'} "
+                f"bars_since_crossover={bars_since_crossover} trigger_mode={trigger_mode} "
+                f"sticky_crossover_used={'yes' if sticky_crossover_used else 'no'} "
                 f"pullback_detected={'yes' if micro_pullback_detected else 'no'} "
+                f"pullback_rule_path={pullback_rule_path} "
                 f"immediate_block={'yes' if immediate_entry_blocked else 'no'} "
+                f"entry_ready_reason={entry_ready_reason} "
                 f"final_decision={final_decision} reject_reason={reject_reason}"
             )
         return {
@@ -3284,7 +4205,15 @@ class KalshiSniperBot:
             "stochastic_d": None if stochastic_d is None else round(stochastic_d, 4),
             "bullish_crossover": bullish_crossover,
             "bearish_crossover": bearish_crossover,
+            "crossover_detected": crossover_detected,
+            "crossover_window_hit": crossover_window_hit,
+            "bars_since_crossover": bars_since_crossover,
+            "trigger_mode": trigger_mode,
+            "sticky_crossover_used": sticky_crossover_used,
             "micro_pullback_detected": micro_pullback_detected,
+            "adaptive_pullback_override_applied": adaptive_pullback_override_applied,
+            "pullback_rule_path": pullback_rule_path,
+            "entry_ready_reason": entry_ready_reason,
             "immediate_entry_blocked": immediate_entry_blocked,
             "phase55_status": phase55_status,
         }
@@ -3389,14 +4318,51 @@ class KalshiSniperBot:
             )
             print(f"[LIVE-SELECT-DEBUG] targeted_top_of_book_gate={'PASS' if orderbook_ok else 'FAIL'}")
             print("[LIVE-SELECT-DEBUG] generic_family_skip_bypassed_for_targeted_candidate=yes")
+            hard_filter_liquidity_fix = self._resolve_effective_liquidity_signal(
+                market,
+                q=q,
+                family=family,
+                spread=spread,
+                liquidity_priority={
+                    "yes_top_size": orderbook_details.get("yes_top_size"),
+                    "no_top_size": orderbook_details.get("no_top_size"),
+                    "both_sides_quoted": bool(orderbook_details.get("yes_top_price") is not None and orderbook_details.get("no_top_price") is not None),
+                },
+                source="hard_filter",
+            )
+            effective_hard_filter_liquidity = hard_filter_liquidity_fix.get("liquidity_final") or 0.0
+            liquidity_pass = effective_hard_filter_liquidity > min_liquidity
             targeted_liquidity_fallback_used = (
                 series_ticker == "KXBTC15M" and (not liquidity_pass) and orderbook_ok
             )
+            sports_hard_filter_fallback_used = False
+            sports_hard_filter_reason = "non_sports_targeted_candidate"
+            sports_hard_filter_yes_top_size = self.to_float(orderbook_details.get("yes_top_size"), 0.0) or 0.0
+            sports_hard_filter_no_top_size = self.to_float(orderbook_details.get("no_top_size"), 0.0) or 0.0
+            if self._is_priority_sports_family(family) and seen_liquidity <= 0.0:
+                if not orderbook_ok:
+                    sports_hard_filter_reason = "targeted_orderbook_not_ok"
+                elif spread is None or spread < 0.0 or spread > 0.05:
+                    sports_hard_filter_reason = "spread_above_sports_liquidity_limit"
+                elif sports_hard_filter_yes_top_size >= 5.0 and sports_hard_filter_no_top_size >= 5.0:
+                    targeted_liquidity_fallback_used = True
+                    sports_hard_filter_fallback_used = True
+                    sports_hard_filter_reason = "sports_top_book_liquidity_hard_filter_bypass"
+                else:
+                    sports_hard_filter_reason = "top_book_below_sports_liquidity_floor"
             print(
                 f"[LIVE-SELECT-DEBUG] final_targeted_liquidity_check "
                 f"series={series_ticker} liquidity={seen_liquidity} threshold={min_liquidity} "
                 f"top_book_ok={'yes' if orderbook_ok else 'no'} "
                 f"fallback_eligible={'yes' if targeted_liquidity_fallback_used else 'no'}"
+            )
+            print(
+                f"[LIVE-SPORTS-LIQUIDITY-FALLBACK-HARD-FILTER] ticker={ticker} family={family} "
+                f"reported_liquidity={seen_liquidity} min_liquidity={min_liquidity} "
+                f"yes_top_size={sports_hard_filter_yes_top_size} no_top_size={sports_hard_filter_no_top_size} "
+                f"spread={round(spread, 4) if spread is not None else None} "
+                f"hard_reject_removed={'yes' if sports_hard_filter_fallback_used else 'no'} "
+                f"reason={sports_hard_filter_reason}"
             )
             if targeted_liquidity_fallback_used:
                 print(
@@ -3419,9 +4385,83 @@ class KalshiSniperBot:
         min_liquidity = self.get_market_min_entry_liquidity(market)
         seen_liquidity = getattr(q, "liquidity", 0.0) or 0.0
         volume = getattr(q, "volume", 0.0) or 0.0
+        liquidity_priority = self.get_market_liquidity_priority(market)
+        decision_liquidity_fix = self._resolve_effective_liquidity_signal(
+            market,
+            q=q,
+            family=family,
+            spread=spread,
+            liquidity_priority=liquidity_priority,
+            source="decision_scoring",
+        )
+        sports_priority_profile = self._get_sports_priority_profile(
+            market,
+            liquidity_priority=liquidity_priority,
+            spread=spread,
+        ) if self.get_market_discovery_category(family) == "sports" else None
+        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), None)
+        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), None)
+        top_size_values = [size for size in (yes_top_size, no_top_size) if size is not None and size > 0.0]
+        effective_liquidity_source = decision_liquidity_fix.get("effective_source")
+        effective_liquidity_value = decision_liquidity_fix.get("liquidity_final")
+        decision_liquidity_fallback_used = bool(decision_liquidity_fix.get("fallback_used"))
+        sports_liquidity_fallback_applied = False
+        sports_liquidity_hard_reject_removed = False
+        sports_liquidity_reason = "non_sports_candidate"
+        sports_liquidity_signal = None
+        if self._is_priority_sports_family(family) and seen_liquidity <= 0.0:
+            sports_liquidity_signal = decision_liquidity_fix.get("effective_top_size")
+            if yes_top_size is None or no_top_size is None or yes_top_size <= 0.0 or no_top_size <= 0.0:
+                sports_liquidity_reason = "missing_or_zero_top_book_side"
+            elif spread is None or spread < 0.0 or spread > 0.05:
+                sports_liquidity_reason = "spread_above_sports_liquidity_limit"
+            elif yes_top_size >= 5.0 and no_top_size >= 5.0 and decision_liquidity_fix.get("fallback_used"):
+                sports_liquidity_fallback_applied = True
+                sports_liquidity_hard_reject_removed = True
+                sports_liquidity_reason = "sports_top_book_liquidity_fallback"
+            else:
+                sports_liquidity_reason = "top_book_below_sports_liquidity_floor"
+        print(
+            f"[LIVE-SPORTS-LIQUIDITY-FALLBACK] ticker={ticker} family={family} "
+            f"reported_liquidity={seen_liquidity} yes_top_size={yes_top_size} no_top_size={no_top_size} "
+            f"derived_liquidity_signal={sports_liquidity_signal} spread={round(spread, 4) if spread is not None else None} "
+            f"hard_reject_removed={'yes' if sports_liquidity_hard_reject_removed else 'no'} reason={sports_liquidity_reason}"
+        )
         debug_context["min_liquidity"] = min_liquidity
-        liquidity_score = min(25.0, max(0.0, (seen_liquidity / max(min_liquidity, 1.0)) * 12.5))
+        debug_context["liquidity_priority"] = liquidity_priority
+        debug_context["decision_liquidity_source"] = effective_liquidity_source
+        debug_context["decision_liquidity_value"] = effective_liquidity_value
+        print(
+            f"[LIVE-SELECT-DECISION-LIQUIDITY] ticker={ticker} family={family} "
+            f"api_liquidity_dollars={(market or {}).get('liquidity_dollars')} api_liquidity={(market or {}).get('liquidity')} "
+            f"quote_liquidity={seen_liquidity} yes_top_size={yes_top_size} no_top_size={no_top_size} "
+            f"has_real_liquidity={'yes' if liquidity_priority.get('has_real_liquidity') else 'no'} "
+            f"liquidity_priority_score={liquidity_priority.get('score', 0.0)} "
+            f"liquidity_priority_reasons={liquidity_priority.get('reasons', [])} "
+            f"effective_source={effective_liquidity_source} effective_value={effective_liquidity_value} "
+            f"fallback_used={'yes' if decision_liquidity_fallback_used else 'no'}"
+        )
+        print(
+            f"[LIVE-SELECT-DECISION-LIQUIDITY-FIELDS] ticker={ticker} family={family} "
+            f"reported_liquidity={seen_liquidity} min_liquidity={min_liquidity} "
+            f"yes_top_size={yes_top_size} no_top_size={no_top_size} "
+            f"top_book_state={liquidity_priority.get('top_book_state')} both_sides_quoted={'yes' if liquidity_priority.get('both_sides_quoted') else 'no'} "
+            f"recent_activity={'yes' if liquidity_priority.get('recent_activity') else 'no'}"
+        )
+        if decision_liquidity_fallback_used:
+            print(
+                f"[LIVE-SELECT-DECISION-LIQUIDITY-FIX] ticker={ticker} family={family} "
+                f"yes_top_size={yes_top_size} no_top_size={no_top_size} "
+                f"field_source={effective_liquidity_source} pass={'yes' if effective_liquidity_value > min_liquidity else 'no'}"
+            )
+        liquidity_score = min(25.0, max(0.0, (effective_liquidity_value / max(min_liquidity, 1.0)) * 12.5))
         spread_score = min(25.0, max(0.0, ((MAX_ENTRY_SPREAD - spread) / MAX_ENTRY_SPREAD) * 25.0))
+        sports_priority_score = 0.0
+        if sports_priority_profile:
+            if sports_priority_profile.get("priority_boost_applied"):
+                sports_priority_score = 24.0
+            elif sports_priority_profile.get("moderate_imbalance"):
+                sports_priority_score = 8.0
         structure_score = 8.0
         if self.is_targeted_series_market(market):
             if orderbook_ok:
@@ -3448,7 +4488,7 @@ class KalshiSniperBot:
             max(0.0, (min(volume, 100.0) / 100.0) * 7.5 + (spread_score / 25.0) * 7.5),
         )
         total_score = round(
-            liquidity_score + spread_score + structure_score + timing_score + confidence_score,
+            liquidity_score + spread_score + structure_score + timing_score + confidence_score + sports_priority_score,
             4,
         )
         score_breakdown = {
@@ -3457,6 +4497,7 @@ class KalshiSniperBot:
             "structure": round(structure_score, 4),
             "timing": round(timing_score, 4),
             "confidence": round(confidence_score, 4),
+            "sports_priority": round(sports_priority_score, 4),
         }
         if total_score >= PHASE5_BUY_SCORE_THRESHOLD:
             decision = "BUY"
@@ -3476,6 +4517,14 @@ class KalshiSniperBot:
         else:
             decision = "SKIP"
             decision_reason = "low_score"
+        print(
+            f"[LIVE-SELECT-DECISION-LIQUIDITY-RULE] ticker={ticker} family={family} "
+            f"liquidity_score={round(liquidity_score, 4)} threshold=10.0 "
+            f"effective_source={debug_context.get('decision_liquidity_source')} "
+            f"effective_value={debug_context.get('decision_liquidity_value')} "
+            f"low_liquidity_rule_triggered={'yes' if decision_reason == 'low_liquidity_score' else 'no'} "
+            f"decision={decision} reason={decision_reason} candidate_score={total_score}"
+        )
         return {
             "decision": decision,
             "decision_reason": decision_reason,
@@ -3487,6 +4536,8 @@ class KalshiSniperBot:
     def find_best_live_ticker(self, markets=None):
         full_select_cycle_start = time.perf_counter()
         self._start_phase55_select_pass()
+        self.phase55_live_execution_gate_by_ticker = {}
+        self.live_direction_decisions_by_ticker = {}
 
         def emit_full_select_cycle_timing():
             print(
@@ -3508,6 +4559,7 @@ class KalshiSniperBot:
         merged_selection_count = len(markets) if markets is not None else 0
         cycle_targeted_dead_book_suppressed_families = []
         self.targeted_orderbook_cache = {}
+        self.targeted_family_activity = {}
         targeted_family_activity = {
             family: {
                 "fetched": 0,
@@ -4632,6 +5684,16 @@ class KalshiSniperBot:
 
         family_priority, family_diagnostics = self._rank_selector_families(family_markets)
         preferred_families, fallback_families = self._resolve_selector_family_order(fetched_family_counts)
+        discovery_category_counts = {}
+        for market in markets:
+            category = self.get_market_discovery_category(market)
+            discovery_category_counts[category] = discovery_category_counts.get(category, 0) + 1
+        print(
+            f"[LIVE-SELECT-DISCOVERY] total_markets_fetched={merged_selection_count or len(markets)} "
+            f"total_markets_after_basic_eligibility={len(markets)} "
+            f"markets_by_category={sorted(discovery_category_counts.items(), key=lambda item: item[1], reverse=True)} "
+            f"families_discovered={sorted(family_markets.keys())}"
+        )
         broad_candidates_before_family_rejection = sum(
             len(family_markets.get(family, [])) for family in broad_origin_families
         )
@@ -4793,6 +5855,20 @@ class KalshiSniperBot:
 
         prefilter_pool = []
         strict_entry_family_counts = {}
+        prefilter_failure_summary = {
+            "candidates_entering_prefilter": 0,
+            "out_of_window": 0,
+            "empty_top_book": 0,
+            "one_sided_quotes": 0,
+            "min_top_size": 0,
+            "spread_too_wide": 0,
+            "low_liquidity": 0,
+            "low_recent_activity": 0,
+            "price_out_of_range": 0,
+            "event_time_rule": 0,
+            "family_category_restriction": 0,
+        }
+        prefilter_removed_candidate_samples = []
         quote_handoff_summary = {
             "total_candidates_arriving": 0,
             "candidates_with_orderbook_payload": 0,
@@ -4811,7 +5887,7 @@ class KalshiSniperBot:
         preferred_pass_survivors = 0
         preferred_lead_family = preferred_order[0] if preferred_order else None
         expand_to_additional_families = False
-        preferred_phase_family_cap = MAX_PREFERRED_FAMILIES_PER_PASS
+        preferred_phase_family_cap = min(len(preferred_order), MAX_FAMILIES_PER_SCAN) if preferred_order else 0
         expansion_reason = self._get_family_expansion_reason(
             preferred_lead_family,
             family_diagnostics.get(preferred_lead_family, {}),
@@ -4969,6 +6045,7 @@ class KalshiSniperBot:
                         f"'too_early': {stats.get('too_early_share', 0.0)}, "
                         f"'survivor': {stats.get('survivor_rate', 0.0)}}}"
                     )
+                    prefilter_failure_summary["family_category_restriction"] += len(family_pool)
                     if family in broad_origin_families:
                         print(
                             f"[LIVE-SELECT-DEBUG] broad_family_reject_checkpoint family={family} "
@@ -5127,6 +6204,7 @@ class KalshiSniperBot:
                                 f"reason={topbook_snapshot.get('failure_reason')}"
                             )
                     quote_handoff_summary["total_candidates_arriving"] += 1
+                    prefilter_failure_summary["candidates_entering_prefilter"] += 1
                     if raw_orderbook_payload:
                         quote_handoff_summary["candidates_with_orderbook_payload"] += 1
                     if yes_quote_present:
@@ -5196,14 +6274,17 @@ class KalshiSniperBot:
                             {
                                 "candidates_seen": 0,
                                 "candidates_failed_low_liquidity": 0,
-                                "effective_values": [],
+                                "effective_top_sizes": [],
+                                "reported_liquidity_values": [],
                                 "thresholds": [],
                             },
                         )
                         liquidity_family_stats["candidates_seen"] += 1
                         liquidity_family_stats["candidates_failed_low_liquidity"] += 1
+                        if prefilter_snapshot.get("effective_top_size") is not None:
+                            liquidity_family_stats["effective_top_sizes"].append(float(prefilter_snapshot.get("effective_top_size")))
                         if effective_liquidity_value is not None:
-                            liquidity_family_stats["effective_values"].append(float(effective_liquidity_value))
+                            liquidity_family_stats["reported_liquidity_values"].append(float(effective_liquidity_value))
                         if threshold_value is not None:
                             liquidity_family_stats["thresholds"].append(float(threshold_value))
                         print(
@@ -5262,6 +6343,10 @@ class KalshiSniperBot:
                                     f"original_reason={reason} near_miss_reason={near_miss_reason}"
                                 )
                     if not allowed:
+                        top_book_state = liquidity_priority.get("top_book_state") or "unknown"
+                        yes_top_size_value = liquidity_priority.get("yes_top_size")
+                        no_top_size_value = liquidity_priority.get("no_top_size")
+                        min_top_size_threshold = self.get_market_min_top_of_book_size(market)
                         if reason == "missing_quotes":
                             missing_side = "both"
                             if yes_quote_present and not no_quote_present:
@@ -5283,6 +6368,27 @@ class KalshiSniperBot:
                             liquidity_visible_market_count += 1
                         if liquidity_priority.get("empty_book"):
                             empty_book_market_count += 1
+                        if top_book_state == "zero_top_book":
+                            prefilter_failure_summary["empty_top_book"] += 1
+                        elif top_book_state == "one_non_zero":
+                            prefilter_failure_summary["one_sided_quotes"] += 1
+                        if (
+                            yes_top_size_value is not None and no_top_size_value is not None
+                            and (yes_top_size_value < min_top_size_threshold or no_top_size_value < min_top_size_threshold)
+                        ):
+                            prefilter_failure_summary["min_top_size"] += 1
+                        if reason == "wide_spread":
+                            prefilter_failure_summary["spread_too_wide"] += 1
+                        elif reason == "low_liquidity":
+                            prefilter_failure_summary["low_liquidity"] += 1
+                        elif reason == "unsafe_price":
+                            prefilter_failure_summary["price_out_of_range"] += 1
+                        elif reason in ("blocked_family", "combo_or_mve", "inactive", "not_tradable"):
+                            prefilter_failure_summary["family_category_restriction"] += 1
+                        if not market_quality.get("recent_activity"):
+                            prefilter_failure_summary["low_recent_activity"] += 1
+                        if self.get_event_time_bucket(self.get_minutes_to_event(market), max_minutes_to_event=broad_discovery_max_minutes_to_event) != "target_window":
+                            prefilter_failure_summary["event_time_rule"] += 1
                         prefilter_rejects[(reason, family)] = prefilter_rejects.get((reason, family), 0) + 1
                         prefilter_reject_reason_counts[reason] = prefilter_reject_reason_counts.get(reason, 0) + 1
                         if len(sample_skips) < 5:
@@ -5407,6 +6513,26 @@ class KalshiSniperBot:
                                 f"[LIVE-SELECT-DEBUG] targeted_reject family={family} "
                                 f"ticker={ticker} reason={reason}"
                             )
+                        if len(prefilter_removed_candidate_samples) < 10:
+                            prefilter_removed_candidate_samples.append({
+                                "ticker": ticker,
+                                "family": family,
+                                "category": self.get_market_discovery_category(market),
+                                "removal_reasons": [reason, top_book_state],
+                                "spread": round((yes_ask - yes_bid), 4) if yes_bid is not None and yes_ask is not None else None,
+                                "yes_top_size": yes_top_size_value,
+                                "no_top_size": no_top_size_value,
+                                "recent_activity": bool(market_quality.get("recent_activity")),
+                                "minutes_to_event": round(self.get_minutes_to_event(market), 4) if self.get_minutes_to_event(market) is not None else None,
+                            })
+                        self._emit_live_select_reject_detail(
+                            stage="coarse_prefilter",
+                            market=market,
+                            family=family,
+                            reason=reason,
+                            source_path=("targeted" if self.is_targeted_series_market(market) else ("fallback" if fallback_to_broad_scan else "broad")),
+                            prefilter_snapshot=prefilter_snapshot if reason == "low_liquidity" else self.get_prefilter_liquidity_snapshot(market),
+                        )
                         print(f"[LIVE-SELECT-FILTER] ticker={ticker} reason={reason}")
                         continue
                     prescore = self.compute_entry_presolve_score(market)
@@ -5460,6 +6586,37 @@ class KalshiSniperBot:
                 break
 
         prefilter_pool = sorted(prefilter_pool, key=lambda item: item[0]["score"], reverse=True)[:MAX_PREFILTER_POOL]
+        prefilter_failure_summary["out_of_window"] = skipped_too_early_markets + skipped_too_close_markets
+        prefilter_failure_summary["event_time_rule"] += skipped_no_timestamp_markets
+        active_prefilter_rule_counts = sorted(
+            prefilter_reject_reason_counts.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        print(
+            f"[LIVE-SELECT-PREFILTER-FAILURE-SUMMARY] candidates_entering_prefilter={prefilter_failure_summary['candidates_entering_prefilter']} "
+            f"candidates_surviving_prefilter={len(prefilter_pool)} total_removed={prefilter_failure_summary['candidates_entering_prefilter'] - len(prefilter_pool)} "
+            f"out_of_window={prefilter_failure_summary['out_of_window']} empty_top_book={prefilter_failure_summary['empty_top_book']} "
+            f"one_sided_quotes={prefilter_failure_summary['one_sided_quotes']} min_top_size={prefilter_failure_summary['min_top_size']} "
+            f"spread_too_wide={prefilter_failure_summary['spread_too_wide']} low_liquidity={prefilter_failure_summary['low_liquidity']} "
+            f"low_recent_activity={prefilter_failure_summary['low_recent_activity']} price_out_of_range={prefilter_failure_summary['price_out_of_range']} "
+            f"event_time_rule={prefilter_failure_summary['event_time_rule']} family_category_restriction={prefilter_failure_summary['family_category_restriction']} "
+            f"active_rules={active_prefilter_rule_counts}"
+        )
+        print(
+            f"[LIVE-SELECT-PREFILTER-REMOVAL-SAMPLES] samples={prefilter_removed_candidate_samples}"
+        )
+        print(
+            f"[LIVE-SELECT-FUNNEL] candidates_entering_prefilter={quote_handoff_summary['total_candidates_arriving']} "
+            f"candidates_surviving_prefilter={len(prefilter_pool)}"
+        )
+        for rank_position, (prescore, market) in enumerate(prefilter_pool[:10], start=1):
+            print(
+                f"[LIVE-SELECT-RANKED-CANDIDATE] stage=prefilter rank={rank_position} "
+                f"ticker={str(market.get('ticker', '') or '').strip()} family={prescore.get('family')} "
+                f"category={self.get_market_discovery_category(market)} score={prescore.get('score')} "
+                f"score_components={prescore.get('components')}"
+            )
         post_prefilter_family_counts = {}
         for prescore, market in prefilter_pool:
             family = prescore.get("family") or self.get_market_family(market)
@@ -5574,17 +6731,19 @@ class KalshiSniperBot:
                 f"partially_quoted_books={stats.get('partially_quoted_books', 0)}"
             )
         for family, stats in sorted(liquidity_check_family_stats.items()):
-            effective_values = stats.get("effective_values", [])
+            effective_top_sizes = stats.get("effective_top_sizes", [])
+            reported_liquidity_values = stats.get("reported_liquidity_values", [])
             thresholds = stats.get("thresholds", [])
-            min_effective = min(effective_values) if effective_values else None
-            avg_effective = (sum(effective_values) / float(len(effective_values))) if effective_values else None
-            max_effective = max(effective_values) if effective_values else None
+            min_effective = min(effective_top_sizes) if effective_top_sizes else None
+            avg_effective = (sum(effective_top_sizes) / float(len(effective_top_sizes))) if effective_top_sizes else None
+            max_effective = max(effective_top_sizes) if effective_top_sizes else None
+            avg_reported_liquidity = (sum(reported_liquidity_values) / float(len(reported_liquidity_values))) if reported_liquidity_values else None
             threshold_used = thresholds[-1] if thresholds else None
             print(
                 f"[LIVE-SELECT-LIQUIDITY-SUMMARY] family={family} candidates_seen={stats.get('candidates_seen', 0)} "
                 f"candidates_failed_low_liquidity={stats.get('candidates_failed_low_liquidity', 0)} "
                 f"min_effective_top_size={min_effective} avg_effective_top_size={round(avg_effective, 4) if avg_effective is not None else None} "
-                f"max_effective_top_size={max_effective} threshold_used={threshold_used}"
+                f"max_effective_top_size={max_effective} avg_reported_liquidity={round(avg_reported_liquidity, 4) if avg_reported_liquidity is not None else None} threshold_used={threshold_used}"
             )
         for family, stats in sorted(topbook_family_stats.items()):
             print(
@@ -6410,6 +7569,16 @@ class KalshiSniperBot:
                     f"no_top_size={orderbook_snapshot.get('no_top_size')} timing_score={validation_snapshot.get('timing_score')} "
                     f"reject_reason={reason}"
                 )
+                self._emit_live_select_reject_detail(
+                    stage="strict_validation",
+                    market=market,
+                    q=q,
+                    family=family,
+                    reason=reason,
+                    source_path=("targeted" if candidate_path == "targeted_series_path" else ("adaptive" if candidate_path == "adaptive_probe_path" else "broad")),
+                    validation_snapshot=validation_snapshot,
+                    orderbook_snapshot=orderbook_snapshot,
+                )
                 self._emit_priority_downstream_trace(
                     "[LIVE-SELECT-STRICT-CANDIDATE-REJECT]",
                     market,
@@ -6837,8 +8006,13 @@ class KalshiSniperBot:
         print(f"[LIVE-SELECT-SUMMARY] top_too_early={top_too_early}")
         print(f"[LIVE-SELECT-SUMMARY] top_prefilter_survivors={top_survivors}")
         print(
+            f"[LIVE-SELECT-FUNNEL] candidates_entering_strict_validation={len(strict_pool)} "
+            f"candidates_surviving_strict_validation={len(candidates)}"
+        )
+        ranked = self.rank_final_candidates(candidates)
+        print(
             f"[LIVE-SELECT-SUMMARY] entering_strict_validation={len(strict_pool)} "
-            f"surviving_strict_validation={len(candidates)} candidates_found={len(ranked := self.rank_final_candidates(candidates))}"
+            f"surviving_strict_validation={len(candidates)} candidates_found={len(ranked)}"
         )
         session_tradability = []
         for family, runtime_stats in sorted(self.live_family_runtime_stats.items()):
@@ -6979,6 +8153,23 @@ class KalshiSniperBot:
                 f"removed_before_strict={stats['prefilter_to_strict_removed']} "
                 f"removed_before_strict_reasons={sorted(stats['prefilter_to_strict_removed_reasons'].items(), key=lambda item: item[1], reverse=True)}"
             )
+            if self._is_balanced_sports_family(family):
+                sports_top_reject_reasons = sorted(
+                    (
+                        (reason, count)
+                        for (reason, reject_family), count in prefilter_rejects.items()
+                        if reject_family == family
+                    ),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:5]
+                print(
+                    f"[LIVE-SELECT-SPORTS-FUNNEL] family={family} fetched={stats['fetched']} "
+                    f"in_window={stats['in_window']} non_empty_top_book={stats['non_empty_top_book']} "
+                    f"both_sides_quoted={stats['both_sides_quoted']} min_top_size_met={stats['min_top_size_met']} "
+                    f"prefilter_survivors={stats['prefilter_survivors']} "
+                    f"top_reject_reasons={sports_top_reject_reasons}"
+                )
             hour_stats = self.targeted_family_hourly_stats.setdefault(family, {}).setdefault(
                 time.gmtime().tm_hour,
                 {
@@ -7020,6 +8211,7 @@ class KalshiSniperBot:
             or targeted_family_activity.get(family, {}).get("prefilter_survivors", 0) > 0
         ]
         print(f"[LIVE-SELECT-DEBUG] prioritized_quote_alive_families={prioritized_quote_alive}")
+        self.targeted_family_activity = targeted_family_activity
         targeted_viable_family_counts = {}
         for _score, q, _spread, family in ranked:
             market = next((item for item in markets if str(item.get("ticker", "") or "").strip() == q.ticker), None)
@@ -7077,16 +8269,30 @@ class KalshiSniperBot:
             summary="yes",
             counts=sorted(ranking_entry_priority_counts.items()),
         )
+        ranked, sports_priority_summary = self._apply_post_strict_sports_priority(ranked, markets)
         print(f"[LIVE-SELECT] candidates_found={len(ranked)}")
         print(
             f"[LIVE-SELECT-COUNT] stage=ranking before={len(candidates)} after={len(ranked)} filtered={len(candidates) - len(ranked)}"
         )
+        ranked = self._rebalance_ranked_candidates_for_family_mix(
+            ranked,
+            prefilter_survivor_family_counts,
+        )
         for rank_position, (score, q, spread, family) in enumerate(ranked[:10], start=1):
+            market = next((item for item in markets if str(item.get("ticker", "") or "").strip() == q.ticker), None)
             print(
                 f"[LIVE-SELECT] candidate_rank={rank_position} ticker={q.ticker} family={family} score={score:.2f} "
                 f"yes_bid={q.yes_bid:.4f} yes_ask={q.yes_ask:.4f} spread={spread:.4f} "
                 f"last={q.last_price:.4f} volume={q.volume} liquidity={q.liquidity:.4f}"
             )
+            print(
+                f"[LIVE-SELECT-RANKED-CANDIDATE] stage=final_ranking rank={rank_position} ticker={q.ticker} "
+                f"family={family} category={self.get_market_discovery_category(market or family)} "
+                f"score={round(score, 4)} score_components=raw_rank_score_only"
+            )
+        ranked_family_counts = {}
+        for _score, _q, _spread, _family in ranked:
+            ranked_family_counts[_family] = ranked_family_counts.get(_family, 0) + 1
         handoff_candidates_after_strict_validation = len(candidates)
         handoff_candidates_after_decision_layer = len(ranked)
         handoff_candidates_presented_to_entry_timing = 0
@@ -7094,6 +8300,7 @@ class KalshiSniperBot:
         handoff_zero_stage = None
         handoff_block_records = []
         activation_candidates = []
+        activation_armed_family_counts = {}
         activation_denial_counts = {}
         decision_entry_priority_counts = {}
         for score, q, spread, family in ranked:
@@ -7139,6 +8346,7 @@ class KalshiSniperBot:
                 )
             if activation_status["armed"]:
                 activation_candidates.append(ranked_candidate)
+                activation_armed_family_counts[family] = activation_armed_family_counts.get(family, 0) + 1
             else:
                 denied_reasons = activation_status.get("denied_reasons", []) or ["activation_not_armed"]
                 handoff_candidates_blocked_before_entry_timing += 1
@@ -7275,6 +8483,8 @@ class KalshiSniperBot:
         selected = None
         decision_buy_count = 0
         decision_skip_count = 0
+        decision_buy_family_counts = {}
+        decision_skip_family_counts = {}
         decision_skip_reasons = {}
         decision_trace = []
         for rank_position, (score, q, spread, family) in enumerate(ranked, start=1):
@@ -7291,6 +8501,39 @@ class KalshiSniperBot:
                 family,
                 stage_label="entry_timing",
             )
+            liquidity_priority = debug_context.get("liquidity_priority", {}) or {}
+            fallback_both_sides_quoted = bool(liquidity_priority.get("both_sides_quoted"))
+            fallback_yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
+            fallback_no_top_size = self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0
+            fallback_has_real_liquidity = bool(liquidity_priority.get("has_real_liquidity"))
+            fallback_activated = False
+            fallback_reason = None
+            if (
+                decision == "BUY"
+                and candidate_score >= 85.0
+                and 0.0 <= spread <= MAX_ENTRY_SPREAD
+                and fallback_both_sides_quoted
+                and fallback_yes_top_size > 0.0
+                and fallback_no_top_size > 0.0
+                and fallback_has_real_liquidity
+                and not entry_timing_observation.get("immediate_entry_blocked")
+                and entry_timing_observation.get("phase55_status") in ("trigger_wait", "pullback_wait")
+            ):
+                fallback_activated = True
+                fallback_reason = "high_quality_buy_timing_fallback"
+                entry_timing_observation = dict(entry_timing_observation)
+                entry_timing_observation["phase55_status"] = "entry_ready"
+                entry_timing_observation["entry_ready_reason"] = fallback_reason
+                entry_timing_observation["phase55_fallback_used"] = True
+                print(
+                    f"[LIVE-ENTRY-FALLBACK-ACTIVATED] ticker={q.ticker} family={family} "
+                    f"reason={fallback_reason} decision={decision} final_score={candidate_score} "
+                    f"spread={round(spread, 4)} both_sides_quoted={'yes' if fallback_both_sides_quoted else 'no'} "
+                    f"yes_top_size={fallback_yes_top_size} no_top_size={fallback_no_top_size} "
+                    f"has_real_liquidity={'yes' if fallback_has_real_liquidity else 'no'} "
+                    f"strict_validation_passed=yes crossover_detected={'yes' if entry_timing_observation.get('crossover_detected') else 'no'} "
+                    f"micro_pullback_detected={'yes' if entry_timing_observation.get('micro_pullback_detected') else 'no'}"
+                )
             trace_live_entry_timing = self._should_trace_priority_topbook_family(family)
             entry_timing_cycle_stats["candidates_seen_by_entry_timing"] += 1
             if trace_live_entry_timing:
@@ -7302,7 +8545,7 @@ class KalshiSniperBot:
                     f"data_available={'yes' if entry_timing_observation.get('stochastic_inputs_available') else 'no'} "
                     f"reject_reason={'insufficient_history' if not entry_timing_observation.get('stochastic_inputs_available') else 'None'}"
                 )
-            crossover_detected = bool(entry_timing_observation.get("bullish_crossover") or entry_timing_observation.get("bearish_crossover"))
+            crossover_detected = bool(entry_timing_observation.get("crossover_detected"))
             if crossover_detected:
                 entry_timing_cycle_stats["stochastic_crossovers_detected"] += 1
                 print(
@@ -7317,6 +8560,9 @@ class KalshiSniperBot:
                     f"stochastic_k={entry_timing_observation.get('stochastic_k')} "
                     f"stochastic_d={entry_timing_observation.get('stochastic_d')} "
                     f"crossover_detected={'yes' if crossover_detected else 'no'} "
+                    f"crossover_window_hit={'yes' if entry_timing_observation.get('crossover_window_hit') else 'no'} "
+                    f"bars_since_crossover={entry_timing_observation.get('bars_since_crossover')} "
+                    f"sticky_crossover_used={'yes' if entry_timing_observation.get('sticky_crossover_used') else 'no'} "
                     f"reject_reason={'no_stochastic_crossover' if entry_timing_observation.get('stochastic_inputs_available') and not crossover_detected else 'None'}"
                 )
             if entry_timing_observation.get("micro_pullback_detected"):
@@ -7327,6 +8573,8 @@ class KalshiSniperBot:
                     f"history_points={entry_timing_observation.get('history_points')} "
                     f"crossover_detected={'yes' if crossover_detected else 'no'} "
                     f"micro_pullback_detected={'yes' if entry_timing_observation.get('micro_pullback_detected') else 'no'} "
+                    f"pullback_rule_path={entry_timing_observation.get('pullback_rule_path')} "
+                    f"entry_ready_reason={entry_timing_observation.get('entry_ready_reason')} "
                     f"reject_reason={'no_micro_pullback' if crossover_detected and not entry_timing_observation.get('micro_pullback_detected') else 'None'}"
                 )
             if entry_timing_observation.get("immediate_entry_blocked"):
@@ -7350,9 +8598,14 @@ class KalshiSniperBot:
                     f"history_points={entry_timing_observation.get('history_points')} "
                     f"stochastic_k={entry_timing_observation.get('stochastic_k')} stochastic_d={entry_timing_observation.get('stochastic_d')} "
                     f"crossover_detected={'yes' if crossover_detected else 'no'} "
+                    f"crossover_window_hit={'yes' if entry_timing_observation.get('crossover_window_hit') else 'no'} "
+                    f"bars_since_crossover={entry_timing_observation.get('bars_since_crossover')} "
+                    f"sticky_crossover_used={'yes' if entry_timing_observation.get('sticky_crossover_used') else 'no'} "
                     f"micro_pullback_detected={'yes' if entry_timing_observation.get('micro_pullback_detected') else 'no'} "
+                    f"pullback_rule_path={entry_timing_observation.get('pullback_rule_path')} "
                     f"immediate_entry_block={'yes' if entry_timing_observation.get('immediate_entry_blocked') else 'no'} "
                     f"pass={'yes' if entry_timing_observation.get('phase55_status') == 'entry_ready' else 'no'} "
+                    f"entry_ready_reason={entry_timing_observation.get('entry_ready_reason')} "
                     f"reject_reason={entry_timing_observation.get('phase55_status')}"
                 )
             print(
@@ -7406,18 +8659,44 @@ class KalshiSniperBot:
                     "reason": decision_reason,
                     "hard_reject_reason": debug_context.get("hard_reject_reason"),
                 })
+            phase55_status = entry_timing_observation.get("phase55_status")
+            phase55_entry_timing_pass = bool(phase55_status == "entry_ready")
+            self.phase55_live_execution_gate_by_ticker[q.ticker] = {
+                "ticker": q.ticker,
+                "family": family,
+                "phase55_status": phase55_status,
+                "entry_timing_pass": phase55_entry_timing_pass,
+                "phase55_explicit_approval": phase55_entry_timing_pass,
+                "decision": decision,
+                "decision_reason": decision_reason,
+            }
             if trace_live_entry_timing:
                 print(
                     f"[LIVE-ENTRY-TIMING-LIVE-HANDOFF] ticker={q.ticker} family={family} "
                     f"phase55_status={entry_timing_observation.get('phase55_status')} decision={decision} "
-                    f"pass={'yes' if decision == 'BUY' else 'no'} "
-                    f"reject_reason={decision_reason if decision != 'BUY' else 'None'}"
+                    f"pass={'yes' if phase55_entry_timing_pass else 'no'} "
+                    f"reject_reason={decision_reason if not phase55_entry_timing_pass else 'None'}"
                 )
+            if family == "KXBTC15M" and decision == "BUY":
+                direction_decision = self._resolve_btc15m_live_direction_decision(
+                    market,
+                    q,
+                    family,
+                    entry_timing_observation=entry_timing_observation,
+                )
+                self.live_direction_decisions_by_ticker[q.ticker] = direction_decision
+                if direction_decision.get("intended_side") not in ("yes", "no"):
+                    decision_skip_count += 1
+                    decision_skip_family_counts[family] = decision_skip_family_counts.get(family, 0) + 1
+                    decision_skip_reasons["btc15m_direction_skip"] = decision_skip_reasons.get("btc15m_direction_skip", 0) + 1
+                    continue
             if decision != "BUY":
                 decision_skip_count += 1
+                decision_skip_family_counts[family] = decision_skip_family_counts.get(family, 0) + 1
                 decision_skip_reasons[decision_reason] = decision_skip_reasons.get(decision_reason, 0) + 1
                 continue
             decision_buy_count += 1
+            decision_buy_family_counts[family] = decision_buy_family_counts.get(family, 0) + 1
             selected = (score, q, spread, family)
             print(
                 f"[LIVE-SELECT-DECISION] chosen rank={rank_position} ticker={q.ticker} family={family} "
@@ -7457,6 +8736,53 @@ class KalshiSniperBot:
                 f"insufficient_data_count={entry_timing_cycle_stats['insufficient_data_count']}"
             )
         print(f"[LIVE-SELECT-DECISION] top_decision_trace={decision_trace}")
+        family_progression_union = sorted(
+            set(fetched_family_counts.keys())
+            .union(set(prefilter_survivor_family_counts.keys()))
+            .union(set(strict_entry_family_counts.keys()))
+            .union(set(final_family_counts.keys()))
+            .union(set(ranked_family_counts.keys()))
+            .union(set(activation_armed_family_counts.keys()))
+            .union(set(decision_buy_family_counts.keys()))
+            .union(set(decision_skip_family_counts.keys()))
+        )
+        family_progression_rows = []
+        for progression_family in family_progression_union:
+            category = self.get_market_discovery_category(progression_family)
+            progression_row = {
+                "family": progression_family,
+                "category": category,
+                "discovered": fetched_family_counts.get(progression_family, 0),
+                "prefilter_survivors": prefilter_survivor_family_counts.get(progression_family, 0),
+                "strict_entered": strict_entry_family_counts.get(progression_family, 0),
+                "strict_passed": final_family_counts.get(progression_family, 0),
+                "ranking_entered": ranked_family_counts.get(progression_family, 0),
+                "activation_armed": activation_armed_family_counts.get(progression_family, 0),
+                "decision_buy": decision_buy_family_counts.get(progression_family, 0),
+                "decision_skip": decision_skip_family_counts.get(progression_family, 0),
+            }
+            family_progression_rows.append(progression_row)
+            print(
+                f"[LIVE-SELECT-FAMILY-PROGRESSION] family={progression_family} category={category} "
+                f"discovered={progression_row['discovered']} prefilter_survivors={progression_row['prefilter_survivors']} "
+                f"strict_entered={progression_row['strict_entered']} strict_passed={progression_row['strict_passed']} "
+                f"ranking_entered={progression_row['ranking_entered']} activation_armed={progression_row['activation_armed']} "
+                f"decision_buy={progression_row['decision_buy']} decision_skip={progression_row['decision_skip']}"
+            )
+        print(
+            f"[LIVE-SELECT-FAMILY-PROGRESSION-SUMMARY] rows={family_progression_rows[:20]} "
+            f"ranked_by_family={sorted(ranked_family_counts.items(), key=lambda item: item[1], reverse=True)} "
+            f"armed_by_family={sorted(activation_armed_family_counts.items(), key=lambda item: item[1], reverse=True)} "
+            f"decision_buy_by_family={sorted(decision_buy_family_counts.items(), key=lambda item: item[1], reverse=True)} "
+            f"decision_skip_by_family={sorted(decision_skip_family_counts.items(), key=lambda item: item[1], reverse=True)}"
+        )
+        final_selected_family = selected[3] if selected else None
+        print(
+            f"[LIVE-SPORTS-PRIORITY-SUMMARY] sports_candidates_seen={sports_priority_summary.get('sports_candidates_seen', 0)} "
+            f"sports_candidates_boosted={sports_priority_summary.get('sports_candidates_boosted', 0)} "
+            f"btc_candidates_seen={sports_priority_summary.get('btc_candidates_seen', 0)} "
+            f"final_selected_family={final_selected_family}"
+        )
         print(
             f"[LIVE-SELECT-COUNT] stage=decision before={len(ranked)} after={1 if selected else 0} "
             f"filtered={len(ranked) - (1 if selected else 0)}"
@@ -7594,7 +8920,13 @@ class KalshiSniperBot:
         if not family_focus:
             families_in_window = summary.get("families_in_window") or []
             family_focus = families_in_window[0] if families_in_window else "None"
-        effective_live_dry_run = DRY_RUN_LIVE_ORDERS or not (LIVE_ARMED and LIVE_ENV_CONFIRMED)
+        effective_live_dry_run = compute_effective_live_dry_run(LIVE_MODE, LIVE_ARMED, LIVE_ENV_CONFIRMED)
+        print(
+            f"[LIVE-MODE-STATUS] source=heartbeat live_mode={'yes' if LIVE_MODE else 'no'} "
+            f"live_armed={'yes' if LIVE_ARMED else 'no'} live_env_confirmed={'yes' if LIVE_ENV_CONFIRMED else 'no'} "
+            f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} "
+            f"effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
+        )
         sent = send_telegram_message(
             "🫀 HEARTBEAT\n"
             f"Mode: {'LIVE' if LIVE_MODE else 'SIM'}\n"
@@ -7778,13 +9110,179 @@ class KalshiSniperBot:
 
         return True, None
 
-    def get_live_exposure_count(self):
-        open_live_positions = sum(
-            1 for position in self.live_positions
-            if position.get("status", "open") == "open"
+    def _get_live_position_max_age_seconds(self, family):
+        family = str(family or "UNKNOWN").strip().upper()
+        if family == "KXBTC15M":
+            return 30 * 60
+        if family.startswith(("KXNBA1H", "KXWNBA1H")):
+            return 3 * 60 * 60
+        if self.get_market_discovery_category(family) == "sports":
+            return 6 * 60 * 60
+        if self.get_market_discovery_category(family) == "weather":
+            return 12 * 60 * 60
+        return 12 * 60 * 60
+
+    def _get_tracked_live_position_age_seconds(self, position, now_ts=None):
+        now_ts = now_ts or time.time()
+        opened_at = position.get("opened_at") if isinstance(position, dict) else None
+        ticker = str((position or {}).get("ticker", "") or "").strip() if isinstance(position, dict) else ""
+        if opened_at in (None, "") and ticker:
+            entry_metadata = self.get_live_entry_metadata(ticker)
+            if isinstance(entry_metadata, dict):
+                opened_at = entry_metadata.get("entry_ts")
+        try:
+            return max(0, int(now_ts - float(opened_at))) if opened_at not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    def reconcile_live_positions(self):
+        before_count = len(self.live_positions)
+        now_ts = time.time()
+        kept_positions = []
+        removed_count = 0
+        for position in self.live_positions:
+            status = str(position.get("status", "open") or "open").strip().lower()
+            if status != "open":
+                kept_positions.append(position)
+                continue
+            ticker = str(position.get("ticker", "") or "").strip()
+            family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+            age_seconds = self._get_tracked_live_position_age_seconds(position, now_ts=now_ts)
+            max_age_seconds = self._get_live_position_max_age_seconds(family)
+            stale_reason = None
+            verification_reason = None
+            try:
+                market_detail = self.get_live_market_detail(ticker) if ticker else {}
+                market_status = str((market_detail or {}).get("status", "") or "").strip().lower()
+                minutes_to_event = self.get_minutes_to_event(market_detail) if isinstance(market_detail, dict) and market_detail else None
+                if market_status and market_status not in ("open", "active"):
+                    stale_reason = f"market_status_{market_status}"
+                elif isinstance(market_detail, dict) and market_detail and (market_detail.get("can_open") is False or market_detail.get("can_close") is False):
+                    stale_reason = "market_closed_or_resolved"
+                elif minutes_to_event is not None and minutes_to_event < -1.0:
+                    stale_reason = "market_expired_by_event_time"
+            except Exception as exc:
+                verification_reason = exc.__class__.__name__
+            if stale_reason is None and age_seconds is not None and age_seconds > max_age_seconds:
+                if verification_reason:
+                    stale_reason = f"unverified_but_age_stale_{verification_reason}"
+                else:
+                    stale_reason = f"age_exceeds_family_max_{max_age_seconds}s"
+            if stale_reason:
+                removed_count += 1
+                after_count = before_count - removed_count
+                self.remove_live_entry_metadata(ticker)
+                print(
+                    f"[LIVE-POSITION-STALE-CLEANUP] ticker={ticker} family={family} age_seconds={age_seconds} "
+                    f"reason={stale_reason} before_count={before_count} after_count={after_count}"
+                )
+                continue
+            kept_positions.append(position)
+            print(
+                f"[LIVE-POSITION-RECONCILE] ticker={ticker} family={family} age_seconds={age_seconds} "
+                f"reason=kept before_count={before_count} after_count={before_count - removed_count}"
+            )
+        self.live_positions = kept_positions
+        print(
+            f"[LIVE-POSITION-RECONCILE] ticker=summary family=summary age_seconds=None "
+            f"reason=reconcile_complete before_count={before_count} after_count={len(self.live_positions)}"
         )
-        pending_live_entries = 1 if getattr(self, "live_pending_entry_ticker", None) else 0
-        return open_live_positions + pending_live_entries
+
+    def _classify_live_exposure_family(self, family):
+        family = str(family or "").strip()
+        if not family or family == "UNKNOWN":
+            return "unknown"
+        if family == "KXBTC15M":
+            return "btc"
+        if self.get_market_discovery_category(family) == "sports":
+            return "sports"
+        return "other"
+
+    def get_live_exposure_snapshot(self, candidate_ticker=None, candidate_family=None):
+        snapshot = {
+            "ok": True,
+            "open_total_positions": 0,
+            "open_btc_positions": 0,
+            "open_sports_positions": 0,
+            "uncertain": False,
+            "uncertain_reasons": [],
+        }
+        try:
+            self.reconcile_live_positions()
+            for position in self.live_positions:
+                if str(position.get("status", "open") or "open").strip().lower() != "open":
+                    continue
+                ticker = str(position.get("ticker", "") or "").strip()
+                family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+                classification = self._classify_live_exposure_family(family)
+                snapshot["open_total_positions"] += 1
+                if classification == "btc":
+                    snapshot["open_btc_positions"] += 1
+                elif classification == "sports":
+                    snapshot["open_sports_positions"] += 1
+                elif classification == "unknown":
+                    snapshot["uncertain"] = True
+                    snapshot["uncertain_reasons"].append(f"unknown_open_family:{ticker or 'missing_ticker'}")
+            pending_ticker = str(getattr(self, "live_pending_entry_ticker", None) or "").strip()
+            if pending_ticker:
+                pending_family = self.get_market_family({"ticker": pending_ticker})
+                pending_classification = self._classify_live_exposure_family(pending_family)
+                snapshot["open_total_positions"] += 1
+                if pending_classification == "btc":
+                    snapshot["open_btc_positions"] += 1
+                elif pending_classification == "sports":
+                    snapshot["open_sports_positions"] += 1
+                elif pending_classification == "unknown":
+                    snapshot["uncertain"] = True
+                    snapshot["uncertain_reasons"].append(f"unknown_pending_family:{pending_ticker}")
+            effective_family = candidate_family or (self.get_market_family({"ticker": candidate_ticker}) if candidate_ticker else "UNKNOWN")
+            snapshot["candidate_family"] = effective_family
+            snapshot["candidate_classification"] = self._classify_live_exposure_family(effective_family)
+            if snapshot["candidate_classification"] == "unknown":
+                snapshot["uncertain"] = True
+                snapshot["uncertain_reasons"].append(f"unknown_candidate_family:{candidate_ticker or 'missing_ticker'}")
+        except Exception as exc:
+            snapshot["ok"] = False
+            snapshot["uncertain"] = True
+            snapshot["uncertain_reasons"].append(f"exposure_calculation_error:{exc.__class__.__name__}")
+        return snapshot
+
+    def check_live_exposure_limits(self, ticker, family=None):
+        snapshot = self.get_live_exposure_snapshot(candidate_ticker=ticker, candidate_family=family)
+        open_total_positions = int(snapshot.get("open_total_positions", 0) or 0)
+        open_btc_positions = int(snapshot.get("open_btc_positions", 0) or 0)
+        open_sports_positions = int(snapshot.get("open_sports_positions", 0) or 0)
+        candidate_classification = snapshot.get("candidate_classification")
+        blocked = False
+        reason = "approved"
+        if not snapshot.get("ok") or snapshot.get("uncertain"):
+            blocked = True
+            reason = ",".join(snapshot.get("uncertain_reasons", [])[:3]) or "exposure_uncertain"
+        else:
+            projected_total_positions = open_total_positions + 1
+            projected_btc_positions = open_btc_positions + (1 if candidate_classification == "btc" else 0)
+            projected_sports_positions = open_sports_positions + (1 if candidate_classification == "sports" else 0)
+            if projected_total_positions > MAX_SIMULTANEOUS_LIVE_POSITIONS:
+                blocked = True
+                reason = "max_total_live_positions"
+            elif candidate_classification == "btc" and projected_btc_positions > MAX_BTC15M_LIVE_POSITIONS:
+                blocked = True
+                reason = "max_btc15m_live_positions"
+            elif candidate_classification == "sports" and projected_sports_positions > MAX_SPORTS_LIVE_POSITIONS:
+                blocked = True
+                reason = "max_sports_live_positions"
+        print(
+            f"[LIVE-EXPOSURE-CHECK] ticker={ticker} family={family or snapshot.get('candidate_family') or 'UNKNOWN'} "
+            f"open_total_positions={open_total_positions} open_btc_positions={open_btc_positions} "
+            f"open_sports_positions={open_sports_positions} max_total_positions={MAX_SIMULTANEOUS_LIVE_POSITIONS} "
+            f"max_btc_positions={MAX_BTC15M_LIVE_POSITIONS} max_sports_positions={MAX_SPORTS_LIVE_POSITIONS} "
+            f"blocked={'yes' if blocked else 'no'} reason={reason}"
+        )
+        return (not blocked), reason, snapshot
+
+    def get_live_exposure_count(self):
+        snapshot = self.get_live_exposure_snapshot()
+        return int(snapshot.get("open_total_positions", 0) or 0)
 
     def get_market_group(self, ticker):
         """
@@ -7824,6 +9322,57 @@ class KalshiSniperBot:
         except (TypeError, ValueError):
             return score
 
+    def _resolve_btc15m_live_direction_decision(self, market, q, family, entry_timing_observation=None):
+        ticker = getattr(q, "ticker", "") or str((market or {}).get("ticker", "") or "").strip()
+        timing_history_key = None
+        if isinstance(entry_timing_observation, dict):
+            timing_history_key = entry_timing_observation.get("timing_history_key")
+        if not timing_history_key:
+            timing_history_key = self._build_phase55_timing_history_key(market or {"ticker": ticker}, q, family=family)
+        rolling_history = list(self.phase55_rolling_price_history.get(str(timing_history_key or "").strip(), []))
+        recent_prices = [round(float(price), 4) for price in rolling_history[-10:] if price is not None][-10:]
+        selected_side = "skip"
+        intended_side = "skip"
+        direction = "flat"
+        reason = "insufficient_history"
+        slope_value = None
+        momentum = None
+        flat_threshold = 0.002
+        if len(recent_prices) >= 5:
+            slope_value = round((recent_prices[-1] - recent_prices[0]) / float(len(recent_prices) - 1), 6)
+            momentum = round(recent_prices[-1] - recent_prices[-2], 6)
+            if abs(slope_value) <= flat_threshold:
+                direction = "flat"
+                selected_side = "skip"
+                intended_side = "skip"
+                reason = "slope_near_zero"
+            elif slope_value > 0:
+                direction = "bullish"
+                selected_side = "yes"
+                intended_side = "yes"
+                reason = "positive_short_term_slope"
+            else:
+                direction = "bearish"
+                selected_side = "no"
+                intended_side = "no"
+                reason = "negative_short_term_slope"
+        print(
+            f"[LIVE-DIRECTION-DECISION] ticker={ticker} family={family} recent_prices={recent_prices} "
+            f"slope_value={slope_value} direction={direction} selected_side={selected_side} reason={reason}"
+        )
+        return {
+            "ticker": ticker,
+            "family": family,
+            "recent_prices": recent_prices,
+            "slope_value": slope_value,
+            "slope": slope_value,
+            "momentum": momentum,
+            "direction": direction,
+            "selected_side": selected_side,
+            "intended_side": intended_side,
+            "reason": reason,
+        }
+
     def build_live_order_payload(self, q, size=None):
         """
         Build and return a dict payload representing the live order that would be sent.
@@ -7831,26 +9380,195 @@ class KalshiSniperBot:
         Return None if the quote is not valid enough to build a payload safely.
         """
         ticker = getattr(q, "ticker", "") or ""
-        yes_ask = getattr(q, "yes_ask", 0.0) or 0.0
-        if not ticker or yes_ask <= 0:
-            return None
-        yes_price = int(round(yes_ask * 100)) if yes_ask <= 1 else int(round(yes_ask))
-        yes_price = max(1, min(99, yes_price))
+        family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+        intended_side = DEFAULT_LIVE_ORDER_SIDE
+        if family == "KXBTC15M":
+            direction_decision = self.live_direction_decisions_by_ticker.get(ticker, {})
+            intended_side = direction_decision.get("intended_side")
+            if intended_side not in ("yes", "no"):
+                return None
         requested_count = size if size is not None else globals().get("MAX_LIVE_ORDER_SIZE", 1)
         count = min(requested_count, MAX_LIVE_ORDER_SIZE)
         if count != requested_count:
             print(f"[LIVE-SAFETY] size clamped from {requested_count} to {count}")
-        return {
+        payload = {
             "ticker": ticker,
-            "side": DEFAULT_LIVE_ORDER_SIDE,
+            "side": intended_side,
             "action": DEFAULT_LIVE_ORDER_ACTION,
             "count": count,
-            "yes_price": yes_price,
             "type": "limit",
             "is_dry_run": DRY_RUN_LIVE_ORDERS or not (
                 globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
             ),
         }
+        if intended_side == "yes":
+            yes_ask = getattr(q, "yes_ask", 0.0) or 0.0
+            if not ticker or yes_ask <= 0 or yes_ask <= MIN_ENTRY_PRICE or yes_ask >= MAX_ENTRY_PRICE:
+                return None
+            yes_price = int(round(yes_ask * 100)) if yes_ask <= 1 else int(round(yes_ask))
+            payload["yes_price"] = max(1, min(99, yes_price))
+            return payload
+        no_ask = getattr(q, "no_ask", 0.0) or 0.0
+        if not ticker or no_ask <= 0 or no_ask <= MIN_ENTRY_PRICE or no_ask >= MAX_ENTRY_PRICE:
+            return None
+        no_price = int(round(no_ask * 100)) if no_ask <= 1 else int(round(no_ask))
+        payload["no_price"] = max(1, min(99, no_price))
+        return payload
+
+    def _evaluate_live_entry_negative_edge_guard(self, q, payload=None):
+        ticker = getattr(q, "ticker", "") or ""
+        payload = payload or self.build_live_order_payload(q)
+        side = (payload or {}).get("side") if isinstance(payload, dict) else None
+        yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.yes_bid")
+        yes_ask = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.yes_ask")
+        no_bid = self.normalize_contract_price(getattr(q, "no_bid", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.no_bid")
+        no_ask = self.normalize_contract_price(getattr(q, "no_ask", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.no_ask")
+        intended_entry_price = None
+        estimated_immediate_edge = None
+        decision = "allow"
+        reason = "guard_disabled"
+        allowed = True
+        if not ENABLE_NEGATIVE_EDGE_ENTRY_GUARD:
+            print(
+                f"[LIVE-ENTRY-NEGATIVE-EDGE-GUARD] ticker={ticker} side={side} intended_entry_price={intended_entry_price} "
+                f"estimated_immediate_edge={estimated_immediate_edge} max_acceptable_edge_loss={MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS} "
+                f"reason={reason} decision={decision}"
+            )
+            return True, reason, {"estimated_immediate_edge": estimated_immediate_edge}
+        if side == "yes":
+            intended_entry_price = yes_ask
+            if intended_entry_price is None or intended_entry_price <= 0 or yes_bid is None or yes_bid <= 0:
+                allowed = False
+                reason = "missing_yes_top_book"
+            else:
+                estimated_immediate_edge = round(float(yes_bid) - float(intended_entry_price), 4)
+        elif side == "no":
+            intended_entry_price = no_ask
+            if intended_entry_price is None or intended_entry_price <= 0 or no_bid is None or no_bid <= 0:
+                allowed = False
+                reason = "missing_no_top_book"
+            else:
+                estimated_immediate_edge = round(float(no_bid) - float(intended_entry_price), 4)
+        else:
+            allowed = False
+            reason = "invalid_side"
+        if allowed and estimated_immediate_edge is not None and estimated_immediate_edge < MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS:
+            allowed = False
+            reason = "immediate_negative_edge"
+        if allowed and reason == "guard_disabled":
+            reason = "acceptable_immediate_edge"
+        decision = "allow" if allowed else "skip"
+        print(
+            f"[LIVE-ENTRY-NEGATIVE-EDGE-GUARD] ticker={ticker} side={side} intended_entry_price={intended_entry_price} "
+            f"estimated_immediate_edge={estimated_immediate_edge} max_acceptable_edge_loss={MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS} "
+            f"reason={reason} decision={decision}"
+        )
+        return allowed, reason, {
+            "ticker": ticker,
+            "side": side,
+            "intended_entry_price": intended_entry_price,
+            "estimated_immediate_edge": estimated_immediate_edge,
+        }
+
+    def _evaluate_live_entry_stale_signal_guard(self, q, payload=None):
+        ticker = getattr(q, "ticker", "") or ""
+        family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+        payload = payload or self.build_live_order_payload(q)
+        side = (payload or {}).get("side") if isinstance(payload, dict) else None
+        original_score = getattr(q, "score", None)
+        try:
+            original_score = round(float(original_score), 4) if original_score is not None else round(float(self._score_live_ticker_candidate(q)), 4)
+        except Exception:
+            original_score = None
+        latest_price = None
+        latest_spread = None
+        decision = "allow"
+        reason = "guard_disabled"
+        if not ENABLE_STALE_SIGNAL_GUARD:
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason={reason} decision={decision}"
+            )
+            return True, reason, {"latest_price": latest_price, "latest_spread": latest_spread}
+        try:
+            latest_market = self.get_live_market_detail(ticker)
+        except Exception as exc:
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason=market_detail_fetch_{exc.__class__.__name__} decision=skip"
+            )
+            return False, f"stale_signal_market_detail_fetch_{exc.__class__.__name__}", {"latest_price": latest_price, "latest_spread": latest_spread}
+        if not isinstance(latest_market, dict) or not latest_market:
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason=missing_latest_market_detail decision=skip"
+            )
+            return False, "stale_signal_missing_latest_market_detail", {"latest_price": latest_price, "latest_spread": latest_spread}
+        latest_quote = self.build_quote(latest_market)
+        latest_payload = self.build_live_order_payload(latest_quote, size=(payload or {}).get("count"))
+        latest_yes_bid = self.normalize_contract_price(getattr(latest_quote, "yes_bid", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.yes_bid")
+        latest_yes_ask = self.normalize_contract_price(getattr(latest_quote, "yes_ask", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.yes_ask")
+        latest_no_bid = self.normalize_contract_price(getattr(latest_quote, "no_bid", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.no_bid")
+        latest_no_ask = self.normalize_contract_price(getattr(latest_quote, "no_ask", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.no_ask")
+        latest_spread = round(float(latest_yes_ask) - float(latest_yes_bid), 4) if latest_yes_ask and latest_yes_bid else None
+        if side == "yes":
+            latest_price = latest_yes_ask
+        elif side == "no":
+            latest_price = latest_no_ask
+        if latest_payload is None:
+            reason = "latest_payload_invalid"
+            decision = "skip"
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason={reason} decision={decision}"
+            )
+            return False, f"stale_signal_{reason}", {"latest_price": latest_price, "latest_spread": latest_spread}
+        if latest_payload.get("side") != side:
+            reason = "direction_changed"
+            decision = "skip"
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason={reason} decision={decision}"
+            )
+            return False, f"stale_signal_{reason}", {"latest_price": latest_price, "latest_spread": latest_spread}
+        original_entry_price = None
+        latest_entry_price = None
+        if side == "yes":
+            original_entry_price = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.original_yes_ask")
+            latest_entry_price = latest_yes_ask
+        elif side == "no":
+            original_entry_price = self.normalize_contract_price(getattr(q, "no_ask", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.original_no_ask")
+            latest_entry_price = latest_no_ask
+        if latest_spread is None or latest_spread > MAX_ENTRY_SPREAD:
+            reason = "latest_spread_deteriorated"
+            decision = "skip"
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason={reason} decision={decision}"
+            )
+            return False, f"stale_signal_{reason}", {"latest_price": latest_price, "latest_spread": latest_spread}
+        if latest_entry_price is None or latest_entry_price <= 0:
+            reason = "latest_price_missing"
+            decision = "skip"
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason={reason} decision={decision}"
+            )
+            return False, f"stale_signal_{reason}", {"latest_price": latest_price, "latest_spread": latest_spread}
+        if original_entry_price is not None and latest_entry_price > (float(original_entry_price) + 0.02):
+            reason = "entry_price_moved_against_signal"
+            decision = "skip"
+            print(
+                f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                f"latest_price={latest_price} latest_spread={latest_spread} reason={reason} decision={decision}"
+            )
+            return False, f"stale_signal_{reason}", {"latest_price": latest_price, "latest_spread": latest_spread}
+        reason = "signal_still_valid"
+        print(
+            f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+            f"latest_price={latest_price} latest_spread={latest_spread} reason={reason} decision=allow"
+        )
+        return True, reason, {"latest_price": latest_price, "latest_spread": latest_spread}
 
     def print_live_order_preview(self, q, size=None):
         """
@@ -8268,9 +9986,38 @@ class KalshiSniperBot:
             f"[LIVE-APPROVAL] REAL order ticker={payload['ticker']} side={payload['side']} "
             f"action={payload['action']} count={payload['count']} price={display_price}"
         )
+        live_mode = bool(globals().get("LIVE_MODE", False))
+        live_armed = bool(globals().get("LIVE_ARMED", False))
+        live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
+        has_live_test_ticker = bool(globals().get("LIVE_TEST_TICKER"))
+        interactive_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+        auto_service_mode = bool(live_mode and live_armed and live_env_confirmed and not has_live_test_ticker and not interactive_tty)
+        print(
+            f"[LIVE-EXECUTION-CONFIRMATION-MODE] ticker={payload.get('ticker')} "
+            f"live_mode={'yes' if live_mode else 'no'} live_armed={'yes' if live_armed else 'no'} "
+            f"live_env_confirmed={'yes' if live_env_confirmed else 'no'} "
+            f"interactive_tty={'yes' if interactive_tty else 'no'} "
+            f"live_test_ticker={'yes' if has_live_test_ticker else 'no'} "
+            f"auto_service_mode={'yes' if auto_service_mode else 'no'}"
+        )
+        if auto_service_mode:
+            print(
+                f"[LIVE-EXECUTION-ABORT-CHECK] ticker={payload.get('ticker')} "
+                f"auto_confirm=yes reason=non_interactive_live_service"
+            )
+            return True
         try:
-            return input("Type YES to place this real live order: ") == "YES"
+            approved = input("Type YES to place this real live order: ") == "YES"
+            print(
+                f"[LIVE-EXECUTION-ABORT-CHECK] ticker={payload.get('ticker')} "
+                f"auto_confirm=no approved={'yes' if approved else 'no'} reason=interactive_confirmation"
+            )
+            return approved
         except Exception:
+            print(
+                f"[LIVE-EXECUTION-ABORT-CHECK] ticker={payload.get('ticker')} "
+                f"auto_confirm=no approved=no reason=no_terminal_confirmation"
+            )
             print("[SAFEGUARD] live submit aborted: no terminal confirmation")
             return False
 
@@ -8396,6 +10143,8 @@ class KalshiSniperBot:
                 "price",
             )
 
+        normalized_ticker = first_value("ticker")
+        price = self.normalize_contract_price(price, ticker=normalized_ticker, source="extract_order_execution_summary.price")
         return {
             "status": first_value("status"),
             "filled_count": fill_count,
@@ -8502,6 +10251,11 @@ class KalshiSniperBot:
         )
         if avg_price is None and total_traded is not None and count not in (None, 0):
             avg_price = total_traded / abs(count)
+        avg_price = self.normalize_contract_price(
+            avg_price,
+            ticker=first_value("ticker", "market_ticker"),
+            source="extract_position_summary.avg_price",
+        )
         updated_ts = num_value("opened_at_ts", "entry_ts", "created_ts", "last_updated_ts", "updated_ts")
         if updated_ts is not None and updated_ts > 1e12:
             updated_ts = updated_ts / 1000.0
@@ -8663,108 +10417,325 @@ class KalshiSniperBot:
         print(f"[LIVE-QUOTE-SOURCE] ticker={ticker} source={quote_result.get('source', 'missing')}")
         return quote_result
 
+    def _get_live_exit_max_hold_seconds(self, family):
+        family = str(family or "UNKNOWN").strip().upper()
+        if family == "KXBTC15M":
+            return min(12 * 60, FAST_TURNOVER_MAX_HOLD_SECONDS)
+        if self.get_market_discovery_category(family) == "sports":
+            return min(45 * 60, FAST_TURNOVER_MAX_HOLD_SECONDS)
+        return min(MAX_HOLD_SECONDS, FAST_TURNOVER_MAX_HOLD_SECONDS)
+
+    def _mark_tracked_live_position_closed(self, ticker, reason=None):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return
+        now_ts = time.time()
+        for position in self.live_positions:
+            if str(position.get("ticker", "") or "").strip() != ticker:
+                continue
+            if str(position.get("status", "open") or "open").strip().lower() != "open":
+                continue
+            position["status"] = "closed"
+            position["closed_at"] = now_ts
+            if reason:
+                position["exit_reason"] = reason
+        self.remove_live_entry_metadata(ticker)
+
+    def _update_live_position_closure_tracker(
+        self,
+        ticker,
+        entry_price=None,
+        side=None,
+        size=None,
+        last_known_price=None,
+        last_exit_decision_reason=None,
+        last_exit_pnl=None,
+        exit_price=None,
+        exit_submit_state=None,
+        source=None,
+        seen_ts=None,
+    ):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return None
+        now_ts = seen_ts if seen_ts is not None else time.time()
+        tracker = self.live_position_closure_tracker.get(ticker)
+        if not isinstance(tracker, dict):
+            tracker = {
+                "ticker": ticker,
+                "first_seen_ts": now_ts,
+                "last_seen_ts": now_ts,
+            }
+        if tracker.get("first_seen_ts") is None:
+            tracker["first_seen_ts"] = now_ts
+        tracker["last_seen_ts"] = now_ts
+        if entry_price is not None:
+            normalized_entry = self.normalize_contract_price(entry_price, ticker=ticker, source=f"{source or 'tracker'}.entry_price")
+            if normalized_entry is not None and 0 < normalized_entry <= 1:
+                tracker["entry_price"] = normalized_entry
+        if side:
+            tracker["side"] = str(side).lower()
+        if size is not None:
+            try:
+                tracker["size"] = int(abs(float(size)))
+            except (TypeError, ValueError):
+                pass
+        if last_known_price is not None:
+            normalized_last = self.normalize_contract_price(last_known_price, ticker=ticker, source=f"{source or 'tracker'}.last_known_price")
+            if normalized_last is not None and 0 < normalized_last <= 1:
+                tracker["last_known_price"] = normalized_last
+        if last_exit_decision_reason:
+            tracker["last_exit_decision_reason"] = str(last_exit_decision_reason)
+            tracker["last_exit_signal_ts"] = now_ts
+        if last_exit_pnl is not None:
+            tracker["last_exit_pnl"] = last_exit_pnl
+        if exit_price is not None:
+            normalized_exit = self.normalize_contract_price(exit_price, ticker=ticker, source=f"{source or 'tracker'}.exit_price")
+            if normalized_exit is not None and 0 < normalized_exit <= 1:
+                tracker["last_exit_price"] = normalized_exit
+        if exit_submit_state:
+            tracker["last_exit_submit_state"] = str(exit_submit_state)
+            tracker["last_exit_submit_ts"] = now_ts
+        if source:
+            tracker["last_update_source"] = source
+        self.live_position_closure_tracker[ticker] = tracker
+        return tracker
+
+    def _emit_live_position_closed_attribution(self, ticker, family=None, market_detail=None, now_ts=None):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return None
+        tracker = self.live_position_closure_tracker.get(ticker)
+        now_ts = now_ts if now_ts is not None else time.time()
+        family = family or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")
+        closure_type = "api_zero_position_only"
+        source = "zero_position_monitor"
+        market_status = ""
+        if not isinstance(market_detail, dict):
+            market_detail = {}
+        meaningful_tracker_state = False
+        if isinstance(tracker, dict):
+            entry_price = tracker.get("entry_price")
+            size = tracker.get("size")
+            first_seen_ts = tracker.get("first_seen_ts")
+            last_seen_ts = tracker.get("last_seen_ts")
+            last_exit_reason = tracker.get("last_exit_decision_reason")
+            submit_state = str(tracker.get("last_exit_submit_state") or "").strip().lower()
+            meaningful_tracker_state = bool(
+                entry_price is not None
+                or (size is not None and float(size) > 0)
+                or first_seen_ts is not None
+                or last_seen_ts is not None
+                or last_exit_reason is not None
+                or submit_state in ("attempted", "submitted", "confirmed")
+            )
+        if not meaningful_tracker_state:
+            self.live_position_closure_tracker.pop(ticker, None)
+            return None
+        try:
+            market_status = str((market_detail or {}).get("status", "") or "").strip().lower()
+        except Exception:
+            market_status = ""
+        market_resolved = market_status and market_status not in ("open", "active")
+        if not market_resolved and market_detail:
+            timestamp_details = self.get_market_event_timestamp_details(market_detail)
+            event_ts = timestamp_details.get("event_ts")
+            if event_ts is not None:
+                try:
+                    market_resolved = float(event_ts) <= float(now_ts)
+                except (TypeError, ValueError):
+                    market_resolved = False
+        if market_resolved:
+            closure_type = "market_resolution"
+            source = "market_detail"
+        elif isinstance(tracker, dict):
+            submit_state = str(tracker.get("last_exit_submit_state") or "").strip().lower()
+            exit_reason = tracker.get("last_exit_decision_reason")
+            if submit_state in ("attempted", "submitted", "confirmed"):
+                closure_type = "bot_exit_confirmed"
+                source = "bot_exit_tracker"
+            elif exit_reason:
+                closure_type = "bot_exit_expected"
+                source = "bot_exit_signal"
+            else:
+                closure_type = "external_or_manual_exit"
+                source = "tracker_no_bot_exit"
+        entry_price = tracker.get("entry_price") if isinstance(tracker, dict) else None
+        last_known_price = tracker.get("last_exit_price") if isinstance(tracker, dict) and tracker.get("last_exit_price") is not None else (tracker.get("last_known_price") if isinstance(tracker, dict) else None)
+        side = tracker.get("side") if isinstance(tracker, dict) else None
+        size = tracker.get("size") if isinstance(tracker, dict) else None
+        first_seen_ts = tracker.get("first_seen_ts") if isinstance(tracker, dict) else None
+        hold_seconds = None
+        if first_seen_ts is not None:
+            try:
+                hold_seconds = max(0, int(float(now_ts) - float(first_seen_ts)))
+            except (TypeError, ValueError):
+                hold_seconds = None
+        last_exit_reason = tracker.get("last_exit_decision_reason") if isinstance(tracker, dict) else None
+        estimated_pnl = tracker.get("last_exit_pnl") if isinstance(tracker, dict) else None
+        print(
+            f"[LIVE-POSITION-CLOSED] ticker={ticker} closure_type={closure_type} "
+            f"entry_price={entry_price} last_known_price={last_known_price} side={side} size={size} "
+            f"hold_seconds={hold_seconds} last_exit_reason={last_exit_reason} estimated_pnl={estimated_pnl} source={source}"
+        )
+        self.live_position_closure_tracker.pop(ticker, None)
+        return {"ticker": ticker, "closure_type": closure_type, "source": source}
+
     def evaluate_exit_decision(self, position_summary, quote, now_ts=None):
+        ticker = position_summary.get("ticker")
+        family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
         side = (position_summary.get("side") or "").lower()
-        avg_price = position_summary.get("avg_price")
+        avg_price = self.normalize_contract_price(position_summary.get("avg_price"), ticker=ticker, source="evaluate_exit_decision.entry_price")
         now_ts = now_ts or time.time()
         updated_ts = position_summary.get("updated_ts")
         if updated_ts is None:
             persisted_entry = self.get_live_entry_metadata(position_summary.get("ticker"))
             if persisted_entry:
                 updated_ts = persisted_entry.get("entry_ts")
+        hold_seconds = None
         hold_minutes = None
         if updated_ts:
             try:
-                hold_minutes = max(0.0, (float(now_ts) - float(updated_ts)) / 60.0)
+                hold_seconds = max(0, int(float(now_ts) - float(updated_ts)))
+                hold_minutes = hold_seconds / 60.0
             except (TypeError, ValueError):
+                hold_seconds = None
                 hold_minutes = None
         if position_summary.get("updated_ts") is None and updated_ts is not None and hold_minutes is not None:
             print(
                 f"[LIVE-EXIT-TIME] ticker={position_summary.get('ticker')} "
                 f"hold_minutes={hold_minutes} source=state"
             )
-        if avg_price is None or not side:
-            return {
-                "should_exit": False,
-                "reason": "missing_position_fields",
-                "target_side": side or None,
-                "expected_exit_price": None,
-                "spread": None,
-                "hold_minutes": hold_minutes,
-            }
-        if side == "yes":
-            current_price = getattr(quote, "yes_bid", 0.0) or 0.0
-            exit_ask = getattr(quote, "yes_ask", 0.0) or 0.0
-            if current_price <= 0:
-                current_price = getattr(quote, "last_price", 0.0) or 0.0
-            spread = (exit_ask - getattr(quote, "yes_bid", 0.0)) if exit_ask > 0 and getattr(quote, "yes_bid", 0.0) > 0 else None
-        elif side == "no":
-            current_price = getattr(quote, "no_bid", 0.0) or 0.0
-            exit_ask = getattr(quote, "no_ask", 0.0) or 0.0
-            if current_price <= 0:
-                last_price = getattr(quote, "last_price", 0.0) or 0.0
-                if 0 < last_price < 1:
-                    current_price = max(0.0, 1.0 - last_price)
-                else:
-                    current_price = 0.0
-            spread = (exit_ask - getattr(quote, "no_bid", 0.0)) if exit_ask > 0 and getattr(quote, "no_bid", 0.0) > 0 else None
-        else:
-            current_price = 0.0
-            spread = None
-        if current_price <= 0:
-            return {
-                "should_exit": False,
-                "reason": "missing_quote_data",
-                "target_side": side or None,
-                "expected_exit_price": None,
-                "spread": spread,
-                "hold_minutes": hold_minutes,
-            }
-        stop_loss_triggered = current_price <= avg_price - STOP_LOSS_DELTA
-        if stop_loss_triggered:
-            return {
-                "should_exit": True,
-                "reason": "stop_loss",
-                "target_side": side,
-                "expected_exit_price": current_price,
-                "spread": spread,
-                "hold_minutes": hold_minutes,
-            }
-        if hold_minutes is not None and hold_minutes >= MAX_HOLD_MINUTES:
-            return {
-                "should_exit": True,
-                "reason": "max_hold",
-                "target_side": side,
-                "expected_exit_price": current_price,
-                "spread": spread,
-                "hold_minutes": hold_minutes,
-            }
-        if spread is not None and spread > MAX_EXIT_SPREAD:
-            return {
-                "should_exit": False,
-                "reason": "spread_too_wide",
-                "target_side": side,
-                "expected_exit_price": current_price,
-                "spread": spread,
-                "hold_minutes": hold_minutes,
-            }
-        if current_price >= avg_price + TAKE_PROFIT_DELTA:
-            return {
-                "should_exit": True,
-                "reason": "take_profit",
-                "target_side": side,
-                "expected_exit_price": current_price,
-                "spread": spread,
-                "hold_minutes": hold_minutes,
-            }
-        return {
+        result = {
             "should_exit": False,
             "reason": "hold",
-            "target_side": side,
-            "expected_exit_price": current_price,
-            "spread": spread,
+            "hold_reason": "awaiting_signal",
+            "target_side": side or None,
+            "min_hold_seconds": MIN_HOLD_SECONDS,
+            "loss_exit_confirmation_checks": LOSS_EXIT_CONFIRMATION_CHECKS,
+            "expected_exit_price": None,
+            "spread": None,
             "hold_minutes": hold_minutes,
+            "hold_seconds": hold_seconds,
+            "entry_price": avg_price,
+            "current_price": None,
+            "contract_move": None,
+            "unrealized_pnl_cents": None,
+            "unrealized_pnl_percent": None,
+            "fast_turnover_take_profit_delta": FAST_TURNOVER_TAKE_PROFIT_DELTA,
+            "fast_turnover_stop_loss_delta": FAST_TURNOVER_STOP_LOSS_DELTA,
+            "fast_turnover_max_hold_seconds": self._get_live_exit_max_hold_seconds(family),
+            "strongly_improving": False,
         }
+        if avg_price is None or avg_price <= 0 or avg_price > 1 or not side:
+            result["reason"] = "invalid_entry_price" if side else "missing_position_fields"
+            return result
+        if side == "yes":
+            raw_yes_bid = getattr(quote, "yes_bid", 0.0) or 0.0
+            raw_yes_ask = getattr(quote, "yes_ask", 0.0) or 0.0
+            current_price = self.normalize_contract_price(raw_yes_bid, ticker=ticker, source="evaluate_exit_decision.yes_bid")
+            exit_ask = self.normalize_contract_price(raw_yes_ask, ticker=ticker, source="evaluate_exit_decision.yes_ask")
+            if not current_price or current_price <= 0:
+                current_price = self.normalize_contract_price(getattr(quote, "last_price", 0.0) or 0.0, ticker=ticker, source="evaluate_exit_decision.last_price_yes")
+            spread = (exit_ask - current_price) if exit_ask and current_price and exit_ask > 0 and current_price > 0 else None
+        elif side == "no":
+            raw_no_bid = getattr(quote, "no_bid", 0.0) or 0.0
+            raw_no_ask = getattr(quote, "no_ask", 0.0) or 0.0
+            current_price = self.normalize_contract_price(raw_no_bid, ticker=ticker, source="evaluate_exit_decision.no_bid")
+            exit_ask = self.normalize_contract_price(raw_no_ask, ticker=ticker, source="evaluate_exit_decision.no_ask")
+            if not current_price or current_price <= 0:
+                last_price = self.normalize_contract_price(getattr(quote, "last_price", 0.0) or 0.0, ticker=ticker, source="evaluate_exit_decision.last_price_no")
+                if last_price is not None and 0 < last_price < 1:
+                    current_price = max(0.0, 1.0 - last_price)
+                else:
+                    current_price = None
+            spread = (exit_ask - current_price) if exit_ask and current_price and exit_ask > 0 and current_price > 0 else None
+        else:
+            current_price = None
+            spread = None
+        result["spread"] = spread
+        if current_price is None or current_price <= 0 or current_price > 1:
+            result["reason"] = "invalid_current_price"
+            return result
+        result["current_price"] = current_price
+        try:
+            contract_move = round(float(current_price) - float(avg_price), 4)
+            pnl_cents = round(contract_move * 100.0, 4)
+            pnl_percent = round((contract_move / float(avg_price)) * 100.0, 4) if float(avg_price) > 0 else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            contract_move = None
+            pnl_cents = None
+            pnl_percent = None
+        result["contract_move"] = contract_move
+        result["unrealized_pnl_cents"] = pnl_cents
+        result["unrealized_pnl_percent"] = pnl_percent
+        family_max_hold_seconds = self._get_live_exit_max_hold_seconds(family)
+        result["fast_turnover_max_hold_seconds"] = family_max_hold_seconds
+        if spread is not None and spread > MAX_EXIT_SPREAD:
+            result["reason"] = "spread_too_wide"
+            result["hold_reason"] = "spread_too_wide"
+            return result
+        strongly_improving = bool(
+            contract_move is not None
+            and contract_move >= FAST_TURNOVER_STRONG_IMPROVING_DELTA
+            and pnl_percent is not None
+            and pnl_percent >= FAST_TURNOVER_STRONG_IMPROVING_PNL_PERCENT
+        )
+        result["strongly_improving"] = strongly_improving
+        severe_loss_trigger = bool(
+            current_price <= avg_price - STOP_LOSS_DELTA
+            or (pnl_percent is not None and pnl_percent <= -15.0)
+        )
+        normal_loss_trigger = bool(contract_move is not None and contract_move <= -FAST_TURNOVER_STOP_LOSS_DELTA)
+        if normal_loss_trigger or severe_loss_trigger:
+            is_emergency_loss_exit = bool(severe_loss_trigger)
+            if not is_emergency_loss_exit and hold_seconds is not None and hold_seconds < MIN_HOLD_SECONDS:
+                result["hold_reason"] = "min_hold_guard"
+                result["reason"] = "fast_stop_loss"
+                print(
+                    f"[LIVE-EXIT-MIN-HOLD-GUARD] ticker={ticker} hold_seconds={hold_seconds} min_hold_seconds={MIN_HOLD_SECONDS} "
+                    f"unrealized_pnl={pnl_cents} exit_reason=fast_stop_loss decision=hold"
+                )
+                self.live_loss_exit_confirmation_counts[ticker] = 0
+                return result
+            if not is_emergency_loss_exit:
+                confirmation_count = int(self.live_loss_exit_confirmation_counts.get(ticker, 0) or 0) + 1
+                self.live_loss_exit_confirmation_counts[ticker] = confirmation_count
+                confirmation_decision = "exit" if confirmation_count >= LOSS_EXIT_CONFIRMATION_CHECKS else "hold"
+                print(
+                    f"[LIVE-EXIT-LOSS-CONFIRMATION] ticker={ticker} loss_check_count={confirmation_count} "
+                    f"required_count={LOSS_EXIT_CONFIRMATION_CHECKS} unrealized_pnl={pnl_cents} decision={confirmation_decision}"
+                )
+                if confirmation_count < LOSS_EXIT_CONFIRMATION_CHECKS:
+                    result["hold_reason"] = "loss_confirmation_pending"
+                    result["reason"] = "fast_stop_loss"
+                    return result
+            print(
+                f"[LIVE-EXIT-MIN-HOLD-GUARD] ticker={ticker} hold_seconds={hold_seconds} min_hold_seconds={MIN_HOLD_SECONDS} "
+                f"unrealized_pnl={pnl_cents} exit_reason={'stop_loss' if is_emergency_loss_exit else 'fast_stop_loss'} decision=exit"
+            )
+            self.live_loss_exit_confirmation_counts[ticker] = 0
+            result["should_exit"] = True
+            result["reason"] = "stop_loss" if is_emergency_loss_exit else "fast_stop_loss"
+            return result
+        self.live_loss_exit_confirmation_counts[ticker] = 0
+        if contract_move is not None and contract_move >= FAST_TURNOVER_TAKE_PROFIT_DELTA:
+            result["should_exit"] = True
+            result["reason"] = "quick_profit"
+            return result
+        if current_price >= avg_price + TAKE_PROFIT_DELTA or (pnl_percent is not None and pnl_percent >= 15.0):
+            result["should_exit"] = True
+            result["reason"] = "take_profit"
+            return result
+        if hold_seconds is not None and hold_seconds >= family_max_hold_seconds:
+            if strongly_improving:
+                result["hold_reason"] = "max_hold_but_improving"
+                return result
+            result["should_exit"] = True
+            result["reason"] = "fast_max_hold"
+            return result
+        result["hold_reason"] = "fast_turnover_hold"
+        return result
 
     def print_live_canary_position_snapshot(self, ticker, verified_status=None):
         retry_delays = (0.0, 0.75, 1.5, 2.5, 4.0)
@@ -8845,9 +10816,7 @@ class KalshiSniperBot:
         if payload is None:
             print(f"[LIVE-FLATTEN] submit status=invalid_payload")
             return {"ok": False, "reason": "invalid_payload"}
-        effective_live_dry_run = DRY_RUN_LIVE_ORDERS or not (
-            globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
-        )
+        effective_live_dry_run = compute_effective_live_dry_run()
         payload["is_dry_run"] = effective_live_dry_run
         if effective_live_dry_run:
             print(
@@ -9202,6 +11171,40 @@ class KalshiSniperBot:
             return {"ok": False, "reason": "no_live_ticker_found", "ticker": None}
         return {"ok": True, "reason": reason, "ticker": ticker}
 
+    def _check_phase55_live_execution_gate(self, ticker, family=None, decision=None):
+        gate_record = dict(self.phase55_live_execution_gate_by_ticker.get(ticker, {}) or {})
+        phase55_status = gate_record.get("phase55_status")
+        entry_timing_pass = gate_record.get("entry_timing_pass")
+        recorded_decision = gate_record.get("decision")
+        effective_family = family or gate_record.get("family") or "UNKNOWN"
+        effective_decision = decision or recorded_decision or "unknown"
+        blocked = False
+        reason = "approved"
+        if phase55_status is None or not isinstance(phase55_status, str) or not phase55_status.strip():
+            blocked = True
+            reason = "missing_phase55_status"
+        else:
+            phase55_status = phase55_status.strip()
+            if phase55_status != "entry_ready":
+                blocked = True
+                reason = f"phase55_status_{phase55_status}"
+        if not blocked and entry_timing_pass is not True:
+            blocked = True
+            reason = "entry_timing_pass_not_explicit"
+        print(
+            f"[LIVE-EXECUTION-PHASE55-GATE] ticker={ticker} family={effective_family} "
+            f"phase55_status={phase55_status} entry_timing_pass={entry_timing_pass} "
+            f"decision={effective_decision} blocked={'yes' if blocked else 'no'} reason={reason}"
+        )
+        return (not blocked), reason, {
+            "ticker": ticker,
+            "family": effective_family,
+            "phase55_status": phase55_status,
+            "entry_timing_pass": entry_timing_pass,
+            "decision": effective_decision,
+            "reason": reason,
+        }
+
     def place_live_order(self, payload):
         ticker = payload.get("ticker", "")
         if (
@@ -9298,6 +11301,22 @@ class KalshiSniperBot:
         Return a result dict describing what happened.
         """
         ticker = getattr(q, "ticker", "") or ""
+        now_ts = time.time()
+        blocked_until = float(self.live_entry_block_cooldowns.get(ticker, 0.0) or 0.0)
+        if blocked_until > now_ts:
+            seconds_remaining = int(max(0, blocked_until - now_ts))
+            print(
+                f"[LIVE-ENTRY-BLOCK-COOLDOWN] ticker={ticker} reason=immediate_negative_edge "
+                f"seconds_remaining={seconds_remaining} decision=skip"
+            )
+            return {"ok": False, "reason": "immediate_negative_edge_block_cooldown", "submitted": False}
+        phase55_allowed, phase55_reason, _phase55_details = self._check_phase55_live_execution_gate(
+            ticker,
+            family=self.get_market_family({"ticker": ticker}) if ticker else None,
+        )
+        if not phase55_allowed:
+            print(f"[LIVE-SKIP] {ticker} reason={phase55_reason}")
+            return {"ok": False, "reason": phase55_reason, "submitted": False}
         live_check = getattr(self, "can_place_live_order", None)
         if callable(live_check):
             allowed, reason = live_check(q)
@@ -9309,38 +11328,84 @@ class KalshiSniperBot:
         if payload is None:
             print(f"[LIVE-SKIP] {ticker} reason=invalid_payload")
             return {"ok": False, "reason": "invalid_payload", "submitted": False}
+        edge_allowed, edge_reason, _edge_details = self._evaluate_live_entry_negative_edge_guard(q, payload=payload)
+        if not edge_allowed:
+            if edge_reason == "immediate_negative_edge":
+                self.live_entry_block_cooldowns[ticker] = time.time() + IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS
+                print(
+                    f"[LIVE-ENTRY-BLOCK-COOLDOWN] ticker={ticker} reason={edge_reason} "
+                    f"seconds_remaining={IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS} decision=skip"
+                )
+            print(f"[LIVE-SKIP] {ticker} reason={edge_reason}")
+            return {"ok": False, "reason": edge_reason, "submitted": False}
+        stale_allowed, stale_reason, _stale_details = self._evaluate_live_entry_stale_signal_guard(q, payload=payload)
+        if not stale_allowed:
+            print(f"[LIVE-SKIP] {ticker} reason={stale_reason}")
+            return {"ok": False, "reason": stale_reason, "submitted": False}
 
-        effective_live_dry_run = DRY_RUN_LIVE_ORDERS or not (
-            globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
-        )
+        live_mode = bool(globals().get("LIVE_MODE", False))
+        live_armed = bool(globals().get("LIVE_ARMED", False))
+        live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
+        internal_execution_enabled = bool(live_mode and live_armed and live_env_confirmed)
+        effective_live_dry_run = not internal_execution_enabled
         payload["is_dry_run"] = effective_live_dry_run
+        print(
+            f"[LIVE-EXECUTION-DRYRUN-CHECK] ticker={ticker} "
+            f"live_mode={'yes' if live_mode else 'no'} "
+            f"live_armed={'yes' if live_armed else 'no'} "
+            f"live_env_confirmed={'yes' if live_env_confirmed else 'no'} "
+            f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} "
+            f"internal_execution_flag={'enabled' if internal_execution_enabled else 'disabled'} "
+            f"effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
+        )
 
         if effective_live_dry_run:
             self.print_live_order_preview(q, size=size)
+            print(
+                f"[LIVE-EXECUTION-RESPONSE] ticker={ticker} ok=yes submitted=no "
+                f"reason=dry_run_only status_code=None"
+            )
             return {"ok": True, "reason": "dry_run_only", "submitted": False, "payload": payload}
 
         supplied_ticker = globals().get("LIVE_TEST_TICKER")
         authorized_canary_ticker = getattr(self, "live_canary_authorized_ticker", None)
         allowed_ticker = authorized_canary_ticker or supplied_ticker
-        if not allowed_ticker:
+        normal_live_service_mode = bool(live_mode and live_armed and live_env_confirmed and not supplied_ticker)
+        print(
+            f"[LIVE-CANARY-STATUS] ticker={ticker} live_canary_submitted={'yes' if self.live_canary_submitted else 'no'} "
+            f"authorized_ticker={authorized_canary_ticker or 'none'} supplied_ticker={supplied_ticker or 'none'} "
+            f"normal_live_service_mode={'yes' if normal_live_service_mode else 'no'} persisted_state=no"
+        )
+        print(
+            f"[LIVE-CANARY-CHECK] ticker={ticker} payload_ticker={payload.get('ticker')} "
+            f"allowed_ticker={allowed_ticker or 'none'} live_canary_submitted={'yes' if self.live_canary_submitted else 'no'}"
+        )
+        if not allowed_ticker and not normal_live_service_mode:
             print("[SAFEGUARD] no live test ticker provided")
+            print(f"[LIVE-CANARY-BLOCK] ticker={ticker} reason=no_live_test_ticker")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="no_live_test_ticker")
             return {"ok": False, "reason": "no_live_test_ticker", "submitted": False}
-        if payload.get("ticker") != allowed_ticker:
+        if allowed_ticker and payload.get("ticker") != allowed_ticker:
             print("[SAFEGUARD] ticker not allowed for canary live submit")
+            print(f"[LIVE-CANARY-BLOCK] ticker={ticker} reason=ticker_not_allowed allowed_ticker={allowed_ticker}")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="ticker_not_allowed")
             return {"ok": False, "reason": "ticker_not_allowed", "submitted": False}
-        if self.live_canary_submitted:
+        if self.live_canary_submitted and not normal_live_service_mode:
             print("[SAFEGUARD] canary live order already used")
+            print(f"[LIVE-CANARY-BLOCK] ticker={ticker} reason=canary_already_used mode=manual_or_canary_only")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="canary_already_used")
             return {"ok": False, "reason": "canary_already_used", "submitted": False}
-        current_live_exposure = self.get_live_exposure_count()
-        if current_live_exposure >= MAX_SIMULTANEOUS_LIVE_POSITIONS:
+        candidate_family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+        exposure_allowed, exposure_reason, _exposure_snapshot = self.check_live_exposure_limits(
+            ticker,
+            family=candidate_family,
+        )
+        if not exposure_allowed:
             print(
-                f"[LIVE-GUARD] blocked new entry reason=max_simultaneous_live_positions "
-                f"current={current_live_exposure} limit={MAX_SIMULTANEOUS_LIVE_POSITIONS} ticker={ticker}"
+                f"[LIVE-GUARD] blocked new entry reason={exposure_reason} "
+                f"ticker={ticker} family={candidate_family}"
             )
-            return {"ok": False, "reason": "max_simultaneous_live_positions", "submitted": False}
+            return {"ok": False, "reason": exposure_reason, "submitted": False}
 
         now = time.time()
         self._live_order_timestamps = [
@@ -9348,6 +11413,11 @@ class KalshiSniperBot:
             for ts in self._live_order_timestamps
             if now - ts < LIVE_ORDER_RATE_WINDOW_SEC
         ]
+        print(
+            f"[LIVE-EXECUTION-RATE-LIMIT-CHECK] ticker={ticker} "
+            f"attempts_in_window={len(self._live_order_timestamps)} "
+            f"limit={LIVE_ORDER_RATE_LIMIT} window_seconds={LIVE_ORDER_RATE_WINDOW_SEC}"
+        )
         if len(self._live_order_timestamps) >= LIVE_ORDER_RATE_LIMIT:
             print("[LIVE-BLOCK] rate limit exceeded")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="rate_limited")
@@ -9357,8 +11427,15 @@ class KalshiSniperBot:
         if self.live_trade_day != today:
             self.live_trade_day = today
             self.live_trade_count_today = 0
+        print(
+            f"[LIVE-EXECUTION-CAP-CHECK] ticker={ticker} day={today} "
+            f"count_today={self.live_trade_count_today} cap={MAX_LIVE_TRADES_PER_DAY}"
+        )
         if self.live_trade_count_today >= MAX_LIVE_TRADES_PER_DAY:
-            print("[LIVE-BLOCK] daily live trade cap reached")
+            print(
+                f"[LIVE-EXECUTION-CAP-BLOCK] ticker={ticker} reason=daily_trade_cap "
+                f"count_today={self.live_trade_count_today} cap={MAX_LIVE_TRADES_PER_DAY}"
+            )
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="daily_trade_cap")
             return {"ok": False, "reason": "daily_trade_cap", "submitted": False}
 
@@ -9372,8 +11449,12 @@ class KalshiSniperBot:
             print("[LIVE-BLOCK] AUTH_SMOKE_REQUIRED failed; aborting live submit")
             return {"ok": False, "reason": "auth_smoke_required_failed", "submitted": False}
 
+        print(
+            f"[LIVE-EXECUTION-ATTEMPT] ticker={ticker} side={payload.get('side')} action={payload.get('action')} "
+            f"count={payload.get('count')} yes_price={payload.get('yes_price')} "
+            f"path=/trade-api/v2/portfolio/orders"
+        )
         self._live_order_timestamps.append(now)
-        self.live_trade_count_today += 1
         print(
             f"[LIVE-CONFIRM] ticker={payload['ticker']} side={payload['side']} "
             f"action={payload['action']} count={payload['count']} "
@@ -9384,12 +11465,27 @@ class KalshiSniperBot:
             self.append_live_audit_log("live_user_aborted", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="user_aborted")
             return {"ok": False, "reason": "user_aborted", "submitted": False}
         self.append_live_audit_log("live_submit_attempt", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"))
+        print(
+            f"[LIVE-EXECUTION-SUBMIT] ticker={ticker} path=/trade-api/v2/portfolio/orders "
+            f"side={payload.get('side')} action={payload.get('action')} count={payload.get('count')} "
+            f"yes_price={payload.get('yes_price')} dry_run={'yes' if payload.get('is_dry_run') else 'no'}"
+        )
         self.live_pending_entry_ticker = ticker
         try:
             result = self.place_live_order(payload)
         finally:
             self.live_pending_entry_ticker = None
+        print(
+            f"[LIVE-EXECUTION-RESPONSE] ticker={ticker} "
+            f"ok={'yes' if result.get('ok') else 'no'} submitted={'yes' if result.get('ok') else 'no'} "
+            f"reason={result.get('reason')} status_code={result.get('status_code')}"
+        )
         if result.get("ok"):
+            self.live_trade_count_today += 1
+            print(
+                f"[LIVE-EXECUTION-CAP-COUNT] ticker={ticker} count_today={self.live_trade_count_today} "
+                f"cap={MAX_LIVE_TRADES_PER_DAY} reason=submitted_live_order"
+            )
             response_data = result.get("response") or {}
             order_id = (
                 response_data.get("order_id")
@@ -9405,6 +11501,10 @@ class KalshiSniperBot:
                     order_id=order_id,
                 )
             self.live_canary_submitted = True
+            print(
+                f"[LIVE-CANARY-STATUS] ticker={ticker} live_canary_submitted=yes "
+                f"status_transition=canary_completed order_id={order_id or 'none'}"
+            )
             print(f"[LIVE-SUBMIT] ticker={ticker} status_code={result.get('status_code')}")
             print(f"[LIVE-SUBMIT] ticker={ticker} success")
             alert_price = payload.get("yes_price")
@@ -9467,6 +11567,36 @@ class KalshiSniperBot:
     def already_holding(self, ticker):
         return any(p["ticker"] == ticker for p in self.positions)
 
+    def _get_live_duplicate_guard_detail(self, ticker):
+        ticker = str(ticker or "").strip()
+        simulated_duplicate = any(p["ticker"] == ticker for p in self.positions)
+        open_live_matches = [
+            pos for pos in self.live_positions
+            if str(pos.get("ticker", "") or "").strip() == ticker
+            and str(pos.get("status", "open") or "open").strip().lower() == "open"
+        ]
+        closed_live_matches = [
+            pos for pos in self.live_positions
+            if str(pos.get("ticker", "") or "").strip() == ticker
+            and str(pos.get("status", "open") or "open").strip().lower() != "open"
+        ]
+        blocked = bool(simulated_duplicate or open_live_matches)
+        if simulated_duplicate:
+            reason = "sim_position_open"
+        elif open_live_matches:
+            reason = "live_position_open_same_ticker"
+        elif closed_live_matches:
+            reason = "previous_live_position_closed"
+        else:
+            reason = "no_duplicate_open_position"
+        return {
+            "blocked": blocked,
+            "reason": reason,
+            "open_live_matches": len(open_live_matches),
+            "closed_live_matches": len(closed_live_matches),
+            "simulated_duplicate": simulated_duplicate,
+        }
+
     def enter_sim_trade(self, q: Quote):
         position = {
             "ticker": q.ticker,
@@ -9485,10 +11615,14 @@ class KalshiSniperBot:
         This is bookkeeping only.
         """
         ticker = getattr(q, "ticker", "") or ""
+        family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
         side = "YES"
         count = size if size is not None else globals().get("MAX_LIVE_ORDER_SIZE", 1)
-        price = entry_price if entry_price is not None else (getattr(q, "yes_ask", 0.0) or 0.0)
-        if not ticker or price <= 0:
+        raw_price = entry_price
+        if raw_price is None:
+            raw_price = getattr(q, "yes_ask", 0.0) or 0.0
+        price = self.normalize_contract_price(raw_price, ticker=ticker, source="record_live_position.entry_price")
+        if not ticker or price is None or price <= 0 or price > 1:
             return None
         position = {
             "ticker": ticker,
@@ -9500,6 +11634,18 @@ class KalshiSniperBot:
             "status": "open",
         }
         self.live_positions.append(position)
+        self._update_live_position_closure_tracker(
+            ticker,
+            entry_price=price,
+            side=side,
+            size=count,
+            last_known_price=price,
+            source="record_live_position",
+        )
+        print(
+            f"[LIVE-ENTRY-RECORDED] ticker={ticker} family={family} side={side} entry_price={price} "
+            f"size={count} status=open"
+        )
         return position
 
     def build_live_exit_payload(self, position, q):
@@ -9515,8 +11661,8 @@ class KalshiSniperBot:
             size = int(abs(float(raw_count)))
         except (TypeError, ValueError):
             size = int(position.get("size", 1) or 1)
-        yes_bid = getattr(q, "yes_bid", 0.0) or 0.0
-        no_bid = getattr(q, "no_bid", 0.0) or 0.0
+        yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="build_live_exit_payload.yes_bid")
+        no_bid = self.normalize_contract_price(getattr(q, "no_bid", 0.0) or 0.0, ticker=ticker, source="build_live_exit_payload.no_bid")
         if not ticker or size <= 0:
             return None
         payload = {
@@ -9547,9 +11693,33 @@ class KalshiSniperBot:
         return self.run_live_monitor_positions_pass(allow_real_exits=False)
 
     def execute_live_exit_plan(self, ticker, payload, decision_reason, approval_required=True, position_summary=None, decision=None):
+        family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+        entry_price = (position_summary or {}).get("avg_price") if isinstance(position_summary, dict) else None
+        entry_price = self.normalize_contract_price(entry_price, ticker=ticker, source="execute_live_exit_plan.entry_price")
+        exit_price = payload.get("yes_price")
+        if exit_price is None:
+            exit_price = payload.get("no_price")
+        exit_price = self.normalize_contract_price(exit_price, ticker=ticker, source="execute_live_exit_plan.exit_price")
+        self._update_live_position_closure_tracker(
+            ticker,
+            entry_price=entry_price,
+            side=payload.get("side"),
+            size=payload.get("count"),
+            last_known_price=exit_price,
+            last_exit_decision_reason=decision_reason,
+            last_exit_pnl=(decision or {}).get("unrealized_pnl_cents") if isinstance(decision, dict) else None,
+            exit_price=exit_price,
+            exit_submit_state="attempted",
+            source="execute_live_exit_plan.submit",
+        )
         print(
-            f"[LIVE-EXIT-SUBMIT] ticker={ticker} count={payload.get('count')} "
-            f"side={payload.get('side')} action={payload.get('action')}"
+            f"[LIVE-EXIT-SUBMIT] ticker={ticker} side={payload.get('side')} action=sell "
+            f"count={payload.get('count')} price={exit_price}"
+        )
+        print(
+            f"[LIVE-EXIT-SELL-ATTEMPT] ticker={ticker} entry_price={entry_price} current_exit_price={exit_price} "
+            f"position_size={payload.get('count')} hold_seconds={(decision or {}).get('hold_seconds') if isinstance(decision, dict) else None} "
+            f"unrealized_pnl={(decision or {}).get('unrealized_pnl_cents') if isinstance(decision, dict) else None} exit_reason={decision_reason}"
         )
         if approval_required:
             if not self.confirm_live_order_submit(payload):
@@ -9558,12 +11728,36 @@ class KalshiSniperBot:
         else:
             print(f"[LIVE-APPROVAL-BYPASS] ticker={ticker} reason=manager_auto_exit")
         result = self.place_live_order(payload)
+        self._update_live_position_closure_tracker(
+            ticker,
+            entry_price=entry_price,
+            side=payload.get("side"),
+            size=payload.get("count"),
+            last_known_price=exit_price,
+            last_exit_decision_reason=decision_reason,
+            last_exit_pnl=(decision or {}).get("unrealized_pnl_cents") if isinstance(decision, dict) else None,
+            exit_price=exit_price,
+            exit_submit_state="submitted" if result.get("ok") else "attempted",
+            source="execute_live_exit_plan.response",
+        )
         print(
-            f"[LIVE-EXIT-SUBMIT] ticker={ticker} status={result.get('reason')} "
-            f"status_code={result.get('status_code')}"
+            f"[LIVE-EXIT-RESPONSE] ticker={ticker} ok={'yes' if result.get('ok') else 'no'} "
+            f"submitted={'yes' if result.get('ok') else 'no'} status_code={result.get('status_code')} "
+            f"reason={result.get('reason')}"
+        )
+        print(
+            f"[LIVE-EXIT-SELL-RESULT] ticker={ticker} entry_price={entry_price} current_exit_price={exit_price} "
+            f"position_size={payload.get('count')} hold_seconds={(decision or {}).get('hold_seconds') if isinstance(decision, dict) else None} "
+            f"unrealized_pnl={(decision or {}).get('unrealized_pnl_cents') if isinstance(decision, dict) else None} "
+            f"ok={'yes' if result.get('ok') else 'no'} reason={result.get('reason')}"
         )
         if not result.get("ok"):
             print(f"[LIVE-EXIT-RESULT] ticker={ticker} ok=False reason={result.get('reason')}")
+            print(
+                f"[LIVE-EXIT-ERROR] ticker={ticker} entry_price={entry_price} current_exit_price={exit_price} "
+                f"position_size={payload.get('count')} hold_seconds={(decision or {}).get('hold_seconds') if isinstance(decision, dict) else None} "
+                f"unrealized_pnl={(decision or {}).get('unrealized_pnl_cents') if isinstance(decision, dict) else None} reason={result.get('reason')}"
+            )
             return {"ok": False, "reason": result.get("reason"), "response": result.get("response")}
         response_data = result.get("response") or {}
         order_id = (
@@ -9574,6 +11768,14 @@ class KalshiSniperBot:
         verification = self.verify_live_order(order_id)
         verify_status = (verification.get("order") or {}).get("status") if verification.get("ok") else verification.get("reason")
         print(f"[LIVE-EXIT-VERIFY] ticker={ticker} order_id={order_id} status={verify_status}")
+        self._update_live_position_closure_tracker(
+            ticker,
+            last_exit_decision_reason=decision_reason,
+            last_exit_pnl=(decision or {}).get("unrealized_pnl_cents") if isinstance(decision, dict) else None,
+            exit_price=exit_price,
+            exit_submit_state="confirmed" if verification.get("ok") and verify_status == "executed" else "submitted",
+            source="execute_live_exit_plan.verify",
+        )
         print(f"[LIVE-EXIT-RESULT] ticker={ticker} ok={verification.get('ok')} reason={verify_status}")
         cleared = False
         if verification.get("ok") and verify_status == "executed":
@@ -9590,11 +11792,8 @@ class KalshiSniperBot:
             exit_price = payload.get("yes_price")
             if exit_price is None:
                 exit_price = payload.get("no_price")
-            try:
-                exit_price = (float(exit_price) / 100.0) if exit_price is not None else None
-            except (TypeError, ValueError):
-                exit_price = None
-            avg_price = (position_summary or {}).get("avg_price")
+            exit_price = self.normalize_contract_price(exit_price, ticker=ticker, source="execute_live_exit_plan.executed_exit_price")
+            avg_price = self.normalize_contract_price((position_summary or {}).get("avg_price"), ticker=ticker, source="execute_live_exit_plan.executed_entry_price")
             count = (position_summary or {}).get("count")
             pnl = None
             try:
@@ -9605,11 +11804,46 @@ class KalshiSniperBot:
             hold_minutes = None
             if isinstance(decision, dict):
                 hold_minutes = decision.get("hold_minutes")
+            hold_time_seconds = None
+            try:
+                hold_time_seconds = int(round(float(hold_minutes) * 60.0)) if hold_minutes is not None else None
+            except (TypeError, ValueError):
+                hold_time_seconds = None
+            print(
+                f"[LIVE-EXIT-PNL] ticker={ticker} family={family} side={(position_summary or {}).get('side')} "
+                f"entry_price={avg_price} exit_price={exit_price} size={count} realized_pnl={pnl} "
+                f"reason={decision_reason} hold_time_seconds={hold_time_seconds} hold_time_minutes={hold_minutes}"
+            )
+            perf_day = time.strftime("%Y-%m-%d")
+            if self.live_perf_day != perf_day:
+                self.live_perf_day = perf_day
+                self.live_perf_trades_today = 0
+                self.live_perf_wins_today = 0
+                self.live_perf_losses_today = 0
+                self.live_realized_pnl_today = 0.0
+                self.live_realized_pnl_by_family_today = {}
+            self.live_perf_trades_today += 1
+            realized_value = float(pnl) if pnl is not None else 0.0
+            self.live_realized_pnl_today += realized_value
+            self.live_realized_pnl_by_family_today[family] = round(self.live_realized_pnl_by_family_today.get(family, 0.0) + realized_value, 4)
+            if realized_value > 0:
+                self.live_perf_wins_today += 1
+            elif realized_value < 0:
+                self.live_perf_losses_today += 1
+            print(
+                f"[LIVE-PERF-SUMMARY] trades_today={self.live_perf_trades_today} "
+                f"wins_today={self.live_perf_wins_today} losses_today={self.live_perf_losses_today} "
+                f"realized_pnl_today={self.live_realized_pnl_today:+.4f} "
+                f"pnl_by_family={sorted(self.live_realized_pnl_by_family_today.items(), key=lambda item: abs(item[1]), reverse=True)}"
+            )
             send_telegram_message(
-                f"🔵 EXIT\n"
+                f"🔴 EXIT\n"
                 f"Ticker: {ticker}\n"
+                f"Family: {family}\n"
+                f"Entry: {avg_price}\n"
+                f"Exit: {exit_price}\n"
                 f"PnL: {pnl}\n"
-                f"Hold Time: {hold_minutes}"
+                f"Reason: {decision_reason}"
             )
         self.live_exit_cooldowns[ticker] = time.time() + LIVE_EXIT_COOLDOWN_SECONDS
         return {"ok": True, "reason": decision_reason, "verification": verification, "response": response_data}
@@ -9637,12 +11871,35 @@ class KalshiSniperBot:
             zero_count = count is not None and abs(count) == 0
             zero_exposure_without_side = market_exposure is not None and abs(market_exposure) == 0 and side is None
             if zero_count or zero_exposure_without_side:
+                family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+                before_count = sum(
+                    1
+                    for pos in self.live_positions
+                    if str(pos.get("status", "open") or "open").strip().lower() == "open"
+                )
+                market_detail = {}
+                try:
+                    market_detail = self.get_live_market_detail(ticker)
+                except Exception:
+                    market_detail = {}
+                self._emit_live_position_closed_attribution(ticker, family=family, market_detail=market_detail, now_ts=time.time())
                 self.remove_live_entry_metadata(ticker)
+                self._mark_tracked_live_position_closed(ticker, reason="zero_position")
+                self.live_exit_pending_tickers.discard(ticker)
+                after_count = sum(
+                    1
+                    for pos in self.live_positions
+                    if str(pos.get("status", "open") or "open").strip().lower() == "open"
+                )
                 print(
                     f"[LIVE-EXIT-POSITION-DEBUG] ticker={ticker} "
                     f"keys={sorted(list(raw_position.keys()))} "
                     f"normalized_count={count} normalized_side={side} "
                     f"normalized_avg_price={avg_price} normalized_market_exposure={market_exposure}"
+                )
+                print(
+                    f"[LIVE-POSITION-ZERO-CLEANUP] ticker={ticker} family={family} reason=zero_position "
+                    f"before_count={before_count} after_count={after_count}"
                 )
                 print(f"[LIVE-EXIT-SKIP] ticker={ticker} reason=zero_position")
                 continue
@@ -9668,27 +11925,91 @@ class KalshiSniperBot:
             actionable_positions += 1
             quote_result = self.resolve_live_exit_quote_for_ticker(ticker)
             if not quote_result.get("ok"):
-                print(f"[LIVE-EXIT-SKIP] ticker={ticker} reason=missing_quote_data")
+                market_status_reason = quote_result.get("reason") or "missing_quote_data"
+                try:
+                    market_detail = self.get_live_market_detail(ticker)
+                except Exception as exc:
+                    market_detail = {}
+                    market_status_reason = f"missing_quote_data:{exc.__class__.__name__}"
+                market_status = str((market_detail or {}).get("status", "") or "").strip().lower()
+                if market_status and market_status not in ("open", "active"):
+                    self._mark_tracked_live_position_closed(ticker, reason=f"market_status_{market_status}")
+                    print(
+                        f"[LIVE-EXIT-CHECK] ticker={ticker} family={self.get_market_family({'ticker': ticker}) if ticker else 'UNKNOWN'} side={side} "
+                        f"entry_price={avg_price} current_price=None pnl_cents=None pnl_percent=None hold_seconds=None "
+                        f"action=exit reason=market_status_{market_status}"
+                    )
+                    continue
+                print(
+                    f"[LIVE-EXIT-CHECK] ticker={ticker} family={self.get_market_family({'ticker': ticker}) if ticker else 'UNKNOWN'} side={side} "
+                    f"entry_price={avg_price} current_price=None pnl_cents=None pnl_percent=None hold_seconds=None "
+                    f"action=hold reason={market_status_reason}"
+                )
                 continue
             quote = quote_result.get("quote")
             decision = self.evaluate_exit_decision(position_summary, quote, now_ts=time.time())
-            current_price = decision.get("expected_exit_price")
+            current_price = decision.get("current_price")
+            self._update_live_position_closure_tracker(
+                ticker,
+                entry_price=avg_price,
+                side=side,
+                size=count,
+                last_known_price=current_price,
+                last_exit_decision_reason=decision.get("reason") if decision.get("should_exit") else None,
+                last_exit_pnl=decision.get("unrealized_pnl_cents"),
+                source="run_live_monitor_positions_pass.decision",
+                seen_ts=time.time(),
+            )
+            action = "exit" if decision.get("should_exit") else "hold"
+            family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
             print(
-                f"[LIVE-EXIT-CHECK] ticker={ticker} side={side} count={count} avg_price={avg_price} "
-                f"current_price={current_price} spread={decision.get('spread')} "
-                f"hold_minutes={decision.get('hold_minutes')} "
-                f"should_exit={decision.get('should_exit')} reason={decision.get('reason')}"
+                f"[LIVE-EXIT-CHECK] ticker={ticker} family={family} "
+                f"side={side} entry_price={decision.get('entry_price')} current_price={current_price} "
+                f"pnl_cents={decision.get('unrealized_pnl_cents')} pnl_percent={decision.get('unrealized_pnl_percent')} "
+                f"hold_seconds={decision.get('hold_seconds')} action={action} reason={decision.get('reason')}"
+            )
+            print(
+                f"[LIVE-EXIT-PRICE] ticker={ticker} entry_price={decision.get('entry_price')} current_exit_price={current_price} "
+                f"position_size={count} hold_seconds={decision.get('hold_seconds')} contract_move={decision.get('contract_move')} "
+                f"exit_reason={decision.get('reason') if decision.get('should_exit') else None} hold_reason={decision.get('hold_reason') if not decision.get('should_exit') else None}"
+            )
+            print(
+                f"[LIVE-EXIT-PNL] ticker={ticker} entry_price={decision.get('entry_price')} current_exit_price={current_price} "
+                f"position_size={count} hold_seconds={decision.get('hold_seconds')} unrealized_pnl_cents={decision.get('unrealized_pnl_cents')} "
+                f"unrealized_pnl_percent={decision.get('unrealized_pnl_percent')} contract_move={decision.get('contract_move')}"
+            )
+            print(
+                f"[LIVE-EXIT-DECISION] ticker={ticker} entry_price={decision.get('entry_price')} current_exit_price={current_price} "
+                f"position_size={count} hold_seconds={decision.get('hold_seconds')} unrealized_pnl={decision.get('unrealized_pnl_cents')} "
+                f"contract_move={decision.get('contract_move')} exit_reason={decision.get('reason') if decision.get('should_exit') else None} "
+                f"hold_reason={decision.get('hold_reason') if not decision.get('should_exit') else None}"
             )
             if not decision.get("should_exit"):
+                print(
+                    f"[LIVE-EXIT-HOLD] ticker={ticker} entry_price={decision.get('entry_price')} current_exit_price={current_price} "
+                    f"position_size={count} hold_seconds={decision.get('hold_seconds')} unrealized_pnl={decision.get('unrealized_pnl_cents')} "
+                    f"contract_move={decision.get('contract_move')} hold_reason={decision.get('hold_reason')}"
+                )
                 print(f"[LIVE-POSITION-STATUS] ticker={ticker} state=holding")
                 continue
-            print(f"[LIVE-EXIT-AUTO] ticker={ticker} trigger_reason={decision.get('reason')}")
+            family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+            print(
+                f"[LIVE-EXIT-TRIGGER] ticker={ticker} family={family} side={side} entry_price={avg_price} "
+                f"exit_price={current_price} reason={decision.get('reason')}"
+            )
+            print(
+                f"[LIVE-EXIT-REASON] ticker={ticker} family={family} reason={decision.get('reason')} "
+                f"spread={decision.get('spread')} hold_minutes={decision.get('hold_minutes')}"
+            )
             send_telegram_message(
                 f"⚠️ Exit Trigger | {ticker} | {decision.get('reason')}"
             )
             print(f"[LIVE-POSITION-STATUS] ticker={ticker} state=exit_pending")
             now_ts = time.time()
             cooldown_until = self.live_exit_cooldowns.get(ticker, 0)
+            if ticker in self.live_exit_pending_tickers:
+                print(f"[LIVE-MANAGER-SAFE] ticker={ticker} would_exit=yes reason={decision.get('reason')} action_blocked=exit_already_pending")
+                continue
             if cooldown_until > now_ts:
                 print(f"[LIVE-MANAGER-SAFE] ticker={ticker} would_exit=yes reason={decision.get('reason')} action_blocked=exit_cooldown")
                 continue
@@ -9711,14 +12032,18 @@ class KalshiSniperBot:
                 )
                 continue
             print(f"[LIVE-POSITION-STATUS] ticker={ticker} state=exit_submitted")
-            self.execute_live_exit_plan(
-                ticker,
-                payload,
-                decision.get("reason"),
-                approval_required=False,
-                position_summary=position_summary,
-                decision=decision,
-            )
+            self.live_exit_pending_tickers.add(ticker)
+            try:
+                self.execute_live_exit_plan(
+                    ticker,
+                    payload,
+                    decision.get("reason"),
+                    approval_required=False,
+                    position_summary=position_summary,
+                    decision=decision,
+                )
+            finally:
+                self.live_exit_pending_tickers.discard(ticker)
         return {
             "ok": True,
             "reason": "completed",
@@ -9754,9 +12079,7 @@ class KalshiSniperBot:
         if payload is None:
             print(f"[LIVE-EXIT-SKIP] {ticker} reason=invalid_payload")
             return {"ok": False, "reason": "invalid_payload", "submitted": False}
-        effective_live_dry_run = DRY_RUN_LIVE_ORDERS or not (
-            globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
-        )
+        effective_live_dry_run = compute_effective_live_dry_run()
         payload["is_dry_run"] = effective_live_dry_run
         if effective_live_dry_run:
             print(
@@ -9790,24 +12113,112 @@ class KalshiSniperBot:
             if position.get("status", "open") != "open":
                 continue
             ticker = position.get("ticker", "")
+            family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
             q = quotes_by_ticker.get(ticker)
             if not q:
                 kept.append(position)
                 continue
-            should_exit, reason, _pnl = self.should_exit_position(position, q, now=now)
+            should_exit, reason, pnl = self.should_exit_position(position, q, now=now)
             if not should_exit:
                 kept.append(position)
                 continue
+            entry_price = position.get("entry")
+            side = position.get("side")
+            size = position.get("size", 1)
+            opened_at = position.get("opened_at", now)
+            hold_time_seconds = None
+            hold_time_minutes = None
+            try:
+                hold_time_seconds = int(max(0, round(now - float(opened_at))))
+                hold_time_minutes = round(hold_time_seconds / 60.0, 4)
+            except (TypeError, ValueError):
+                hold_time_seconds = None
+                hold_time_minutes = None
+            exit_price = None
+            if side == "YES":
+                exit_price = getattr(q, "yes_bid", 0.0) or getattr(q, "last_price", 0.0) or None
+            elif side == "NO":
+                exit_price = getattr(q, "no_bid", 0.0) or None
+                if (not exit_price) and 0 < (getattr(q, "last_price", 0.0) or 0.0) < 1:
+                    exit_price = max(0.0, 1.0 - float(getattr(q, "last_price", 0.0)))
+            print(
+                f"[LIVE-EXIT-TRIGGER] ticker={ticker} family={family} side={side} entry_price={entry_price} "
+                f"exit_price={exit_price} reason={reason}"
+            )
+            print(
+                f"[LIVE-EXIT-REASON] ticker={ticker} family={family} reason={reason} "
+                f"hold_time_seconds={hold_time_seconds} hold_time_minutes={hold_time_minutes}"
+            )
+            payload_preview = self.build_live_exit_payload(position, q)
+            preview_exit_price = None
+            if payload_preview:
+                preview_exit_price = payload_preview.get("yes_price")
+                if preview_exit_price is None:
+                    preview_exit_price = payload_preview.get("no_price")
+                try:
+                    preview_exit_price = (float(preview_exit_price) / 100.0) if preview_exit_price is not None else None
+                except (TypeError, ValueError):
+                    preview_exit_price = None
+                print(
+                    f"[LIVE-EXIT-SUBMIT] ticker={ticker} family={family} count={payload_preview.get('count')} "
+                    f"side={payload_preview.get('side')} action={payload_preview.get('action')} "
+                    f"entry_price={entry_price} exit_price={preview_exit_price} reason={reason}"
+                )
             result = self.submit_live_exit(position, q)
+            print(
+                f"[LIVE-EXIT-RESPONSE] ticker={ticker} family={family} ok={'yes' if result.get('submitted') else 'no'} "
+                f"status={result.get('reason')} entry_price={entry_price} exit_price={preview_exit_price} reason={reason}"
+            )
             if result.get("reason") == "dry_run_only":
                 kept.append(position)
                 continue
             if result.get("submitted"):
-                payload = result.get("payload") or {}
+                payload = result.get("payload") or payload_preview or {}
                 position["status"] = "closed"
                 position["closed_at"] = now
                 position["exit_reason"] = reason
                 position["exit_price"] = payload.get("price")
+                realized_pnl = None
+                try:
+                    realized_pnl = round(float(pnl) * abs(float(size)), 4) if pnl is not None else None
+                except (TypeError, ValueError):
+                    realized_pnl = None
+                print(
+                    f"[LIVE-EXIT-PNL] ticker={ticker} family={family} side={side} entry_price={entry_price} "
+                    f"exit_price={preview_exit_price} size={size} realized_pnl={realized_pnl} "
+                    f"reason={reason} hold_time_seconds={hold_time_seconds} hold_time_minutes={hold_time_minutes}"
+                )
+                perf_day = time.strftime("%Y-%m-%d")
+                if self.live_perf_day != perf_day:
+                    self.live_perf_day = perf_day
+                    self.live_perf_trades_today = 0
+                    self.live_perf_wins_today = 0
+                    self.live_perf_losses_today = 0
+                    self.live_realized_pnl_today = 0.0
+                    self.live_realized_pnl_by_family_today = {}
+                self.live_perf_trades_today += 1
+                realized_value = float(realized_pnl) if realized_pnl is not None else 0.0
+                self.live_realized_pnl_today += realized_value
+                self.live_realized_pnl_by_family_today[family] = round(self.live_realized_pnl_by_family_today.get(family, 0.0) + realized_value, 4)
+                if realized_value > 0:
+                    self.live_perf_wins_today += 1
+                elif realized_value < 0:
+                    self.live_perf_losses_today += 1
+                print(
+                    f"[LIVE-PERF-SUMMARY] trades_today={self.live_perf_trades_today} "
+                    f"wins_today={self.live_perf_wins_today} losses_today={self.live_perf_losses_today} "
+                    f"realized_pnl_today={self.live_realized_pnl_today:+.4f} "
+                    f"pnl_by_family={sorted(self.live_realized_pnl_by_family_today.items(), key=lambda item: abs(item[1]), reverse=True)}"
+                )
+                send_telegram_message(
+                    f"🔴 EXIT\n"
+                    f"Ticker: {ticker}\n"
+                    f"Family: {family}\n"
+                    f"Entry: {entry_price}\n"
+                    f"Exit: {preview_exit_price}\n"
+                    f"PnL: {realized_pnl}\n"
+                    f"Reason: {reason}"
+                )
                 if reason == "stop_loss":
                     LIVE_ARMED = False
                     print("[SAFEGUARD] live trading DISARMED after stop-loss")
@@ -10160,6 +12571,15 @@ class KalshiSniperBot:
             size = pos.get("size", 1)
             opened_at = pos.get("opened_at")
             hold_seconds = int(now - opened_at) if opened_at else 0
+            self._update_live_position_closure_tracker(
+                ticker,
+                entry_price=entry,
+                side=pos.get("side"),
+                size=size,
+                last_known_price=entry,
+                source="print_status.live_position",
+                seen_ts=now,
+            )
             print(f"[LIVE-POSITION] {ticker} entry={entry:.4f} size={size} hold={hold_seconds}s")
 
         if active_cooldowns:
@@ -10356,8 +12776,131 @@ class KalshiSniperBot:
             if auto_live_ticker:
                 print(f"[LIVE-SELECT] using_auto_ticker={auto_live_ticker}")
                 print(f"[LIVE-SELECT] using_auto_reason={auto_live_reason}")
+                self.live_canary_authorized_ticker = auto_live_ticker
 
         if len(self.positions) >= MAX_TOTAL_EXPOSURE:
+            return
+
+        if globals().get("LIVE_MODE", False) and auto_live_ticker:
+            selected_quote = quotes_by_ticker.get(auto_live_ticker)
+            quote_source = "initial_cycle_quotes"
+            if selected_quote is None:
+                try:
+                    detail_market = self.get_live_market_detail(auto_live_ticker)
+                    selected_quote = self.build_quote(detail_market) if isinstance(detail_market, dict) and detail_market else None
+                    quote_source = "live_market_detail"
+                except Exception as exc:
+                    print(
+                        f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=quote_lookup_failed "
+                        f"source=live_market_detail error={exc.__class__.__name__}"
+                    )
+                    return
+            selected_family = self.get_market_family({"ticker": auto_live_ticker}) if selected_quote is None else self.get_market_family({"ticker": auto_live_ticker})
+            execution_funnel = {
+                "signals_generated": 1,
+                "signals_passed_entry": 0,
+                "execution_attempted": 0,
+                "execution_blocked": 0,
+                "execution_submitted": 0,
+            }
+            phase55_allowed, phase55_reason, _phase55_details = self._check_phase55_live_execution_gate(auto_live_ticker, family=selected_family)
+            if not phase55_allowed:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={phase55_reason}")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            duplicate_guard_detail = self._get_live_duplicate_guard_detail(auto_live_ticker)
+            print(
+                f"[LIVE-EXECUTION-PREFLIGHT] ticker={auto_live_ticker} source={quote_source} "
+                f"live_mode={'yes' if globals().get('LIVE_MODE', False) else 'no'} "
+                f"live_armed={'yes' if globals().get('LIVE_ARMED', False) else 'no'} "
+                f"live_env_confirmed={'yes' if globals().get('LIVE_ENV_CONFIRMED', False) else 'no'} "
+                f"duplicate_position_guard={'yes' if duplicate_guard_detail.get('blocked') else 'no'} "
+                f"insufficient_balance_check=not_implemented internal_execution_flag={'enabled' if globals().get('LIVE_ARMED', False) and globals().get('LIVE_ENV_CONFIRMED', False) else 'disabled'}"
+            )
+            print(
+                f"[LIVE-DUPLICATE-GUARD-DETAIL] ticker={auto_live_ticker} blocked={'yes' if duplicate_guard_detail.get('blocked') else 'no'} "
+                f"reason={duplicate_guard_detail.get('reason')} open_live_matches={duplicate_guard_detail.get('open_live_matches')} "
+                f"closed_live_matches={duplicate_guard_detail.get('closed_live_matches')} simulated_duplicate={'yes' if duplicate_guard_detail.get('simulated_duplicate') else 'no'}"
+            )
+            if selected_quote is None or not getattr(selected_quote, 'ticker', ''):
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=missing_selected_quote")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            if duplicate_guard_detail.get("blocked"):
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=duplicate_position_guard")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            if self.is_on_cooldown(auto_live_ticker):
+                remaining = int(self.market_cooldowns[auto_live_ticker] - time.time())
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=cooldown remaining_seconds={remaining}")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            allowed, reason = self.can_open_new_position(selected_quote)
+            if not allowed:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={reason}")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            passes_group_filters, reason = self.passes_group_filters(selected_quote)
+            if not passes_group_filters:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=group_{reason}")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            if not globals().get('LIVE_ARMED', False) or not globals().get('LIVE_ENV_CONFIRMED', False):
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=live_trading_not_armed")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            payload_preview = self.build_live_order_payload(selected_quote)
+            if payload_preview is None:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=invalid_payload")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            if (payload_preview.get('count') or 0) <= 0:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=order_size_below_minimum count={payload_preview.get('count')}")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            now = time.time()
+            cooldown_until = self.live_execution_attempt_cooldowns.get(auto_live_ticker, 0.0)
+            if cooldown_until > now:
+                remaining = int(max(0, cooldown_until - now))
+                print(
+                    f"[LIVE-EXECUTION-COOLDOWN] ticker={auto_live_ticker} active=yes "
+                    f"remaining_seconds={remaining} reason=recent_execution_attempt"
+                )
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=execution_attempt_cooldown remaining_seconds={remaining}")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            execution_funnel["signals_passed_entry"] = 1
+            result = self.submit_live_order(selected_quote)
+            if result.get("submitted"):
+                execution_funnel["execution_attempted"] = 1
+            if result.get("submitted"):
+                self.live_execution_attempt_cooldowns[auto_live_ticker] = time.time() + LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS
+                print(
+                    f"[LIVE-EXECUTION-COOLDOWN] ticker={auto_live_ticker} active=yes "
+                    f"remaining_seconds={LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS} reason=post_execution_attempt_submitted"
+                )
+                execution_funnel["execution_submitted"] = 1
+                payload = result.get("payload") or payload_preview
+                self.record_live_position(
+                    selected_quote,
+                    size=payload.get("count"),
+                    entry_price=payload.get("price"),
+                )
+            else:
+                execution_funnel["execution_blocked"] = 1
+                self.live_execution_attempt_cooldowns.pop(auto_live_ticker, None)
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={result.get('reason')}")
+            print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
             return
 
         for score, q in candidates[:3]:
@@ -10583,6 +13126,29 @@ def main():
     while True:
         try:
             bot.run_once()
+            open_live_positions_count = 0
+            monitor_called = False
+            monitor_reason = "live_mode_disabled"
+            if globals().get("LIVE_MODE", False):
+                try:
+                    bot.reconcile_live_positions()
+                    open_live_positions_count = sum(
+                        1
+                        for pos in bot.live_positions
+                        if str(pos.get("status", "open") or "open").strip().lower() == "open"
+                    )
+                    if open_live_positions_count > 0:
+                        bot.run_live_monitor_positions_pass(allow_real_exits=True)
+                        monitor_called = True
+                        monitor_reason = "open_positions"
+                    else:
+                        monitor_reason = "no_open_positions"
+                except Exception as exc:
+                    monitor_reason = f"monitor_error_{exc.__class__.__name__}"
+                print(
+                    f"[LIVE-EXIT-MONITOR] open_positions_count={open_live_positions_count} "
+                    f"monitor_called={'yes' if monitor_called else 'no'} reason={monitor_reason}"
+                )
             print(f"Open positions: {len(bot.positions)}")
             print("-" * 70)
             time.sleep(2)
