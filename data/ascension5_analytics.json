@@ -1,0 +1,87 @@
+{
+  "summary": {
+    "analytics_records_written": 1,
+    "ascension3_summary": {},
+    "best_strategy": "adaptive_entry",
+    "calibrated_thresholds": {
+      "edge_threshold": 0.0206,
+      "hard_caps": {
+        "max_entry_spread": 0.06,
+        "min_entry_liquidity": 50,
+        "min_entry_volume": 25
+      },
+      "liquidity_threshold": 56,
+      "momentum_threshold": 0.5296,
+      "spread_threshold": 0.0543
+    },
+    "candidate_count": 14,
+    "edge_retention": 0.4391,
+    "execution_efficiency": 0.4321,
+    "execution_summary": {
+      "blocked_executions": 1,
+      "buy_candidates": 1,
+      "candidates_seen": 14,
+      "entry_ready_count": 1,
+      "execution_attempted": 0,
+      "execution_submitted": 0,
+      "liquidity_failure_count": 0,
+      "quote_failure_count": 13,
+      "trades_taken": 1
+    },
+    "false_positive_count": 14,
+    "false_positive_rate": 1.0,
+    "fill_slippage_estimate": 0.5679,
+    "historical_improvement_estimate": true,
+    "profitability_score": 41.1372,
+    "replay_pnl": -0.4102,
+    "replay_validation_score": 43.2981,
+    "replay_win_rate": 0.4286,
+    "simulation_environment": {
+      "candidate_count": 14,
+      "known_losses": 4,
+      "known_wins": 3,
+      "replay_window": 180,
+      "tracked_outcomes": 7
+    },
+    "strategy_comparison": {
+      "adaptive_entry": {
+        "candidate_count": 14,
+        "fill_quality": 0.4321,
+        "profitability_score": 0.5831,
+        "simulated_edge_capture": 0.4391,
+        "simulated_pnl": 3.708,
+        "simulated_win_rate": 0.7622,
+        "strategy_score": 59.0806
+      },
+      "fair_value_entry": {
+        "candidate_count": 14,
+        "fill_quality": 0.4321,
+        "profitability_score": 0.3903,
+        "simulated_edge_capture": 0.1851,
+        "simulated_pnl": 0.4446,
+        "simulated_win_rate": 0.5313,
+        "strategy_score": 39.9592
+      },
+      "momentum_entry": {
+        "candidate_count": 14,
+        "fill_quality": 0.4321,
+        "profitability_score": 0.3235,
+        "simulated_edge_capture": 0.0971,
+        "simulated_pnl": -0.6874,
+        "simulated_win_rate": 0.4513,
+        "strategy_score": 33.3336
+      },
+      "probabilistic_entry": {
+        "candidate_count": 14,
+        "fill_quality": 0.4321,
+        "profitability_score": 0.4979,
+        "simulated_edge_capture": 0.3269,
+        "simulated_pnl": 2.2647,
+        "simulated_win_rate": 0.6601,
+        "strategy_score": 50.6297
+      }
+    },
+    "tracked_outcomes": 7
+  },
+  "updatedAt": "2026-05-14T04:32:54Z"
+}

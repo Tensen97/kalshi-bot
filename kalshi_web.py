@@ -1,13 +1,60 @@
 import argparse
 import base64
+import builtins
 from datetime import datetime, timezone
 import csv
 import json
 import os
+import re
 import sys
 import time
 import requests
+import sqlite3
 from dataclasses import dataclass
+
+
+DEBUG_LIVE = (os.environ.get("DEBUG_LIVE", "false") or "false").strip().lower() == "true"
+DEBUG_LIVE_PREFIXES = (
+    "[LIVE-SELECT-DEBUG]",
+    "[LIVE-LIQUIDITY-FIX]",
+    "[LIVE-SELECT-TOPBOOK-NORMALIZE]",
+    "[LIVE-SELECT-LIQUIDITY-TRACE]",
+    "[LIVE-SELECT-REJECT-DETAIL]",
+    "[LIVE-SELECT-GATE-ENTRY]",
+    "[LIVE-SELECT-GATE-RETURN]",
+    "[LIVE-MARKETS-DEBUG]",
+    "[LIVE-SIGN-DEBUG]",
+    "[LIVE-HEADER-DEBUG]",
+    "[LIVE-SUBMIT-DEBUG]",
+    "[TELEGRAM-DEBUG]",
+)
+
+
+def _should_emit_module_log(*args):
+    if not args:
+        return True
+    first = args[0]
+    if not isinstance(first, str):
+        return True
+    if DEBUG_LIVE:
+        return True
+    return not first.startswith(DEBUG_LIVE_PREFIXES)
+
+
+def print(*args, **kwargs):
+    if _should_emit_module_log(*args):
+        return builtins.print(*args, **kwargs)
+    return None
+
+
+def _env_float(name, default):
+    raw_value = (os.environ.get(name, "") or "").strip()
+    if not raw_value:
+        return float(default)
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def send_telegram_message(text):
@@ -67,15 +114,43 @@ MIN_LIQUIDITY_EXIT = 20
 MIN_ENTRY_LIQUIDITY = 50
 MIN_ENTRY_VOLUME = 25
 MAX_ENTRY_SPREAD = 0.06
-MAX_YES_ASK_TO_ENTER = 0.92
+MAX_YES_ASK_TO_ENTER = 0.93
 TAKE_PROFIT_DELTA = 0.08
-STOP_LOSS_DELTA = 0.06
+STOP_LOSS_DELTA = 0.045
 MAX_HOLD_MINUTES = 20
-FAST_TURNOVER_TAKE_PROFIT_DELTA = 0.03
-FAST_TURNOVER_STOP_LOSS_DELTA = 0.02
+FAST_TURNOVER_TAKE_PROFIT_DELTA = 0.08
+FAST_TURNOVER_STOP_LOSS_DELTA = 0.045
 FAST_TURNOVER_MAX_HOLD_SECONDS = 900
 FAST_TURNOVER_STRONG_IMPROVING_DELTA = 0.015
 FAST_TURNOVER_STRONG_IMPROVING_PNL_PERCENT = 5.0
+# MLB totals are noisier in live trading, so require stronger same-family
+# confirmation and allow a tighter family-specific adverse-move stop.
+MLB_TOTAL_MIN_MOMENTUM_DELTA = _env_float("KALSHI_MLB_TOTAL_MIN_MOMENTUM_DELTA", 0.01)
+MLB_TOTAL_MIN_MOMENTUM_RANGE = _env_float("KALSHI_MLB_TOTAL_MIN_MOMENTUM_RANGE", 0.008)
+MLB_TOTAL_MIN_LAST_STEP_DELTA = _env_float("KALSHI_MLB_TOTAL_MIN_LAST_STEP_DELTA", 0.002)
+MLB_TOTAL_STOP_LOSS_DELTA = _env_float("KALSHI_MLB_TOTAL_STOP_LOSS_DELTA", 0.035)
+MLB_TOTAL_EARLY_ADVERSE_DELTA = _env_float("KALSHI_MLB_TOTAL_EARLY_ADVERSE_DELTA", 0.03)
+MLB_TOTAL_EARLY_ADVERSE_HOLD_SECONDS = int(_env_float("KALSHI_MLB_TOTAL_EARLY_ADVERSE_HOLD_SECONDS", 360))
+KALSHI_FAMILY_PERF_ENABLED = (os.environ.get("KALSHI_FAMILY_PERF_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+KALSHI_FAMILY_NEGATIVE_PNL_PENALTY = _env_float("KALSHI_FAMILY_NEGATIVE_PNL_PENALTY", 0.15)
+KALSHI_FAMILY_POSITIVE_PNL_BOOST = _env_float("KALSHI_FAMILY_POSITIVE_PNL_BOOST", 0.05)
+KALSHI_FAMILY_LOSS_STREAK_PENALTY = _env_float("KALSHI_FAMILY_LOSS_STREAK_PENALTY", 0.10)
+KALSHI_FAMILY_MIN_TRADES_FOR_PENALTY = int(_env_float("KALSHI_FAMILY_MIN_TRADES_FOR_PENALTY", 2))
+KALSHI_POST_LOSS_TICKER_COOLDOWN_SECONDS = int(_env_float("KALSHI_POST_LOSS_TICKER_COOLDOWN_SECONDS", 1800))
+KALSHI_POST_LOSS_FAMILY_COOLDOWN_ENABLED = (os.environ.get("KALSHI_POST_LOSS_FAMILY_COOLDOWN_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+KALSHI_POST_LOSS_FAMILY_COOLDOWN_SECONDS = int(_env_float("KALSHI_POST_LOSS_FAMILY_COOLDOWN_SECONDS", 900))
+KALSHI_POST_LOSS_FAMILY_MAX_RECENT_LOSSES = int(_env_float("KALSHI_POST_LOSS_FAMILY_MAX_RECENT_LOSSES", 2))
+KALSHI_SESSION_PROTECTION_ENABLED = (os.environ.get("KALSHI_SESSION_PROTECTION_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+KALSHI_PROTECTED_MODE_PNL = _env_float("KALSHI_PROTECTED_MODE_PNL", 0.25)
+KALSHI_DEFENSIVE_MODE_PNL = _env_float("KALSHI_DEFENSIVE_MODE_PNL", -0.25)
+KALSHI_DEFENSIVE_MODE_ENTRY_PENALTY = _env_float("KALSHI_DEFENSIVE_MODE_ENTRY_PENALTY", 0.10)
+KALSHI_PROTECTED_MODE_ENTRY_PENALTY = _env_float("KALSHI_PROTECTED_MODE_ENTRY_PENALTY", 0.05)
+SMART_ENTRY_MAX_EDGE_TO_MID = 0.035
+SMART_ENTRY_MOMENTUM_MIN_SLOPE = 0.005
+SMART_ENTRY_MOMENTUM_MIN_DELTA = 0.005
+SMART_ENTRY_PRIORITY_VOLUME_THRESHOLD = 50
+SMART_ENTRY_PRIORITY_TIGHT_SPREAD = 0.03
+FAST_MARKET_MAX_HOLD_SECONDS = 10 * 60
 # Defensive live-exit guard: do not allow routine loss exits immediately after entry.
 MIN_HOLD_SECONDS = 180
 # Defensive live-exit guard: require loss exits to persist across multiple checks.
@@ -87,7 +162,12 @@ ENABLE_STALE_SIGNAL_GUARD = True
 # Defensive retry guard: avoid hammering the same ticker after immediate negative-edge rejection.
 IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS = 15
 # Defensive edge threshold: allow normal 1-cent top-of-book entry cost, block worse starts.
-MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS = -0.01
+MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS = -0.05
+ENTRY_ATTEMPT_TICKER_COOLDOWN_SECONDS = 120
+ENTRY_ATTEMPT_FAMILY_COOLDOWN_SECONDS = 60
+ENTRY_ATTEMPT_FAMILY_THRESHOLD_PER_CYCLE = 5
+ENTRY_ATTEMPT_LAST_SEEN = {}
+ENTRY_ATTEMPT_FAMILY_LAST_SEEN = {}
 MAX_EXIT_SPREAD = 0.12
 LIVE_POSITION_POLL_SECONDS = 15
 ALLOW_CONTINUOUS_LIVE_EXITS = False
@@ -182,7 +262,7 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
     },
 )
 BASE_MAX_TARGETED_CONTRACTS_PER_FAMILY = 8
-TARGETED_CONTRACT_CAP_INCREASE = 2
+TARGETED_CONTRACT_CAP_INCREASE = 4
 MAX_TARGETED_CONTRACTS_PER_FAMILY = BASE_MAX_TARGETED_CONTRACTS_PER_FAMILY + TARGETED_CONTRACT_CAP_INCREASE
 TARGETED_CONTRACT_DISTANCE_BUFFER_MINUTES = 30
 TARGETED_SERIES_EXCLUDE_KEYWORDS = (
@@ -196,13 +276,30 @@ TARGETED_SERIES_EXCLUDE_KEYWORDS = (
 )
 TARGETED_ORDERBOOK_MIN_SIZE = 5.0
 TARGETED_SERIES_MIN_LIQUIDITY = {
-    "KXBTC15M": 10.0,
+    "KXBTC15M": 8.0,
 }
 TARGETED_SERIES_MIN_TOP_OF_BOOK_SIZE = {
     "KXBTC15M": 5.0,
 }
 BTC15M_DEAD_BOOK_MIN_CYCLES = 3
+BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES = int(_env_float("KALSHI_BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES", 2))
+BTC15M_ROTATION_HISTORY_CYCLES = int(_env_float("KALSHI_BTC15M_ROTATION_HISTORY_CYCLES", 5))
+BTC15M_DEAD_CONTRACT_COOLDOWN_SECONDS = int(_env_float("KALSHI_BTC15M_DEAD_CONTRACT_COOLDOWN_SECONDS", 300))
+BTC15M_MISSING_RAW_BOOK_COOLDOWN_CYCLES = int(_env_float("KALSHI_BTC15M_MISSING_RAW_BOOK_COOLDOWN_CYCLES", 3))
+BTC15M_ZERO_SIZE_COOLDOWN_CYCLES = int(_env_float("KALSHI_BTC15M_ZERO_SIZE_COOLDOWN_CYCLES", 3))
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
+SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS = int(_env_float("SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS", 45))
+SPORTS_QUOTE_CONTINUITY_MAX_SPREAD = _env_float("SPORTS_QUOTE_CONTINUITY_MAX_SPREAD", 0.035)
+SPORTS_QUOTE_CONTINUITY_MIN_TOP_SIZE = _env_float("SPORTS_QUOTE_CONTINUITY_MIN_TOP_SIZE", 3.0)
+SPORTS_SYNTHETIC_SIZE_ENABLED = (os.environ.get("SPORTS_SYNTHETIC_SIZE_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+SPORTS_SYNTHETIC_SIZE_CAP = _env_float("SPORTS_SYNTHETIC_SIZE_CAP", 25.0)
+SPORTS_SYNTHETIC_SIZE_LIQUIDITY_FRACTION = _env_float("SPORTS_SYNTHETIC_SIZE_LIQUIDITY_FRACTION", 0.20)
+SPORTS_SYNTHETIC_SIZE_MIN_LIQUIDITY = _env_float("SPORTS_SYNTHETIC_SIZE_MIN_LIQUIDITY", 20.0)
+SPORTS_ADAPTIVE_SPREAD_MAX = _env_float("SPORTS_ADAPTIVE_SPREAD_MAX", 0.08)
+SPORTS_ADAPTIVE_STRONG_TOP_SIZE = _env_float("SPORTS_ADAPTIVE_STRONG_TOP_SIZE", 100.0)
+SPORTS_ADAPTIVE_STRONG_OPEN_INTEREST = _env_float("SPORTS_ADAPTIVE_STRONG_OPEN_INTEREST", 250.0)
+SPORTS_CONTINUITY_STABILITY_MIN_CYCLES = int(_env_float("SPORTS_CONTINUITY_STABILITY_MIN_CYCLES", 2))
 PREFERRED_MARKET_FAMILIES = HIGH_LIQUIDITY_PRIORITY_FAMILIES
 FALLBACK_MARKET_FAMILIES = DISCOVERY_DEPRIORITIZED_FAMILIES
 DEPRIORITIZED_MARKET_FAMILIES = (
@@ -253,6 +350,7 @@ MIN_ENTRY_PRICE = 0.10
 MAX_ENTRY_PRICE = 0.90
 TRADE_LOG_CSV = "kalshi_trade_log.csv"
 LIVE_POSITION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_position_state.json")
+MARKET_PERSONALITY_PROFILE_FILE = "/opt/kalshi-bot/data/market_personality_profiles.json"
 STATUS_EVERY_N_CYCLES = 1
 SHOW_TOP_CANDIDATES = 3
 ENABLE_GROUP_ALLOWLIST = False
@@ -264,7 +362,7 @@ GROUP_SCORE_WEIGHTS = {}
 MIN_TRADES_FOR_GROUP_WEIGHT_SUGGESTION = 5
 MAX_SUGGESTED_GROUP_MULTIPLIER = 1.15
 MIN_SUGGESTED_GROUP_MULTIPLIER = 0.85
-DRY_RUN_LIVE_ORDERS = True
+DRY_RUN_LIVE_ORDERS = False
 DEFAULT_LIVE_ORDER_SIDE = "yes"
 DEFAULT_LIVE_ORDER_ACTION = "buy"
 LIVE_MODE = False
@@ -276,21 +374,38 @@ LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
 MAX_SIMULTANEOUS_LIVE_POSITIONS = 3
 MAX_BTC15M_LIVE_POSITIONS = 1
 MAX_SPORTS_LIVE_POSITIONS = 2
+MAX_CORRELATED_SPORTS_POSITIONS_PER_GAME = int(_env_float("KALSHI_MAX_CORRELATED_SPORTS_POSITIONS_PER_GAME", 2))
+SPORTS_SPREAD_LADDER_CONFLICT_LINE_DISTANCE = _env_float("KALSHI_SPORTS_SPREAD_LADDER_CONFLICT_LINE_DISTANCE", 3.0)
+CORRELATED_SPORTS_TAKE_PROFIT_DELTA = _env_float("KALSHI_CORRELATED_SPORTS_TAKE_PROFIT_DELTA", 0.03)
+CORRELATED_SPORTS_STOP_LOSS_DELTA = _env_float("KALSHI_CORRELATED_SPORTS_STOP_LOSS_DELTA", 0.035)
+CORRELATED_SPORTS_MAX_HOLD_SECONDS = int(_env_float("KALSHI_CORRELATED_SPORTS_MAX_HOLD_SECONDS", 420))
+SPORTS_CONTEXT_GATE_ENABLED = (os.environ.get("SPORTS_CONTEXT_GATE_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS = (os.environ.get("SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+SPORTS_CONTEXT_ALLOW_STRONG_SIGNAL_WITHOUT_DATA = (os.environ.get("SPORTS_CONTEXT_ALLOW_STRONG_SIGNAL_WITHOUT_DATA", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 MAX_LIVE_ORDER_SIZE = 1
-MAX_LIVE_TRADES_PER_DAY = 20
+MAX_LIVE_TRADES_PER_DAY = 30
 LIVE_TEST_TICKER = None
 LIVE_AUDIT_LOG_FILE = "live_audit_log.csv"
 DEFAULT_LIVE_PRIVATE_KEY_PATH = "/Users/Kevin/Downloads/kalshi.key.txt"
+SERAPH_MEMORY_SQLITE_PATH = "/opt/kalshi-bot/seraph_memory.sqlite3"
+SERAPH_MEMORY_READ_LIMIT = 300
+SERAPH_MEMORY_RESTORE_LIMIT = 1000
 
 
-def compute_effective_live_dry_run(live_mode=None, live_armed=None, live_env_confirmed=None):
+def compute_effective_live_dry_run(live_mode=None, live_armed=None, live_env_confirmed=None, configured_dry_run=None):
     if live_mode is None:
         live_mode = bool(globals().get("LIVE_MODE", False))
     if live_armed is None:
         live_armed = bool(globals().get("LIVE_ARMED", False))
     if live_env_confirmed is None:
         live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
-    return not bool(live_mode and live_armed and live_env_confirmed)
+    if configured_dry_run is None:
+        configured_dry_run = bool(globals().get("DRY_RUN_LIVE_ORDERS", False))
+    allow_live_raw = (os.environ.get("KALSHI_ALLOW_LIVE", "") or "").strip().lower()
+    allow_live_enabled = allow_live_raw in {"1", "true", "yes", "on"}
+    if live_armed and allow_live_enabled:
+        return False
+    return bool(configured_dry_run or not (live_mode and live_armed and live_env_confirmed))
 
 
 @dataclass
@@ -335,6 +450,15 @@ class KalshiSniperBot:
         self.live_perf_losses_today = 0
         self.live_realized_pnl_today = 0.0
         self.live_realized_pnl_by_family_today = {}
+        self.live_family_perf_stats = {}
+        self.live_recent_family_pnl_events = []
+        self.live_recent_session_outcomes = []
+        self.execution_diversity_family_seen = {}
+        self.live_session_mode = "neutral"
+        self.live_session_mode_log_marker = None
+        self.live_post_loss_ticker_cooldowns = {}
+        self.live_post_loss_family_cooldowns = {}
+        self.live_recent_negative_exit_events = []
         self.live_canary_submitted = False
         self.live_canary_selected_ticker = None
         self.live_canary_authorized_ticker = None
@@ -348,11 +472,49 @@ class KalshiSniperBot:
         self.targeted_family_hourly_stats = {}
         self.live_family_hourly_observation_stats = {}
         self.btc15m_top_book_observation_state = {}
+        self.btc15m_rotation_quality_state = {}
+        self.btc15m_dead_contract_cooldowns = {}
+        self.sports_quote_continuity_cache = {}
+        self.sports_momentum_state = {}
         self.phase55_live_execution_gate_by_ticker = {}
         self.live_direction_decisions_by_ticker = {}
         self.live_position_closure_tracker = {}
         self.live_loss_exit_confirmation_counts = {}
         self.live_entry_block_cooldowns = {}
+        self.market_personality_profiles = self.load_market_personality_profiles()
+        self.market_awareness_profiles = {}
+        self.last_market_awareness_summary = {}
+        self.market_adaptive_profiles = {}
+        self.last_market_adaptive_summary = {}
+        self.market_predictive_profiles = {}
+        self.last_market_predictive_summary = {}
+        self.market_position_profiles = {}
+        self.last_market_position_summary = {}
+        self.realm_ix_startup_alert_sent = False
+        self.market_memory_profiles = {}
+        self.last_market_memory_summary = {}
+        self.seraph_memory_db_path = SERAPH_MEMORY_SQLITE_PATH
+        self.seraph_memory_store_ready = False
+        self.realm_xiii_startup_alert_sent = False
+        self.market_multi_agent_profiles = {}
+        self.last_market_multi_agent_summary = {}
+        self.realm_xiv_startup_alert_sent = False
+        self.realm_x_startup_alert_sent = False
+        self.realm_xi_startup_alert_sent = False
+        self.realm_xii_startup_alert_sent = False
+        self.entry_attempt_seen_this_cycle = set()
+        self.entry_attempt_cycle_family_counts = {}
+        self.entry_attempt_cycle_marker = None
+        self.entry_attempt_ticker_log_last_seen = {}
+        self.entry_attempt_family_log_last_seen = {}
+        self.entry_attempt_cycle_summary = {
+            "ticker_cooldowns": 0,
+            "family_cooldowns": 0,
+            "dedupes": 0,
+            "allowed_attempts": 0,
+        }
+        self.phase55_gate_log_markers = {}
+        self.live_momentum_hard_block_log_last_seen = {}
         self.btc15m_near_miss_persistence = {}
         self.last_safety_alert_reason = None
         self.last_telegram_heartbeat_ts = 0.0
@@ -367,6 +529,7 @@ class KalshiSniperBot:
         self.phase55_select_pass_counter = 0
         self.strict_validation_liquidity_trace_tickers = set()
         self.last_targeted_priority_adaptation = {}
+        self.seraph_memory_store_ready = bool(self.init_seraph_memory_store())
 
     def get_markets(self, limit=25, status="open", cursor=None, return_cursor=False, extra_params=None):
         if globals().get("LIVE_MODE", False):
@@ -420,6 +583,655 @@ class KalshiSniperBot:
         quote_values = self.get_market_quote_values(market)
         return all(value is not None for value in quote_values.values())
 
+    def _safe_payload_keys(self, payload):
+        if not isinstance(payload, dict):
+            return []
+        return sorted(str(key) for key in payload.keys())[:30]
+
+    def _is_sports_market_or_family(self, market_or_family):
+        return self.get_market_discovery_category(market_or_family) == "sports"
+
+    def _topbook_reject_reason(self, yes_price=None, yes_size=None, no_price=None, no_size=None, spread=None, max_spread=None):
+        if yes_price is None and no_price is None and yes_size in (None, 0.0) and no_size in (None, 0.0):
+            return "missing_prices_and_sizes"
+        if yes_price is None:
+            return "missing_yes_price"
+        if no_price is None:
+            return "missing_no_price"
+        if yes_size is None:
+            return "missing_yes_size"
+        if no_size is None:
+            return "missing_no_size"
+        if (yes_size or 0.0) <= 0.0 and (no_size or 0.0) <= 0.0:
+            return "zero_yes_no_sizes"
+        if (yes_size or 0.0) <= 0.0:
+            return "zero_yes_size"
+        if (no_size or 0.0) <= 0.0:
+            return "zero_no_size"
+        spread_limit = MAX_ENTRY_SPREAD if max_spread is None else max_spread
+        if spread is not None and (spread < 0.0 or spread > spread_limit):
+            return "spread_outside_allowed_range"
+        return "converted"
+
+    def _emit_topbook_trace(self, prefix, market=None, family=None, reason=None, **fields):
+        market = market if isinstance(market, dict) else {}
+        family = family or self.get_market_family(market)
+        if not self._is_sports_market_or_family(family) and family != "KXBTC15M":
+            return
+        ticker = str(fields.pop("ticker", "") or market.get("ticker", "") or "").strip()
+        quote_values = self.get_market_quote_values(market) if market else {}
+        yes_bid = fields.pop("yes_bid", quote_values.get("yes_bid"))
+        yes_ask = fields.pop("yes_ask", quote_values.get("yes_ask"))
+        no_bid = fields.pop("no_bid", quote_values.get("no_bid"))
+        no_ask = fields.pop("no_ask", quote_values.get("no_ask"))
+        spread = fields.pop("spread", None)
+        if spread is None and yes_bid is not None and yes_ask is not None:
+            try:
+                spread = round(float(yes_ask) - float(yes_bid), 4)
+            except (TypeError, ValueError):
+                spread = None
+        detected_fields = fields.pop("detected_fields", None)
+        if detected_fields is None:
+            detected_fields = self._get_raw_liquidity_candidate_fields(market)
+        extras = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+        print(
+            f"{prefix} ticker={ticker} family={family} raw_payload_keys={self._safe_payload_keys(market)} "
+            f"detected_fields={detected_fields} yes_bid={yes_bid} yes_ask={yes_ask} no_bid={no_bid} no_ask={no_ask} "
+            f"yes_price={fields.get('yes_price')} no_price={fields.get('no_price')} "
+            f"yes_size={fields.get('yes_size')} no_size={fields.get('no_size')} "
+            f"spread={spread} liquidity={market.get('liquidity_dollars', market.get('liquidity'))} "
+            f"exact_reject_reason={reason or 'none'}"
+            f"{' ' + extras if extras else ''}"
+        )
+
+    def _iter_nested_dict_items(self, payload, max_depth=5):
+        if not isinstance(payload, dict):
+            return
+        queue = [("", payload, 0)]
+        seen = set()
+        while queue:
+            path, current, depth = queue.pop(0)
+            if not isinstance(current, dict):
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            for key, value in current.items():
+                key_text = str(key)
+                child_path = f"{path}.{key_text}" if path else key_text
+                yield child_path, key_text, value
+                if depth >= max_depth:
+                    continue
+                if isinstance(value, dict):
+                    queue.append((child_path, value, depth + 1))
+                elif isinstance(value, list):
+                    for index, item in enumerate(value[:5]):
+                        if isinstance(item, dict):
+                            queue.append((f"{child_path}[{index}]", item, depth + 1))
+
+    def _extract_sports_size_map(self, market, yes_price=None, no_price=None, spread=None):
+        result = {
+            "yes_size": None,
+            "no_size": None,
+            "discovered_size_fields": {},
+            "mapped_size_fields": {},
+            "fallback_source": "none",
+            "yes_path": None,
+            "no_path": None,
+            "synthetic_used": False,
+            "synthetic_reason": None,
+        }
+        if not isinstance(market, dict):
+            return result
+        ticker = str(market.get("ticker", "") or "").strip()
+        family = self.get_market_family(market)
+        if not self._is_sports_market_or_family(family):
+            return result
+
+        yes_candidates = []
+        no_candidates = []
+        generic_candidates = []
+        size_tokens = (
+            "size", "qty", "quantity", "contracts", "contract_count", "count",
+            "shares", "quantity_fp", "size_fp", "orders_count", "available",
+        )
+        noise_tokens = ("price", "bid_dollars", "ask_dollars", "liquidity", "volume", "interest", "timestamp", "time")
+        for path, key, value in self._iter_nested_dict_items(market, max_depth=6):
+            numeric = self.to_float(value, None)
+            if numeric is None or numeric <= 0.0:
+                continue
+            low_path = path.lower()
+            low_key = key.lower()
+            if not any(token in low_key for token in size_tokens):
+                continue
+            if any(token in low_key for token in noise_tokens):
+                continue
+            result["discovered_size_fields"][path] = numeric
+            candidate = (numeric, path)
+            if "yes_ask_size" in low_key or "best_yes_ask_size" in low_key:
+                yes_candidates.append(candidate)
+            elif "yes_bid_size" in low_key or "best_yes_bid_size" in low_key:
+                # A YES bid is the executable top size for buying NO at the complementary NO ask.
+                no_candidates.append(candidate)
+            elif "no_ask_size" in low_key or "best_no_ask_size" in low_key:
+                no_candidates.append(candidate)
+            elif "no_bid_size" in low_key or "best_no_bid_size" in low_key:
+                # A NO bid is the executable top size for buying YES at the complementary YES ask.
+                yes_candidates.append(candidate)
+            elif "yes" in low_path:
+                yes_candidates.append(candidate)
+            elif "no" in low_path:
+                no_candidates.append(candidate)
+            elif "bid" in low_path:
+                yes_candidates.append(candidate)
+            elif "ask" in low_path:
+                no_candidates.append(candidate)
+            else:
+                generic_candidates.append(candidate)
+
+        def choose(candidates):
+            if not candidates:
+                return None, None
+            # Use the best visible top size but cap extreme nested aggregate fields later
+            # through normal liquidity/safety gates rather than inflating the order size.
+            value, path = max(candidates, key=lambda item: item[0])
+            return value, path
+
+        yes_size, yes_path = choose(yes_candidates)
+        no_size, no_path = choose(no_candidates)
+        if yes_size is None and generic_candidates:
+            yes_size, yes_path = choose(generic_candidates)
+        if no_size is None and generic_candidates:
+            no_size, no_path = choose(generic_candidates)
+
+        result["yes_size"] = yes_size
+        result["no_size"] = no_size
+        result["yes_path"] = yes_path
+        result["no_path"] = no_path
+        if yes_path:
+            result["mapped_size_fields"]["yes"] = yes_path
+        if no_path:
+            result["mapped_size_fields"]["no"] = no_path
+        if yes_size is not None or no_size is not None:
+            result["fallback_source"] = "recursive_size_field"
+
+        if (yes_size is None or no_size is None) and SPORTS_SYNTHETIC_SIZE_ENABLED:
+            synthetic_size, synthetic_source, synthetic_reason = self._derive_sports_synthetic_top_size(
+                market,
+                yes_price=yes_price,
+                no_price=no_price,
+                spread=spread,
+            )
+            if synthetic_size is not None:
+                if yes_size is None:
+                    yes_size = synthetic_size
+                    yes_path = synthetic_source
+                if no_size is None:
+                    no_size = synthetic_size
+                    no_path = synthetic_source
+                result.update({
+                    "yes_size": yes_size,
+                    "no_size": no_size,
+                    "yes_path": yes_path,
+                    "no_path": no_path,
+                    "fallback_source": synthetic_source,
+                    "synthetic_used": True,
+                    "synthetic_reason": synthetic_reason,
+                })
+                result["mapped_size_fields"].setdefault("yes", yes_path)
+                result["mapped_size_fields"].setdefault("no", no_path)
+                print(
+                    f"[LIVE-TOPBOOK-SYNTHETIC-SIZE] ticker={ticker} family={family} "
+                    f"fallback_source={synthetic_source} reason={synthetic_reason} "
+                    f"liquidity_dollars={market.get('liquidity_dollars', market.get('liquidity'))} "
+                    f"yes_price={yes_price} no_price={no_price} spread={spread} "
+                    f"final_yes_size={yes_size} final_no_size={no_size}"
+                )
+
+        print(
+            f"[LIVE-TOPBOOK-SIZE-MAP] ticker={ticker} family={family} "
+            f"discovered_size_fields={result.get('discovered_size_fields')} "
+            f"mapped_size_fields={result.get('mapped_size_fields')} "
+            f"fallback_source={result.get('fallback_source')} "
+            f"yes_path={result.get('yes_path')} no_path={result.get('no_path')} "
+            f"final_yes_size={result.get('yes_size')} final_no_size={result.get('no_size')}"
+        )
+        return result
+
+    def _derive_sports_synthetic_top_size(self, market, yes_price=None, no_price=None, spread=None):
+        if not isinstance(market, dict):
+            return None, "none", "market_not_dict"
+        family = self.get_market_family(market)
+        if not self._is_sports_market_or_family(family):
+            return None, "none", "not_sports"
+        quote_values = self.get_market_quote_values(market)
+        yes_bid = quote_values.get("yes_bid")
+        yes_ask = quote_values.get("yes_ask")
+        no_bid = quote_values.get("no_bid")
+        no_ask = quote_values.get("no_ask")
+        yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        if yes_price is None:
+            yes_price = yes_ask
+        if no_price is None:
+            no_price = no_ask
+        if spread is None and yes_bid is not None and yes_ask is not None:
+            try:
+                spread = float(yes_ask) - float(yes_bid)
+            except (TypeError, ValueError):
+                spread = None
+        if None in (yes_bid, yes_ask, no_bid, no_ask):
+            return None, "none", "missing_two_sided_quotes"
+        adaptive_spread = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=spread,
+            liquidity=liquidity if "liquidity" in locals() else None,
+            context="synthetic_size",
+        ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
+        if spread is None or spread < 0.0 or spread > adaptive_spread:
+            return None, "none", "spread_not_safe"
+        yes_price = self.to_float(yes_price, None)
+        no_price = self.to_float(no_price, None)
+        if yes_price is None or no_price is None or yes_price <= 0.0 or no_price <= 0.0:
+            return None, "none", "missing_prices"
+        liquidity = self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0) or 0.0
+        if liquidity < SPORTS_SYNTHETIC_SIZE_MIN_LIQUIDITY:
+            return None, "none", "liquidity_below_synthetic_floor"
+        volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0) or 0.0
+        open_interest = self.to_float(market.get("open_interest_fp", market.get("open_interest")), 0.0) or 0.0
+        if volume <= 0.0 and open_interest <= 0.0:
+            return None, "none", "market_not_clearly_active"
+        conservative_contracts = liquidity * SPORTS_SYNTHETIC_SIZE_LIQUIDITY_FRACTION / max(yes_price, no_price, 0.01)
+        synthetic_size = max(0.0, min(SPORTS_SYNTHETIC_SIZE_CAP, conservative_contracts))
+        if synthetic_size < SPORTS_QUOTE_CONTINUITY_MIN_TOP_SIZE:
+            return None, "none", "synthetic_size_below_min"
+        return round(synthetic_size, 4), "liquidity_dollars_conservative_synthetic", "valid_quotes_spread_activity_liquidity"
+
+    def compute_live_sports_momentum(self, market, q=None, liquidity_priority=None, spread=None, context="generic"):
+        family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
+        ticker = str((market or {}).get("ticker", "") or getattr(q, "ticker", "") or "").strip()
+        if not ticker or family == "KXBTC15M" or not self._is_sports_market_or_family(family):
+            return {
+                "momentum_score": 0.0,
+                "directional_bias": "not_sports",
+                "volatility_state": "none",
+                "orderbook_pressure": "neutral",
+                "repricing_velocity": 0.0,
+                "spread_behavior": "unknown",
+                "event_urgency": "unknown",
+            }
+        market = market if isinstance(market, dict) else {}
+        quote_values = self.get_market_quote_values(market)
+        yes_bid = quote_values.get("yes_bid")
+        yes_ask = quote_values.get("yes_ask")
+        no_bid = quote_values.get("no_bid")
+        no_ask = quote_values.get("no_ask")
+        yes_bid = yes_bid if yes_bid is not None else (getattr(q, "yes_bid", None) if getattr(q, "yes_bid", 0.0) > 0 else None)
+        yes_ask = yes_ask if yes_ask is not None else (getattr(q, "yes_ask", None) if getattr(q, "yes_ask", 0.0) > 0 else None)
+        no_bid = no_bid if no_bid is not None else (getattr(q, "no_bid", None) if getattr(q, "no_bid", 0.0) > 0 else None)
+        no_ask = no_ask if no_ask is not None else (getattr(q, "no_ask", None) if getattr(q, "no_ask", 0.0) > 0 else None)
+        yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        if spread is None and yes_bid is not None and yes_ask is not None:
+            try:
+                spread = float(yes_ask) - float(yes_bid)
+            except (TypeError, ValueError):
+                spread = None
+        liquidity_priority = liquidity_priority or {}
+        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), None)
+        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), None)
+        if yes_top_size is None or no_top_size is None:
+            cached_book = self.targeted_orderbook_cache.get(ticker, {}) if hasattr(self, "targeted_orderbook_cache") else {}
+            yes_top_size = self.to_float(cached_book.get("yes_top_size"), yes_top_size)
+            no_top_size = self.to_float(cached_book.get("no_top_size"), no_top_size)
+        if yes_top_size is None or no_top_size is None:
+            yes_top_size = self.to_float(
+                market.get("yes_ask_size_fp", market.get("yes_ask_size", market.get("no_bid_size_fp", market.get("no_bid_size")))),
+                yes_top_size,
+            )
+            no_top_size = self.to_float(
+                market.get("yes_bid_size_fp", market.get("yes_bid_size", market.get("no_ask_size_fp", market.get("no_ask_size")))),
+                no_top_size,
+            )
+        yes_top_size = self.to_float(yes_top_size, 0.0) or 0.0
+        no_top_size = self.to_float(no_top_size, 0.0) or 0.0
+        yes_mid = None
+        if yes_bid is not None and yes_ask is not None:
+            yes_mid = (float(yes_bid) + float(yes_ask)) / 2.0
+        elif yes_ask is not None:
+            yes_mid = float(yes_ask)
+        volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0) or 0.0
+        now_ts = time.time()
+        state = dict(self.sports_momentum_state.get(ticker, {}) or {})
+        history = list(state.get("history", []) or [])
+        current = {
+            "ts": now_ts,
+            "yes_mid": yes_mid,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "spread": spread,
+            "yes_top_size": yes_top_size,
+            "no_top_size": no_top_size,
+            "volume": volume,
+        }
+        if yes_mid is not None and (not history or abs(now_ts - float(history[-1].get("ts", 0.0) or 0.0)) >= 1.0 or history[-1].get("yes_mid") != yes_mid or history[-1].get("spread") != spread):
+            history.append(current)
+            history = history[-8:]
+            state["history"] = history
+            self.sports_momentum_state[ticker] = state
+        recent = [item for item in history if item.get("yes_mid") is not None]
+        previous = recent[-2] if len(recent) >= 2 else {}
+        price_delta = 0.0
+        if previous and yes_mid is not None:
+            price_delta = float(yes_mid) - float(previous.get("yes_mid", yes_mid))
+        deltas = [
+            float(recent[i].get("yes_mid")) - float(recent[i - 1].get("yes_mid"))
+            for i in range(1, len(recent))
+            if recent[i].get("yes_mid") is not None and recent[i - 1].get("yes_mid") is not None
+        ][-5:]
+        directional_consistency = 0.0
+        if deltas:
+            positive = sum(1 for value in deltas if value > 0.0001)
+            negative = sum(1 for value in deltas if value < -0.0001)
+            directional_consistency = (positive - negative) / max(len(deltas), 1)
+        spread_delta = 0.0
+        if previous and spread is not None and previous.get("spread") is not None:
+            spread_delta = float(previous.get("spread")) - float(spread)
+        previous_min_size = min(
+            self.to_float(previous.get("yes_top_size"), 0.0) or 0.0,
+            self.to_float(previous.get("no_top_size"), 0.0) or 0.0,
+        ) if previous else 0.0
+        current_min_size = min(yes_top_size, no_top_size) if yes_top_size > 0.0 and no_top_size > 0.0 else max(yes_top_size, no_top_size)
+        size_acceleration = (current_min_size - previous_min_size) / max(previous_min_size, 1.0) if previous else 0.0
+        volume_delta = 0.0
+        if previous:
+            volume_delta = volume - (self.to_float(previous.get("volume"), 0.0) or 0.0)
+        if yes_top_size > 0.0 or no_top_size > 0.0:
+            imbalance = (yes_top_size - no_top_size) / max(yes_top_size + no_top_size, 1.0)
+        else:
+            imbalance = 0.0
+        seconds_delta = max(1.0, now_ts - float(previous.get("ts", now_ts) or now_ts)) if previous else 1.0
+        repricing_velocity = price_delta / seconds_delta
+        volatility = 0.0
+        if len(deltas) >= 2:
+            mean_delta = sum(deltas) / len(deltas)
+            volatility = (sum((value - mean_delta) ** 2 for value in deltas) / len(deltas)) ** 0.5
+        volatility_state = "burst" if volatility >= 0.025 else ("elevated" if volatility >= 0.012 else "stable")
+        spread_behavior = "tightening" if spread_delta > 0.002 else ("widening" if spread_delta < -0.002 else "stable")
+        orderbook_pressure = "yes_pressure" if imbalance > 0.20 else ("no_pressure" if imbalance < -0.20 else "balanced")
+        directional_bias = "up" if price_delta > 0.002 else ("down" if price_delta < -0.002 else "flat")
+        minutes_to_event = self.get_minutes_to_event(market)
+        if minutes_to_event is None:
+            event_urgency = "unknown"
+            event_component = 0.0
+        elif 0.0 <= minutes_to_event <= 30.0:
+            event_urgency = "high"
+            event_component = 0.06
+        elif 30.0 < minutes_to_event <= self.get_effective_max_minutes_to_event():
+            event_urgency = "normal"
+            event_component = 0.03
+        else:
+            event_urgency = "low"
+            event_component = 0.0
+        price_component = max(-0.35, min(0.35, price_delta * 10.0))
+        direction_component = max(-0.18, min(0.18, directional_consistency * 0.18))
+        spread_component = max(-0.12, min(0.12, spread_delta * 6.0))
+        size_component = max(-0.12, min(0.12, size_acceleration * 0.08))
+        volume_component = 0.06 if volume_delta > 0 else (-0.03 if volume_delta < 0 else 0.0)
+        imbalance_component = max(-0.12, min(0.12, imbalance * 0.12))
+        repricing_component = max(-0.12, min(0.12, repricing_velocity * 30.0))
+        volatility_component = -0.08 if volatility_state == "burst" and abs(directional_consistency) < 0.4 else (0.04 if volatility_state == "burst" and directional_consistency > 0 else 0.0)
+        momentum_score = max(-1.0, min(1.0, price_component + direction_component + spread_component + size_component + volume_component + imbalance_component + repricing_component + volatility_component + event_component))
+        if directional_bias == "down" and orderbook_pressure == "no_pressure":
+            momentum_score = min(momentum_score, -0.20)
+        if directional_bias == "up" and orderbook_pressure == "yes_pressure":
+            momentum_score = max(momentum_score, 0.20)
+        momentum_score = round(momentum_score, 4)
+        result = {
+            "momentum_score": momentum_score,
+            "directional_bias": directional_bias,
+            "volatility_state": volatility_state,
+            "orderbook_pressure": orderbook_pressure,
+            "repricing_velocity": round(repricing_velocity, 6),
+            "spread_behavior": spread_behavior,
+            "event_urgency": event_urgency,
+            "price_delta": round(price_delta, 6),
+            "spread_delta": round(spread_delta, 6),
+            "size_acceleration": round(size_acceleration, 6),
+            "directional_consistency": round(directional_consistency, 4),
+            "history_points": len(recent),
+        }
+        print(
+            f"[LIVE-SPORTS-MOMENTUM] ticker={ticker} family={family} momentum_score={momentum_score} "
+            f"directional_bias={directional_bias} volatility_state={volatility_state} "
+            f"orderbook_pressure={orderbook_pressure} repricing_velocity={round(repricing_velocity, 6)} "
+            f"spread_behavior={spread_behavior} event_urgency={event_urgency} "
+            f"price_delta={round(price_delta, 6)} spread_delta={round(spread_delta, 6)} "
+            f"size_acceleration={round(size_acceleration, 6)} directional_consistency={round(directional_consistency, 4)} "
+            f"history_points={len(recent)} context={context}"
+        )
+        return result
+
+    def _get_sports_adaptive_spread_threshold(self, market, spread=None, liquidity=None, yes_top_size=None, no_top_size=None, context="generic"):
+        family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
+        base_threshold = MAX_ENTRY_SPREAD
+        if family == "KXBTC15M" or not self._is_sports_market_or_family(family):
+            return {
+                "base_threshold": base_threshold,
+                "adaptive_threshold": base_threshold,
+                "pass": bool(spread is None or (0.0 <= spread <= base_threshold)),
+                "reason": "non_sports_strict",
+            }
+        market = market if isinstance(market, dict) else {}
+        if liquidity is None:
+            liquidity = self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0) or 0.0
+        if yes_top_size is None:
+            yes_top_size = self.to_float(market.get("yes_top_size"), None)
+        if no_top_size is None:
+            no_top_size = self.to_float(market.get("no_top_size"), None)
+        top_sizes = [self.to_float(value, 0.0) or 0.0 for value in (yes_top_size, no_top_size)]
+        max_top_size = max(top_sizes) if top_sizes else 0.0
+        min_top_size = min(top_sizes) if all(value > 0.0 for value in top_sizes) else 0.0
+        open_interest = self.to_float(market.get("open_interest_fp", market.get("open_interest")), 0.0) or 0.0
+        volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0) or 0.0
+        minutes_to_event = self.get_minutes_to_event(market)
+        category_confidence = 1.0 if self._is_priority_sports_family(family) else 0.5
+        momentum = self.compute_live_sports_momentum(
+            market,
+            liquidity_priority={"yes_top_size": yes_top_size, "no_top_size": no_top_size},
+            spread=spread,
+            context=f"adaptive_spread:{context}",
+        )
+        live_momentum = self.to_float(momentum.get("momentum_score"), 0.0) or 0.0
+        adjustment = 0.0
+        reasons = []
+        if min_top_size >= SPORTS_ADAPTIVE_STRONG_TOP_SIZE or max_top_size >= SPORTS_ADAPTIVE_STRONG_TOP_SIZE * 5.0:
+            adjustment += 0.008
+            reasons.append("strong_topbook_depth")
+        elif max_top_size >= self.get_market_min_top_of_book_size(market):
+            adjustment += 0.004
+            reasons.append("usable_topbook_depth")
+        if open_interest >= SPORTS_ADAPTIVE_STRONG_OPEN_INTEREST:
+            adjustment += 0.006
+            reasons.append("open_interest_present")
+        if volume >= MIN_ENTRY_VOLUME:
+            adjustment += 0.004
+            reasons.append("recent_volume")
+        if minutes_to_event is not None and 0.0 <= minutes_to_event <= self.get_effective_max_minutes_to_event():
+            adjustment += 0.004
+            reasons.append("event_in_target_window")
+        if category_confidence >= 1.0:
+            adjustment += 0.004
+            reasons.append("priority_sports_family")
+        if live_momentum >= 0.45:
+            adjustment += min(0.006, live_momentum * 0.01)
+            reasons.append("positive_live_momentum")
+        elif live_momentum <= -0.35:
+            adjustment -= min(0.01, abs(live_momentum) * 0.015)
+            reasons.append("negative_live_momentum_tighten")
+        adaptive_threshold = min(SPORTS_ADAPTIVE_SPREAD_MAX, base_threshold + adjustment)
+        pass_fail = bool(spread is None or (0.0 <= spread <= adaptive_threshold))
+        reason = "+".join(reasons) if reasons else "base_sports_threshold"
+        print(
+            f"[LIVE-SPREAD-ADAPTIVE] ticker={str(market.get('ticker', '') or '').strip()} family={family} "
+            f"base_threshold={round(base_threshold, 4)} adaptive_threshold={round(adaptive_threshold, 4)} "
+            f"reason={reason} liquidity={liquidity} open_interest={open_interest} "
+            f"yes_top_size={yes_top_size} no_top_size={no_top_size} spread={spread} "
+            f"category_confidence={category_confidence} live_momentum={live_momentum} "
+            f"final_pass_fail={'pass' if pass_fail else 'fail'} context={context}"
+        )
+        return {
+            "base_threshold": base_threshold,
+            "adaptive_threshold": adaptive_threshold,
+            "pass": pass_fail,
+            "reason": reason,
+            "liquidity": liquidity,
+            "open_interest": open_interest,
+            "minutes_to_event": minutes_to_event,
+            "category_confidence": category_confidence,
+        }
+
+    def _infer_missing_binary_quotes(self, yes_bid, yes_ask, no_bid, no_ask):
+        if no_bid is None and yes_ask is not None:
+            no_bid = max(0.0, 1.0 - float(yes_ask))
+        if no_ask is None and yes_bid is not None:
+            no_ask = min(1.0, 1.0 - float(yes_bid))
+        if yes_bid is None and no_ask is not None:
+            yes_bid = max(0.0, 1.0 - float(no_ask))
+        if yes_ask is None and no_bid is not None:
+            yes_ask = min(1.0, 1.0 - float(no_bid))
+        return yes_bid, yes_ask, no_bid, no_ask
+
+    def _record_sports_quote_continuity_snapshot(self, ticker, family, yes_bid, yes_ask, no_bid, no_ask, yes_top_size=None, no_top_size=None, source="build_quote"):
+        if not ticker or not self._is_sports_market_or_family(family):
+            return
+        if None in (yes_bid, yes_ask, no_bid, no_ask):
+            return
+        try:
+            spread = float(yes_ask) - float(yes_bid)
+        except (TypeError, ValueError):
+            return
+        adaptive_spread = SPORTS_ADAPTIVE_SPREAD_MAX if self._is_sports_market_or_family(family) else MAX_ENTRY_SPREAD
+        if spread < 0.0 or spread > adaptive_spread:
+            return
+        previous = dict(self.sports_quote_continuity_cache.get(ticker, {}) or {})
+        stable_cycles = 1
+        if previous:
+            quote_delta = max(
+                abs(float(previous.get("yes_bid", yes_bid)) - float(yes_bid)),
+                abs(float(previous.get("yes_ask", yes_ask)) - float(yes_ask)),
+                abs(float(previous.get("no_bid", no_bid)) - float(no_bid)),
+                abs(float(previous.get("no_ask", no_ask)) - float(no_ask)),
+            )
+            stable_cycles = int(previous.get("stable_cycles", 1) or 1) + 1 if quote_delta <= 0.02 else 1
+        self.sports_quote_continuity_cache[ticker] = {
+            "ts": time.time(),
+            "family": family,
+            "yes_bid": float(yes_bid),
+            "yes_ask": float(yes_ask),
+            "no_bid": float(no_bid),
+            "no_ask": float(no_ask),
+            "spread": round(spread, 4),
+            "yes_top_size": yes_top_size,
+            "no_top_size": no_top_size,
+            "source": source,
+            "stable_cycles": stable_cycles,
+            "adaptive_spread": adaptive_spread,
+        }
+
+    def _apply_sports_quote_continuity(self, market, yes_bid, yes_ask, no_bid, no_ask):
+        ticker = str((market or {}).get("ticker", "") or "").strip()
+        family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
+        if not SPORTS_QUOTE_CONTINUITY_ENABLED or not ticker or not self._is_sports_market_or_family(family):
+            return yes_bid, yes_ask, no_bid, no_ask, False, "not_applicable"
+        missing_count = sum(1 for value in (yes_bid, yes_ask, no_bid, no_ask) if value is None)
+        cached = dict(self.sports_quote_continuity_cache.get(ticker, {}) or {})
+        age_seconds = time.time() - float(cached.get("ts", 0.0) or 0.0) if cached else None
+        stable_cycles = int(cached.get("stable_cycles", 0) or 0) if cached else 0
+        if missing_count <= 0:
+            print(
+                f"[LIVE-SPORTS-CONTINUITY] ticker={ticker} family={family} eligibility_status=not_needed "
+                f"missing_count={missing_count} cache_age={round(age_seconds, 2) if age_seconds is not None else None} "
+                f"prior_valid_quotes={'yes' if cached else 'no'} carry_forward_used=no stability_confidence={stable_cycles} "
+                f"reason=complete_current_quote"
+            )
+            return yes_bid, yes_ask, no_bid, no_ask, False, "missing_count_not_eligible"
+        if missing_count > 3:
+            print(
+                f"[LIVE-SPORTS-CONTINUITY] ticker={ticker} family={family} eligibility_status=blocked "
+                f"missing_count={missing_count} cache_age={round(age_seconds, 2) if age_seconds is not None else None} "
+                f"prior_valid_quotes={'yes' if cached else 'no'} carry_forward_used=no stability_confidence={stable_cycles} "
+                f"reason=too_many_missing_quote_fields"
+            )
+            return yes_bid, yes_ask, no_bid, no_ask, False, "missing_count_not_eligible"
+        if not cached:
+            print(
+                f"[LIVE-SPORTS-CONTINUITY] ticker={ticker} family={family} eligibility_status=blocked "
+                f"missing_count={missing_count} cache_age=None prior_valid_quotes=no carry_forward_used=no "
+                f"stability_confidence=0 reason=no_recent_valid_quote"
+            )
+            return yes_bid, yes_ask, no_bid, no_ask, False, "no_recent_valid_quote"
+        if age_seconds > SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS:
+            print(
+                f"[LIVE-SPORTS-CONTINUITY] ticker={ticker} family={family} eligibility_status=blocked "
+                f"missing_count={missing_count} cache_age={round(age_seconds, 2)} prior_valid_quotes=yes "
+                f"carry_forward_used=no stability_confidence={stable_cycles} reason=recent_quote_too_old"
+            )
+            return yes_bid, yes_ask, no_bid, no_ask, False, "recent_quote_too_old"
+        topbook_snapshot = self._extract_non_targeted_topbook_snapshot(market)
+        yes_top_size = self.to_float(topbook_snapshot.get("yes_top_size"), 0.0) or 0.0
+        no_top_size = self.to_float(topbook_snapshot.get("no_top_size"), 0.0) or 0.0
+        top_size_ok = max(yes_top_size, no_top_size, self.to_float(cached.get("yes_top_size"), 0.0) or 0.0, self.to_float(cached.get("no_top_size"), 0.0) or 0.0) >= SPORTS_QUOTE_CONTINUITY_MIN_TOP_SIZE
+        cached_spread = self.to_float(cached.get("spread"), None)
+        adaptive_spread = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=cached_spread,
+            liquidity=market.get("liquidity_dollars", market.get("liquidity")),
+            yes_top_size=yes_top_size or cached.get("yes_top_size"),
+            no_top_size=no_top_size or cached.get("no_top_size"),
+            context="continuity_apply",
+        ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
+        continuity_spread_limit = min(SPORTS_ADAPTIVE_SPREAD_MAX, max(SPORTS_QUOTE_CONTINUITY_MAX_SPREAD, adaptive_spread))
+        if cached_spread is None or cached_spread < 0.0 or cached_spread > continuity_spread_limit:
+            print(
+                f"[LIVE-SPORTS-CONTINUITY] ticker={ticker} family={family} eligibility_status=blocked "
+                f"missing_count={missing_count} cache_age={round(age_seconds, 2)} prior_valid_quotes=yes "
+                f"carry_forward_used=no stability_confidence={stable_cycles} cached_spread={cached_spread} "
+                f"adaptive_spread={round(continuity_spread_limit, 4)} reason=cached_spread_not_safe"
+            )
+            return yes_bid, yes_ask, no_bid, no_ask, False, "cached_spread_not_safe"
+        liquidity = self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0) or 0.0
+        if not top_size_ok and liquidity < MIN_ENTRY_LIQUIDITY:
+            print(
+                f"[LIVE-SPORTS-CONTINUITY] ticker={ticker} family={family} eligibility_status=blocked "
+                f"missing_count={missing_count} cache_age={round(age_seconds, 2)} prior_valid_quotes=yes "
+                f"carry_forward_used=no stability_confidence={stable_cycles} top_size_ok=no liquidity={liquidity} "
+                f"reason=continuity_liquidity_not_safe"
+            )
+            return yes_bid, yes_ask, no_bid, no_ask, False, "continuity_liquidity_not_safe"
+        recovered = {
+            "yes_bid": yes_bid if yes_bid is not None else cached.get("yes_bid"),
+            "yes_ask": yes_ask if yes_ask is not None else cached.get("yes_ask"),
+            "no_bid": no_bid if no_bid is not None else cached.get("no_bid"),
+            "no_ask": no_ask if no_ask is not None else cached.get("no_ask"),
+        }
+        print(
+            f"[LIVE-TOPBOOK-CONVERTED] ticker={ticker} family={family} raw_payload_keys={self._safe_payload_keys(market)} "
+            f"detected_fields={self._get_raw_liquidity_candidate_fields(market)} yes_bid={recovered.get('yes_bid')} yes_ask={recovered.get('yes_ask')} "
+            f"no_bid={recovered.get('no_bid')} no_ask={recovered.get('no_ask')} spread={cached_spread} liquidity={liquidity} "
+            f"exact_reject_reason=soft_continuity_used age_seconds={round(age_seconds, 2)} top_size_ok={'yes' if top_size_ok else 'no'}"
+        )
+        print(
+            f"[LIVE-SPORTS-CONTINUITY] ticker={ticker} family={family} eligibility_status=allowed "
+            f"missing_count={missing_count} cache_age={round(age_seconds, 2)} prior_valid_quotes=yes "
+            f"prior_yes_bid={cached.get('yes_bid')} prior_yes_ask={cached.get('yes_ask')} "
+            f"prior_no_bid={cached.get('no_bid')} prior_no_ask={cached.get('no_ask')} "
+            f"carry_forward_used=yes stability_confidence={stable_cycles} cached_spread={cached_spread} "
+            f"adaptive_spread={round(continuity_spread_limit, 4)} reason=soft_continuity_used"
+        )
+        return recovered["yes_bid"], recovered["yes_ask"], recovered["no_bid"], recovered["no_ask"], True, "soft_continuity_used"
+
     def append_live_audit_log(self, event_type, **fields):
         try:
             log_path = LIVE_AUDIT_LOG_FILE
@@ -468,6 +1280,2266 @@ class KalshiSniperBot:
                 json.dump(state if isinstance(state, dict) else {}, state_file, sort_keys=True, indent=2)
         except OSError:
             print(f"[LIVE-STATE] warning unable_to_save path={LIVE_POSITION_STATE_FILE}")
+
+    def _ensure_parent_dir(self, file_path):
+        directory = os.path.dirname(file_path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+
+    def _load_json_file(self, file_path, default=None):
+        default = {} if default is None else default
+        if not os.path.exists(file_path):
+            return default
+        try:
+            with open(file_path) as json_file:
+                data = json.load(json_file)
+            return data if data is not None else default
+        except (OSError, ValueError, TypeError):
+            return default
+
+    def _save_json_file(self, file_path, payload):
+        try:
+            self._ensure_parent_dir(file_path)
+            with open(file_path, "w") as json_file:
+                json.dump(payload if payload is not None else {}, json_file, sort_keys=True, indent=2)
+            return True
+        except OSError as exc:
+            print(f"[LIVE-STATE] warning unable_to_save path={file_path} error={exc.__class__.__name__}")
+            return False
+
+    def load_market_personality_profiles(self):
+        payload = self._load_json_file(MARKET_PERSONALITY_PROFILE_FILE, default={})
+        if not isinstance(payload, dict):
+            return {"version": 1, "updated_at": None, "families": {}}
+        families = payload.get("families", {})
+        if not isinstance(families, dict):
+            families = {}
+        return {
+            "version": int(payload.get("version", 1) or 1),
+            "updated_at": payload.get("updated_at"),
+            "families": families,
+        }
+
+    def save_market_personality_profiles(self, payload=None):
+        payload = payload if isinstance(payload, dict) else self.market_personality_profiles
+        payload = payload if isinstance(payload, dict) else {"version": 1, "updated_at": None, "families": {}}
+        self.market_personality_profiles = payload
+        self._save_json_file(MARKET_PERSONALITY_PROFILE_FILE, payload)
+
+    def _clamp(self, value, minimum=0.0, maximum=1.0):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = minimum
+        return max(minimum, min(maximum, numeric))
+
+    def _safe_round(self, value, digits=4, default=0.0):
+        try:
+            return round(float(value), digits)
+        except (TypeError, ValueError):
+            return default
+
+    def _bucket_value(self, value, thresholds, labels, default="unknown"):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return default
+        for threshold, label in zip(thresholds, labels):
+            if numeric <= threshold:
+                return label
+        return labels[-1] if labels else default
+
+    def _spread_bucket(self, spread):
+        return self._bucket_value(
+            spread,
+            thresholds=(0.012, 0.025, 0.045, 0.075),
+            labels=("tight", "normal", "wide", "very_wide", "extreme"),
+        )
+
+    def _liquidity_bucket(self, liquidity):
+        return self._bucket_value(
+            liquidity,
+            thresholds=(10.0, 25.0, 75.0, 150.0, 300.0),
+            labels=("thin", "light", "moderate", "good", "deep", "very_deep"),
+        )
+
+    def _volatility_bucket(self, volatility):
+        return self._bucket_value(
+            volatility,
+            thresholds=(0.015, 0.03, 0.06, 0.10),
+            labels=("calm", "active", "volatile", "burst", "extreme"),
+        )
+
+    def _momentum_bucket(self, momentum_score):
+        if momentum_score is None:
+            return "unknown"
+        momentum_score = float(momentum_score)
+        if momentum_score <= -0.35:
+            return "strong_negative"
+        if momentum_score < -0.10:
+            return "negative"
+        if momentum_score < 0.10:
+            return "neutral"
+        if momentum_score < 0.35:
+            return "positive"
+        return "strong_positive"
+
+    def _probability_bucket(self, probability_score):
+        return self._bucket_value(
+            probability_score,
+            thresholds=(0.20, 0.40, 0.60, 0.80),
+            labels=("low", "soft", "balanced", "high", "very_high"),
+        )
+
+    def _time_to_event_bucket_for_minutes(self, minutes_to_event):
+        if minutes_to_event is None:
+            return "unknown"
+        if minutes_to_event < MIN_MINUTES_TO_EVENT:
+            return "too_close"
+        if minutes_to_event <= 30:
+            return "immediate"
+        if minutes_to_event <= 120:
+            return "near_term"
+        if minutes_to_event <= self.get_effective_max_minutes_to_event():
+            return "in_window"
+        return "distant"
+
+    def _load_trade_history_rows(self, limit=400):
+        csv_path = getattr(self, "trade_log_csv", TRADE_LOG_CSV)
+        if not os.path.exists(csv_path):
+            return []
+        rows = []
+        try:
+            with open(csv_path, newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                for row in reader:
+                    if row:
+                        rows.append(row)
+        except OSError:
+            return []
+        if limit and len(rows) > limit:
+            return rows[-limit:]
+        return rows
+
+    def init_seraph_memory_store(self):
+        path = str(getattr(self, "seraph_memory_db_path", SERAPH_MEMORY_SQLITE_PATH) or SERAPH_MEMORY_SQLITE_PATH).strip()
+        if not path:
+            path = SERAPH_MEMORY_SQLITE_PATH
+        self.seraph_memory_db_path = path
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with sqlite3.connect(path, timeout=5) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS seraph_trade_memory (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        timestamp_ts REAL,
+                        ticker TEXT,
+                        category TEXT,
+                        family TEXT,
+                        series_ticker TEXT,
+                        side TEXT,
+                        entry_price REAL,
+                        exit_price REAL,
+                        realized_pnl_delta REAL,
+                        hold_seconds REAL,
+                        outcome TEXT,
+                        exit_reason TEXT,
+                        realm_ix_awareness_score REAL,
+                        realm_x_adaptive_score REAL,
+                        realm_x_adaptive_mode TEXT,
+                        realm_x_take_profit_mode TEXT,
+                        realm_x_stop_behavior_mode TEXT,
+                        realm_xi_predictive_score REAL,
+                        realm_xi_momentum_direction TEXT,
+                        realm_xi_momentum_strength TEXT,
+                        realm_xi_breakout_state TEXT,
+                        realm_xii_position_score REAL,
+                        realm_xii_position_health TEXT,
+                        realm_xii_conviction_level TEXT,
+                        setup_signature TEXT,
+                        memory_tags_json TEXT,
+                        notes_json TEXT,
+                        trade_mode TEXT,
+                        created_at REAL DEFAULT (strftime('%s', 'now'))
+                    )
+                    """
+                )
+                for column in (
+                    "ticker",
+                    "category",
+                    "family",
+                    "series_ticker",
+                    "setup_signature",
+                    "realm_x_adaptive_mode",
+                    "realm_xi_breakout_state",
+                    "outcome",
+                ):
+                    conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_seraph_trade_memory_{column} ON seraph_trade_memory({column})"
+                    )
+                conn.commit()
+            print(f"[REALM-XIII-MEMORY-STORE] ok=yes path={path} format=sqlite")
+            return {"ok": True, "reason": "initialized", "path": path, "format": "sqlite"}
+        except Exception as exc:
+            print(f"[REALM-XIII-MEMORY-STORE] ok=no path={path} reason={exc.__class__.__name__}")
+            return {"ok": False, "reason": exc.__class__.__name__, "path": path, "format": "sqlite"}
+
+    def safe_memory_write(self, record):
+        record = record if isinstance(record, dict) else {}
+        if not record:
+            return {"ok": False, "reason": "empty_record"}
+        if not getattr(self, "seraph_memory_db_path", None):
+            self.seraph_memory_db_path = SERAPH_MEMORY_SQLITE_PATH
+        if not getattr(self, "seraph_memory_store_ready", False):
+            self.seraph_memory_store_ready = bool(self.init_seraph_memory_store().get("ok"))
+        payload = dict(record)
+        try:
+            memory_tags = payload.get("memory_tags", [])
+            notes = payload.get("notes", {})
+            payload["memory_tags_json"] = json.dumps(memory_tags if isinstance(memory_tags, list) else [memory_tags], sort_keys=True, separators=(",", ":"))
+            payload["notes_json"] = json.dumps(notes if isinstance(notes, dict) else {"notes": notes}, sort_keys=True, separators=(",", ":"))
+            timestamp = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
+            timestamp_ts = self.to_float(payload.get("timestamp_ts"), time.time())
+            row = {
+                "timestamp": timestamp,
+                "timestamp_ts": timestamp_ts,
+                "ticker": str(payload.get("ticker") or "").strip(),
+                "category": str(payload.get("category") or "unknown").strip().lower(),
+                "family": str(payload.get("family") or "UNKNOWN").strip().upper(),
+                "series_ticker": str(payload.get("series_ticker") or "").strip().upper(),
+                "side": str(payload.get("side") or "unknown").strip().lower(),
+                "entry_price": self.to_float(payload.get("entry_price"), None),
+                "exit_price": self.to_float(payload.get("exit_price"), None),
+                "realized_pnl_delta": self.to_float(payload.get("realized_pnl_delta"), None),
+                "hold_seconds": self.to_float(payload.get("hold_seconds"), None),
+                "outcome": str(payload.get("outcome") or "unknown").strip().lower(),
+                "exit_reason": str(payload.get("exit_reason") or "unknown").strip(),
+                "realm_ix_awareness_score": self.to_float(payload.get("realm_ix_awareness_score"), None),
+                "realm_x_adaptive_score": self.to_float(payload.get("realm_x_adaptive_score"), None),
+                "realm_x_adaptive_mode": str(payload.get("realm_x_adaptive_mode") or "unknown").strip().lower(),
+                "realm_x_take_profit_mode": str(payload.get("realm_x_take_profit_mode") or "unknown").strip().lower(),
+                "realm_x_stop_behavior_mode": str(payload.get("realm_x_stop_behavior_mode") or "unknown").strip().lower(),
+                "realm_xi_predictive_score": self.to_float(payload.get("realm_xi_predictive_score"), None),
+                "realm_xi_momentum_direction": str(payload.get("realm_xi_momentum_direction") or "unknown").strip().lower(),
+                "realm_xi_momentum_strength": str(payload.get("realm_xi_momentum_strength") or "unknown").strip().lower(),
+                "realm_xi_breakout_state": str(payload.get("realm_xi_breakout_state") or "unknown").strip().lower(),
+                "realm_xii_position_score": self.to_float(payload.get("realm_xii_position_score"), None),
+                "realm_xii_position_health": str(payload.get("realm_xii_position_health") or "unknown").strip().lower(),
+                "realm_xii_conviction_level": str(payload.get("realm_xii_conviction_level") or "unknown").strip().lower(),
+                "setup_signature": str(payload.get("setup_signature") or "unknown").strip().lower(),
+                "memory_tags_json": payload.get("memory_tags_json") or "[]",
+                "notes_json": payload.get("notes_json") or "{}",
+                "trade_mode": str(payload.get("trade_mode") or "unknown").strip().lower(),
+            }
+            with sqlite3.connect(self.seraph_memory_db_path, timeout=5) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO seraph_trade_memory (
+                        timestamp, timestamp_ts, ticker, category, family, series_ticker, side,
+                        entry_price, exit_price, realized_pnl_delta, hold_seconds, outcome, exit_reason,
+                        realm_ix_awareness_score, realm_x_adaptive_score, realm_x_adaptive_mode,
+                        realm_x_take_profit_mode, realm_x_stop_behavior_mode, realm_xi_predictive_score,
+                        realm_xi_momentum_direction, realm_xi_momentum_strength, realm_xi_breakout_state,
+                        realm_xii_position_score, realm_xii_position_health, realm_xii_conviction_level,
+                        setup_signature, memory_tags_json, notes_json, trade_mode
+                    ) VALUES (
+                        :timestamp, :timestamp_ts, :ticker, :category, :family, :series_ticker, :side,
+                        :entry_price, :exit_price, :realized_pnl_delta, :hold_seconds, :outcome, :exit_reason,
+                        :realm_ix_awareness_score, :realm_x_adaptive_score, :realm_x_adaptive_mode,
+                        :realm_x_take_profit_mode, :realm_x_stop_behavior_mode, :realm_xi_predictive_score,
+                        :realm_xi_momentum_direction, :realm_xi_momentum_strength, :realm_xi_breakout_state,
+                        :realm_xii_position_score, :realm_xii_position_health, :realm_xii_conviction_level,
+                        :setup_signature, :memory_tags_json, :notes_json, :trade_mode
+                    )
+                    """,
+                    row,
+                )
+                conn.commit()
+            print(
+                f"[REALM-XIII-MEMORY-WRITE] ok=yes ticker={row['ticker']} category={row['category']} family={row['family']} "
+                f"setup_signature={row['setup_signature']} outcome={row['outcome']} realized_pnl_delta={row['realized_pnl_delta']}"
+            )
+            return {"ok": True, "reason": "written", "row": row}
+        except Exception as exc:
+            print(
+                f"[REALM-XIII-MEMORY-WRITE] ok=no ticker={record.get('ticker')} category={record.get('category')} "
+                f"family={record.get('family')} reason={exc.__class__.__name__}"
+            )
+            self.seraph_memory_store_ready = False
+            return {"ok": False, "reason": exc.__class__.__name__}
+
+    def safe_memory_read(self, ticker=None, category=None, family=None, setup_signature=None, adaptive_mode=None, breakout_state=None, limit=SERAPH_MEMORY_READ_LIMIT):
+        if not getattr(self, "seraph_memory_db_path", None):
+            self.seraph_memory_db_path = SERAPH_MEMORY_SQLITE_PATH
+        try:
+            with sqlite3.connect(self.seraph_memory_db_path, timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                total_records = self.to_float(
+                    conn.execute("SELECT COUNT(*) AS total FROM seraph_trade_memory").fetchone()[0],
+                    0.0,
+                )
+                clauses = []
+                params = []
+                for column, value in (
+                    ("ticker", ticker),
+                    ("category", category),
+                    ("family", family),
+                    ("setup_signature", setup_signature),
+                    ("realm_x_adaptive_mode", adaptive_mode),
+                    ("realm_xi_breakout_state", breakout_state),
+                ):
+                    value = str(value or "").strip()
+                    if value:
+                        clauses.append(f"LOWER(COALESCE({column}, '')) = LOWER(?)")
+                        params.append(value)
+                where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                limit_value = max(1, int(limit or 1)) if limit is not None else SERAPH_MEMORY_READ_LIMIT
+                query = (
+                    "SELECT timestamp, timestamp_ts, ticker, category, family, series_ticker, side, entry_price, exit_price, "
+                    "realized_pnl_delta, hold_seconds, outcome, exit_reason, realm_ix_awareness_score, realm_x_adaptive_score, "
+                    "realm_x_adaptive_mode, realm_x_take_profit_mode, realm_x_stop_behavior_mode, realm_xi_predictive_score, "
+                    "realm_xi_momentum_direction, realm_xi_momentum_strength, realm_xi_breakout_state, realm_xii_position_score, "
+                    "realm_xii_position_health, realm_xii_conviction_level, setup_signature, memory_tags_json, notes_json, trade_mode "
+                    f"FROM seraph_trade_memory {where_sql} ORDER BY id DESC LIMIT ?"
+                )
+                rows = conn.execute(query, params + [limit_value]).fetchall()
+        except Exception as exc:
+            print(
+                f"[REALM-XIII-MEMORY-READ] ok=no ticker={ticker} category={category} family={family} "
+                f"setup_signature={setup_signature} reason={exc.__class__.__name__}"
+            )
+            return {
+                "ok": False,
+                "reason": exc.__class__.__name__,
+                "total_records": 0,
+                "total_seen": 0,
+                "wins": 0,
+                "losses": 0,
+                "breakevens": 0,
+                "unknowns": 0,
+                "estimated_win_rate": None,
+                "average_pnl_delta": None,
+                "average_hold_seconds": None,
+                "confidence_sample_size": 0,
+                "memory_bias": "unknown",
+                "memory_score": 0.5,
+                "sample_size_quality": "none",
+                "memory_reasons": ["memory_store_unavailable"],
+                "rows": [],
+            }
+        rows = [dict(row) for row in rows if row]
+        total_seen = len(rows)
+        wins = losses = breakevens = unknowns = 0
+        pnl_total = 0.0
+        hold_total = 0.0
+        predictive_total = 0.0
+        position_total = 0.0
+        predictive_samples = 0
+        position_samples = 0
+        for row in rows:
+            outcome = str(row.get("outcome") or "unknown").strip().lower()
+            pnl = self.to_float(row.get("realized_pnl_delta"), None)
+            hold_seconds = self.to_float(row.get("hold_seconds"), None)
+            if outcome == "win":
+                wins += 1
+            elif outcome == "loss":
+                losses += 1
+            elif outcome == "breakeven":
+                breakevens += 1
+            else:
+                unknowns += 1
+            if pnl is not None:
+                pnl_total += pnl
+            if hold_seconds is not None:
+                hold_total += hold_seconds
+            predictive_score = self.to_float(row.get("realm_xi_predictive_score"), None)
+            if predictive_score is not None:
+                predictive_total += predictive_score
+                predictive_samples += 1
+            position_score = self.to_float(row.get("realm_xii_position_score"), None)
+            if position_score is not None:
+                position_total += position_score
+                position_samples += 1
+        confidence_sample_size = wins + losses + breakevens
+        estimated_win_rate = (wins / confidence_sample_size) if confidence_sample_size else None
+        average_pnl_delta = (pnl_total / confidence_sample_size) if confidence_sample_size else None
+        average_hold_seconds = (hold_total / confidence_sample_size) if confidence_sample_size else None
+        average_predictive_score = (predictive_total / predictive_samples) if predictive_samples else None
+        average_position_score = (position_total / position_samples) if position_samples else None
+        if confidence_sample_size <= 0:
+            sample_size_quality = "none"
+        elif confidence_sample_size < 3:
+            sample_size_quality = "tiny"
+        elif confidence_sample_size < 8:
+            sample_size_quality = "small"
+        elif confidence_sample_size < 20:
+            sample_size_quality = "medium"
+        else:
+            sample_size_quality = "strong"
+        if confidence_sample_size <= 0:
+            memory_bias = "unknown"
+        elif (estimated_win_rate is not None and estimated_win_rate >= 0.58) or (average_pnl_delta is not None and average_pnl_delta > 0):
+            memory_bias = "positive"
+        elif (estimated_win_rate is not None and estimated_win_rate <= 0.42) or (average_pnl_delta is not None and average_pnl_delta < 0):
+            memory_bias = "negative"
+        else:
+            memory_bias = "neutral"
+        scope_signal = self._clamp((estimated_win_rate or 0.5))
+        pnl_signal = self._clamp(0.5 + ((average_pnl_delta or 0.0) * 2.5)) if average_pnl_delta is not None else 0.5
+        predictive_signal = self._clamp(average_predictive_score if average_predictive_score is not None else 0.5)
+        position_signal = self._clamp(average_position_score if average_position_score is not None else 0.5)
+        sample_factor = 0.0 if confidence_sample_size <= 0 else min(1.0, confidence_sample_size / 20.0)
+        combined = 0.5
+        combined += ((scope_signal - 0.5) * 0.55 + (pnl_signal - 0.5) * 0.20 + (predictive_signal - 0.5) * 0.15 + (position_signal - 0.5) * 0.10) * sample_factor
+        memory_reasons = []
+        if memory_bias == "positive":
+            memory_reasons.append("historically_profitable")
+        elif memory_bias == "negative":
+            memory_reasons.append("historically_weak")
+        elif memory_bias == "unknown":
+            memory_reasons.append("no_memory_data")
+        if average_predictive_score is not None and average_predictive_score >= 0.7:
+            memory_reasons.append("predictive_support")
+        if average_position_score is not None and average_position_score >= 0.7:
+            memory_reasons.append("position_support")
+        return {
+            "ok": True,
+            "reason": "loaded",
+            "total_records": int(total_records or 0),
+            "total_seen": total_seen,
+            "wins": wins,
+            "losses": losses,
+            "breakevens": breakevens,
+            "unknowns": unknowns,
+            "estimated_win_rate": self._safe_round(estimated_win_rate, 4, None),
+            "average_pnl_delta": self._safe_round(average_pnl_delta, 4, None),
+            "average_hold_seconds": self._safe_round(average_hold_seconds, 4, None),
+            "average_predictive_score": self._safe_round(average_predictive_score, 4, None),
+            "average_position_score": self._safe_round(average_position_score, 4, None),
+            "confidence_sample_size": confidence_sample_size,
+            "memory_bias": memory_bias,
+            "memory_score": round(self._clamp(combined), 4),
+            "sample_size_quality": sample_size_quality,
+            "memory_reasons": memory_reasons,
+            "rows": rows,
+        }
+
+    def load_memory_stats(self, context=None):
+        context = context if isinstance(context, dict) else {}
+        return self.safe_memory_read(
+            ticker=context.get("ticker"),
+            category=context.get("category"),
+            family=context.get("family"),
+            setup_signature=context.get("setup_signature"),
+            adaptive_mode=context.get("adaptive_mode"),
+            breakout_state=context.get("breakout_state"),
+            limit=context.get("limit", SERAPH_MEMORY_READ_LIMIT),
+        )
+
+    def build_setup_signature(self, context=None):
+        context = context if isinstance(context, dict) else {}
+        parts = [
+            str(context.get("category") or "unknown").strip().lower(),
+            str(context.get("liquidity_regime") or "unknown").strip().lower(),
+            str(context.get("trend_regime") or "unknown").strip().lower(),
+            str(context.get("volatility_class") or "unknown").strip().lower(),
+            str(context.get("adaptive_mode") or "unknown").strip().lower(),
+            str(context.get("momentum_strength") or "unknown").strip().lower(),
+            str(context.get("breakout_state") or "unknown").strip().lower(),
+        ]
+        if context.get("position_health") or context.get("conviction_level"):
+            parts.append(str(context.get("position_health") or "unknown").strip().lower())
+            parts.append(str(context.get("conviction_level") or "unknown").strip().lower())
+        signature = "|".join(part or "unknown" for part in parts)
+        signature = signature.replace(" ", "_")
+        print(
+            f"[REALM-XIII-SETUP-SIGNATURE] ticker={context.get('ticker')} category={context.get('category')} "
+            f"setup_signature={signature} liquidity_regime={context.get('liquidity_regime')} trend_regime={context.get('trend_regime')} "
+            f"volatility_class={context.get('volatility_class')} adaptive_mode={context.get('adaptive_mode')} "
+            f"momentum_strength={context.get('momentum_strength')} breakout_state={context.get('breakout_state')}"
+        )
+        return signature
+
+    def build_trade_memory_record(self, position_summary=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, position_profile=None, decision=None, exit_reason=None, exit_price=None, realized_pnl_delta=None, hold_seconds=None, trade_mode=None, notes=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        notes = notes if isinstance(notes, dict) else {"notes": notes}
+        ticker = str(position_summary.get("ticker") or position_profile.get("ticker") or predictive_profile.get("ticker") or awareness_profile.get("ticker") or "").strip()
+        family = str(position_summary.get("family") or position_profile.get("family") or adaptive_profile.get("family") or awareness_profile.get("family") or self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN").strip().upper()
+        category = str(position_summary.get("category") or position_profile.get("category") or adaptive_profile.get("category") or awareness_profile.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower()
+        series_ticker = str(position_summary.get("series_ticker") or position_profile.get("series_ticker") or adaptive_profile.get("series_ticker") or awareness_profile.get("series_ticker") or "").strip().upper()
+        side = str(position_summary.get("side") or position_profile.get("side") or decision.get("side") or "unknown").strip().lower()
+        entry_price = self.to_float(position_summary.get("entry_price"), None)
+        if entry_price is None:
+            entry_price = self.to_float(position_summary.get("avg_price"), None)
+        if entry_price is None:
+            entry_price = self.to_float(position_profile.get("entry_price"), None)
+        if exit_price is None:
+            exit_price = self.to_float(decision.get("current_price"), None)
+        if realized_pnl_delta is None:
+            realized_pnl_delta = self.to_float(decision.get("unrealized_pnl_cents"), None)
+            if realized_pnl_delta is not None:
+                realized_pnl_delta = realized_pnl_delta / 100.0
+        if realized_pnl_delta is None:
+            realized_pnl_delta = self.to_float(position_profile.get("unrealized_pnl_delta"), None)
+        if hold_seconds is None:
+            hold_seconds = self.to_float(position_summary.get("hold_seconds"), None)
+        if hold_seconds is None:
+            hold_seconds = self.to_float(decision.get("hold_seconds"), None)
+        if hold_seconds is None:
+            hold_seconds = self.to_float(position_profile.get("hold_seconds"), None)
+        if exit_reason is None:
+            exit_reason = decision.get("reason") or position_profile.get("management_mode") or "unknown"
+        outcome = "unknown"
+        if realized_pnl_delta is not None:
+            if realized_pnl_delta > 0:
+                outcome = "win"
+            elif realized_pnl_delta < 0:
+                outcome = "loss"
+            elif realized_pnl_delta == 0:
+                outcome = "breakeven"
+        setup_signature = self.build_setup_signature(
+            {
+                "ticker": ticker,
+                "category": category,
+                "liquidity_regime": awareness_profile.get("liquidity_regime") or adaptive_profile.get("liquidity_regime") or "unknown",
+                "trend_regime": awareness_profile.get("trend_regime") or adaptive_profile.get("trend_regime") or "unknown",
+                "volatility_class": awareness_profile.get("volatility_class") or predictive_profile.get("volatility_class") or "unknown",
+                "adaptive_mode": adaptive_profile.get("adaptive_mode") or "unknown",
+                "momentum_strength": predictive_profile.get("momentum_strength") or "unknown",
+                "breakout_state": predictive_profile.get("breakout_state") or "unknown",
+                "position_health": position_profile.get("position_health") or "unknown",
+                "conviction_level": position_profile.get("conviction_level") or "unknown",
+            }
+        )
+        memory_tags = [
+            category,
+            str(adaptive_profile.get("adaptive_mode") or "unknown").strip().lower(),
+            str(predictive_profile.get("breakout_state") or "unknown").strip().lower(),
+            str(position_profile.get("position_health") or "unknown").strip().lower(),
+            str(position_profile.get("conviction_level") or "unknown").strip().lower(),
+        ]
+        memory_tags = [tag for tag in dict.fromkeys(tag for tag in memory_tags if tag)]
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp_ts": time.time(),
+            "ticker": ticker,
+            "category": category,
+            "family": family,
+            "series_ticker": series_ticker,
+            "side": side,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "realized_pnl_delta": realized_pnl_delta,
+            "hold_seconds": hold_seconds,
+            "outcome": outcome,
+            "exit_reason": str(exit_reason or "unknown"),
+            "realm_ix_awareness_score": self.to_float(awareness_profile.get("awareness_score"), None),
+            "realm_x_adaptive_score": self.to_float(adaptive_profile.get("adaptive_score", adaptive_profile.get("realm_x_adaptive_score")), None),
+            "realm_x_adaptive_mode": adaptive_profile.get("adaptive_mode", "unknown"),
+            "realm_x_take_profit_mode": adaptive_profile.get("take_profit_mode", "unknown"),
+            "realm_x_stop_behavior_mode": adaptive_profile.get("stop_behavior_mode", "unknown"),
+            "realm_xi_predictive_score": self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), None),
+            "realm_xi_momentum_direction": predictive_profile.get("momentum_direction", "unknown"),
+            "realm_xi_momentum_strength": predictive_profile.get("momentum_strength", "unknown"),
+            "realm_xi_breakout_state": predictive_profile.get("breakout_state", "unknown"),
+            "realm_xii_position_score": self.to_float(position_profile.get("position_score"), None),
+            "realm_xii_position_health": position_profile.get("position_health", "unknown"),
+            "realm_xii_conviction_level": position_profile.get("conviction_level", "unknown"),
+            "setup_signature": setup_signature,
+            "memory_tags": memory_tags,
+            "notes": notes,
+            "trade_mode": trade_mode or position_summary.get("mode") or position_profile.get("trade_mode") or "live",
+        }
+        print(
+            f"[REALM-XIII-MEMORY-RECORD] ticker={ticker} category={category} family={family} setup_signature={setup_signature} "
+            f"outcome={outcome} realized_pnl_delta={realized_pnl_delta} hold_seconds={hold_seconds} exit_reason={exit_reason}"
+        )
+        return record
+
+    def record_trade_memory(self, record):
+        record = record if isinstance(record, dict) else {}
+        if not record:
+            return {"ok": False, "reason": "empty_record"}
+        write_result = self.safe_memory_write(record)
+        if write_result.get("ok"):
+            return write_result
+        return write_result
+
+    def compute_memory_score(self, memory_stats=None, weak_pattern=None, strong_pattern=None):
+        memory_stats = memory_stats if isinstance(memory_stats, dict) else {}
+        confidence_sample_size = int(memory_stats.get("confidence_sample_size", 0) or 0)
+        if confidence_sample_size <= 0:
+            return {"memory_score": 0.5, "score_delta": 0.0, "memory_reasons": ["no_memory_data"]}
+        base_score = self.to_float(memory_stats.get("memory_score"), 0.5)
+        score = self._clamp(base_score)
+        if weak_pattern and weak_pattern.get("detected"):
+            score -= 0.10
+        if strong_pattern and strong_pattern.get("detected"):
+            score += 0.10
+        if memory_stats.get("sample_size_quality") in {"tiny", "small"}:
+            score = 0.5 + ((score - 0.5) * (0.5 if memory_stats.get("sample_size_quality") == "small" else 0.25))
+        elif memory_stats.get("sample_size_quality") == "medium":
+            score = 0.5 + ((score - 0.5) * 0.75)
+        score = self._clamp(score)
+        return {
+            "memory_score": round(score, 4),
+            "score_delta": round((score - 0.5) * 2.0, 4),
+            "memory_reasons": list(dict.fromkeys((memory_stats.get("memory_reasons") or []) + (weak_pattern.get("memory_reasons") if weak_pattern else []) + (strong_pattern.get("memory_reasons") if strong_pattern else []))),
+        }
+
+    def detect_weak_pattern(self, memory_stats=None):
+        memory_stats = memory_stats if isinstance(memory_stats, dict) else {}
+        sample_size = int(memory_stats.get("confidence_sample_size", 0) or 0)
+        win_rate = self.to_float(memory_stats.get("estimated_win_rate"), None)
+        avg_pnl = self.to_float(memory_stats.get("average_pnl_delta"), None)
+        avg_predictive = self.to_float(memory_stats.get("average_predictive_score"), None)
+        memory_bias = str(memory_stats.get("memory_bias") or "unknown").strip().lower()
+        reasons = []
+        detected = False
+        if sample_size >= 2 and (win_rate is not None and win_rate < 0.45):
+            detected = True
+            reasons.append("low_win_rate")
+        if sample_size >= 2 and (avg_pnl is not None and avg_pnl < 0):
+            detected = True
+            reasons.append("negative_average_pnl")
+        if sample_size >= 2 and memory_bias == "negative":
+            detected = True
+            reasons.append("negative_bias")
+        if sample_size >= 2 and avg_predictive is not None and avg_predictive >= 0.7 and (win_rate is not None and win_rate < 0.45):
+            detected = True
+            reasons.append("high_predictive_poor_outcomes")
+        if memory_stats.get("sample_size_quality") in {"tiny", "none"}:
+            reasons.append("small_sample")
+        return {"detected": detected, "memory_reasons": reasons}
+
+    def detect_strong_pattern(self, memory_stats=None):
+        memory_stats = memory_stats if isinstance(memory_stats, dict) else {}
+        sample_size = int(memory_stats.get("confidence_sample_size", 0) or 0)
+        win_rate = self.to_float(memory_stats.get("estimated_win_rate"), None)
+        avg_pnl = self.to_float(memory_stats.get("average_pnl_delta"), None)
+        avg_predictive = self.to_float(memory_stats.get("average_predictive_score"), None)
+        memory_bias = str(memory_stats.get("memory_bias") or "unknown").strip().lower()
+        reasons = []
+        detected = False
+        if sample_size >= 2 and (win_rate is not None and win_rate >= 0.6):
+            detected = True
+            reasons.append("high_win_rate")
+        if sample_size >= 2 and (avg_pnl is not None and avg_pnl > 0):
+            detected = True
+            reasons.append("positive_average_pnl")
+        if sample_size >= 2 and memory_bias == "positive":
+            detected = True
+            reasons.append("positive_bias")
+        if sample_size >= 2 and avg_predictive is not None and avg_predictive >= 0.7 and (win_rate is not None and win_rate >= 0.55):
+            detected = True
+            reasons.append("high_predictive_good_outcomes")
+        return {"detected": detected, "memory_reasons": reasons}
+
+    def build_memory_profile(self, market=None, q=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, position_profile=None, candidate_confidence=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else None
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or position_profile.get("ticker") or predictive_profile.get("ticker") or "").strip()
+        family = str(position_profile.get("family") or adaptive_profile.get("family") or awareness_profile.get("family") or self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN").strip().upper()
+        category = str(position_profile.get("category") or adaptive_profile.get("category") or awareness_profile.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower()
+        setup_signature = self.build_setup_signature(
+            {
+                "ticker": ticker,
+                "category": category,
+                "liquidity_regime": awareness_profile.get("liquidity_regime") or adaptive_profile.get("liquidity_regime") or "unknown",
+                "trend_regime": awareness_profile.get("trend_regime") or adaptive_profile.get("trend_regime") or "unknown",
+                "volatility_class": awareness_profile.get("volatility_class") or predictive_profile.get("volatility_class") or "unknown",
+                "adaptive_mode": adaptive_profile.get("adaptive_mode") or "unknown",
+                "momentum_strength": predictive_profile.get("momentum_strength") or "unknown",
+                "breakout_state": predictive_profile.get("breakout_state") or "unknown",
+                "position_health": position_profile.get("position_health") or "unknown",
+                "conviction_level": position_profile.get("conviction_level") or "unknown",
+            }
+        )
+        exact_stats = self.load_memory_stats({
+            "ticker": ticker,
+            "category": category,
+            "family": family,
+            "setup_signature": setup_signature,
+            "adaptive_mode": adaptive_profile.get("adaptive_mode"),
+            "breakout_state": predictive_profile.get("breakout_state"),
+            "limit": SERAPH_MEMORY_READ_LIMIT,
+        })
+        ticker_stats = self.load_memory_stats({"ticker": ticker, "limit": SERAPH_MEMORY_READ_LIMIT}) if ticker else {"total_seen": 0, "confidence_sample_size": 0, "memory_score": 0.5, "memory_bias": "unknown", "memory_reasons": []}
+        category_stats = self.load_memory_stats({"category": category, "limit": SERAPH_MEMORY_READ_LIMIT}) if category else {"total_seen": 0, "confidence_sample_size": 0, "memory_score": 0.5, "memory_bias": "unknown", "memory_reasons": []}
+        family_stats = self.load_memory_stats({"family": family, "limit": SERAPH_MEMORY_READ_LIMIT}) if family else {"total_seen": 0, "confidence_sample_size": 0, "memory_score": 0.5, "memory_bias": "unknown", "memory_reasons": []}
+        signature_stats = self.load_memory_stats({"setup_signature": setup_signature, "limit": SERAPH_MEMORY_READ_LIMIT}) if setup_signature else {"total_seen": 0, "confidence_sample_size": 0, "memory_score": 0.5, "memory_bias": "unknown", "memory_reasons": []}
+        adaptive_stats = self.load_memory_stats({"adaptive_mode": adaptive_profile.get("adaptive_mode"), "limit": SERAPH_MEMORY_READ_LIMIT}) if adaptive_profile.get("adaptive_mode") else {"total_seen": 0, "confidence_sample_size": 0, "memory_score": 0.5, "memory_bias": "unknown", "memory_reasons": []}
+        breakout_stats = self.load_memory_stats({"breakout_state": predictive_profile.get("breakout_state"), "limit": SERAPH_MEMORY_READ_LIMIT}) if predictive_profile.get("breakout_state") else {"total_seen": 0, "confidence_sample_size": 0, "memory_score": 0.5, "memory_bias": "unknown", "memory_reasons": []}
+        scope_stats = {
+            "ticker": ticker_stats,
+            "category": category_stats,
+            "family": family_stats,
+            "setup_signature": signature_stats,
+            "adaptive_mode": adaptive_stats,
+            "breakout_state": breakout_stats,
+        }
+        exact_sample_size = int(exact_stats.get("confidence_sample_size", 0) or 0)
+        has_exact_memory = exact_sample_size > 0
+        if has_exact_memory:
+            strong_pattern = self.detect_strong_pattern(exact_stats)
+            weak_pattern = self.detect_weak_pattern(exact_stats)
+            total_seen = int(exact_stats.get("total_seen", 0) or 0)
+            estimated_win_rate = self.to_float(exact_stats.get("estimated_win_rate"), None)
+            average_pnl_delta = self.to_float(exact_stats.get("average_pnl_delta"), None)
+            average_hold_seconds = self.to_float(exact_stats.get("average_hold_seconds"), None)
+            confidence_sample_size = exact_sample_size
+            weighted_score = self.to_float(exact_stats.get("memory_score"), 0.5)
+            memory_bias = exact_stats.get("memory_bias") or "unknown"
+        else:
+            strong_pattern = {"detected": False, "memory_reasons": []}
+            weak_pattern = {"detected": False, "memory_reasons": []}
+            total_seen = 0
+            estimated_win_rate = None
+            average_pnl_delta = None
+            average_hold_seconds = None
+            confidence_sample_size = 0
+            weighted_score = 0.5
+            memory_bias = "unknown"
+        if confidence_sample_size <= 0:
+            sample_size_quality = "none"
+        elif confidence_sample_size < 3:
+            sample_size_quality = "tiny"
+        elif confidence_sample_size < 8:
+            sample_size_quality = "small"
+        elif confidence_sample_size < 20:
+            sample_size_quality = "medium"
+        else:
+            sample_size_quality = "strong"
+        if memory_bias == "unknown" and confidence_sample_size > 0:
+            if estimated_win_rate is not None and estimated_win_rate >= 0.58:
+                memory_bias = "positive"
+            elif estimated_win_rate is not None and estimated_win_rate <= 0.42:
+                memory_bias = "negative"
+            elif average_pnl_delta is not None and average_pnl_delta > 0:
+                memory_bias = "positive"
+            elif average_pnl_delta is not None and average_pnl_delta < 0:
+                memory_bias = "negative"
+            else:
+                memory_bias = "neutral"
+        memory_score_payload = self.compute_memory_score(
+            {
+                "memory_score": weighted_score,
+                "confidence_sample_size": confidence_sample_size,
+                "sample_size_quality": sample_size_quality,
+                "estimated_win_rate": estimated_win_rate,
+                "average_pnl_delta": average_pnl_delta,
+                "memory_bias": memory_bias,
+                "memory_reasons": signature_stats.get("memory_reasons", []),
+            },
+            weak_pattern=weak_pattern,
+            strong_pattern=strong_pattern,
+        )
+        memory_score = self._clamp(memory_score_payload.get("memory_score", 0.5))
+        memory_reasons = []
+        if has_exact_memory:
+            for stats in scope_stats.values():
+                memory_reasons.extend(stats.get("memory_reasons", []) or [])
+        memory_reasons.extend(memory_score_payload.get("memory_reasons", []) or [])
+        if candidate_confidence is not None:
+            memory_reasons.append(f"candidate_confidence={self._safe_round(candidate_confidence, 4, 0.0)}")
+        memory_reasons = list(dict.fromkeys(str(reason) for reason in memory_reasons if reason is not None and str(reason).strip()))
+        print(
+            f"[REALM-XIII-MEMORY-READ] ticker={ticker} category={category} family={family} setup_signature={setup_signature} "
+            f"total_seen={total_seen} wins={signature_stats.get('wins', 0)} losses={signature_stats.get('losses', 0)} "
+            f"breakevens={signature_stats.get('breakevens', 0)} unknowns={signature_stats.get('unknowns', 0)} "
+            f"estimated_win_rate={self._safe_round(estimated_win_rate, 4, None)} average_pnl_delta={self._safe_round(average_pnl_delta, 4, None)} "
+            f"average_hold_seconds={self._safe_round(average_hold_seconds, 4, None)} confidence_sample_size={confidence_sample_size} memory_bias={memory_bias}"
+        )
+        weak_pattern_detected = bool(weak_pattern.get("detected"))
+        strong_pattern_detected = bool(strong_pattern.get("detected"))
+        if weak_pattern_detected:
+            print(
+                f"[REALM-XIII-WEAK-PATTERN] ticker={ticker} category={category} family={family} setup_signature={setup_signature} "
+                f"confidence_sample_size={confidence_sample_size} reasons={weak_pattern.get('memory_reasons', [])}"
+            )
+        if strong_pattern_detected:
+            print(
+                f"[REALM-XIII-STRONG-PATTERN] ticker={ticker} category={category} family={family} setup_signature={setup_signature} "
+                f"confidence_sample_size={confidence_sample_size} reasons={strong_pattern.get('memory_reasons', [])}"
+            )
+        memory_profile = {
+            "ticker": ticker,
+            "category": category,
+            "family": family,
+            "series_ticker": position_profile.get("series_ticker") or adaptive_profile.get("series_ticker") or awareness_profile.get("series_ticker"),
+            "setup_signature": setup_signature,
+            "total_seen": int(total_seen or 0),
+            "estimated_win_rate": self._safe_round(estimated_win_rate, 4, None),
+            "average_pnl_delta": self._safe_round(average_pnl_delta, 4, None),
+            "average_hold_seconds": self._safe_round(average_hold_seconds, 4, None),
+            "memory_bias": memory_bias,
+            "memory_score": memory_score,
+            "sample_size_quality": sample_size_quality,
+            "weak_pattern_detected": "yes" if weak_pattern_detected else "no",
+            "strong_pattern_detected": "yes" if strong_pattern_detected else "no",
+            "memory_reasons": memory_reasons,
+            "confidence_sample_size": confidence_sample_size,
+            "scope_stats": scope_stats,
+        }
+        print(
+            f"[REALM-XIII-SCORE] ticker={ticker} category={category} setup_signature={setup_signature} memory_bias={memory_bias} "
+            f"memory_score={memory_score} confidence_sample_size={confidence_sample_size} weak_pattern_detected={memory_profile['weak_pattern_detected']} "
+            f"strong_pattern_detected={memory_profile['strong_pattern_detected']} reasons={memory_reasons}"
+        )
+        return memory_profile
+
+    def apply_memory_influence(self, candidate, memory_profile=None):
+        candidate = candidate if isinstance(candidate, tuple) and len(candidate) >= 4 else None
+        memory_profile = memory_profile if isinstance(memory_profile, dict) else {}
+        if candidate is None:
+            return candidate, {"memory_score_delta": 0.0, "adjusted_score": 0.0, "memory_reasons": ["invalid_candidate"]}
+        score, q, spread, family = candidate[:4]
+        ticker = str(getattr(q, "ticker", "") or "").strip()
+        awareness_bias = str(memory_profile.get("memory_bias") or "unknown").strip().lower()
+        sample_quality = str(memory_profile.get("sample_size_quality") or "none").strip().lower()
+        memory_score = self._clamp(self.to_float(memory_profile.get("memory_score"), 0.5))
+        confidence_sample_size = int(memory_profile.get("confidence_sample_size", 0) or 0)
+        if confidence_sample_size <= 0 or awareness_bias == "unknown":
+            delta = 0.0
+        else:
+            delta = (memory_score - 0.5) * 2.5
+            if memory_profile.get("weak_pattern_detected") == "yes":
+                delta -= 0.65
+            if memory_profile.get("strong_pattern_detected") == "yes":
+                delta += 0.35
+            if sample_quality in {"none", "tiny"}:
+                delta *= 0.15
+            elif sample_quality == "small":
+                delta *= 0.35
+            elif sample_quality == "medium":
+                delta *= 0.75
+            elif sample_quality == "strong":
+                delta *= 1.0
+            if awareness_bias == "negative":
+                delta = min(delta, 0.0)
+            elif awareness_bias == "positive":
+                delta = max(delta, 0.0)
+        if awareness_bias != "unknown":
+            delta = max(-1.5, min(1.5, delta))
+        adjusted_score = self.to_float(score, 0.0) + delta
+        if str(memory_profile.get("memory_bias") or "unknown").strip().lower() == "negative":
+            adjusted_score = min(adjusted_score, self.to_float(score, 0.0))
+        print(
+            f"[REALM-XIII-INFLUENCE] ticker={ticker} category={memory_profile.get('category')} family={memory_profile.get('family')} "
+            f"setup_signature={memory_profile.get('setup_signature')} original_score={self.to_float(score, 0.0)} memory_score={memory_score} "
+            f"memory_score_delta={round(delta, 4)} adjusted_score={round(adjusted_score, 4)} memory_bias={memory_profile.get('memory_bias')}"
+        )
+        return (adjusted_score, q, spread, family), {"memory_score_delta": round(delta, 4), "adjusted_score": round(adjusted_score, 4), "memory_reasons": memory_profile.get("memory_reasons", [])}
+
+    def summarize_memory_profiles(self, profiles):
+        profiles = profiles or []
+        summary = {
+            "total_memory_records": 0,
+            "candidates_with_memory": 0,
+            "candidates_without_memory": 0,
+            "positive_memory_count": 0,
+            "negative_memory_count": 0,
+            "neutral_memory_count": 0,
+            "weak_patterns_detected": 0,
+            "strong_patterns_detected": 0,
+            "average_memory_score": 0.0,
+            "top_memory_supported_tickers": [],
+            "top_memory_penalized_tickers": [],
+        }
+        total_score = 0.0
+        supported = []
+        penalized = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            memory_score = self.to_float(profile.get("memory_score"), 0.5)
+            total_score += memory_score
+            if int(profile.get("total_seen", 0) or 0) > 0:
+                summary["candidates_with_memory"] += 1
+            else:
+                summary["candidates_without_memory"] += 1
+            bias = str(profile.get("memory_bias") or "unknown").strip().lower()
+            if bias == "positive":
+                summary["positive_memory_count"] += 1
+            elif bias == "negative":
+                summary["negative_memory_count"] += 1
+            else:
+                summary["neutral_memory_count"] += 1
+            if str(profile.get("weak_pattern_detected") or "no").strip().lower() == "yes":
+                summary["weak_patterns_detected"] += 1
+            if str(profile.get("strong_pattern_detected") or "no").strip().lower() == "yes":
+                summary["strong_patterns_detected"] += 1
+            supported.append((memory_score, str(profile.get("ticker") or "").strip()))
+            penalized.append((memory_score, str(profile.get("ticker") or "").strip()))
+        try:
+            summary["total_memory_records"] = int(self.safe_memory_read(limit=1).get("total_records", 0) or 0)
+        except Exception:
+            summary["total_memory_records"] = 0
+        summary["average_memory_score"] = round(total_score / len(profiles), 4) if profiles else 0.5
+        summary["top_memory_supported_tickers"] = [ticker for _score, ticker in sorted(supported, key=lambda item: item[0], reverse=True)[:5] if ticker]
+        summary["top_memory_penalized_tickers"] = [ticker for _score, ticker in sorted(penalized, key=lambda item: item[0])[:5] if ticker]
+        print(
+            f"[REALM-XIII-SUMMARY] total_memory_records={summary['total_memory_records']} candidates_with_memory={summary['candidates_with_memory']} "
+            f"candidates_without_memory={summary['candidates_without_memory']} positive_memory_count={summary['positive_memory_count']} "
+            f"negative_memory_count={summary['negative_memory_count']} neutral_memory_count={summary['neutral_memory_count']} "
+            f"weak_patterns_detected={summary['weak_patterns_detected']} strong_patterns_detected={summary['strong_patterns_detected']} "
+            f"average_memory_score={summary['average_memory_score']} top_memory_supported_tickers={summary['top_memory_supported_tickers']} "
+            f"top_memory_penalized_tickers={summary['top_memory_penalized_tickers']}"
+        )
+        return summary
+
+    def profile_memory_intelligence(self, markets, memory_candidates):
+        markets = markets or []
+        memory_candidates = memory_candidates or []
+        market_lookup = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+        awareness_lookup = self.market_awareness_profiles if isinstance(self.market_awareness_profiles, dict) else {}
+        adaptive_lookup = self.market_adaptive_profiles if isinstance(self.market_adaptive_profiles, dict) else {}
+        predictive_lookup = self.market_predictive_profiles if isinstance(self.market_predictive_profiles, dict) else {}
+        position_lookup = self.market_position_profiles if isinstance(self.market_position_profiles, dict) else {}
+        profiled_candidates = []
+        profiles = []
+        for candidate in memory_candidates:
+            if not isinstance(candidate, tuple) or len(candidate) < 4:
+                continue
+            score, q, spread, family = candidate[:4]
+            ticker = str(getattr(q, "ticker", "") or "").strip()
+            market = market_lookup.get(ticker, {})
+            awareness_profile = awareness_lookup.get(ticker, {}) if isinstance(awareness_lookup.get(ticker, {}), dict) else {}
+            adaptive_profile = adaptive_lookup.get(ticker, {}) if isinstance(adaptive_lookup.get(ticker, {}), dict) else {}
+            predictive_profile = predictive_lookup.get(ticker, {}) if isinstance(predictive_lookup.get(ticker, {}), dict) else {}
+            position_profile = position_lookup.get(ticker, {}) if isinstance(position_lookup.get(ticker, {}), dict) else {}
+            if not awareness_profile:
+                awareness_profile = self.build_market_awareness_profile(market, q=q, spread=spread, family=family, raw_rank_score=score)
+            if not adaptive_profile:
+                adaptive_profile = self.build_adaptive_behavior_profile(market, q=q, awareness_profile=awareness_profile, adaptive_score_hint=score)
+            if not predictive_profile:
+                predictive_profile = self.build_predictive_momentum_profile(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile, candidate_confidence=score)
+            if not position_profile:
+                position_profile = self.market_position_profiles.get(ticker, {}) if isinstance(self.market_position_profiles, dict) else {}
+            memory_profile = self.build_memory_profile(
+                market=market,
+                q=q,
+                awareness_profile=awareness_profile,
+                adaptive_profile=adaptive_profile,
+                predictive_profile=predictive_profile,
+                position_profile=position_profile,
+                candidate_confidence=score,
+            )
+            adjusted_candidate, influence_payload = self.apply_memory_influence(candidate, memory_profile)
+            profiles.append(memory_profile)
+            profiled_candidates.append(adjusted_candidate)
+            print(
+                f"[REALM-XIII-PROFILE] ticker={memory_profile.get('ticker')} category={memory_profile.get('category')} setup_signature={memory_profile.get('setup_signature')} "
+                f"total_seen={memory_profile.get('total_seen')} estimated_win_rate={memory_profile.get('estimated_win_rate')} average_pnl_delta={memory_profile.get('average_pnl_delta')} "
+                f"memory_bias={memory_profile.get('memory_bias')} memory_score={memory_profile.get('memory_score')} sample_size_quality={memory_profile.get('sample_size_quality')} "
+                f"weak_pattern_detected={memory_profile.get('weak_pattern_detected')} strong_pattern_detected={memory_profile.get('strong_pattern_detected')} reasons={memory_profile.get('memory_reasons', [])}"
+            )
+        summary = self.summarize_memory_profiles(profiles)
+        self.market_memory_profiles = {profile.get("ticker"): profile for profile in profiles if profile.get("ticker")}
+        self.last_market_memory_summary = summary
+        return profiled_candidates, summary
+    def seraph_scout_agent(self, awareness_profile=None, position_profile=None):
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        liquidity_regime = str(awareness_profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(awareness_profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(awareness_profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(awareness_profile.get("session_state") or "unknown").strip().lower()
+        awareness_score = self._clamp(self.to_float(awareness_profile.get("awareness_score"), 0.0))
+        reasons = []
+        if liquidity_regime == "dead" or position_profile.get("position_health") == "danger":
+            signal = "avoid"
+            reasons.append("dead_or_danger")
+        elif liquidity_regime == "strong" and trend_regime == "trending" and session_state == "active" and awareness_score >= 0.65:
+            signal = "strong"
+            reasons.append("strong_market_conditions")
+        elif liquidity_regime in {"tradable", "thin"} and trend_regime in {"trending", "flat"} and awareness_score >= 0.40:
+            signal = "neutral" if liquidity_regime == "thin" else "weak"
+            reasons.append("usable_but_not_ideal")
+        elif liquidity_regime == "unknown" or trend_regime == "unknown" or session_state == "unknown":
+            signal = "unknown"
+            reasons.append("insufficient_scouter_data")
+        else:
+            signal = "weak"
+            reasons.append("soft_market_quality")
+        print(f"[REALM-XIV-SCOUT] ticker={awareness_profile.get('ticker')} category={awareness_profile.get('category')} signal={signal} liquidity_regime={liquidity_regime} volatility_class={volatility_class} trend_regime={trend_regime} session_state={session_state} awareness_score={awareness_score} reasons={reasons}")
+        return {"signal": signal, "reasons": reasons, "awareness_score": awareness_score, "liquidity_regime": liquidity_regime, "volatility_class": volatility_class, "trend_regime": trend_regime, "session_state": session_state}
+
+    def seraph_oracle_agent(self, predictive_profile=None, awareness_profile=None):
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        predictive_score = self._clamp(self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0))
+        momentum_strength = str(predictive_profile.get("momentum_strength") or "unknown").strip().lower()
+        breakout_state = str(predictive_profile.get("breakout_state") or "unknown").strip().lower()
+        confluence_count = int(self.to_float(predictive_profile.get("confluence_count"), 0.0) or 0)
+        velocity_state = str(predictive_profile.get("velocity_state") or "unknown").strip().lower()
+        orderbook_pressure = str(predictive_profile.get("orderbook_pressure") or "unknown").strip().lower()
+        trend_regime = str(awareness_profile.get("trend_regime") or "unknown").strip().lower()
+        reasons = []
+        if momentum_strength == "unknown" or breakout_state == "unknown":
+            signal = "unknown"
+            reasons.append("missing_predictive_data")
+        elif predictive_score >= 0.8 and momentum_strength == "strong":
+            signal = "high_momentum"
+            reasons.append("strong_predictive_support")
+        elif predictive_score >= 0.65 and breakout_state in {"pre_breakout", "confirmed_breakout"} and confluence_count >= 4:
+            signal = "bullish"
+            reasons.append("breakout_confluence")
+        elif predictive_score <= 0.35 or breakout_state == "failed_breakout" or trend_regime == "choppy":
+            signal = "bearish"
+            reasons.append("weak_or_failed_breakout")
+        else:
+            signal = "neutral"
+            reasons.append("mixed_predictive_signal")
+        print(f"[REALM-XIV-ORACLE] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} signal={signal} momentum_strength={momentum_strength} breakout_state={breakout_state} confluence_count={confluence_count} velocity_state={velocity_state} orderbook_pressure={orderbook_pressure} predictive_score={predictive_score} reasons={reasons}")
+        return {"signal": signal, "reasons": reasons, "predictive_score": predictive_score, "momentum_strength": momentum_strength, "breakout_state": breakout_state, "confluence_count": confluence_count, "velocity_state": velocity_state, "orderbook_pressure": orderbook_pressure}
+
+    def seraph_guardian_agent(self, position_profile=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, memory_profile=None, open_positions=None, cluster_snapshot=None):
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        memory_profile = memory_profile if isinstance(memory_profile, dict) else {}
+        cluster_snapshot = cluster_snapshot if isinstance(cluster_snapshot, dict) else {}
+        liquidity_regime = str(awareness_profile.get("liquidity_regime") or adaptive_profile.get("liquidity_regime") or "unknown").strip().lower()
+        position_health = str(position_profile.get("position_health") or "unknown").strip().lower()
+        exposure_warning = str(position_profile.get("exposure_cluster_warning") or ("yes" if cluster_snapshot.get("warning") else "no" if cluster_snapshot.get("warning") is False else "unknown")).strip().lower()
+        memory_bias = str(memory_profile.get("memory_bias") or "unknown").strip().lower()
+        reasons = []
+        if liquidity_regime == "dead" or position_health == "danger":
+            signal = "blocked"
+            reasons.append("dead_or_danger")
+        elif exposure_warning == "yes" or cluster_snapshot.get("warning"):
+            signal = "caution"
+            reasons.append("exposure_warning")
+        elif liquidity_regime in {"thin", "unknown"} or position_health in {"weak", "unknown"}:
+            signal = "caution" if liquidity_regime != "dead" else "blocked"
+            reasons.append("liquidity_or_health_uncertain")
+        else:
+            signal = "clear"
+            reasons.append("safety_clear")
+        if memory_bias == "negative" and signal == "clear":
+            signal = "caution"
+            reasons.append("negative_memory_soften")
+        print(f"[REALM-XIV-GUARDIAN] ticker={position_profile.get('ticker')} category={position_profile.get('category')} signal={signal} liquidity_regime={liquidity_regime} exposure_warning={exposure_warning} position_health={position_health} memory_bias={memory_bias} reasons={reasons}")
+        return {"signal": signal, "reasons": reasons, "liquidity_regime": liquidity_regime, "position_health": position_health, "exposure_warning": exposure_warning, "memory_bias": memory_bias}
+
+    def seraph_executor_agent(self, adaptive_profile=None, position_profile=None, predictive_profile=None):
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        adaptive_mode = str(adaptive_profile.get("adaptive_mode") or "unknown").strip().lower()
+        entry_strictness = str(adaptive_profile.get("entry_strictness") or "unknown").strip().lower()
+        spread_tolerance = str(adaptive_profile.get("spread_tolerance_mode") or "unknown").strip().lower()
+        timing_mode = str(adaptive_profile.get("timing_mode") or "unknown").strip().lower()
+        take_profit_mode = str(adaptive_profile.get("take_profit_mode") or "unknown").strip().lower()
+        stop_behavior_mode = str(adaptive_profile.get("stop_behavior_mode") or "unknown").strip().lower()
+        management_mode = str(position_profile.get("management_mode") or "unknown").strip().lower()
+        position_health = str(position_profile.get("position_health") or "unknown").strip().lower()
+        reasons = []
+        if adaptive_mode in {"avoid", "defensive"} or position_health in {"danger", "unknown"}:
+            signal = "wait" if position_health != "danger" else "not_ready"
+            reasons.append("defensive_or_risk_constrained")
+        elif adaptive_mode in {"opportunistic", "aggressive"} and entry_strictness in {"strict", "normal", "flexible"} and spread_tolerance in {"normal", "flexible"} and management_mode in {"hold", "press", "protect"}:
+            signal = "preferred" if predictive_profile.get("predictive_score", 0.0) and self.to_float(predictive_profile.get("predictive_score"), 0.0) >= 0.75 else "ready"
+            reasons.append("execution_conditions_supportive")
+        elif adaptive_mode == "normal":
+            signal = "ready"
+            reasons.append("normal_execution_profile")
+        else:
+            signal = "wait"
+            reasons.append("insufficient_execution_signal")
+        if take_profit_mode in {"quick_profit", "defensive_take_profit"} and signal == "preferred":
+            signal = "ready"
+            reasons.append("profit_profile_softened")
+        print(f"[REALM-XIV-EXECUTOR] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} signal={signal} adaptive_mode={adaptive_mode} entry_strictness={entry_strictness} spread_tolerance_mode={spread_tolerance} timing_mode={timing_mode} take_profit_mode={take_profit_mode} stop_behavior_mode={stop_behavior_mode} management_mode={management_mode} reasons={reasons}")
+        return {"signal": signal, "reasons": reasons, "adaptive_mode": adaptive_mode, "entry_strictness": entry_strictness, "spread_tolerance_mode": spread_tolerance, "timing_mode": timing_mode, "take_profit_mode": take_profit_mode, "stop_behavior_mode": stop_behavior_mode, "management_mode": management_mode}
+
+    def seraph_archivist_agent(self, memory_profile=None):
+        memory_profile = memory_profile if isinstance(memory_profile, dict) else {}
+        memory_score = self._clamp(self.to_float(memory_profile.get("memory_score"), 0.5))
+        memory_bias = str(memory_profile.get("memory_bias") or "unknown").strip().lower()
+        weak_pattern = str(memory_profile.get("weak_pattern_detected") or "no").strip().lower() == "yes"
+        strong_pattern = str(memory_profile.get("strong_pattern_detected") or "no").strip().lower() == "yes"
+        reasons = list(memory_profile.get("memory_reasons", []) or [])
+        if memory_bias == "positive" or strong_pattern:
+            signal = "positive_memory"
+        elif memory_bias == "negative" or weak_pattern:
+            signal = "negative_memory"
+        elif memory_bias == "unknown":
+            signal = "unknown"
+        else:
+            signal = "neutral_memory"
+        print(f"[REALM-XIV-ARCHIVIST] ticker={memory_profile.get('ticker')} category={memory_profile.get('category')} signal={signal} memory_bias={memory_bias} memory_score={memory_score} weak_pattern_detected={weak_pattern} strong_pattern_detected={strong_pattern} reasons={reasons}")
+        return {"signal": signal, "reasons": reasons, "memory_score": memory_score, "memory_bias": memory_bias, "weak_pattern_detected": weak_pattern, "strong_pattern_detected": strong_pattern}
+
+    def detect_agent_disagreement(self, scout=None, oracle=None, guardian=None, executor=None, archivist=None, position_profile=None):
+        scout = scout if isinstance(scout, dict) else {}
+        oracle = oracle if isinstance(oracle, dict) else {}
+        guardian = guardian if isinstance(guardian, dict) else {}
+        executor = executor if isinstance(executor, dict) else {}
+        archivist = archivist if isinstance(archivist, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        reasons = []
+        if oracle.get("signal") in {"high_momentum", "bullish"} and guardian.get("signal") in {"caution", "blocked"}:
+            reasons.append("oracle_vs_guardian")
+        if scout.get("signal") in {"avoid", "weak"} and executor.get("signal") in {"ready", "preferred"}:
+            reasons.append("scout_vs_executor")
+        if archivist.get("signal") == "negative_memory" and oracle.get("signal") in {"bullish", "high_momentum"}:
+            reasons.append("memory_vs_oracle")
+        if oracle.get("signal") in {"bullish", "high_momentum"} and scout.get("signal") in {"avoid", "weak"}:
+            reasons.append("oracle_vs_scout")
+        if str(position_profile.get("management_mode") or "unknown").strip().lower() in {"reduce", "exit_watch"} and executor.get("signal") in {"preferred", "ready"}:
+            reasons.append("position_vs_executor")
+        detected = bool(reasons)
+        if detected:
+            print(f"[REALM-XIV-DISAGREEMENT] ticker={position_profile.get('ticker')} category={position_profile.get('category')} detected=yes reasons={reasons}")
+        return {"detected": detected, "reasons": reasons}
+
+    def compute_council_score(self, scout=None, oracle=None, guardian=None, executor=None, archivist=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, position_profile=None, memory_profile=None, disagreement=None):
+        scout = scout if isinstance(scout, dict) else {}
+        oracle = oracle if isinstance(oracle, dict) else {}
+        guardian = guardian if isinstance(guardian, dict) else {}
+        executor = executor if isinstance(executor, dict) else {}
+        archivist = archivist if isinstance(archivist, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        memory_profile = memory_profile if isinstance(memory_profile, dict) else {}
+        disagreement = disagreement if isinstance(disagreement, dict) else {}
+        scout_map = {"avoid": 0.08, "weak": 0.32, "neutral": 0.52, "strong": 0.78, "unknown": 0.40}
+        oracle_map = {"bearish": 0.18, "neutral": 0.50, "bullish": 0.72, "high_momentum": 0.86, "unknown": 0.40}
+        guardian_map = {"blocked": 0.02, "caution": 0.36, "clear": 0.82, "unknown": 0.40}
+        executor_map = {"not_ready": 0.12, "wait": 0.36, "ready": 0.68, "preferred": 0.86, "unknown": 0.40}
+        archivist_map = {"negative_memory": 0.22, "neutral_memory": 0.50, "positive_memory": 0.72, "unknown": 0.40}
+        scout_score = scout_map.get(str(scout.get("signal") or "unknown").strip().lower(), 0.40)
+        oracle_score = oracle_map.get(str(oracle.get("signal") or "unknown").strip().lower(), 0.40)
+        guardian_score = guardian_map.get(str(guardian.get("signal") or "unknown").strip().lower(), 0.40)
+        executor_score = executor_map.get(str(executor.get("signal") or "unknown").strip().lower(), 0.40)
+        archivist_score = archivist_map.get(str(archivist.get("signal") or "unknown").strip().lower(), 0.40)
+        realm_ix_awareness = self._clamp(self.to_float(awareness_profile.get("awareness_score"), 0.0))
+        realm_x_adaptive = self._clamp(self.to_float(adaptive_profile.get("adaptive_score", adaptive_profile.get("realm_x_adaptive_score")), 0.0))
+        realm_xi_predictive = self._clamp(self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0))
+        realm_xii_position = self._clamp(self.to_float(position_profile.get("position_score"), 0.0))
+        realm_xiii_memory = self._clamp(self.to_float(memory_profile.get("memory_score"), 0.5))
+        base = (
+            scout_score * 0.14
+            + oracle_score * 0.20
+            + guardian_score * 0.20
+            + executor_score * 0.12
+            + archivist_score * 0.10
+            + realm_ix_awareness * 0.08
+            + realm_x_adaptive * 0.08
+            + realm_xi_predictive * 0.08
+            + realm_xii_position * 0.05
+            + realm_xiii_memory * 0.05
+        )
+        reasons = []
+        if guardian.get("signal") == "blocked":
+            base = min(base, 0.10)
+            reasons.append("guardian_blocked")
+        if scout.get("signal") == "avoid":
+            base = min(base, 0.18)
+            reasons.append("scout_avoid")
+        if oracle.get("signal") == "high_momentum":
+            base += 0.05
+            reasons.append("oracle_high_momentum")
+        if executor.get("signal") == "preferred":
+            base += 0.04
+            reasons.append("executor_preferred")
+        if archivist.get("signal") == "positive_memory":
+            base += 0.03
+            reasons.append("positive_memory")
+        if archivist.get("signal") == "negative_memory":
+            base -= 0.04
+            reasons.append("negative_memory")
+        if disagreement.get("detected"):
+            base -= min(0.12, 0.03 * len(disagreement.get("reasons", []) or []))
+            reasons.append("agent_disagreement")
+        if any(value == "unknown" for value in (scout.get("signal"), oracle.get("signal"), guardian.get("signal"), executor.get("signal"), archivist.get("signal"))):
+            base = min(base, 0.58)
+            reasons.append("unknown_cap")
+        return {"council_score": round(self._clamp(base), 4), "council_reasons": reasons}
+
+    def seraph_council_decision(self, scout=None, oracle=None, guardian=None, executor=None, archivist=None, council_score=None, disagreement=None):
+        scout = scout if isinstance(scout, dict) else {}
+        oracle = oracle if isinstance(oracle, dict) else {}
+        guardian = guardian if isinstance(guardian, dict) else {}
+        executor = executor if isinstance(executor, dict) else {}
+        archivist = archivist if isinstance(archivist, dict) else {}
+        disagreement = disagreement if isinstance(disagreement, dict) else {}
+        council_score = self._clamp(self.to_float(council_score, 0.5))
+        reasons = []
+        if guardian.get("signal") == "blocked":
+            decision = "avoid"
+            reasons.append("guardian_veto")
+        elif scout.get("signal") == "avoid":
+            decision = "avoid" if council_score < 0.35 else "observe"
+            reasons.append("scout_avoid")
+        else:
+            if council_score >= 0.85 and guardian.get("signal") == "clear" and executor.get("signal") in {"ready", "preferred"} and oracle.get("signal") in {"bullish", "high_momentum"} and archivist.get("signal") != "negative_memory":
+                decision = "high_conviction"
+                reasons.append("strong_agent_alignment")
+            elif council_score >= 0.72 and guardian.get("signal") == "clear" and executor.get("signal") in {"ready", "preferred"} and oracle.get("signal") in {"bullish", "high_momentum"}:
+                decision = "preferred"
+                reasons.append("positive_alignment")
+            elif council_score >= 0.55 and guardian.get("signal") != "blocked":
+                decision = "eligible"
+                reasons.append("moderate_alignment")
+            elif council_score >= 0.35:
+                decision = "observe"
+                reasons.append("limited_alignment")
+            else:
+                decision = "avoid"
+                reasons.append("low_alignment")
+        if disagreement.get("detected"):
+            reasons.append("disagreement_penalty")
+        print(f"[REALM-XIV-COUNCIL] ticker={guardian.get('ticker') or executor.get('ticker') or scout.get('ticker')} category={guardian.get('category') or executor.get('category') or scout.get('category')} decision={decision} council_score={council_score} scout_signal={scout.get('signal')} oracle_signal={oracle.get('signal')} guardian_signal={guardian.get('signal')} executor_signal={executor.get('signal')} archivist_signal={archivist.get('signal')} reasons={reasons}")
+        return {"council_decision": decision, "council_reasons": reasons}
+
+    def build_multi_agent_profile(self, market=None, q=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, position_profile=None, memory_profile=None, open_positions=None):
+        market = market if isinstance(market, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        memory_profile = memory_profile if isinstance(memory_profile, dict) else {}
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or position_profile.get("ticker") or awareness_profile.get("ticker") or "").strip()
+        family = str(position_profile.get("family") or awareness_profile.get("family") or adaptive_profile.get("family") or self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN").strip().upper()
+        category = str(position_profile.get("category") or awareness_profile.get("category") or adaptive_profile.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower()
+        scout = self.seraph_scout_agent(awareness_profile=awareness_profile, position_profile=position_profile)
+        oracle = self.seraph_oracle_agent(predictive_profile=predictive_profile, awareness_profile=awareness_profile)
+        cluster_snapshot = position_profile.get("cluster_snapshot") if isinstance(position_profile.get("cluster_snapshot"), dict) else self.detect_exposure_cluster(position_summary={"ticker": ticker, "family": family, "category": category}, open_positions=open_positions, market=market)
+        guardian = self.seraph_guardian_agent(position_profile=position_profile, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile, predictive_profile=predictive_profile, memory_profile=memory_profile, open_positions=open_positions, cluster_snapshot=cluster_snapshot)
+        executor = self.seraph_executor_agent(adaptive_profile=adaptive_profile, position_profile=position_profile, predictive_profile=predictive_profile)
+        archivist = self.seraph_archivist_agent(memory_profile=memory_profile)
+        disagreement = self.detect_agent_disagreement(scout=scout, oracle=oracle, guardian=guardian, executor=executor, archivist=archivist, position_profile=position_profile)
+        council_score_payload = self.compute_council_score(scout=scout, oracle=oracle, guardian=guardian, executor=executor, archivist=archivist, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile, predictive_profile=predictive_profile, position_profile=position_profile, memory_profile=memory_profile, disagreement=disagreement)
+        council = self.seraph_council_decision(scout=scout, oracle=oracle, guardian=guardian, executor=executor, archivist=archivist, council_score=council_score_payload.get("council_score"), disagreement=disagreement)
+        council_score = self._clamp(self.to_float(council_score_payload.get("council_score"), 0.5))
+        final_recommendation = council.get("council_decision", "observe")
+        if guardian.get("signal") == "blocked":
+            final_recommendation = "avoid"
+        council_signal_order = {"avoid": 0.1, "observe": 0.3, "eligible": 0.55, "preferred": 0.8, "high_conviction": 0.95}
+        final_score = self._clamp(council_signal_order.get(str(final_recommendation).strip().lower(), 0.3) * 0.6 + council_score * 0.4)
+        council_reasons = list(dict.fromkeys((scout.get("reasons", []) or []) + (oracle.get("reasons", []) or []) + (guardian.get("reasons", []) or []) + (executor.get("reasons", []) or []) + (archivist.get("reasons", []) or []) + (council.get("council_reasons", []) or []) + (council_score_payload.get("council_reasons", []) or []) + (disagreement.get("reasons", []) or [])))
+        agent_profile = {
+            "ticker": ticker,
+            "category": category,
+            "family": family,
+            "series_ticker": position_profile.get("series_ticker") or awareness_profile.get("series_ticker") or adaptive_profile.get("series_ticker"),
+            "scout_signal": scout.get("signal", "unknown"),
+            "oracle_signal": oracle.get("signal", "unknown"),
+            "guardian_signal": guardian.get("signal", "unknown"),
+            "executor_signal": executor.get("signal", "unknown"),
+            "archivist_signal": archivist.get("signal", "unknown"),
+            "council_decision": council.get("council_decision", "observe"),
+            "council_score": round(council_score, 4),
+            "council_reasons": council_reasons,
+            "agent_disagreement_detected": "yes" if disagreement.get("detected") else "no",
+            "final_recommendation": final_recommendation,
+            "realm_ix_awareness_score": self.to_float(awareness_profile.get("awareness_score"), 0.0),
+            "realm_x_adaptive_score": self.to_float(adaptive_profile.get("adaptive_score", adaptive_profile.get("realm_x_adaptive_score")), 0.0),
+            "realm_xi_predictive_score": self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0),
+            "realm_xii_position_score": self.to_float(position_profile.get("position_score"), 0.0),
+            "realm_xiii_memory_score": self.to_float(memory_profile.get("memory_score"), 0.5),
+            "guardian_signal": guardian.get("signal", "unknown"),
+            "scout": scout,
+            "oracle": oracle,
+            "guardian": guardian,
+            "executor": executor,
+            "archivist": archivist,
+            "disagreement": disagreement,
+            "cluster_snapshot": cluster_snapshot,
+        }
+        print(f"[REALM-XIV-DISAGREEMENT] ticker={ticker} category={category} detected={agent_profile['agent_disagreement_detected']} reasons={disagreement.get('reasons', [])}")
+        print(f"[REALM-XIV-SCORE] ticker={ticker} category={category} council_score={agent_profile['council_score']} final_recommendation={final_recommendation} guardian_signal={guardian.get('signal')} scout_signal={scout.get('signal')} oracle_signal={oracle.get('signal')} executor_signal={executor.get('signal')} archivist_signal={archivist.get('signal')} reasons={council_reasons}")
+        print(f"[REALM-XIV-PROFILE] ticker={ticker} scout_signal={agent_profile['scout_signal']} oracle_signal={agent_profile['oracle_signal']} guardian_signal={agent_profile['guardian_signal']} executor_signal={agent_profile['executor_signal']} archivist_signal={agent_profile['archivist_signal']} council_decision={agent_profile['council_decision']} final_recommendation={agent_profile['final_recommendation']} council_score={agent_profile['council_score']} disagreement={agent_profile['agent_disagreement_detected']} reasons={council_reasons}")
+        return agent_profile
+
+    def summarize_multi_agent_profiles(self, profiles):
+        profiles = profiles or []
+        counts = {"avoid": 0, "observe": 0, "eligible": 0, "preferred": 0, "high_conviction": 0, "guardian_blocked": 0, "disagreement": 0}
+        total_score = 0.0
+        top_candidates = []
+        blocked = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            recommendation = str(profile.get("final_recommendation") or "observe").strip().lower()
+            if recommendation in counts:
+                counts[recommendation] += 1
+            if str(profile.get("guardian_signal") or "unknown").strip().lower() == "blocked":
+                counts["guardian_blocked"] += 1
+                blocked.append((self.to_float(profile.get("council_score"), 0.0), str(profile.get("ticker") or "").strip()))
+            if str(profile.get("agent_disagreement_detected") or "no").strip().lower() == "yes":
+                counts["disagreement"] += 1
+            total_score += self.to_float(profile.get("council_score"), 0.0)
+            top_candidates.append((self.to_float(profile.get("council_score"), 0.0), str(profile.get("ticker") or "").strip()))
+        summary = {
+            "total_candidates_profiled": len([profile for profile in profiles if isinstance(profile, dict)]),
+            "avoid": counts["avoid"],
+            "observe": counts["observe"],
+            "eligible": counts["eligible"],
+            "preferred": counts["preferred"],
+            "high_conviction": counts["high_conviction"],
+            "guardian_blocked": counts["guardian_blocked"],
+            "disagreement": counts["disagreement"],
+            "average_council_score": round(total_score / len([profile for profile in profiles if isinstance(profile, dict)]) if profiles else 0.5, 4),
+            "top_council_tickers": [ticker for _score, ticker in sorted(top_candidates, key=lambda item: item[0], reverse=True)[:5] if ticker],
+            "top_blocked_tickers": [ticker for _score, ticker in sorted(blocked, key=lambda item: item[0])[:5] if ticker],
+        }
+        print(f"[REALM-XIV-SUMMARY] total_candidates_profiled={summary['total_candidates_profiled']} avoid_count={summary['avoid']} observe_count={summary['observe']} eligible_count={summary['eligible']} preferred_count={summary['preferred']} high_conviction_count={summary['high_conviction']} guardian_blocked_count={summary['guardian_blocked']} disagreement_count={summary['disagreement']} average_council_score={summary['average_council_score']} top_council_tickers={summary['top_council_tickers']} top_blocked_tickers={summary['top_blocked_tickers']}")
+        return summary
+
+    def profile_multi_agent_network(self, markets, memory_candidates):
+        markets = markets or []
+        memory_candidates = memory_candidates or []
+        market_lookup = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+        awareness_lookup = self.market_awareness_profiles if isinstance(self.market_awareness_profiles, dict) else {}
+        adaptive_lookup = self.market_adaptive_profiles if isinstance(self.market_adaptive_profiles, dict) else {}
+        predictive_lookup = self.market_predictive_profiles if isinstance(self.market_predictive_profiles, dict) else {}
+        position_lookup = self.market_position_profiles if isinstance(self.market_position_profiles, dict) else {}
+        memory_lookup = self.market_memory_profiles if isinstance(self.market_memory_profiles, dict) else {}
+        profiles = []
+        adjusted_candidates = []
+        for candidate in memory_candidates:
+            if not isinstance(candidate, tuple) or len(candidate) < 4:
+                continue
+            score, q, spread, family = candidate[:4]
+            ticker = str(getattr(q, "ticker", "") or "").strip()
+            market = market_lookup.get(ticker, {})
+            awareness_profile = awareness_lookup.get(ticker, {}) if isinstance(awareness_lookup.get(ticker, {}), dict) else {}
+            adaptive_profile = adaptive_lookup.get(ticker, {}) if isinstance(adaptive_lookup.get(ticker, {}), dict) else {}
+            predictive_profile = predictive_lookup.get(ticker, {}) if isinstance(predictive_lookup.get(ticker, {}), dict) else {}
+            position_profile = position_lookup.get(ticker, {}) if isinstance(position_lookup.get(ticker, {}), dict) else {}
+            memory_profile = memory_lookup.get(ticker, {}) if isinstance(memory_lookup.get(ticker, {}), dict) else {}
+            agent_profile = self.build_multi_agent_profile(
+                market=market,
+                q=q,
+                awareness_profile=awareness_profile,
+                adaptive_profile=adaptive_profile,
+                predictive_profile=predictive_profile,
+                position_profile=position_profile,
+                memory_profile=memory_profile,
+                open_positions=self._get_open_live_positions(),
+            )
+            profiles.append(agent_profile)
+            council_delta = (self.to_float(agent_profile.get("council_score"), 0.5) - 0.5) * 4.0
+            if agent_profile.get("final_recommendation") == "avoid":
+                council_delta -= 1.0
+            elif agent_profile.get("final_recommendation") == "observe":
+                council_delta -= 0.35
+            elif agent_profile.get("final_recommendation") == "eligible":
+                council_delta += 0.15
+            elif agent_profile.get("final_recommendation") == "preferred":
+                council_delta += 0.45
+            elif agent_profile.get("final_recommendation") == "high_conviction":
+                council_delta += 0.75
+            council_delta = max(-3.0, min(3.0, council_delta))
+            adjusted_score = self.to_float(score, 0.0) + council_delta
+            print(f"[REALM-XIV-INFLUENCE] ticker={ticker} category={agent_profile.get('category')} family={agent_profile.get('family')} original_score={self.to_float(score, 0.0)} council_score={agent_profile.get('council_score')} final_recommendation={agent_profile.get('final_recommendation')} council_delta={round(council_delta, 4)} adjusted_score={round(adjusted_score, 4)}")
+            adjusted_candidates.append((adjusted_score, q, spread, family))
+        summary = self.summarize_multi_agent_profiles(profiles)
+        self.market_multi_agent_profiles = {profile.get("ticker"): profile for profile in profiles if profile.get("ticker")}
+        self.last_market_multi_agent_summary = summary
+        return adjusted_candidates, summary
+    def _get_combined_family_outcome_stats(self, family, lookback_rows=250):
+        family = str(family or "UNKNOWN").strip() or "UNKNOWN"
+        rows = self._load_trade_history_rows(limit=lookback_rows)
+        wins = losses = 0
+        total_pnl = 0.0
+        total_samples = 0
+        recent_reasons = {}
+        for row in rows:
+            row_family = self.get_market_family({"ticker": row.get("ticker", "")})
+            if row_family != family:
+                continue
+            pnl = self.to_float(row.get("realized_pnl"), 0.0)
+            total_pnl += pnl
+            total_samples += 1
+            if pnl > 0:
+                wins += 1
+            elif pnl < 0:
+                losses += 1
+            reason = str(row.get("reason") or "unknown").strip() or "unknown"
+            recent_reasons[reason] = recent_reasons.get(reason, 0) + 1
+
+        live_stats = dict(self.live_family_perf_stats.get(family, {}) or {})
+        if live_stats:
+            total_samples += int(live_stats.get("trades", 0) or 0)
+            wins += int(live_stats.get("wins", 0) or 0)
+            losses += int(live_stats.get("losses", 0) or 0)
+            total_pnl += self.to_float(live_stats.get("pnl", 0.0), 0.0)
+        win_rate = (wins / total_samples) if total_samples else 0.0
+        avg_pnl = (total_pnl / total_samples) if total_samples else 0.0
+        return {
+            "samples": total_samples,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "avg_pnl": avg_pnl,
+            "recent_reasons": recent_reasons,
+        }
+
+    def _build_entry_context(self, q=None, market=None, strategy_label=None, timing_state=None, source="unknown"):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else None
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = self.get_market_family(market or {"ticker": ticker}) if ticker else "UNKNOWN"
+        category = self.get_market_discovery_category(market or family)
+        yes_bid = self.to_float(getattr(q, "yes_bid", None), None)
+        yes_ask = self.to_float(getattr(q, "yes_ask", None), None)
+        no_bid = self.to_float(getattr(q, "no_bid", None), None)
+        no_ask = self.to_float(getattr(q, "no_ask", None), None)
+        last_price = self.to_float(getattr(q, "last_price", None), None)
+        volume = self.to_float(getattr(q, "volume", None), None)
+        liquidity = self.to_float(getattr(q, "liquidity", None), None)
+        spread = None
+        mid_price = None
+        if yes_bid is not None and yes_ask is not None:
+            spread = round(max(0.0, yes_ask - yes_bid), 4)
+            mid_price = round((yes_bid + yes_ask) / 2.0, 4)
+        volatility_index = None
+        if last_price is not None and mid_price is not None:
+            volatility_index = round(abs(last_price - mid_price) / max(spread or 0.01, 0.01), 4)
+        momentum_score = 0.0
+        if last_price is not None and mid_price is not None and spread is not None and spread > 0:
+            momentum_score = round((last_price - mid_price) / max(spread, 0.01), 4)
+        probabilistic_score = None
+        if yes_ask is not None:
+            probabilistic_score = round(self._clamp(yes_ask), 4)
+        time_to_event = self.get_minutes_to_event(market) if market else None
+        timing_bucket = self._time_to_event_bucket_for_minutes(time_to_event)
+        entry_timing_state = str((timing_state or {}).get("phase55_status") or (timing_state or {}).get("entry_timing_state") or timing_bucket or "unknown")
+        quote_reliability = 0.0
+        if yes_bid is not None and yes_ask is not None and spread is not None and spread <= MAX_ENTRY_SPREAD:
+            quote_reliability = 1.0
+        liquidity_reliability = self._clamp((liquidity or 0.0) / max(MIN_ENTRY_LIQUIDITY * 2.0, 1.0))
+        spread_stability = self._clamp(1.0 - ((spread or 0.0) / max(MAX_ENTRY_SPREAD, 0.01)))
+        fake_breakout_risk = self._clamp(
+            0.25 + max(0.0, momentum_score) * 0.35 + max(0.0, volatility_index or 0.0) * 0.15 + (1.0 - liquidity_reliability) * 0.25
+        )
+        return {
+            "ticker": ticker,
+            "family": family,
+            "category": category,
+            "strategy_label": strategy_label or "unknown",
+            "entry_timing_state": entry_timing_state,
+            "time_to_event_bucket": timing_bucket,
+            "spread": self._safe_round(spread, 4, None),
+            "spread_bucket": self._spread_bucket(spread),
+            "liquidity": self._safe_round(liquidity, 4, None),
+            "liquidity_bucket": self._liquidity_bucket(liquidity),
+            "volume": self._safe_round(volume, 4, None),
+            "volatility": self._safe_round(volatility_index, 4, None),
+            "volatility_bucket": self._volatility_bucket(volatility_index),
+            "momentum_score": self._safe_round(momentum_score, 4, 0.0),
+            "momentum_bucket": self._momentum_bucket(momentum_score),
+            "probabilistic_score": self._safe_round(probabilistic_score, 4, None),
+            "probability_bucket": self._probability_bucket(probabilistic_score),
+            "quote_reliability": self._safe_round(quote_reliability, 4, 0.0),
+            "liquidity_reliability": self._safe_round(liquidity_reliability, 4, 0.0),
+            "spread_stability": self._safe_round(spread_stability, 4, 0.0),
+            "fake_breakout_risk": self._safe_round(fake_breakout_risk, 4, 0.0),
+            "mid_price": self._safe_round(mid_price, 4, None),
+            "yes_bid": self._safe_round(yes_bid, 4, None),
+            "yes_ask": self._safe_round(yes_ask, 4, None),
+            "no_bid": self._safe_round(no_bid, 4, None),
+            "no_ask": self._safe_round(no_ask, 4, None),
+            "last_price": self._safe_round(last_price, 4, None),
+            "time_to_event": self._safe_round(time_to_event, 4, None),
+            "source": source,
+        }
+
+    def _calculate_confidence_decay(self, raw_confidence, sample_age_seconds=None, regime_staleness=0.0, sample_size=0, contradictory_score=0.0):
+        raw_confidence = self._clamp(raw_confidence)
+        sample_size = max(0, int(sample_size or 0))
+        sample_age_seconds = max(0.0, float(sample_age_seconds or 0.0))
+        age_penalty = min(0.45, sample_age_seconds / float(6 * 3600)) * 0.45
+        staleness_penalty = self._clamp(regime_staleness) * 0.25
+        sample_penalty = 0.0 if sample_size >= 10 else (0.25 if sample_size < 5 else 0.12)
+        contradiction_penalty = self._clamp(contradictory_score) * 0.20
+        decay_factor = self._clamp(1.0 - age_penalty - staleness_penalty - sample_penalty - contradiction_penalty, 0.20, 1.0)
+        return {
+            "raw_confidence": self._safe_round(raw_confidence, 4, 0.0),
+            "decay_factor": self._safe_round(decay_factor, 4, 1.0),
+            "decayed_confidence": self._safe_round(raw_confidence * decay_factor, 4, 0.0),
+            "decay_reason": "age" if age_penalty >= max(staleness_penalty, sample_penalty, contradiction_penalty) else "regime" if staleness_penalty >= max(sample_penalty, contradiction_penalty) else "sample" if sample_penalty >= contradiction_penalty else "contradiction" if contradiction_penalty > 0 else "stable",
+        }
+
+    def _update_market_personality_profiles(self, markets=None, quotes=None):
+        markets = markets or []
+        quotes = quotes or []
+        family_summaries = {}
+        quote_lookup = {getattr(q, "ticker", ""): q for q in quotes if getattr(q, "ticker", "")}
+        for market in markets:
+            ticker = str(market.get("ticker", "") or "").strip()
+            if not ticker:
+                continue
+            q = quote_lookup.get(ticker)
+            if q is None:
+                continue
+            family = self.get_market_family(market)
+            category = self.get_market_discovery_category(market)
+            context = self._build_entry_context(q=q, market=market, strategy_label="observed", source="market_observation")
+            summary = family_summaries.setdefault(
+                family,
+                {
+                    "family": family,
+                    "category": category,
+                    "count": 0,
+                    "spread_total": 0.0,
+                    "liquidity_total": 0.0,
+                    "volume_total": 0.0,
+                    "momentum_total": 0.0,
+                    "volatility_total": 0.0,
+                    "quote_reliability_total": 0.0,
+                    "liquidity_reliability_total": 0.0,
+                    "spread_stability_total": 0.0,
+                    "fake_breakout_total": 0.0,
+                    "time_to_event_bucket_counts": {},
+                    "last_seen_at": time.time(),
+                },
+            )
+            summary["count"] += 1
+            summary["spread_total"] += self.to_float(context.get("spread"), 0.0)
+            summary["liquidity_total"] += self.to_float(context.get("liquidity"), 0.0)
+            summary["volume_total"] += self.to_float(context.get("volume"), 0.0)
+            summary["momentum_total"] += self.to_float(context.get("momentum_score"), 0.0)
+            summary["volatility_total"] += self.to_float(context.get("volatility"), 0.0)
+            summary["quote_reliability_total"] += self.to_float(context.get("quote_reliability"), 0.0)
+            summary["liquidity_reliability_total"] += self.to_float(context.get("liquidity_reliability"), 0.0)
+            summary["spread_stability_total"] += self.to_float(context.get("spread_stability"), 0.0)
+            summary["fake_breakout_total"] += self.to_float(context.get("fake_breakout_risk"), 0.0)
+            bucket = context.get("time_to_event_bucket") or "unknown"
+            summary["time_to_event_bucket_counts"][bucket] = summary["time_to_event_bucket_counts"].get(bucket, 0) + 1
+
+        now_ts = time.time()
+        updated_families = {}
+        for family, observed in family_summaries.items():
+            count = max(1, int(observed.get("count", 0) or 0))
+            outcome_stats = self._get_combined_family_outcome_stats(family)
+            avg_spread = observed["spread_total"] / count
+            avg_liquidity = observed["liquidity_total"] / count
+            avg_volume = observed["volume_total"] / count
+            avg_momentum = observed["momentum_total"] / count
+            avg_volatility = observed["volatility_total"] / count
+            quote_reliability = observed["quote_reliability_total"] / count
+            liquidity_reliability = observed["liquidity_reliability_total"] / count
+            spread_stability = observed["spread_stability_total"] / count
+            fake_breakout_risk = observed["fake_breakout_total"] / count
+            momentum_bias = self._clamp((avg_momentum + max(0.0, quote_reliability - 0.5) + min(0.5, avg_volatility)) / 1.5)
+            reversion_bias = self._clamp((max(0.0, 0.5 - avg_momentum) + spread_stability + (1.0 - quote_reliability)) / 3.0)
+            personality_type = "balanced"
+            if fake_breakout_risk >= 0.65:
+                personality_type = "fake_breakout_prone"
+            elif momentum_bias >= 0.60 and reversion_bias < 0.45:
+                personality_type = "momentum_heavy"
+            elif reversion_bias >= 0.60 and momentum_bias < 0.45:
+                personality_type = "mean_reversion"
+            elif liquidity_reliability < 0.40 or quote_reliability < 0.40:
+                personality_type = "unstable"
+            historical_confidence = self._clamp(
+                min(1.0, (count + outcome_stats.get("samples", 0)) / 30.0)
+            )
+            sample_age_seconds = max(0.0, now_ts - float(observed.get("last_seen_at") or now_ts))
+            decay = self._calculate_confidence_decay(
+                historical_confidence,
+                sample_age_seconds=sample_age_seconds,
+                regime_staleness=0.0 if sample_age_seconds < 3600 else 0.25,
+                sample_size=count + outcome_stats.get("samples", 0),
+                contradictory_score=max(0.0, reversion_bias - momentum_bias),
+            )
+            category, used_category_fallback, fallback_category = self._resolve_market_category_label(observed)
+            if used_category_fallback:
+                title = str(
+                    observed.get("title")
+                    or observed.get("subtitle")
+                    or observed.get("no_sub_title")
+                    or ""
+                ).strip() or "unknown"
+                print(
+                    f"[LIVE-CATEGORY-FALLBACK] ticker={observed.get('ticker', 'unknown')} "
+                    f"title={title} fallback_category={fallback_category}"
+                )
+            profile = {
+                "family": family,
+                "category": category,
+                "personality_type": personality_type,
+                "momentum_bias": self._safe_round(momentum_bias, 4, 0.0),
+                "reversion_bias": self._safe_round(reversion_bias, 4, 0.0),
+                "fake_breakout_risk": self._safe_round(fake_breakout_risk, 4, 0.0),
+                "liquidity_reliability": self._safe_round(liquidity_reliability, 4, 0.0),
+                "spread_stability": self._safe_round(spread_stability, 4, 0.0),
+                "quote_reliability": self._safe_round(quote_reliability, 4, 0.0),
+                "historical_confidence": decay.get("decayed_confidence"),
+                "raw_historical_confidence": decay.get("raw_confidence"),
+                "confidence_decay_factor": decay.get("decay_factor"),
+                "confidence_decay_reason": decay.get("decay_reason"),
+                "sample_count": count,
+                "outcome_samples": outcome_stats.get("samples", 0),
+                "win_rate": self._safe_round(outcome_stats.get("win_rate"), 4, 0.0),
+                "average_pnl": self._safe_round(outcome_stats.get("avg_pnl"), 4, 0.0),
+                "typical_volatility": self._safe_round(avg_volatility, 4, 0.0),
+                "typical_execution_quality": self._safe_round((quote_reliability + liquidity_reliability + spread_stability) / 3.0, 4, 0.0),
+                "avg_spread": self._safe_round(avg_spread, 4, 0.0),
+                "avg_liquidity": self._safe_round(avg_liquidity, 4, 0.0),
+                "avg_volume": self._safe_round(avg_volume, 4, 0.0),
+                "last_seen_at": now_ts,
+                "time_to_event_bucket_counts": observed.get("time_to_event_bucket_counts", {}),
+            }
+            updated_families[family] = profile
+            print(
+                f"[LIVE-MARKET-PERSONALITY] family={family} category={profile.get('category', 'unknown')} "
+                f"personality_type={profile['personality_type']} momentum_bias={profile['momentum_bias']} "
+                f"reversion_bias={profile['reversion_bias']} fake_breakout_risk={profile['fake_breakout_risk']} "
+                f"liquidity_reliability={profile['liquidity_reliability']} spread_stability={profile['spread_stability']} "
+                f"quote_reliability={profile['quote_reliability']} historical_confidence={profile['historical_confidence']}"
+            )
+        if updated_families:
+            profiles = self.market_personality_profiles if isinstance(self.market_personality_profiles, dict) else {"version": 1, "updated_at": None, "families": {}}
+            profiles["version"] = int(profiles.get("version", 1) or 1)
+            profiles["updated_at"] = now_ts
+            families = profiles.setdefault("families", {})
+            families.update(updated_families)
+            self.market_personality_profiles = profiles
+            self.save_market_personality_profiles(profiles)
+        return updated_families
+
+    def _score_trade_memory_similarity(self, current_context):
+        rows = self._load_trade_history_rows(limit=400)
+        if not rows:
+            return {
+                "similar_setups_found": 0,
+                "similar_win_rate": None,
+                "similar_average_pnl": None,
+                "similar_failure_pattern": "insufficient_history",
+                "similarity_confidence": 0.0,
+                "memory_recommendation": "neutral",
+                "sample_size": 0,
+            }
+        family = current_context.get("family")
+        category = current_context.get("category")
+        spread_bucket = current_context.get("spread_bucket")
+        liquidity_bucket = current_context.get("liquidity_bucket")
+        volatility_bucket = current_context.get("volatility_bucket")
+        momentum_bucket = current_context.get("momentum_bucket")
+        probabilistic_bucket = current_context.get("probability_bucket")
+        strategy_label = current_context.get("strategy_label")
+        time_to_event_bucket = current_context.get("time_to_event_bucket")
+        entry_timing_state = current_context.get("entry_timing_state")
+        similar_rows = []
+        for row in rows:
+            row_family = self.get_market_family({"ticker": row.get("ticker", "")})
+            row_category = row.get("category") or self.get_market_discovery_category({"ticker": row.get("ticker", "")})
+            row_spread_bucket = row.get("spread_bucket") or self._spread_bucket(self.to_float(row.get("yes_ask"), None) - self.to_float(row.get("yes_bid"), None) if row.get("yes_bid") and row.get("yes_ask") else None)
+            row_liquidity_bucket = row.get("liquidity_bucket") or self._liquidity_bucket(self.to_float(row.get("liquidity"), None))
+            row_volatility_bucket = row.get("volatility_bucket") or self._volatility_bucket(self.to_float(row.get("volatility"), None))
+            row_momentum_bucket = row.get("momentum_bucket") or self._momentum_bucket(self.to_float(row.get("momentum_score"), None))
+            row_probability_bucket = row.get("probability_bucket") or self._probability_bucket(self.to_float(row.get("probabilistic_score"), None))
+            row_strategy_label = row.get("strategy_label") or "unknown"
+            row_time_bucket = row.get("time_to_event_bucket") or "unknown"
+            row_entry_timing = row.get("entry_timing_state") or "unknown"
+            matches = 0
+            weight = 0.0
+            if family and row_family == family:
+                matches += 1
+                weight += 1.0
+            if category and row_category == category:
+                matches += 1
+                weight += 1.0
+            if spread_bucket and row_spread_bucket == spread_bucket:
+                matches += 1
+                weight += 1.0
+            if liquidity_bucket and row_liquidity_bucket == liquidity_bucket:
+                matches += 1
+                weight += 1.0
+            if volatility_bucket and row_volatility_bucket == volatility_bucket:
+                matches += 1
+                weight += 1.0
+            if momentum_bucket and row_momentum_bucket == momentum_bucket:
+                matches += 1
+                weight += 1.0
+            if probabilistic_bucket and row_probability_bucket == probabilistic_bucket:
+                matches += 1
+                weight += 1.0
+            if strategy_label and row_strategy_label == strategy_label:
+                matches += 1
+                weight += 0.5
+            if time_to_event_bucket and row_time_bucket == time_to_event_bucket:
+                matches += 1
+                weight += 0.5
+            if entry_timing_state and row_entry_timing == entry_timing_state:
+                matches += 1
+                weight += 0.5
+            if weight < 2.5:
+                continue
+            pnl = self.to_float(row.get("realized_pnl"), 0.0)
+            similar_rows.append({
+                "row": row,
+                "weight": weight,
+                "pnl": pnl,
+                "win": pnl > 0,
+            })
+        if not similar_rows:
+            return {
+                "similar_setups_found": 0,
+                "similar_win_rate": None,
+                "similar_average_pnl": None,
+                "similar_failure_pattern": "no_similar_history",
+                "similarity_confidence": 0.0,
+                "memory_recommendation": "neutral",
+                "sample_size": 0,
+            }
+        similar_rows.sort(key=lambda item: item["weight"], reverse=True)
+        top_rows = similar_rows[:25]
+        similar_setups_found = len(top_rows)
+        wins = sum(1 for item in top_rows if item["win"])
+        total_pnl = sum(item["pnl"] for item in top_rows)
+        similar_win_rate = wins / similar_setups_found if similar_setups_found else None
+        similar_average_pnl = total_pnl / similar_setups_found if similar_setups_found else None
+        failure_reason_counts = {}
+        for item in top_rows:
+            if item["pnl"] < 0:
+                reason = str(item["row"].get("reason") or "negative_pnl").strip() or "negative_pnl"
+                failure_reason_counts[reason] = failure_reason_counts.get(reason, 0) + 1
+        failure_pattern = "negative_pnl" if not failure_reason_counts else sorted(failure_reason_counts.items(), key=lambda item: item[1], reverse=True)[0][0]
+        similarity_confidence = self._clamp(similar_setups_found / 12.0)
+        if similar_win_rate is not None and similar_average_pnl is not None and similar_win_rate >= 0.6 and similar_average_pnl > 0:
+            recommendation = "support_entry"
+        elif similar_win_rate is not None and similar_win_rate < 0.4:
+            recommendation = "avoid_if_optional"
+        elif similar_average_pnl is not None and similar_average_pnl < 0:
+            recommendation = "reduce_confidence"
+        else:
+            recommendation = "neutral"
+        return {
+            "similar_setups_found": similar_setups_found,
+            "similar_win_rate": self._safe_round(similar_win_rate, 4, None),
+            "similar_average_pnl": self._safe_round(similar_average_pnl, 4, None),
+            "similar_failure_pattern": failure_pattern,
+            "similarity_confidence": self._safe_round(similarity_confidence, 4, 0.0),
+            "memory_recommendation": recommendation,
+            "sample_size": similar_setups_found,
+        }
+
+    def _classify_market_behavior_state(self, context, profile=None):
+        profile = profile or {}
+        liquidity_reliability = self._clamp(context.get("liquidity_reliability", 0.0))
+        quote_reliability = self._clamp(context.get("quote_reliability", 0.0))
+        fake_breakout_risk = self._clamp(context.get("fake_breakout_risk", 0.0))
+        volatility = self._clamp((context.get("volatility") or 0.0) / 0.10)
+        momentum = self._clamp(abs(context.get("momentum_score") or 0.0))
+        spread_stability = self._clamp(context.get("spread_stability", 0.0))
+        spread = context.get("spread")
+        spread_shock = self._clamp((spread or 0.0) / max(MAX_ENTRY_SPREAD, 0.01))
+        panic_score = self._clamp((volatility * 0.45) + ((1.0 - liquidity_reliability) * 0.35) + (spread_shock * 0.20))
+        euphoria_score = self._clamp((max(0.0, context.get("momentum_score") or 0.0) * 0.55) + (1.0 - spread_stability) * 0.25 + volatility * 0.20)
+        exhaustion_score = self._clamp((volatility * 0.40) + ((1.0 - momentum) * 0.30) + ((1.0 - quote_reliability) * 0.30))
+        fake_urgency_score = self._clamp((fake_breakout_risk * 0.55) + (spread_shock * 0.25) + ((1.0 - quote_reliability) * 0.20))
+        dead_liquidity_risk = self._clamp(((1.0 - liquidity_reliability) * 0.60) + ((1.0 - quote_reliability) * 0.25) + (1.0 - spread_stability) * 0.15)
+        if dead_liquidity_risk >= 0.75:
+            behavior_state = "dead_liquidity_trap"
+            recommended_response = "avoid"
+        elif panic_score >= 0.72:
+            behavior_state = "panic_spike"
+            recommended_response = "reduce_confidence"
+        elif euphoria_score >= 0.72:
+            behavior_state = "euphoric_spike"
+            recommended_response = "wait_for_confirmation"
+        elif exhaustion_score >= 0.68:
+            behavior_state = "exhausted_momentum"
+            recommended_response = "caution"
+        elif fake_urgency_score >= 0.70:
+            behavior_state = "fake_urgency"
+            recommended_response = "avoid"
+        elif quote_reliability < 0.45:
+            behavior_state = "quote_instability"
+            recommended_response = "reduce_confidence"
+        elif spread_shock >= 0.65:
+            behavior_state = "spread_shock"
+            recommended_response = "caution"
+        elif volatility >= 0.65:
+            behavior_state = "volatility_burst"
+            recommended_response = "caution"
+        else:
+            behavior_state = "normal"
+            recommended_response = "normal"
+        return {
+            "behavior_state": behavior_state,
+            "panic_score": self._safe_round(panic_score, 4, 0.0),
+            "euphoria_score": self._safe_round(euphoria_score, 4, 0.0),
+            "exhaustion_score": self._safe_round(exhaustion_score, 4, 0.0),
+            "fake_urgency_score": self._safe_round(fake_urgency_score, 4, 0.0),
+            "dead_liquidity_risk": self._safe_round(dead_liquidity_risk, 4, 0.0),
+            "recommended_response": recommended_response,
+        }
+
+    def _classify_market_regime(self, context, summary=None):
+        summary = summary or {}
+        profile = context.get("profile") or {}
+        market_category = context.get("category") or "unknown"
+        volatility = self._clamp((context.get("volatility") or 0.0) / 0.10)
+        liquidity = self._clamp(context.get("liquidity_reliability", 0.0))
+        momentum = self._clamp(abs(context.get("momentum_score") or 0.0))
+        edge_density = self._clamp(context.get("edge_density", 0.0))
+        no_candidate_streak = int(summary.get("no_candidate_cycle_streak", self.no_candidate_cycle_streak) or 0)
+        current_hour = int(time.gmtime().tm_hour)
+        weekend = time.gmtime().tm_wday >= 5
+        if liquidity < 0.25 and edge_density < 0.25:
+            regime = "dead_liquidity"
+            strategy_bias = "defensive"
+        elif volatility >= 0.72 and momentum >= 0.40:
+            regime = "news_like_volatility"
+            strategy_bias = "wait"
+        elif volatility >= 0.60:
+            regime = "high_volatility"
+            strategy_bias = "defensive"
+        elif volatility <= 0.22 and liquidity >= 0.55:
+            regime = "low_volatility"
+            strategy_bias = "momentum" if momentum >= 0.30 else "normal"
+        elif momentum >= 0.35 and summary.get("candidate_count", 0) > 0:
+            regime = "trending"
+            strategy_bias = "momentum"
+        else:
+            regime = "choppy" if edge_density < 0.5 else "normal"
+            strategy_bias = "reversion" if regime == "choppy" else "normal"
+        if market_category == "crypto" and weekend:
+            regime = "weekend_crypto_behavior"
+            strategy_bias = "defensive" if liquidity < 0.5 else strategy_bias
+        elif market_category == "sports" and context.get("time_to_event_bucket") in {"immediate", "near_term"}:
+            regime = "sports_event_urgency"
+            strategy_bias = "momentum"
+        elif current_hour >= 0 and current_hour <= 12 and liquidity < 0.45:
+            regime = "overnight_slowdown"
+            strategy_bias = "wait"
+        if no_candidate_streak >= 3 and regime not in {"dead_liquidity", "news_like_volatility"}:
+            regime = "dead_liquidity"
+            strategy_bias = "observe"
+        regime_confidence = self._clamp((abs(momentum - 0.25) + liquidity + edge_density) / 3.0)
+        return {
+            "regime": regime,
+            "regime_confidence": self._safe_round(regime_confidence, 4, 0.0),
+            "volatility_state": context.get("volatility_bucket") or "unknown",
+            "liquidity_state": context.get("liquidity_bucket") or "unknown",
+            "momentum_state": context.get("momentum_bucket") or "unknown",
+            "recommended_strategy_bias": strategy_bias,
+        }
+
+    def _evaluate_entry_quality_replay(self, current_context):
+        rows = self._load_trade_history_rows(limit=400)
+        if not rows:
+            return {
+                "entry_quality_score": None,
+                "best_entry_traits": "insufficient_history",
+                "weak_entry_traits": "insufficient_history",
+                "replay_sample_size": 0,
+                "entry_quality_recommendation": "wait_for_better_entry",
+            }
+        family = current_context.get("family")
+        category = current_context.get("category")
+        current_spread = current_context.get("spread")
+        current_liquidity = current_context.get("liquidity")
+        current_volatility = current_context.get("volatility")
+        current_momentum = current_context.get("momentum_score")
+        current_probability = current_context.get("probabilistic_score")
+        current_time_bucket = current_context.get("time_to_event_bucket")
+        current_timing = current_context.get("entry_timing_state")
+        scored_rows = []
+        for row in rows:
+            row_family = self.get_market_family({"ticker": row.get("ticker", "")})
+            row_category = row.get("category") or self.get_market_discovery_category({"ticker": row.get("ticker", "")})
+            row_spread = self.to_float(row.get("spread"), None)
+            if row_spread is None and row.get("yes_bid") and row.get("yes_ask"):
+                row_spread = self.to_float(row.get("yes_ask"), 0.0) - self.to_float(row.get("yes_bid"), 0.0)
+            row_liquidity = self.to_float(row.get("liquidity"), None)
+            row_volatility = self.to_float(row.get("volatility"), None)
+            row_momentum = self.to_float(row.get("momentum_score"), None)
+            row_probability = self.to_float(row.get("probabilistic_score"), None)
+            row_time_bucket = row.get("time_to_event_bucket") or "unknown"
+            row_timing = row.get("entry_timing_state") or "unknown"
+            score = 0.0
+            if family and row_family == family:
+                score += 1.8
+            if category and row_category == category:
+                score += 1.0
+            if current_spread is not None and row_spread is not None:
+                score += max(0.0, 1.0 - abs(float(current_spread) - float(row_spread)) / max(MAX_ENTRY_SPREAD, 0.01))
+            if current_liquidity is not None and row_liquidity is not None:
+                score += max(0.0, 1.0 - abs(float(current_liquidity) - float(row_liquidity)) / max(MIN_ENTRY_LIQUIDITY * 3.0, 1.0))
+            if current_volatility is not None and row_volatility is not None:
+                score += max(0.0, 1.0 - abs(float(current_volatility) - float(row_volatility)) / 0.12)
+            if current_momentum is not None and row_momentum is not None:
+                score += max(0.0, 1.0 - abs(float(current_momentum) - float(row_momentum)) / 0.50)
+            if current_probability is not None and row_probability is not None:
+                score += max(0.0, 1.0 - abs(float(current_probability) - float(row_probability)) / 0.35)
+            if current_time_bucket and row_time_bucket == current_time_bucket:
+                score += 0.45
+            if current_timing and row_timing == current_timing:
+                score += 0.35
+            if score <= 0:
+                continue
+            scored_rows.append((score, row))
+        if not scored_rows:
+            return {
+                "entry_quality_score": None,
+                "best_entry_traits": "no_matching_history",
+                "weak_entry_traits": "no_matching_history",
+                "replay_sample_size": 0,
+                "entry_quality_recommendation": "wait_for_better_entry",
+            }
+        scored_rows.sort(key=lambda item: item[0], reverse=True)
+        top_rows = scored_rows[:20]
+        entry_quality_score = self._clamp(sum(score for score, _row in top_rows) / (len(top_rows) * 6.0))
+        best_entry_traits = top_rows[0][1]
+        weak_entry_traits = min(top_rows, key=lambda item: self.to_float(item[1].get("realized_pnl"), 0.0))[1]
+        positive_rows = [row for score, row in top_rows if self.to_float(row.get("realized_pnl"), 0.0) > 0]
+        if entry_quality_score >= 0.65 and len(positive_rows) >= max(3, len(top_rows) // 2):
+            recommendation = "entry_quality_strong"
+        elif entry_quality_score >= 0.40:
+            recommendation = "entry_quality_neutral"
+        else:
+            recommendation = "entry_quality_weak"
+        if entry_quality_score < 0.35:
+            recommendation = "wait_for_better_entry"
+        return {
+            "entry_quality_score": self._safe_round(entry_quality_score, 4, None),
+            "best_entry_traits": {
+                "family": self.get_market_family({"ticker": best_entry_traits.get("ticker", "")}),
+                "spread_bucket": best_entry_traits.get("spread_bucket") or self._spread_bucket(self.to_float(best_entry_traits.get("spread"), None)),
+                "liquidity_bucket": best_entry_traits.get("liquidity_bucket") or self._liquidity_bucket(self.to_float(best_entry_traits.get("liquidity"), None)),
+                "time_to_event_bucket": best_entry_traits.get("time_to_event_bucket") or "unknown",
+            },
+            "weak_entry_traits": {
+                "family": self.get_market_family({"ticker": weak_entry_traits.get("ticker", "")}),
+                "spread_bucket": weak_entry_traits.get("spread_bucket") or self._spread_bucket(self.to_float(weak_entry_traits.get("spread"), None)),
+                "liquidity_bucket": weak_entry_traits.get("liquidity_bucket") or self._liquidity_bucket(self.to_float(weak_entry_traits.get("liquidity"), None)),
+                "time_to_event_bucket": weak_entry_traits.get("time_to_event_bucket") or "unknown",
+            },
+            "replay_sample_size": len(top_rows),
+            "entry_quality_recommendation": recommendation,
+        }
+
+    def _detect_opportunity_scarcity(self, summary=None, candidates=None):
+        summary = summary or {}
+        candidates = candidates or []
+        candidate_count = int(summary.get("candidates_found", len(candidates)) or len(candidates) or 0)
+        valid_candidate_count = len([item for item in candidates if isinstance(item, tuple) and item and self.to_float(item[0], 0.0) > 0]) if candidates else candidate_count
+        edge_density = self._clamp(valid_candidate_count / max(candidate_count, 1))
+        liquidity_availability = self._clamp((summary.get("within_window", 0) or candidate_count) / max(summary.get("original_market_count", candidate_count) or 1, 1))
+        market_quality = self._clamp((edge_density + liquidity_availability) / 2.0)
+        weak_confidence_distribution = self._clamp(1.0 - market_quality)
+        repeated_no_valid = int(getattr(self, "no_candidate_cycle_streak", 0) or 0)
+        high_rejection_concentration = self._clamp((summary.get("spread_skip_count", 0) or 0) / max(candidate_count or 1, 1))
+        low_liquidity_period = bool(summary.get("low_liquidity_reject_count", 0) or 0)
+        high_spread_period = bool(summary.get("spread_skip_count", 0) or 0)
+        if repeated_no_valid >= 3 or market_quality < 0.18:
+            scarcity_state = "observe_only"
+            recommended_mode = "observe_only"
+        elif low_liquidity_period or high_spread_period or weak_confidence_distribution > 0.55:
+            scarcity_state = "defensive"
+            recommended_mode = "defensive"
+        elif market_quality < 0.45 or high_rejection_concentration > 0.45:
+            scarcity_state = "selective"
+            recommended_mode = "selective"
+        else:
+            scarcity_state = "normal"
+            recommended_mode = "normal"
+        return {
+            "scarcity_state": scarcity_state,
+            "candidate_count": candidate_count,
+            "valid_candidate_count": valid_candidate_count,
+            "edge_density": self._safe_round(edge_density, 4, 0.0),
+            "liquidity_availability": self._safe_round(liquidity_availability, 4, 0.0),
+            "market_quality": self._safe_round(market_quality, 4, 0.0),
+            "recommended_mode": recommended_mode,
+            "weak_confidence_distribution": self._safe_round(weak_confidence_distribution, 4, 0.0),
+        }
+
+    def _compute_adaptive_aggression(self, summary=None, regime=None, scarcity=None, execution_quality=None):
+        summary = summary or {}
+        scarcity = scarcity or {}
+        regime = regime or {}
+        execution_quality = execution_quality or {}
+        recent_win_rate = self._safe_round((self.live_perf_wins_today / self.live_perf_trades_today) if self.live_perf_trades_today else 0.0, 4, 0.0)
+        recent_pnl = self._safe_round(self.live_realized_pnl_today, 4, 0.0)
+        confidence_quality = self._clamp(execution_quality.get("historical_confidence", 0.0))
+        regime_name = regime.get("regime", "unknown")
+        scarcity_state = scarcity.get("scarcity_state", "normal")
+        recovery_watchdog = "healthy"
+        if self.last_error_message:
+            recovery_watchdog = "watch"
+        if int(self.consecutive_losses or 0) >= 3 or recent_pnl <= -0.10:
+            posture = "defensive"
+            reason = "drawdown_or_loss_streak"
+        elif scarcity_state in {"observe_only", "defensive"}:
+            posture = "defensive"
+            reason = "opportunity_scarcity"
+        elif regime_name in {"dead_liquidity", "news_like_volatility"}:
+            posture = "defensive"
+            reason = "regime_risk"
+        elif recent_win_rate < 0.45 or recent_pnl < 0:
+            posture = "cautious"
+            reason = "recent_underperformance"
+        elif recent_win_rate > 0.60 and recent_pnl > 0 and confidence_quality >= 0.55 and scarcity_state == "normal":
+            posture = "opportunistic"
+            reason = "positive_recent_momentum"
+        else:
+            posture = "normal"
+            reason = "steady_state"
+        return {
+            "aggression_posture": posture,
+            "reason": reason,
+            "recent_win_rate": recent_win_rate,
+            "recent_pnl": recent_pnl,
+            "execution_quality": self._safe_round(confidence_quality, 4, 0.0),
+            "risk_adjustment_recommendation": "reduce_confidence" if posture in {"defensive", "cautious"} else "normal",
+            "recovery_watchdog_state": recovery_watchdog,
+            "confidence_quality": self._safe_round(confidence_quality, 4, 0.0),
+        }
+
+    def emit_ascension_v2_telemetry(self, markets=None, quotes=None, candidates=None, selected_quote=None, live_select_summary=None, auto_live_ticker=None, auto_live_reason=None):
+        markets = markets or []
+        quotes = quotes or []
+        candidates = candidates or []
+        live_select_summary = live_select_summary or self.last_live_select_summary or {}
+        if not quotes and selected_quote is not None:
+            quotes = [selected_quote]
+        active_context = None
+        if selected_quote is None and candidates:
+            first_candidate = candidates[0]
+            if isinstance(first_candidate, tuple) and len(first_candidate) >= 2:
+                selected_quote = first_candidate[1]
+        if selected_quote is not None:
+            selected_ticker = getattr(selected_quote, "ticker", "") or ""
+            selected_market = next((market for market in markets if str(market.get("ticker", "") or "").strip() == selected_ticker), None)
+            timing_state = {}
+            if selected_ticker:
+                timing_state = self.phase55_live_execution_gate_by_ticker.get(selected_ticker, {}) or {}
+            active_context = self._build_entry_context(
+                q=selected_quote,
+                market=selected_market or {"ticker": selected_ticker},
+                strategy_label="live_candidate" if auto_live_ticker else "scan_candidate",
+                timing_state=timing_state,
+                source="ascension_v2",
+            )
+        elif markets:
+            fallback_market = markets[0]
+            fallback_quote = quotes[0] if quotes else None
+            if fallback_quote is not None:
+                active_context = self._build_entry_context(
+                    q=fallback_quote,
+                    market=fallback_market,
+                    strategy_label="scan_candidate",
+                    timing_state=self.phase55_live_execution_gate_by_ticker.get(str(fallback_market.get("ticker", "") or "").strip(), {}) or {},
+                    source="ascension_v2_fallback",
+                )
+        if active_context is None:
+            print("[LIVE-ASCENSIONV2-SUMMARY] status=waiting_for_more_data reason=insufficient_behavioral_history")
+            return {
+                "status": "waiting_for_more_data",
+                "reason": "insufficient_behavioral_history",
+            }
+        market_personality = self._update_market_personality_profiles(markets=markets, quotes=quotes)
+        family = active_context.get("family", "UNKNOWN")
+        profile = dict((self.market_personality_profiles or {}).get("families", {}).get(family, {}) or {})
+        behavior_state = self._classify_market_behavior_state(active_context, profile=profile)
+        regime = self._classify_market_regime(
+            {**active_context, "profile": profile, "edge_density": live_select_summary.get("candidates_found", 0) / max(live_select_summary.get("original_market_count", 1) or 1, 1)},
+            summary=live_select_summary,
+        )
+        memory = self._score_trade_memory_similarity(active_context)
+        decay = self._calculate_confidence_decay(
+            profile.get("historical_confidence", 0.0),
+            sample_age_seconds=max(0.0, time.time() - float(profile.get("last_seen_at") or time.time())),
+            regime_staleness=0.0 if regime.get("regime") in {"trending", "normal", "low_volatility"} else 0.20,
+            sample_size=int(profile.get("sample_count", 0) or 0) + int(profile.get("outcome_samples", 0) or 0),
+            contradictory_score=max(0.0, self.to_float(memory.get("similar_win_rate"), 0.0) - self.to_float(profile.get("win_rate"), 0.0)),
+        )
+        entry_replay = self._evaluate_entry_quality_replay(active_context)
+        scarcity = self._detect_opportunity_scarcity(summary=live_select_summary, candidates=candidates)
+        aggression = self._compute_adaptive_aggression(summary=live_select_summary, regime=regime, scarcity=scarcity, execution_quality=profile)
+        insufficient_data = any(
+            (
+                int(profile.get("sample_count", 0) or 0) + int(profile.get("outcome_samples", 0) or 0) < 5,
+                memory.get("sample_size", 0) < 3,
+                entry_replay.get("replay_sample_size", 0) < 3,
+            )
+        )
+        summary_status = "waiting_for_more_data" if insufficient_data else "operational"
+        final_behavioral_recommendation = aggression.get("risk_adjustment_recommendation", "normal")
+        if regime.get("recommended_strategy_bias") in {"wait", "defensive"} and final_behavioral_recommendation == "normal":
+            final_behavioral_recommendation = regime.get("recommended_strategy_bias")
+        elif behavior_state.get("recommended_response") in {"avoid", "reduce_confidence", "wait_for_confirmation"}:
+            final_behavioral_recommendation = behavior_state.get("recommended_response")
+        print(
+            f"[LIVE-MARKET-BEHAVIOR-STATE] behavior_state={behavior_state.get('behavior_state')} "
+            f"panic_score={behavior_state.get('panic_score')} euphoria_score={behavior_state.get('euphoria_score')} "
+            f"exhaustion_score={behavior_state.get('exhaustion_score')} fake_urgency_score={behavior_state.get('fake_urgency_score')} "
+            f"dead_liquidity_risk={behavior_state.get('dead_liquidity_risk')} recommended_response={behavior_state.get('recommended_response')}"
+        )
+        print(
+            f"[LIVE-TRADE-MEMORY-SIMILARITY] similar_setups_found={memory.get('similar_setups_found')} "
+            f"similar_win_rate={memory.get('similar_win_rate')} similar_average_pnl={memory.get('similar_average_pnl')} "
+            f"similar_failure_pattern={memory.get('similar_failure_pattern')} similarity_confidence={memory.get('similarity_confidence')} "
+            f"memory_recommendation={memory.get('memory_recommendation')}"
+        )
+        print(
+            f"[LIVE-CONFIDENCE-DECAY] raw_confidence={decay.get('raw_confidence')} decay_factor={decay.get('decay_factor')} "
+            f"decayed_confidence={decay.get('decayed_confidence')} decay_reason={decay.get('decay_reason')} "
+            f"sample_age={self._safe_round(time.time() - float(profile.get('last_seen_at') or time.time()), 2, 0.0)} "
+            f"regime_staleness={'yes' if regime.get('regime') in {'dead_liquidity', 'news_like_volatility', 'high_volatility'} else 'no'}"
+        )
+        print(
+            f"[LIVE-REGIME-AWARENESS] regime={regime.get('regime')} regime_confidence={regime.get('regime_confidence')} "
+            f"volatility_state={regime.get('volatility_state')} liquidity_state={regime.get('liquidity_state')} "
+            f"momentum_state={regime.get('momentum_state')} recommended_strategy_bias={regime.get('recommended_strategy_bias')}"
+        )
+        print(
+            f"[LIVE-ENTRY-QUALITY-REPLAY] entry_quality_score={entry_replay.get('entry_quality_score')} "
+            f"best_entry_traits={entry_replay.get('best_entry_traits')} weak_entry_traits={entry_replay.get('weak_entry_traits')} "
+            f"replay_sample_size={entry_replay.get('replay_sample_size')} entry_quality_recommendation={entry_replay.get('entry_quality_recommendation')}"
+        )
+        print(
+            f"[LIVE-OPPORTUNITY-SCARCITY] scarcity_state={scarcity.get('scarcity_state')} candidate_count={scarcity.get('candidate_count')} "
+            f"valid_candidate_count={scarcity.get('valid_candidate_count')} edge_density={scarcity.get('edge_density')} "
+            f"liquidity_availability={scarcity.get('liquidity_availability')} market_quality={scarcity.get('market_quality')} "
+            f"recommended_mode={scarcity.get('recommended_mode')}"
+        )
+        print(
+            f"[LIVE-ADAPTIVE-AGGRESSION] aggression_posture={aggression.get('aggression_posture')} reason={aggression.get('reason')} "
+            f"recent_win_rate={aggression.get('recent_win_rate')} recent_pnl={aggression.get('recent_pnl')} "
+            f"execution_quality={aggression.get('execution_quality')} risk_adjustment_recommendation={aggression.get('risk_adjustment_recommendation')}"
+        )
+        print(
+            f"[LIVE-ASCENSIONV2-SUMMARY] market_personality_profiles={len((self.market_personality_profiles or {}).get('families', {}) if isinstance(self.market_personality_profiles, dict) else {})} "
+            f"behavior_state={behavior_state.get('behavior_state')} similarity_confidence={memory.get('similarity_confidence')} "
+            f"confidence_decay_applied={decay.get('decay_factor')} current_regime={regime.get('regime')} "
+            f"entry_quality_score={entry_replay.get('entry_quality_score')} scarcity_state={scarcity.get('scarcity_state')} "
+            f"aggression_posture={aggression.get('aggression_posture')} final_behavioral_recommendation={final_behavioral_recommendation} "
+            f"status={summary_status}"
+        )
+        if summary_status != "operational":
+            print("[LIVE-ASCENSIONV2-SUMMARY] status=waiting_for_more_data reason=insufficient_behavioral_history")
+        return {
+            "status": summary_status,
+            "market_personality_profiles": market_personality,
+            "behavior_state": behavior_state,
+            "memory": memory,
+            "confidence_decay": decay,
+            "regime": regime,
+            "entry_quality": entry_replay,
+            "scarcity": scarcity,
+            "aggression": aggression,
+            "final_behavioral_recommendation": final_behavioral_recommendation,
+        }
+
+    def is_debug_live_enabled(self):
+        return DEBUG_LIVE
+
+    def get_live_execution_flags(self):
+        live_mode = bool(globals().get("LIVE_MODE", False))
+        live_armed = bool(globals().get("LIVE_ARMED", False))
+        live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
+        effective_live_dry_run = compute_effective_live_dry_run(
+            live_mode=live_mode,
+            live_armed=live_armed,
+            live_env_confirmed=live_env_confirmed,
+            configured_dry_run=DRY_RUN_LIVE_ORDERS,
+        )
+        return {
+            "live_mode": live_mode,
+            "live_armed": live_armed,
+            "live_env_confirmed": live_env_confirmed,
+            "all_live_switches_on": bool(live_mode and live_armed and live_env_confirmed),
+            "effective_live_dry_run": effective_live_dry_run,
+            "real_submit_enabled": bool(live_mode and live_armed and live_env_confirmed and not effective_live_dry_run),
+        }
+
+    def get_live_submit_authorization(self, payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        ticker = str(payload.get("ticker") or "").strip()
+        flags = self.get_live_execution_flags()
+        supplied_ticker = str(globals().get("LIVE_TEST_TICKER") or "").strip() or None
+        authorized_canary_ticker = str(getattr(self, "live_canary_authorized_ticker", None) or "").strip() or None
+        allowed_ticker = authorized_canary_ticker or supplied_ticker
+        normal_live_service_mode = bool(flags["all_live_switches_on"] and not supplied_ticker)
+        if not flags["live_mode"]:
+            reason = "live_mode_disabled"
+        elif not flags["live_armed"]:
+            reason = "live_not_armed"
+        elif not flags["live_env_confirmed"]:
+            reason = "live_env_not_confirmed"
+        elif flags["effective_live_dry_run"]:
+            reason = "effective_dry_run"
+        elif not normal_live_service_mode:
+            if not allowed_ticker:
+                reason = "no_live_test_ticker"
+            elif ticker and ticker != allowed_ticker:
+                reason = "ticker_not_allowed"
+            elif self.live_canary_submitted and not authorized_canary_ticker:
+                reason = "canary_already_used"
+            else:
+                reason = "authorized_canary_ticker"
+        else:
+            reason = "authorized_live_service"
+        return {
+            "ok": reason in {"authorized_live_service", "authorized_canary_ticker"},
+            "reason": reason,
+            "flags": flags,
+            "supplied_ticker": supplied_ticker,
+            "authorized_canary_ticker": authorized_canary_ticker,
+            "allowed_ticker": allowed_ticker,
+            "normal_live_service_mode": normal_live_service_mode,
+        }
+
+    def prune_live_position_state(self, active_tickers=None):
+        active_tickers = {
+            str(ticker or "").strip()
+            for ticker in (active_tickers or [])
+            if str(ticker or "").strip()
+        }
+        tracked_open_tickers = {
+            str(position.get("ticker") or "").strip()
+            for position in self.live_positions
+            if isinstance(position, dict)
+            and str(position.get("ticker") or "").strip()
+            and str(position.get("status", "open") or "open").strip().lower() == "open"
+        }
+        keep_tickers = active_tickers | tracked_open_tickers
+        state = self.load_live_position_state()
+        removed = []
+        for ticker in list(state.keys()):
+            if ticker not in keep_tickers:
+                removed.append(ticker)
+                state.pop(ticker, None)
+        if removed:
+            print(f"[LIVE-STATE-PRUNE] removed={removed} keep_count={len(keep_tickers)}")
+            self.save_live_position_state(state)
+        return removed
 
     def normalize_contract_price(self, price, ticker=None, source="unknown"):
         if price is None:
@@ -518,6 +3590,7 @@ class KalshiSniperBot:
             return
         entry_price = self.normalize_contract_price(entry_price, ticker=ticker, source="persist_live_entry_metadata")
         state = self.load_live_position_state()
+        entry_context = (payload or {}).get("entry_context")
         state[ticker] = {
             "ticker": ticker,
             "side": side,
@@ -525,6 +3598,7 @@ class KalshiSniperBot:
             "count": count,
             "entry_ts": time.time(),
             "order_id": summary.get("order_id") or order_id,
+            "entry_context": entry_context if isinstance(entry_context, dict) else None,
         }
         self.save_live_position_state(state)
 
@@ -566,13 +3640,23 @@ class KalshiSniperBot:
             ticker=ticker,
             source="upsert_live_entry_metadata_from_position.avg_price",
         )
+        selected_entry_price = normalized_avg_price
+        if existing:
+            existing_entry_price = self.normalize_contract_price(
+                existing.get("entry_price"),
+                ticker=ticker,
+                source="upsert_live_entry_metadata_from_position.existing_entry_price",
+            )
+            if existing_entry_price is not None and 0 < existing_entry_price <= 1:
+                selected_entry_price = existing_entry_price
         state[ticker] = {
             "ticker": ticker,
             "side": position_summary.get("side"),
-            "entry_price": normalized_avg_price,
+            "entry_price": selected_entry_price,
             "count": count,
             "entry_ts": entry_ts,
             "last_update_ts": updated_ts if updated_ts is not None else time.time(),
+            "entry_context": position_summary.get("entry_context") if isinstance(position_summary.get("entry_context"), dict) else existing.get("entry_context") if isinstance(existing, dict) else None,
         }
         self.save_live_position_state(state)
         return state[ticker]
@@ -673,12 +3757,13 @@ class KalshiSniperBot:
     def build_quote(self, market):
         ticker = market.get("ticker", "N/A")
         title = market.get("title") or market.get("subtitle") or "Untitled"
+        family = self.get_market_family(market)
 
         yes_bid = self.to_float(
-            market.get("yes_bid_dollars", market.get("yes_bid"))
+            market.get("yes_bid_dollars", market.get("yes_bid")), None
         )
         yes_ask = self.to_float(
-            market.get("yes_ask_dollars", market.get("yes_ask"))
+            market.get("yes_ask_dollars", market.get("yes_ask")), None
         )
         last_price = self.to_float(
             market.get("last_price_dollars", market.get("last_price", yes_bid))
@@ -687,16 +3772,88 @@ class KalshiSniperBot:
         liquidity = self.to_float(market.get("liquidity_dollars"), 0.0)
 
         no_bid = self.to_float(
-            market.get("no_bid_dollars", market.get("no_bid"))
+            market.get("no_bid_dollars", market.get("no_bid")), None
         )
         no_ask = self.to_float(
-            market.get("no_ask_dollars", market.get("no_ask"))
+            market.get("no_ask_dollars", market.get("no_ask")), None
         )
 
-        if no_bid == 0.0 and yes_ask > 0.0:
-            no_bid = max(0.0, 1.0 - yes_ask)
-        if no_ask == 0.0 and yes_bid > 0.0:
-            no_ask = min(1.0, 1.0 - yes_bid)
+        if self._is_sports_market_or_family(family):
+            self._emit_topbook_trace(
+                "[LIVE-TOPBOOK-RAW]",
+                market,
+                family=family,
+                reason="build_quote_input",
+                ticker=ticker,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+            )
+
+        yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        continuity_used = False
+        continuity_reason = "not_needed"
+        if self._is_sports_market_or_family(family):
+            yes_bid, yes_ask, no_bid, no_ask, continuity_used, continuity_reason = self._apply_sports_quote_continuity(
+                market,
+                yes_bid,
+                yes_ask,
+                no_bid,
+                no_ask,
+            )
+
+        yes_bid = self.to_float(yes_bid, 0.0)
+        yes_ask = self.to_float(yes_ask, 0.0)
+        no_bid = self.to_float(no_bid, 0.0)
+        no_ask = self.to_float(no_ask, 0.0)
+        if self._is_sports_market_or_family(family):
+            spread = round(yes_ask - yes_bid, 4) if yes_bid > 0.0 and yes_ask > 0.0 else None
+            topbook_snapshot = self._extract_non_targeted_topbook_snapshot(market)
+            adaptive_spread_limit = self._get_sports_adaptive_spread_threshold(
+                market,
+                spread=spread,
+                liquidity=liquidity,
+                yes_top_size=topbook_snapshot.get("yes_top_size"),
+                no_top_size=topbook_snapshot.get("no_top_size"),
+                context="build_quote_final",
+            ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
+            reject_reason = self._topbook_reject_reason(
+                yes_price=yes_ask if yes_ask > 0.0 else None,
+                yes_size=topbook_snapshot.get("yes_top_size"),
+                no_price=no_ask if no_ask > 0.0 else None,
+                no_size=topbook_snapshot.get("no_top_size"),
+                spread=spread,
+                max_spread=adaptive_spread_limit,
+            )
+            self._emit_topbook_trace(
+                "[LIVE-TOPBOOK-FINAL]",
+                market,
+                family=family,
+                reason=f"{reject_reason};continuity={continuity_reason}",
+                ticker=ticker,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+                yes_price=yes_ask,
+                no_price=no_ask,
+                yes_size=topbook_snapshot.get("yes_top_size"),
+                no_size=topbook_snapshot.get("no_top_size"),
+                spread=spread,
+                continuity_used="yes" if continuity_used else "no",
+            )
+            self._record_sports_quote_continuity_snapshot(
+                ticker,
+                family,
+                yes_bid,
+                yes_ask,
+                no_bid,
+                no_ask,
+                yes_top_size=topbook_snapshot.get("yes_top_size"),
+                no_top_size=topbook_snapshot.get("no_top_size"),
+                source="build_quote",
+            )
 
         return Quote(
             ticker=ticker,
@@ -719,9 +3876,599 @@ class KalshiSniperBot:
         score += max(0.0, MAX_ENTRY_SPREAD - spread) * 40
         score += min(q.liquidity, 500) / 25
         score += min(q.volume, 500) / 40
+        if 0.68 <= q.yes_ask <= 0.93 and 0 <= spread <= 0.045:
+            score += 10.0
+        if q.volume > SMART_ENTRY_PRIORITY_VOLUME_THRESHOLD and 0 <= spread <= SMART_ENTRY_PRIORITY_TIGHT_SPREAD:
+            score += 8.0
+            if 0.68 <= q.yes_ask <= 0.93:
+                score += 6.0
         score += max(0.0, 0.25 - abs(mid_price - 0.5)) * 8
         score += max(0.0, 24 - len(q.ticker)) / 24
         return round(score, 4)
+
+    def _should_adaptive_allow_momentum_warning(self, ticker, yes_ask=None, spread=None, payload=None):
+        ticker = str(ticker or "").strip()
+        gate_record = dict(self.phase55_live_execution_gate_by_ticker.get(ticker, {}) or {})
+        payload_action = str((payload or {}).get("action") or "").strip().lower() if isinstance(payload, dict) else ""
+        decision = str(gate_record.get("decision") or "").strip().upper()
+        buy_intent = bool(decision == "BUY" or payload_action == "buy")
+        phase55_status = str(gate_record.get("phase55_status") or "").strip()
+        entry_timing_pass = gate_record.get("entry_timing_pass") is True
+        price_valid = yes_ask is not None and yes_ask > 0
+        spread_valid = spread is not None and spread <= 0.03
+        adaptive_allow = bool(
+            ticker
+            and buy_intent
+            and price_valid
+            and spread_valid
+        )
+        why = []
+        if not ticker:
+            why.append("missing_ticker")
+        if not buy_intent:
+            why.append("decision_not_buy")
+        if not price_valid:
+            why.append("invalid_price")
+        if not spread_valid:
+            why.append("spread_above_0.03")
+        return adaptive_allow, {
+            "decision": decision,
+            "buy_intent": buy_intent,
+            "phase55_status": phase55_status,
+            "entry_timing_pass": entry_timing_pass,
+            "price_valid": price_valid,
+            "spread_valid": spread_valid,
+            "why": ",".join(why) if why else "eligible",
+        }
+
+    def _evaluate_mlb_total_entry_confirmation(self, ticker, recent_prices, recent_delta, spread, adaptive_allow=False):
+        recent_prices = [float(price) for price in (recent_prices or []) if price is not None]
+        if spread is None or spread > 0.03:
+            return False, "spread_not_tight_enough"
+        if len(recent_prices) < 3:
+            return False, "insufficient_recent_price_history"
+        recent_range = max(recent_prices) - min(recent_prices)
+        last_step_delta = recent_prices[-1] - recent_prices[-2]
+        reversing = recent_prices[-1] < recent_prices[-2]
+        if recent_delta is None or recent_delta < MLB_TOTAL_MIN_MOMENTUM_DELTA:
+            return False, "momentum_too_weak"
+        if recent_range < MLB_TOTAL_MIN_MOMENTUM_RANGE:
+            return False, "price_action_flat"
+        if last_step_delta < MLB_TOTAL_MIN_LAST_STEP_DELTA:
+            return False, "last_step_not_improving"
+        if reversing:
+            return False, "recent_reversal_detected"
+        if adaptive_allow and last_step_delta <= 0:
+            return False, "adaptive_allow_without_stronger_confirmation"
+        return True, "confirmed"
+
+    def _evaluate_smart_entry_gate(self, market, q, payload=None):
+        ticker = getattr(q, "ticker", "") or str((market or {}).get("ticker", "") or "").strip()
+        family = self.get_market_family(market or {"ticker": ticker}) if ticker else "UNKNOWN"
+        yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="smart_entry.yes_bid")
+        yes_ask = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="smart_entry.yes_ask")
+        spread = (yes_ask - yes_bid) if yes_ask and yes_bid else None
+        edge = "bad"
+        reason = "missing_yes_top_book"
+        momentum_ok = True
+        recent_delta = None
+        high_prob_ok = False
+        adaptive_allow = False
+        recent_prices = []
+        session_adjustment = self._get_live_session_entry_adjustment(adaptive_entry=False, borderline=False)
+        if yes_ask is None or yes_ask <= 0 or yes_ask < 0.68 or yes_ask > MAX_YES_ASK_TO_ENTER:
+            allowed = False
+            reason = "price_out_of_range"
+        elif spread is None or spread < 0:
+            allowed = False
+            reason = "missing_spread"
+        else:
+            high_prob_ok = bool(spread <= 0.045)
+            timing_history_key = self._build_phase55_timing_history_key(market or {"ticker": ticker}, q, family=family)
+            rolling_history = list(self.phase55_rolling_price_history.get(str(timing_history_key or "").strip(), []))
+            recent_prices = [float(price) for price in rolling_history[-4:] if price is not None]
+            if len(recent_prices) >= 2:
+                recent_delta = recent_prices[-1] - recent_prices[0]
+                momentum_ok = recent_delta >= 0
+            allowed = bool(high_prob_ok and momentum_ok)
+            if allowed:
+                edge = "good"
+                reason = "junk_bond_neutral_momentum" if recent_delta is None else "junk_bond"
+            elif not high_prob_ok:
+                reason = "spread_too_wide"
+            else:
+                adaptive_allow, adaptive_details = self._should_adaptive_allow_momentum_warning(
+                    ticker,
+                    yes_ask=yes_ask,
+                    spread=spread,
+                    payload=payload,
+                )
+                if adaptive_allow:
+                    borderline_adaptive = bool(yes_ask >= 0.85 or (spread is not None and spread >= 0.025) or recent_delta is None)
+                    session_adjustment = self._get_live_session_entry_adjustment(
+                        adaptive_entry=True,
+                        borderline=borderline_adaptive,
+                    )
+                    if session_adjustment.get("adaptive_block"):
+                        adaptive_allow = False
+                        allowed = False
+                        reason = "session_mode_requires_stronger_confirmation"
+                    else:
+                        allowed = True
+                        edge = "good"
+                        reason = "momentum_warning"
+                        print(
+                            f"[LIVE-EXECUTION-MOMENTUM-WARN] ticker={ticker} "
+                            f"adaptive_allow=yes original_reason=momentum_not_stable "
+                            f"price={yes_ask} spread={spread}"
+                        )
+                else:
+                    reason = "momentum_not_stable"
+                    now_ts = time.time()
+                    last_log_ts = float(self.live_momentum_hard_block_log_last_seen.get(ticker, 0.0) or 0.0)
+                    if (now_ts - last_log_ts) >= 30.0:
+                        print(
+                            f"[LIVE-EXECUTION-MOMENTUM-HARD-BLOCK] ticker={ticker} "
+                            f"reason=momentum_not_stable why={adaptive_details.get('why')}"
+                        )
+                        self.live_momentum_hard_block_log_last_seen[ticker] = now_ts
+        if family == "KXMLBTOTAL" and (allowed or adaptive_allow):
+            mlb_confirm_ok, mlb_confirm_reason = self._evaluate_mlb_total_entry_confirmation(
+                ticker,
+                recent_prices=recent_prices,
+                recent_delta=recent_delta,
+                spread=spread,
+                adaptive_allow=adaptive_allow,
+            )
+            if mlb_confirm_ok:
+                print(
+                    f"[LIVE-MLB-ENTRY-CONFIRM-PASS] ticker={ticker} spread={spread} "
+                    f"delta={recent_delta} adaptive_allow={'yes' if adaptive_allow else 'no'}"
+                )
+            else:
+                print(
+                    f"[LIVE-MLB-ENTRY-CONFIRM-REJECT] ticker={ticker} spread={spread} "
+                    f"delta={recent_delta} adaptive_allow={'yes' if adaptive_allow else 'no'} reason={mlb_confirm_reason}"
+                )
+                allowed = False
+                adaptive_allow = False
+                edge = "bad"
+                reason = mlb_confirm_reason
+        status = "adaptive_allowed" if adaptive_allow else ("accepted" if allowed else "rejected")
+        momentum_status = "passed" if momentum_ok else "blocked"
+        print(f"[MOMENTUM-CHECK] ticker={ticker} status={momentum_status} delta={recent_delta}")
+        print(f"[SMART-ENTRY] ticker={ticker} price={yes_ask} spread={spread} edge={edge}")
+        print(f"[HIGH-PROB-ENTRY] ticker={ticker} price={yes_ask} spread={spread} status={status} reason={reason}")
+        print(f"[EDGE-ENTRY] ticker={ticker} price={yes_ask} spread={spread} status={status} reason={reason}")
+        return allowed, reason, {
+            "ticker": ticker,
+            "family": family,
+            "price": yes_ask,
+            "edge": edge,
+            "momentum_ok": momentum_ok,
+            "recent_delta": recent_delta,
+            "spread": spread,
+            "high_prob_ok": high_prob_ok,
+            "adaptive_allow": adaptive_allow,
+        }
+
+    def _is_high_prob_submission_candidate(self, q, market=None):
+        ticker = getattr(q, "ticker", "") or str((market or {}).get("ticker", "") or "").strip()
+        market = market or {"ticker": ticker}
+        family = self.get_market_family(market) if ticker else "UNKNOWN"
+        yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="submission_candidate.yes_bid")
+        yes_ask = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="submission_candidate.yes_ask")
+        spread = (yes_ask - yes_bid) if yes_ask and yes_bid else None
+        recent_delta = None
+        momentum_ok = True
+        if yes_ask is None or yes_ask < 0.68 or yes_ask > 0.93 or spread is None or spread < 0 or spread > 0.045:
+            return False, {"ticker": ticker, "family": family, "yes_ask": yes_ask, "spread": spread, "recent_delta": recent_delta}
+        timing_history_key = self._build_phase55_timing_history_key(market, q, family=family)
+        rolling_history = list(self.phase55_rolling_price_history.get(str(timing_history_key or "").strip(), []))
+        recent_prices = [float(price) for price in rolling_history[-4:] if price is not None]
+        if len(recent_prices) >= 2:
+            recent_delta = recent_prices[-1] - recent_prices[0]
+            momentum_ok = recent_delta >= 0
+        return bool(momentum_ok), {"ticker": ticker, "family": family, "yes_ask": yes_ask, "spread": spread, "recent_delta": recent_delta}
+
+    def _classify_entry_block_reason(self, reason):
+        reason = str(reason or "").strip().lower()
+        if (
+            "phase55" in reason
+            or reason in {
+                "insufficient_data",
+                "trigger_wait",
+                "no_crossover",
+                "pullback_wait",
+                "immediate_entry_block",
+            }
+        ):
+            return "phase55"
+        if "negative_edge" in reason or "top_book" in reason:
+            return "negative_edge"
+        if "stale_signal" in reason or "direction_changed" in reason or "spread_deteriorated" in reason:
+            return "stale"
+        if "duplicate" in reason or "sim_position_open" in reason or "live_position_open_same_ticker" in reason:
+            return "duplicate"
+        return "other"
+
+    def _record_live_family_performance(self, family, realized_value):
+        family = str(family or "UNKNOWN").strip() or "UNKNOWN"
+        stats = dict(self.live_family_perf_stats.get(family, {}) or {})
+        stats["trades"] = int(stats.get("trades", 0) or 0) + 1
+        stats["wins"] = int(stats.get("wins", 0) or 0)
+        stats["losses"] = int(stats.get("losses", 0) or 0)
+        stats["loss_streak"] = int(stats.get("loss_streak", 0) or 0)
+        stats["pnl"] = round(float(stats.get("pnl", 0.0) or 0.0) + float(realized_value or 0.0), 4)
+        if realized_value > 0:
+            stats["wins"] += 1
+            stats["loss_streak"] = 0
+        elif realized_value < 0:
+            stats["losses"] += 1
+            stats["loss_streak"] += 1
+        self.live_family_perf_stats[family] = stats
+        print(
+            f"[LIVE-FAMILY-PERFORMANCE-UPDATE] family={family} trades={stats.get('trades')} "
+            f"wins={stats.get('wins')} losses={stats.get('losses')} "
+            f"pnl={stats.get('pnl')} loss_streak={stats.get('loss_streak')}"
+        )
+
+    def _record_live_session_outcome(self, realized_value, now_ts=None):
+        now_ts = float(now_ts or time.time())
+        self.live_recent_session_outcomes.append({"ts": now_ts, "pnl": float(realized_value or 0.0)})
+        self.live_recent_session_outcomes = [
+            item for item in list(self.live_recent_session_outcomes or [])
+            if now_ts - float((item or {}).get("ts", 0.0) or 0.0) <= 6 * 3600
+        ]
+
+    def _get_live_session_streaks(self):
+        profit_streak = 0
+        loss_streak = 0
+        for item in reversed(list(self.live_recent_session_outcomes or [])):
+            pnl_value = float((item or {}).get("pnl", 0.0) or 0.0)
+            if pnl_value > 0:
+                if loss_streak > 0:
+                    break
+                profit_streak += 1
+            elif pnl_value < 0:
+                if profit_streak > 0:
+                    break
+                loss_streak += 1
+            else:
+                break
+        return profit_streak, loss_streak
+
+    def _get_live_session_mode(self):
+        wins_today = int(self.live_perf_wins_today or 0)
+        losses_today = int(self.live_perf_losses_today or 0)
+        realized_pnl_today = float(self.live_realized_pnl_today or 0.0)
+        profit_streak, loss_streak = self._get_live_session_streaks()
+        mode = "neutral"
+        reason = "flat_session"
+        if not KALSHI_SESSION_PROTECTION_ENABLED:
+            reason = "feature_disabled"
+        elif realized_pnl_today <= KALSHI_DEFENSIVE_MODE_PNL or loss_streak >= 2 or (losses_today >= wins_today + 2 and losses_today >= 3):
+            mode = "defensive"
+            reason = "drawdown_or_loss_streak"
+        elif realized_pnl_today >= KALSHI_PROTECTED_MODE_PNL:
+            mode = "protected"
+            reason = "protecting_session_gains"
+        elif realized_pnl_today > 0 or profit_streak >= 2:
+            mode = "aggressive"
+            reason = "positive_session_flow"
+        log_marker = (mode, round(realized_pnl_today, 4), wins_today, losses_today, profit_streak, loss_streak)
+        if self.live_session_mode_log_marker != log_marker:
+            print(
+                f"[LIVE-SESSION-MODE] mode={mode} realized_pnl_today={round(realized_pnl_today, 4)} "
+                f"wins_today={wins_today} losses_today={losses_today} "
+                f"profit_streak={profit_streak} loss_streak={loss_streak} reason={reason}"
+            )
+            if mode == "protected":
+                print(
+                    f"[LIVE-SESSION-PROTECTED] realized_pnl_today={round(realized_pnl_today, 4)} "
+                    f"threshold={KALSHI_PROTECTED_MODE_PNL}"
+                )
+            elif mode == "defensive":
+                print(
+                    f"[LIVE-SESSION-DEFENSIVE] realized_pnl_today={round(realized_pnl_today, 4)} "
+                    f"threshold={KALSHI_DEFENSIVE_MODE_PNL}"
+                )
+            elif mode == "aggressive":
+                print(
+                    f"[LIVE-SESSION-AGGRESSIVE] realized_pnl_today={round(realized_pnl_today, 4)} "
+                    f"profit_streak={profit_streak}"
+                )
+            self.live_session_mode_log_marker = log_marker
+            self.live_session_mode = mode
+        return {
+            "mode": mode,
+            "reason": reason,
+            "realized_pnl_today": realized_pnl_today,
+            "wins_today": wins_today,
+            "losses_today": losses_today,
+            "profit_streak": profit_streak,
+            "loss_streak": loss_streak,
+        }
+
+    def _get_live_session_entry_adjustment(self, adaptive_entry=False, borderline=False):
+        session_state = self._get_live_session_mode()
+        mode = session_state.get("mode", "neutral")
+        if not KALSHI_SESSION_PROTECTION_ENABLED:
+            return {"mode": mode, "score_penalty": 0.0, "adaptive_block": False, "reason": "feature_disabled"}
+        score_penalty = 0.0
+        adaptive_block = False
+        reason = "neutral"
+        if mode == "protected":
+            score_penalty = PHASE5_BUY_SCORE_THRESHOLD * KALSHI_PROTECTED_MODE_ENTRY_PENALTY
+            if adaptive_entry and borderline:
+                adaptive_block = True
+                reason = "protected_mode_blocks_borderline_adaptive"
+            else:
+                reason = "protected_mode_penalty"
+        elif mode == "defensive":
+            score_penalty = PHASE5_BUY_SCORE_THRESHOLD * KALSHI_DEFENSIVE_MODE_ENTRY_PENALTY
+            if adaptive_entry or borderline:
+                adaptive_block = True
+                reason = "defensive_mode_blocks_adaptive_or_borderline"
+            else:
+                reason = "defensive_mode_penalty"
+        elif mode == "aggressive":
+            reason = "normal_operation"
+        print(
+            f"[LIVE-SESSION-ENTRY-ADJUSTMENT] mode={mode} adaptive_entry={'yes' if adaptive_entry else 'no'} "
+            f"borderline={'yes' if borderline else 'no'} score_penalty={round(score_penalty, 4)} "
+            f"adaptive_block={'yes' if adaptive_block else 'no'} reason={reason}"
+        )
+        return {
+            "mode": mode,
+            "score_penalty": float(score_penalty),
+            "adaptive_block": adaptive_block,
+            "reason": reason,
+        }
+
+    def _get_family_performance_weight(self, family):
+        family = str(family or "UNKNOWN").strip() or "UNKNOWN"
+        if not KALSHI_FAMILY_PERF_ENABLED:
+            print(f"[LIVE-FAMILY-PERF-SKIP] family={family} reason=feature_disabled")
+            return 0.0
+        stats = dict(self.live_family_perf_stats.get(family, {}) or {})
+        trades = int(stats.get("trades", 0) or 0)
+        pnl = float(self.live_realized_pnl_by_family_today.get(family, stats.get("pnl", 0.0)) or 0.0)
+        loss_streak = int(stats.get("loss_streak", 0) or 0)
+        if trades < KALSHI_FAMILY_MIN_TRADES_FOR_PENALTY:
+            print(
+                f"[LIVE-FAMILY-PERF-SKIP] family={family} reason=insufficient_trades "
+                f"trades={trades} min_trades={KALSHI_FAMILY_MIN_TRADES_FOR_PENALTY}"
+            )
+            return 0.0
+        adjustment = 0.0
+        if pnl < 0:
+            adjustment -= KALSHI_FAMILY_NEGATIVE_PNL_PENALTY
+            print(
+                f"[LIVE-FAMILY-RANKING-PENALTY] family={family} type=negative_pnl "
+                f"pnl={pnl} penalty={KALSHI_FAMILY_NEGATIVE_PNL_PENALTY}"
+            )
+        elif pnl > 0:
+            adjustment += KALSHI_FAMILY_POSITIVE_PNL_BOOST
+            print(
+                f"[LIVE-FAMILY-RANKING-BOOST] family={family} type=positive_pnl "
+                f"pnl={pnl} boost={KALSHI_FAMILY_POSITIVE_PNL_BOOST}"
+            )
+        if loss_streak >= 2:
+            adjustment -= KALSHI_FAMILY_LOSS_STREAK_PENALTY
+            print(
+                f"[LIVE-FAMILY-RANKING-PENALTY] family={family} type=loss_streak "
+                f"loss_streak={loss_streak} penalty={KALSHI_FAMILY_LOSS_STREAK_PENALTY}"
+            )
+        print(
+            f"[LIVE-FAMILY-PERF-WEIGHT] family={family} trades={trades} pnl={pnl} "
+            f"loss_streak={loss_streak} adjustment={round(adjustment, 4)}"
+        )
+        return float(adjustment)
+
+    def _prune_post_loss_cooldowns(self, now_ts=None):
+        now_ts = float(now_ts or time.time())
+        for ticker, event in list((self.live_post_loss_ticker_cooldowns or {}).items()):
+            expires_at = float((event or {}).get("expires_at", 0.0) or 0.0)
+            if expires_at and expires_at <= now_ts:
+                print(
+                    f"[LIVE-POST-LOSS-COOLDOWN-EXPIRED] scope=ticker ticker={ticker} "
+                    f"family={(event or {}).get('family')} reason={(event or {}).get('reason')}"
+                )
+                self.live_post_loss_ticker_cooldowns.pop(ticker, None)
+        for family, event in list((self.live_post_loss_family_cooldowns or {}).items()):
+            expires_at = float((event or {}).get("expires_at", 0.0) or 0.0)
+            if expires_at and expires_at <= now_ts:
+                print(
+                    f"[LIVE-POST-LOSS-COOLDOWN-EXPIRED] scope=family family={family} "
+                    f"reason={(event or {}).get('reason')}"
+                )
+                self.live_post_loss_family_cooldowns.pop(family, None)
+        recent_window = max(1800, KALSHI_POST_LOSS_TICKER_COOLDOWN_SECONDS)
+        self.live_recent_negative_exit_events = [
+            event for event in list(self.live_recent_negative_exit_events or [])
+            if now_ts - float((event or {}).get("ts", 0.0) or 0.0) <= recent_window
+        ]
+
+    def _record_post_loss_exit_event(self, ticker, family, realized_pnl, reason, now_ts=None):
+        now_ts = float(now_ts or time.time())
+        self._prune_post_loss_cooldowns(now_ts=now_ts)
+        ticker = str(ticker or "").strip()
+        family = str(family or "UNKNOWN").strip() or "UNKNOWN"
+        realized_value = float(realized_pnl or 0.0)
+        reason = str(reason or "loss_exit").strip() or "loss_exit"
+        should_track = bool(
+            realized_value < 0
+            or reason in {"stop_loss", "fast_stop_loss", "mlb_early_adverse_exit", "early_adverse_exit"}
+            or (reason == "fast_max_hold" and realized_value < 0)
+        )
+        if not should_track or not ticker:
+            return
+        event = {
+            "ticker": ticker,
+            "family": family,
+            "ts": now_ts,
+            "realized_pnl": realized_value,
+            "reason": reason,
+        }
+        self.live_recent_negative_exit_events.append(event)
+        self.live_post_loss_ticker_cooldowns[ticker] = {
+            **event,
+            "expires_at": now_ts + KALSHI_POST_LOSS_TICKER_COOLDOWN_SECONDS,
+        }
+        print(
+            f"[LIVE-POST-LOSS-COOLDOWN-SET] scope=ticker ticker={ticker} family={family} "
+            f"seconds={KALSHI_POST_LOSS_TICKER_COOLDOWN_SECONDS} realized_pnl={realized_value} reason={reason}"
+        )
+        if KALSHI_POST_LOSS_FAMILY_COOLDOWN_ENABLED:
+            family_recent_losses = [
+                loss for loss in self.live_recent_negative_exit_events
+                if str((loss or {}).get("family") or "").strip() == family
+                and now_ts - float((loss or {}).get("ts", 0.0) or 0.0) <= 1800
+            ]
+            if len(family_recent_losses) >= KALSHI_POST_LOSS_FAMILY_MAX_RECENT_LOSSES:
+                self.live_post_loss_family_cooldowns[family] = {
+                    "family": family,
+                    "reason": "recent_family_losses",
+                    "count": len(family_recent_losses),
+                    "expires_at": now_ts + KALSHI_POST_LOSS_FAMILY_COOLDOWN_SECONDS,
+                }
+                print(
+                    f"[LIVE-POST-LOSS-COOLDOWN-SET] scope=family family={family} "
+                    f"seconds={KALSHI_POST_LOSS_FAMILY_COOLDOWN_SECONDS} count={len(family_recent_losses)} reason=recent_family_losses"
+                )
+
+    def _check_post_loss_reentry_block(self, ticker, family=None, now_ts=None):
+        now_ts = float(now_ts or time.time())
+        self._prune_post_loss_cooldowns(now_ts=now_ts)
+        ticker = str(ticker or "").strip()
+        family = str((family or (ticker.split("-")[0] if ticker else "UNKNOWN")) or "UNKNOWN").strip() or "UNKNOWN"
+        ticker_event = dict((self.live_post_loss_ticker_cooldowns or {}).get(ticker, {}) or {})
+        if ticker_event:
+            expires_at = float(ticker_event.get("expires_at", 0.0) or 0.0)
+            if expires_at > now_ts:
+                remaining = int(max(0, expires_at - now_ts))
+                print(
+                    f"[LIVE-POST-LOSS-TICKER-BLOCK] ticker={ticker} family={family} "
+                    f"seconds_remaining={remaining} realized_pnl={ticker_event.get('realized_pnl')} reason={ticker_event.get('reason')}"
+                )
+                return False, "post_loss_ticker_cooldown"
+        family_event = dict((self.live_post_loss_family_cooldowns or {}).get(family, {}) or {})
+        if family_event:
+            expires_at = float(family_event.get("expires_at", 0.0) or 0.0)
+            if expires_at > now_ts:
+                remaining = int(max(0, expires_at - now_ts))
+                print(
+                    f"[LIVE-POST-LOSS-FAMILY-BLOCK] family={family} ticker={ticker} "
+                    f"seconds_remaining={remaining} count={family_event.get('count')} reason={family_event.get('reason')}"
+                )
+                return False, "post_loss_family_cooldown"
+        return True, "clear"
+
+    def _reset_entry_attempt_cycle_state_if_needed(self):
+        cycle_marker = int(self.cycle_count or 0)
+        if self.entry_attempt_cycle_marker == cycle_marker:
+            return
+        previous_summary = dict(getattr(self, "entry_attempt_cycle_summary", {}) or {})
+        previous_marker = self.entry_attempt_cycle_marker
+        if previous_marker is not None:
+            print(
+                f"[ENTRY-ATTEMPT-COOLDOWN-SUMMARY] ticker_cooldowns={int(previous_summary.get('ticker_cooldowns', 0) or 0)} "
+                f"family_cooldowns={int(previous_summary.get('family_cooldowns', 0) or 0)} "
+                f"dedupes={int(previous_summary.get('dedupes', 0) or 0)} "
+                f"allowed_attempts={int(previous_summary.get('allowed_attempts', 0) or 0)}"
+            )
+        self.entry_attempt_cycle_marker = cycle_marker
+        self.entry_attempt_seen_this_cycle = set()
+        self.entry_attempt_cycle_family_counts = {}
+        self.entry_attempt_cycle_summary = {
+            "ticker_cooldowns": 0,
+            "family_cooldowns": 0,
+            "dedupes": 0,
+            "allowed_attempts": 0,
+        }
+
+    def _prune_entry_attempt_tracking(self, now_ts=None):
+        now_ts = float(now_ts or time.time())
+        global ENTRY_ATTEMPT_LAST_SEEN, ENTRY_ATTEMPT_FAMILY_LAST_SEEN
+        ENTRY_ATTEMPT_LAST_SEEN = {
+            ticker: ts
+            for ticker, ts in dict(ENTRY_ATTEMPT_LAST_SEEN).items()
+            if (now_ts - float(ts or 0.0)) < ENTRY_ATTEMPT_TICKER_COOLDOWN_SECONDS
+        }
+        ENTRY_ATTEMPT_FAMILY_LAST_SEEN = {
+            family: ts
+            for family, ts in dict(ENTRY_ATTEMPT_FAMILY_LAST_SEEN).items()
+            if (now_ts - float(ts or 0.0)) < ENTRY_ATTEMPT_FAMILY_COOLDOWN_SECONDS
+        }
+
+    def _register_entry_attempt_event(self, ticker, family=None, reason=None):
+        ticker = str(ticker or "").strip()
+        family = str((ticker.split("-")[0] if ticker else family) or "UNKNOWN").strip()
+        now_ts = time.time()
+        self._reset_entry_attempt_cycle_state_if_needed()
+        self._prune_entry_attempt_tracking(now_ts=now_ts)
+        if not ticker:
+            return False
+        btc15m_overnight_mode = self._is_btc15m_overnight_mode(family, now_ts=now_ts)
+        ticker_cooldown_seconds = ENTRY_ATTEMPT_TICKER_COOLDOWN_SECONDS
+        family_cooldown_seconds = ENTRY_ATTEMPT_FAMILY_COOLDOWN_SECONDS
+        if btc15m_overnight_mode:
+            ticker_cooldown_seconds = max(1.0, ENTRY_ATTEMPT_TICKER_COOLDOWN_SECONDS * 0.5)
+            family_cooldown_seconds = max(1.0, ENTRY_ATTEMPT_FAMILY_COOLDOWN_SECONDS * 0.5)
+            print(
+                f"[LIVE-BTC15M-OVERNIGHT-COOLDOWN-SOFTENED] ticker={ticker} family={family} "
+                f"ticker_cooldown_seconds={ticker_cooldown_seconds} "
+                f"family_cooldown_seconds={family_cooldown_seconds}"
+            )
+        last_ticker_seen = float(ENTRY_ATTEMPT_LAST_SEEN.get(ticker, 0.0) or 0.0)
+        if last_ticker_seen > 0.0 and (now_ts - last_ticker_seen) < ticker_cooldown_seconds:
+            seconds_remaining = int(max(0, ticker_cooldown_seconds - (now_ts - last_ticker_seen)))
+            self.entry_attempt_cycle_summary["ticker_cooldowns"] = int(self.entry_attempt_cycle_summary.get("ticker_cooldowns", 0) or 0) + 1
+            last_log_ts = float(self.entry_attempt_ticker_log_last_seen.get(ticker, 0.0) or 0.0)
+            if (now_ts - last_log_ts) >= 30.0:
+                print(
+                    f"[ENTRY-ATTEMPT-COOLDOWN] ticker={ticker} reason=recent_attempt "
+                    f"seconds_remaining={seconds_remaining}"
+                )
+                self.entry_attempt_ticker_log_last_seen[ticker] = now_ts
+            return False
+        if ticker in self.entry_attempt_seen_this_cycle:
+            self.entry_attempt_cycle_summary["dedupes"] = int(self.entry_attempt_cycle_summary.get("dedupes", 0) or 0) + 1
+            print(f"[ENTRY-ATTEMPT-DEDUPE] ticker={ticker} reason=already_attempted_this_cycle")
+            return False
+        last_family_seen = float(ENTRY_ATTEMPT_FAMILY_LAST_SEEN.get(family, 0.0) or 0.0)
+        if last_family_seen > 0.0 and (now_ts - last_family_seen) < family_cooldown_seconds:
+            self.entry_attempt_cycle_summary["family_cooldowns"] = int(self.entry_attempt_cycle_summary.get("family_cooldowns", 0) or 0) + 1
+            last_family_log_ts = float(self.entry_attempt_family_log_last_seen.get(family, 0.0) or 0.0)
+            if (now_ts - last_family_log_ts) >= 30.0:
+                print(
+                    f"[ENTRY-ATTEMPT-FAMILY-COOLDOWN] family={family} reason=soft_pass_attempt_cluster"
+                )
+                self.entry_attempt_family_log_last_seen[family] = now_ts
+            return False
+        next_family_count = int(self.entry_attempt_cycle_family_counts.get(family, 0) or 0) + 1
+        if next_family_count > ENTRY_ATTEMPT_FAMILY_THRESHOLD_PER_CYCLE:
+            ENTRY_ATTEMPT_FAMILY_LAST_SEEN[family] = now_ts
+            self.entry_attempt_cycle_summary["family_cooldowns"] = int(self.entry_attempt_cycle_summary.get("family_cooldowns", 0) or 0) + 1
+            last_family_log_ts = float(self.entry_attempt_family_log_last_seen.get(family, 0.0) or 0.0)
+            if (now_ts - last_family_log_ts) >= 30.0:
+                print(
+                    f"[ENTRY-ATTEMPT-FAMILY-COOLDOWN] family={family} reason=soft_pass_attempt_cluster"
+                )
+                self.entry_attempt_family_log_last_seen[family] = now_ts
+            return False
+        self.entry_attempt_seen_this_cycle.add(ticker)
+        self.entry_attempt_cycle_family_counts[family] = next_family_count
+        ENTRY_ATTEMPT_LAST_SEEN[ticker] = now_ts
+        self.entry_attempt_cycle_summary["allowed_attempts"] = int(self.entry_attempt_cycle_summary.get("allowed_attempts", 0) or 0) + 1
+        return True
+
+    def _log_live_execution_final_blocked(self, ticker, reason):
+        print(f"[LIVE-EXECUTION-FINAL-BLOCKED] ticker={ticker} reason={reason}")
+
+    def _log_live_execution_final_approved(self, ticker, reason="all_gates_passed"):
+        print(f"[LIVE-EXECUTION-FINAL-APPROVED] ticker={ticker} reason={reason}")
 
     def _filter_live_entry_candidate(self, market, q):
         ticker = getattr(q, "ticker", "") or market.get("ticker", "")
@@ -852,6 +4599,23 @@ class KalshiSniperBot:
             return self.get_market_group(event_ticker)
         return "UNKNOWN"
 
+    def _resolve_market_category_label(self, market_or_family):
+        if isinstance(market_or_family, dict):
+            direct_category = str(market_or_family.get("category") or "").strip().lower()
+            fallback_category = str(
+                market_or_family.get("event_category")
+                or market_or_family.get("market_category")
+                or market_or_family.get("series_ticker")
+                or market_or_family.get("ticker")
+                or "unknown"
+            ).strip().lower()
+            resolved_category = direct_category or fallback_category
+            if not resolved_category:
+                resolved_category = self.get_market_discovery_category(market_or_family)
+            return resolved_category, bool(direct_category), fallback_category
+        resolved_category = self.get_market_discovery_category(market_or_family)
+        return resolved_category, True, resolved_category
+
     def get_market_discovery_category(self, market_or_family):
         if isinstance(market_or_family, dict):
             family = self.get_market_family(market_or_family)
@@ -891,6 +4655,2411 @@ class KalshiSniperBot:
         family_boost = 4.0 if family in HIGH_LIQUIDITY_PRIORITY_FAMILIES else 0.0
         deprioritized_penalty = -8.0 if family in DEPRIORITIZED_MARKET_FAMILIES else 0.0
         return round(category_boost + family_boost + deprioritized_penalty, 4)
+
+    def safe_get_category(self, market_or_family):
+        try:
+            category = self.get_market_discovery_category(market_or_family)
+        except Exception:
+            category = "general"
+        category = str(category or "").strip().lower()
+        return category if category in {"crypto", "sports", "weather", "general"} else "general"
+
+    def _safe_get_market_title(self, market):
+        market = market if isinstance(market, dict) else {}
+        for key in ("title", "name", "subtitle", "no_sub_title"):
+            value = str(market.get(key, "") or "").strip()
+            if value:
+                return value
+        return "unknown"
+
+    def _safe_get_series_ticker(self, market):
+        market = market if isinstance(market, dict) else {}
+        try:
+            direct_series = str(market.get("series_ticker", "") or "").strip()
+        except Exception:
+            direct_series = ""
+        if direct_series:
+            return direct_series
+        targeted_series = self.get_targeted_series_ticker(market)
+        if targeted_series:
+            return targeted_series
+        try:
+            family = self.get_market_family(market)
+        except Exception:
+            family = "UNKNOWN"
+        return family or "UNKNOWN"
+
+    def _extract_market_awareness_price_series(self, market, q=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        payload_context = self._extract_phase55_price_series_context_from_payload(market, source_label="market_awareness")
+        series = list(payload_context.get("series", []) or [])
+        current_points = []
+        if q is not None:
+            for value in (
+                getattr(q, "last_price", None),
+                getattr(q, "yes_ask", None),
+                getattr(q, "yes_bid", None),
+                getattr(q, "no_ask", None),
+                getattr(q, "no_bid", None),
+            ):
+                numeric = self.to_float(value, None)
+                if numeric is not None and numeric > 0:
+                    current_points.append(numeric)
+        for value in current_points:
+            if value not in series:
+                series.append(value)
+        if len(series) < 2 and ticker:
+            rolling_key = self._build_phase55_timing_history_key(market, q, family=self.get_market_family(market))
+            rolling_history = list(self.phase55_rolling_price_history.get(str(rolling_key or "").strip(), []))
+            for value in rolling_history[-8:]:
+                numeric = self.to_float(value, None)
+                if numeric is not None and numeric > 0:
+                    series.append(numeric)
+            series = series[-16:]
+        normalized_series = [self.to_float(value, None) for value in series if self.to_float(value, None) is not None and self.to_float(value, None) > 0]
+        return {
+            "series": normalized_series,
+            "source": payload_context.get("stochastic_source", "unavailable"),
+            "history_points": len(normalized_series),
+            "history_reason": payload_context.get("history_reason", "no_price_series"),
+        }
+
+    def classify_volatility(self, market, q=None, series_context=None, liquidity_priority=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        family = self.get_market_family(market)
+        series_context = series_context or self._extract_market_awareness_price_series(market, q=q)
+        series = [self.to_float(value, None) for value in (series_context.get("series") or [])]
+        series = [value for value in series if value is not None and value > 0]
+        quote_values = self.get_market_quote_values(market)
+        yes_bid = self.to_float(quote_values.get("yes_bid"), None)
+        yes_ask = self.to_float(quote_values.get("yes_ask"), None)
+        if self._is_sports_market_or_family(family):
+            if q is not None:
+                q_yes_bid = self.to_float(getattr(q, "yes_bid", None), None)
+                q_yes_ask = self.to_float(getattr(q, "yes_ask", None), None)
+                if yes_bid is None and q_yes_bid is not None and q_yes_bid > 0:
+                    yes_bid = q_yes_bid
+                if yes_ask is None and q_yes_ask is not None and q_yes_ask > 0:
+                    yes_ask = q_yes_ask
+        spread = None
+        if yes_bid is not None and yes_ask is not None:
+            try:
+                spread = max(0.0, float(yes_ask) - float(yes_bid))
+            except (TypeError, ValueError):
+                spread = None
+        if len(series) < 3 and spread is None:
+            result = {
+                "volatility_class": "unknown",
+                "volatility_value": None,
+                "volatility_reasons": ["insufficient_history"],
+                "volatility_source": series_context.get("source", "unavailable"),
+            }
+            print(
+                f"[REALM-IX-VOLATILITY] ticker={ticker} family={family} class=unknown history_points={len(series)} spread={spread} reason=insufficient_history"
+            )
+            return result
+        price_range = (max(series) - min(series)) if len(series) >= 2 else 0.0
+        last_price = series[-1] if series else None
+        normalized_range = price_range / max(last_price or 0.0, 0.01) if price_range > 0 else 0.0
+        spread_component = spread if spread is not None else 0.0
+        avg_step = 0.0
+        if len(series) >= 2:
+            diffs = [abs(series[idx] - series[idx - 1]) for idx in range(1, len(series))]
+            avg_step = sum(diffs) / float(len(diffs)) if diffs else 0.0
+        volatility_metric = max(normalized_range, spread_component * 2.0, avg_step)
+        reasons = []
+        if spread is not None:
+            reasons.append(f"spread={self._safe_round(spread, 4, 0.0)}")
+        if normalized_range > 0:
+            reasons.append(f"normalized_range={self._safe_round(normalized_range, 4, 0.0)}")
+        if avg_step > 0:
+            reasons.append(f"avg_step={self._safe_round(avg_step, 4, 0.0)}")
+        if volatility_metric >= 0.08:
+            volatility_class = "high"
+            reasons.append("wide_or_fast_movement")
+        elif volatility_metric >= 0.03:
+            volatility_class = "medium"
+            reasons.append("moderate_movement")
+        else:
+            volatility_class = "low"
+            reasons.append("tight_or_stable_movement")
+        print(
+            f"[REALM-IX-VOLATILITY] ticker={ticker} family={family} class={volatility_class} history_points={len(series)} spread={self._safe_round(spread, 4, None)} normalized_range={self._safe_round(normalized_range, 4, 0.0)} metric={self._safe_round(volatility_metric, 4, 0.0)} reasons={reasons}"
+        )
+        return {
+            "volatility_class": volatility_class,
+            "volatility_value": self._safe_round(volatility_metric, 4, 0.0),
+            "volatility_reasons": reasons,
+            "volatility_source": series_context.get("source", "unavailable"),
+        }
+
+    def classify_liquidity_regime(self, market, q=None, liquidity_priority=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        family = self.get_market_family(market)
+        try:
+            liquidity_priority = liquidity_priority or self.get_market_liquidity_priority(market)
+        except Exception:
+            liquidity_priority = liquidity_priority or {}
+        quote_values = self.get_market_quote_values(market)
+        yes_bid = self.to_float(quote_values.get("yes_bid"), None)
+        yes_ask = self.to_float(quote_values.get("yes_ask"), None)
+        no_bid = self.to_float(quote_values.get("no_bid"), None)
+        no_ask = self.to_float(quote_values.get("no_ask"), None)
+        if self._is_sports_market_or_family(family) and q is not None:
+            q_yes_bid = self.to_float(getattr(q, "yes_bid", None), None)
+            q_yes_ask = self.to_float(getattr(q, "yes_ask", None), None)
+            q_no_bid = self.to_float(getattr(q, "no_bid", None), None)
+            q_no_ask = self.to_float(getattr(q, "no_ask", None), None)
+            if yes_bid is None and q_yes_bid is not None and q_yes_bid > 0:
+                yes_bid = q_yes_bid
+            if yes_ask is None and q_yes_ask is not None and q_yes_ask > 0:
+                yes_ask = q_yes_ask
+            if no_bid is None and q_no_bid is not None and q_no_bid > 0:
+                no_bid = q_no_bid
+            if no_ask is None and q_no_ask is not None and q_no_ask > 0:
+                no_ask = q_no_ask
+        spread = None
+        if yes_bid is not None and yes_ask is not None:
+            try:
+                spread = max(0.0, float(yes_ask) - float(yes_bid))
+            except (TypeError, ValueError):
+                spread = None
+        volume = self.to_float(getattr(q, "volume", None), None)
+        if volume is None:
+            volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0)
+        liquidity = self.to_float(getattr(q, "liquidity", None), None)
+        if liquidity is None:
+            liquidity = self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0)
+        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
+        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0
+        top_book_state = str(liquidity_priority.get("top_book_state") or "unknown").strip()
+        reasons = []
+        quotes_present = bool((yes_bid is not None and yes_ask is not None) or (no_bid is not None and no_ask is not None))
+        orderbook_present = bool(
+            top_book_state in {"both_non_zero", "one_non_zero"}
+            or yes_top_size > 0
+            or no_top_size > 0
+            or liquidity_priority.get("topbook_snapshot")
+        )
+        meaningful_liquidity = bool(
+            (liquidity or 0.0) > 0
+            or (volume or 0.0) > 0
+            or yes_top_size > 0
+            or no_top_size > 0
+        )
+        if not quotes_present and not orderbook_present and not meaningful_liquidity:
+            regime = "dead"
+            reasons.extend(["missing_usable_quotes", "empty_or_missing_orderbook", "no_meaningful_liquidity"])
+        elif spread is not None and spread >= 0.12:
+            regime = "dead"
+            reasons.extend(["extremely_wide_spread", f"spread={self._safe_round(spread, 4, 0.0)}"])
+        elif top_book_state == "zero_top_book":
+            regime = "dead"
+            reasons.extend(["zero_top_book", "no_liquidity_on_either_side"])
+        elif not meaningful_liquidity or (liquidity or 0.0) <= 0 or (volume or 0.0) <= 0:
+            regime = "thin"
+            reasons.extend(["weak_liquidity", f"volume={self._safe_round(volume, 4, 0.0)}", f"liquidity={self._safe_round(liquidity, 4, 0.0)}"])
+        elif top_book_state == "one_non_zero" or yes_top_size <= 0 or no_top_size <= 0 or (spread is not None and spread > MAX_ENTRY_SPREAD):
+            regime = "thin"
+            reasons.extend(["partial_or_wide_top_book", f"spread={self._safe_round(spread, 4, None)}"])
+        elif (
+            quotes_present
+            and orderbook_present
+            and meaningful_liquidity
+            and (spread is not None and spread <= max(0.02, MAX_ENTRY_SPREAD / 2.0))
+            and (liquidity or 0.0) >= self.get_market_min_entry_liquidity(market)
+            and (volume or 0.0) > 0
+        ):
+            regime = "strong"
+            reasons.extend(["tight_spread", "usable_orderbook", "meaningful_activity"])
+        else:
+            regime = "tradable"
+            reasons.extend(["usable_quotes", "adequate_liquidity"])
+        print(
+            f"[REALM-IX-LIQUIDITY] ticker={ticker} family={family} regime={regime} quotes_present={'yes' if quotes_present else 'no'} orderbook_present={'yes' if orderbook_present else 'no'} yes_top_size={yes_top_size} no_top_size={no_top_size} spread={self._safe_round(spread, 4, None)} volume={self._safe_round(volume, 4, 0.0)} liquidity={self._safe_round(liquidity, 4, 0.0)} reasons={reasons}"
+        )
+        if regime == "dead":
+            print(
+                f"[REALM-IX-DEAD-MARKET] ticker={ticker} family={family} spread={self._safe_round(spread, 4, None)} yes_top_size={yes_top_size} no_top_size={no_top_size} volume={self._safe_round(volume, 4, 0.0)} liquidity={self._safe_round(liquidity, 4, 0.0)} reasons={reasons}"
+            )
+        return {
+            "liquidity_regime": regime,
+            "liquidity_reasons": reasons,
+            "quotes_present": quotes_present,
+            "orderbook_present": orderbook_present,
+            "volume": self._safe_round(volume, 4, 0.0),
+            "liquidity": self._safe_round(liquidity, 4, 0.0),
+            "spread": self._safe_round(spread, 4, None),
+            "top_book_state": top_book_state,
+        }
+
+    def classify_trend_regime(self, market, q=None, series_context=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        family = self.get_market_family(market)
+        series_context = series_context or self._extract_market_awareness_price_series(market, q=q)
+        series = [self.to_float(value, None) for value in (series_context.get("series") or [])]
+        series = [value for value in series if value is not None and value > 0]
+        if len(series) < 4:
+            print(
+                f"[REALM-IX-TREND] ticker={ticker} family={family} regime=unknown history_points={len(series)} reason=insufficient_history"
+            )
+            return {
+                "trend_regime": "unknown",
+                "trend_reasons": ["insufficient_history"],
+                "trend_strength": None,
+                "trend_source": series_context.get("source", "unavailable"),
+            }
+        deltas = [series[idx] - series[idx - 1] for idx in range(1, len(series))]
+        tiny_threshold = max(0.0025, (max(series) - min(series)) * 0.08)
+        filtered_deltas = [delta for delta in deltas if abs(delta) >= tiny_threshold]
+        direction_changes = 0
+        last_sign = 0
+        for delta in filtered_deltas:
+            sign = 1 if delta > 0 else -1 if delta < 0 else 0
+            if sign == 0:
+                continue
+            if last_sign and sign != last_sign:
+                direction_changes += 1
+            last_sign = sign
+        net_move = series[-1] - series[0]
+        price_range = max(series) - min(series)
+        normalized_move = abs(net_move) / max(series[0], 0.01)
+        if price_range <= 0.01 or normalized_move <= 0.01:
+            regime = "flat"
+            reasons = ["minimal_range", f"net_move={self._safe_round(net_move, 4, 0.0)}"]
+        elif direction_changes >= 2 and normalized_move <= max(0.02, price_range * 0.35):
+            regime = "choppy"
+            reasons = ["multiple_direction_changes", f"changes={direction_changes}"]
+        elif abs(net_move) >= max(0.015, price_range * 0.35) and direction_changes <= 1:
+            regime = "trending"
+            reasons = ["directional_drift", f"net_move={self._safe_round(net_move, 4, 0.0)}"]
+        elif normalized_move >= 0.02 and direction_changes <= 2:
+            regime = "trending"
+            reasons = ["moderate_directional_move", f"net_move={self._safe_round(net_move, 4, 0.0)}"]
+        else:
+            regime = "choppy"
+            reasons = ["mixed_direction", f"changes={direction_changes}"]
+        print(
+            f"[REALM-IX-TREND] ticker={ticker} family={family} regime={regime} history_points={len(series)} net_move={self._safe_round(net_move, 4, 0.0)} range={self._safe_round(price_range, 4, 0.0)} direction_changes={direction_changes} reasons={reasons}"
+        )
+        return {
+            "trend_regime": regime,
+            "trend_reasons": reasons,
+            "trend_strength": self._safe_round(normalized_move, 4, 0.0),
+            "trend_source": series_context.get("source", "unavailable"),
+        }
+
+    def classify_session_state(self, market, q=None, liquidity_priority=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        family = self.get_market_family(market)
+        now_ts = time.time()
+        minutes_to_event = self.get_minutes_to_event(market)
+        volume = self.to_float(getattr(q, "volume", None), None)
+        if volume is None:
+            volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0)
+        liquidity_priority = liquidity_priority or self.get_market_liquidity_priority(market)
+        staleness_candidates = []
+        for key in ("quote_age", "age_seconds", "staleness_seconds"):
+            value = self.to_float(market.get(key), None)
+            if value is not None and value >= 0:
+                staleness_candidates.append(value)
+        for key in ("quote_ts", "quote_timestamp", "updated_at_ts", "last_updated_ts", "timestamp", "ts"):
+            value = self.to_float(market.get(key), None)
+            if value is not None and value > 0:
+                if value > 1e12:
+                    value = value / 1000.0
+                staleness_candidates.append(max(0.0, now_ts - value))
+        staleness_seconds = min(staleness_candidates) if staleness_candidates else None
+        quotes_present = bool(liquidity_priority.get("both_sides_quoted") or liquidity_priority.get("top_book_state") in {"both_non_zero", "one_non_zero"})
+        if minutes_to_event is not None and minutes_to_event <= 15:
+            state = "closing_soon"
+            reasons = [f"minutes_to_event={self._safe_round(minutes_to_event, 2, 0.0)}"]
+        elif staleness_seconds is not None and staleness_seconds >= 300:
+            state = "quiet"
+            reasons = [f"stale_quotes={int(staleness_seconds)}"]
+        elif (volume or 0.0) <= 0 and (minutes_to_event is None or minutes_to_event > 120):
+            state = "quiet"
+            reasons = ["low_activity_or_far_from_event"]
+        elif quotes_present or (volume or 0.0) > 0:
+            state = "active"
+            reasons = [
+                f"volume={self._safe_round(volume, 4, 0.0)}",
+                f"staleness={self._safe_round(staleness_seconds, 2, None)}",
+            ]
+        else:
+            state = "unknown"
+            reasons = ["missing_session_signals"]
+        print(
+            f"[REALM-IX-SESSION] ticker={ticker} family={family} state={state} minutes_to_event={self._safe_round(minutes_to_event, 2, None)} staleness_seconds={self._safe_round(staleness_seconds, 2, None)} volume={self._safe_round(volume, 4, 0.0)} reasons={reasons}"
+        )
+        return {
+            "session_state": state,
+            "session_reasons": reasons,
+            "minutes_to_event": self._safe_round(minutes_to_event, 2, None),
+            "staleness_seconds": self._safe_round(staleness_seconds, 2, None),
+        }
+
+    def compute_awareness_score(self, market, q=None, volatility_profile=None, liquidity_profile=None, trend_profile=None, session_profile=None, raw_rank_score=None):
+        volatility_profile = volatility_profile or {}
+        liquidity_profile = liquidity_profile or {}
+        trend_profile = trend_profile or {}
+        session_profile = session_profile or {}
+        liquidity_weights = {
+            "dead": 0.0,
+            "thin": 0.22,
+            "tradable": 0.68,
+            "strong": 0.95,
+            "unknown": 0.35,
+        }
+        volatility_weights = {
+            "low": 0.55,
+            "medium": 0.85,
+            "high": 0.50,
+            "unknown": 0.35,
+        }
+        trend_weights = {
+            "trending": 0.88,
+            "choppy": 0.56,
+            "flat": 0.42,
+            "unknown": 0.35,
+        }
+        session_weights = {
+            "active": 0.90,
+            "quiet": 0.55,
+            "closing_soon": 0.48,
+            "unknown": 0.35,
+        }
+        liquidity_regime = str(liquidity_profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(volatility_profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(trend_profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(session_profile.get("session_state") or "unknown").strip().lower()
+        confidence_component = self._clamp(self.to_float(raw_rank_score, 0.0) / 100.0) if raw_rank_score is not None else 0.5
+        liquidity_component = liquidity_weights.get(liquidity_regime, 0.35)
+        volatility_component = volatility_weights.get(volatility_class, 0.35)
+        trend_component = trend_weights.get(trend_regime, 0.35)
+        session_component = session_weights.get(session_state, 0.35)
+        weighted_score = (
+            liquidity_component * 0.40
+            + volatility_component * 0.15
+            + trend_component * 0.15
+            + session_component * 0.15
+            + confidence_component * 0.15
+        )
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_market_penalty")
+            weighted_score = min(weighted_score, 0.15)
+        if liquidity_regime == "strong":
+            reasons.append("liquidity_strength_bonus")
+        if volatility_class in {"medium", "high"}:
+            reasons.append(f"volatility_{volatility_class}")
+        if trend_regime == "trending":
+            reasons.append("trend_clarity")
+        elif trend_regime == "choppy":
+            reasons.append("trend_uncertainty")
+        if session_state == "closing_soon":
+            reasons.append("session_closing_soon")
+        elif session_state == "quiet":
+            reasons.append("session_quiet")
+        return {
+            "awareness_score": round(self._clamp(weighted_score), 4),
+            "awareness_reasons": reasons,
+            "confidence_component": round(confidence_component, 4),
+            "liquidity_component": round(liquidity_component, 4),
+            "volatility_component": round(volatility_component, 4),
+            "trend_component": round(trend_component, 4),
+            "session_component": round(session_component, 4),
+        }
+
+    def build_market_awareness_profile(self, market, q=None, spread=None, family=None, raw_rank_score=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        family = family or self.get_market_family(market)
+        category = self.safe_get_category(market)
+        title = self._safe_get_market_title(market)
+        series_ticker = self._safe_get_series_ticker(market)
+        try:
+            liquidity_priority = self.get_market_liquidity_priority(market)
+        except Exception:
+            liquidity_priority = {}
+        series_context = self._extract_market_awareness_price_series(market, q=q)
+        volatility_profile = self.classify_volatility(
+            market,
+            q=q,
+            series_context=series_context,
+            liquidity_priority=liquidity_priority,
+        )
+        liquidity_profile = self.classify_liquidity_regime(
+            market,
+            q=q,
+            liquidity_priority=liquidity_priority,
+        )
+        trend_profile = self.classify_trend_regime(
+            market,
+            q=q,
+            series_context=series_context,
+        )
+        session_profile = self.classify_session_state(
+            market,
+            q=q,
+            liquidity_priority=liquidity_priority,
+        )
+        awareness_score = self.compute_awareness_score(
+            market,
+            q=q,
+            volatility_profile=volatility_profile,
+            liquidity_profile=liquidity_profile,
+            trend_profile=trend_profile,
+            session_profile=session_profile,
+            raw_rank_score=raw_rank_score,
+        )
+        profile = {
+            "ticker": ticker,
+            "title": title,
+            "category": category,
+            "family": family,
+            "series_ticker": series_ticker,
+            "volatility_class": volatility_profile.get("volatility_class", "unknown"),
+            "liquidity_regime": liquidity_profile.get("liquidity_regime", "unknown"),
+            "trend_regime": trend_profile.get("trend_regime", "unknown"),
+            "session_state": session_profile.get("session_state", "unknown"),
+            "awareness_score": awareness_score.get("awareness_score", 0.0),
+            "awareness_reasons": list(
+                dict.fromkeys(
+                    (volatility_profile.get("volatility_reasons", []) or [])
+                    + (liquidity_profile.get("liquidity_reasons", []) or [])
+                    + (trend_profile.get("trend_reasons", []) or [])
+                    + (session_profile.get("session_reasons", []) or [])
+                    + (awareness_score.get("awareness_reasons", []) or [])
+                )
+            ),
+            "confidence_component": awareness_score.get("confidence_component"),
+            "volatility_source": volatility_profile.get("volatility_source"),
+            "trend_source": trend_profile.get("trend_source"),
+            "session_minutes_to_event": session_profile.get("minutes_to_event"),
+            "session_staleness_seconds": session_profile.get("staleness_seconds"),
+            "series_history_points": series_context.get("history_points", 0),
+            "series_history_reason": series_context.get("history_reason", "no_price_series"),
+            "series_source": series_context.get("source", "unavailable"),
+        }
+        if liquidity_profile.get("liquidity_regime") == "dead":
+            print(
+                f"[REALM-IX-DEAD-MARKET] ticker={ticker} family={family} title={title} category={category} series_ticker={series_ticker} awareness_score={profile.get('awareness_score')} reasons={liquidity_profile.get('liquidity_reasons', [])}"
+            )
+        return profile
+
+    def _apply_market_awareness_adjustment(self, score, profile):
+        profile = profile if isinstance(profile, dict) else {}
+        awareness_score = self.to_float(profile.get("awareness_score"), 0.0)
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        adjusted = self.to_float(score, 0.0)
+        adjusted += (awareness_score - 0.5) * 12.0
+        if liquidity_regime == "dead":
+            adjusted -= 40.0
+        elif liquidity_regime == "thin":
+            adjusted -= 8.0
+        elif liquidity_regime == "strong":
+            adjusted += 4.0
+        if volatility_class == "unknown":
+            adjusted -= 2.0
+        elif volatility_class == "medium":
+            adjusted += 1.5
+        elif volatility_class == "high":
+            adjusted -= 1.5
+        if trend_regime == "trending":
+            adjusted += 2.0
+        elif trend_regime == "choppy":
+            adjusted -= 1.5
+        if session_state == "closing_soon":
+            adjusted -= 1.5
+        elif session_state == "quiet":
+            adjusted -= 0.75
+        return round(adjusted, 4)
+
+    def profile_market_awareness(self, markets, candidates):
+        markets = markets or []
+        candidates = candidates or []
+        market_lookup = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+        profiled_candidates = []
+        profile_map = {}
+        summary_counts = {
+            "dead": 0,
+            "thin": 0,
+            "tradable": 0,
+            "strong": 0,
+            "unknown": 0,
+        }
+        total_score = 0.0
+        top_candidates = []
+        for score, q, spread, family in candidates:
+            ticker = getattr(q, "ticker", "") or ""
+            market = market_lookup.get(str(ticker or "").strip(), {})
+            try:
+                profile = self.build_market_awareness_profile(
+                    market,
+                    q=q,
+                    spread=spread,
+                    family=family,
+                    raw_rank_score=score,
+                )
+            except Exception as exc:
+                print(
+                    f"[REALM-IX-PROFILE] ticker={ticker} category=unknown volatility_class=unknown liquidity_regime=unknown trend_regime=unknown session_state=unknown awareness_score=0.0 reasons=['profile_error:{exc.__class__.__name__}']"
+                )
+                profile = {
+                    "ticker": ticker,
+                    "title": self._safe_get_market_title(market),
+                    "category": "general",
+                    "family": family,
+                    "series_ticker": self._safe_get_series_ticker(market),
+                    "volatility_class": "unknown",
+                    "liquidity_regime": "unknown",
+                    "trend_regime": "unknown",
+                    "session_state": "unknown",
+                    "awareness_score": 0.0,
+                    "awareness_reasons": [f"profile_error:{exc.__class__.__name__}"],
+                }
+            profile_map[str(ticker or "").strip()] = profile
+            regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+            summary_counts[regime] = summary_counts.get(regime, 0) + 1
+            total_score += self.to_float(profile.get("awareness_score"), 0.0)
+            top_candidates.append((self.to_float(profile.get("awareness_score"), 0.0), str(ticker or "").strip()))
+            print(
+                f"[REALM-IX-PROFILE] ticker={profile.get('ticker')} category={profile.get('category')} volatility_class={profile.get('volatility_class')} liquidity_regime={profile.get('liquidity_regime')} trend_regime={profile.get('trend_regime')} session_state={profile.get('session_state')} awareness_score={profile.get('awareness_score')} reasons={profile.get('awareness_reasons', [])}"
+            )
+            adjusted_score = self._apply_market_awareness_adjustment(score, profile)
+            profiled_candidates.append((adjusted_score, q, spread, family))
+        average_awareness = round(total_score / float(len(candidates)), 4) if candidates else 0.0
+        top_awareness_tickers = [
+            ticker for _score, ticker in sorted(top_candidates, key=lambda item: item[0], reverse=True)[:5] if ticker
+        ]
+        summary = {
+            "profiled_candidates": len(candidates),
+            "dead_markets": summary_counts.get("dead", 0),
+            "thin_markets": summary_counts.get("thin", 0),
+            "tradable_markets": summary_counts.get("tradable", 0),
+            "strong_markets": summary_counts.get("strong", 0),
+            "unknown_markets": summary_counts.get("unknown", 0),
+            "average_awareness_score": average_awareness,
+            "top_awareness_candidates": top_awareness_tickers,
+        }
+        self.market_awareness_profiles = profile_map
+        self.last_market_awareness_summary = summary
+        print(
+            f"[REALM-IX-SUMMARY] total_candidates_profiled={summary['profiled_candidates']} dead_markets={summary['dead_markets']} thin_markets={summary['thin_markets']} tradable_markets={summary['tradable_markets']} strong_markets={summary['strong_markets']} average_awareness_score={summary['average_awareness_score']} top_awareness_candidate_tickers={summary['top_awareness_candidates']}"
+        )
+        return profiled_candidates, summary
+
+
+    def _normalize_adaptive_mode(self, value, fallback="normal"):
+        mode = str(value or fallback or "normal").strip().lower()
+        if mode not in {"defensive", "normal", "opportunistic", "aggressive", "avoid"}:
+            return fallback
+        return mode
+
+    def determine_entry_strictness(self, market, awareness_profile=None, adaptive_mode=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        category = str(profile.get("category") or self.safe_get_category(market) or "unknown").strip().lower()
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_liquidity_requires_avoid")
+            return "avoid", reasons
+        if liquidity_regime == "thin":
+            reasons.append("thin_liquidity_requires_defensive_entry")
+            return "defensive", reasons
+        if volatility_class == "high" and trend_regime == "choppy":
+            reasons.append("high_volatility_choppy_requires_defensive_entry")
+            return "defensive", reasons
+        if session_state == "closing_soon":
+            reasons.append("closing_soon_requires_defensive_entry")
+            return "defensive", reasons
+        if category == "crypto" and liquidity_regime in {"strong", "tradable"} and trend_regime == "trending" and volatility_class in {"low", "medium"}:
+            reasons.append("crypto_momentum_allows_looser_entry")
+            if adaptive_mode == "aggressive":
+                return "aggressive", reasons
+            return "opportunistic", reasons
+        if category == "sports" and liquidity_regime in {"strong", "tradable"} and trend_regime == "trending" and session_state == "active":
+            reasons.append("sports_liquidity_and_trend_support_entry")
+            return "opportunistic", reasons
+        if trend_regime == "trending" and volatility_class == "medium" and liquidity_regime in {"tradable", "strong"}:
+            reasons.append("medium_volatility_trend_supports_opportunity")
+            return "opportunistic", reasons
+        if trend_regime == "trending" and liquidity_regime in {"tradable", "strong"} and session_state == "active":
+            reasons.append("clear_trend_supports_normal_entry")
+            return "normal", reasons
+        if volatility_class == "unknown" or trend_regime == "unknown" or session_state == "unknown":
+            reasons.append("insufficient_environment_data_defaults_to_defensive")
+            return "defensive", reasons
+        reasons.append("default_normal_entry")
+        return "normal", reasons
+
+    def determine_spread_tolerance_mode(self, market, awareness_profile=None, adaptive_mode=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        category = str(profile.get("category") or self.safe_get_category(market) or "unknown").strip().lower()
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_market_blocks_spread_tolerance")
+            return "blocked", reasons
+        if liquidity_regime == "thin":
+            reasons.append("thin_liquidity_requires_strict_spread")
+            return "strict", reasons
+        if volatility_class == "high" or trend_regime == "choppy":
+            reasons.append("high_volatility_or_chop_requires_strict_spread")
+            return "strict", reasons
+        if session_state == "closing_soon":
+            reasons.append("closing_soon_prefers_strict_spread")
+            return "strict", reasons
+        if liquidity_regime == "strong" and trend_regime == "trending" and adaptive_mode in {"opportunistic", "aggressive"}:
+            reasons.append("strong_liquidity_trend_allows_flexible_spread")
+            return "flexible", reasons
+        if category == "crypto" and liquidity_regime in {"tradable", "strong"} and trend_regime == "trending" and volatility_class in {"low", "medium"}:
+            reasons.append("crypto_momentum_can_use_normal_spread")
+            return "normal", reasons
+        if volatility_class == "unknown" or trend_regime == "unknown":
+            reasons.append("insufficient_environment_data_defaults_to_normal_spread")
+            return "normal", reasons
+        reasons.append("default_normal_spread")
+        return "normal", reasons
+
+    def determine_category_aggression(self, market, awareness_profile=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        category = str(profile.get("category") or self.safe_get_category(market) or "unknown").strip().lower()
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        awareness_score = self.to_float(profile.get("realm_ix_awareness_score", profile.get("awareness_score")), 0.0)
+        reasons = []
+        mode = "normal"
+        level = "normal"
+        if liquidity_regime == "dead":
+            reasons.append("dead_liquidity_forces_avoid")
+            return "avoid", "avoid", reasons
+        if liquidity_regime == "thin" or session_state == "closing_soon":
+            reasons.append("thin_or_closing_soon_limits_aggression")
+            return "defensive", "defensive", reasons
+        if category == "crypto":
+            if (
+                liquidity_regime in {"tradable", "strong"}
+                and trend_regime == "trending"
+                and volatility_class in {"low", "medium"}
+                and session_state == "active"
+                and awareness_score >= 0.75
+            ):
+                reasons.append("crypto_momentum_supports_aggressive_bias")
+                return "aggressive", "aggressive", reasons
+            if liquidity_regime in {"tradable", "strong"} and trend_regime == "trending":
+                reasons.append("crypto_momentum_supports_opportunistic_bias")
+                return "opportunistic", "opportunistic", reasons
+            if volatility_class == "high" or trend_regime == "choppy":
+                reasons.append("crypto_high_volatility_requires_defensive_bias")
+                return "defensive", "defensive", reasons
+            reasons.append("crypto_default_normal_bias")
+            return "normal", "normal", reasons
+        if category == "sports":
+            if liquidity_regime in {"tradable", "strong"} and trend_regime == "trending" and session_state == "active" and awareness_score >= 0.7:
+                reasons.append("sports_liquidity_and_trend_support_opportunistic_bias")
+                return "opportunistic", "opportunistic", reasons
+            if trend_regime == "choppy" or volatility_class == "high":
+                reasons.append("sports_chop_or_high_volatility_requires_defensive_bias")
+                return "defensive", "defensive", reasons
+            reasons.append("sports_default_normal_bias")
+            return "normal", "normal", reasons
+        if category in {"general", "unknown"}:
+            if liquidity_regime in {"tradable", "strong"} and trend_regime == "trending" and awareness_score >= 0.72:
+                reasons.append("general_trend_can_support_opportunistic_bias")
+                return "opportunistic", "opportunistic", reasons
+            reasons.append("general_default_defensive_bias")
+            return "defensive", "defensive", reasons
+        if trend_regime == "trending" and liquidity_regime in {"tradable", "strong"}:
+            reasons.append("fallback_trend_supports_normal_bias")
+            mode = "normal"
+            level = "normal"
+        else:
+            reasons.append("fallback_default_defensive_bias")
+            mode = "defensive"
+            level = "defensive"
+        return mode, level, reasons
+
+    def determine_take_profit_mode(self, market, awareness_profile=None, adaptive_mode=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_market_prefers_defensive_take_profit")
+            return "defensive_take_profit", reasons
+        if liquidity_regime == "thin" or trend_regime == "choppy" or session_state == "closing_soon":
+            reasons.append("thin_choppy_or_closing_soon_prefers_quick_profit")
+            return "quick_profit", reasons
+        if liquidity_regime in {"tradable", "strong"} and trend_regime == "trending" and volatility_class in {"low", "medium"} and adaptive_mode in {"opportunistic", "aggressive"}:
+            reasons.append("strong_trend_supports_extended_runner")
+            return "extended_runner", reasons
+        if volatility_class == "high" and liquidity_regime in {"tradable", "strong"}:
+            reasons.append("high_volatility_prefers_defensive_take_profit")
+            return "defensive_take_profit", reasons
+        if volatility_class == "unknown" or trend_regime == "unknown":
+            reasons.append("insufficient_environment_data_defaults_to_normal_profit")
+            return "normal_profit", reasons
+        reasons.append("default_normal_profit")
+        return "normal_profit", reasons
+
+    def determine_stop_behavior_mode(self, market, awareness_profile=None, adaptive_mode=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_market_forces_avoid_entry")
+            return "avoid_entry", reasons
+        if liquidity_regime == "thin" or trend_regime == "choppy":
+            reasons.append("thin_or_choppy_requires_tight_stop")
+            return "tight_stop", reasons
+        if volatility_class == "high" and liquidity_regime in {"tradable", "strong"} and trend_regime == "trending":
+            reasons.append("high_volatility_with_quality_supports_adjusted_stop")
+            return "volatility_adjusted_stop", reasons
+        if session_state == "closing_soon":
+            reasons.append("closing_soon_prefers_tight_stop")
+            return "tight_stop", reasons
+        if volatility_class == "unknown" or trend_regime == "unknown":
+            reasons.append("insufficient_environment_data_defaults_to_tight_stop")
+            return "tight_stop", reasons
+        reasons.append("default_normal_stop")
+        return "normal_stop", reasons
+
+    def determine_timing_mode(self, market, awareness_profile=None, adaptive_mode=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_market_blocks_timing_aggression")
+            return "avoid", reasons
+        if session_state == "active" and trend_regime == "trending" and liquidity_regime in {"tradable", "strong"}:
+            if adaptive_mode in {"opportunistic", "aggressive"} and volatility_class in {"low", "medium"}:
+                reasons.append("active_session_trend_supports_opportunistic_timing")
+                return "opportunistic", reasons
+            reasons.append("active_session_supports_normal_timing")
+            return "normal", reasons
+        if session_state == "quiet":
+            reasons.append("quiet_session_prefers_defensive_timing")
+            return "defensive", reasons
+        if session_state == "closing_soon":
+            reasons.append("closing_soon_prefers_defensive_timing")
+            return "defensive", reasons
+        if session_state == "unknown" or trend_regime == "unknown" or volatility_class == "unknown":
+            reasons.append("insufficient_environment_data_defaults_to_defensive_timing")
+            return "defensive", reasons
+        reasons.append("default_normal_timing")
+        return "normal", reasons
+
+    def determine_adaptive_mode(self, market, awareness_profile=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        category = str(profile.get("category") or self.safe_get_category(market) or "unknown").strip().lower()
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        awareness_score = self.to_float(profile.get("realm_ix_awareness_score", profile.get("awareness_score")), 0.0)
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_liquidity_sets_avoid_mode")
+            return "avoid", reasons
+        if liquidity_regime == "thin":
+            reasons.append("thin_liquidity_sets_defensive_mode")
+            return "defensive", reasons
+        if session_state == "closing_soon":
+            reasons.append("closing_soon_sets_defensive_mode")
+            return "defensive", reasons
+        if category == "crypto" and liquidity_regime in {"tradable", "strong"} and trend_regime == "trending" and volatility_class in {"low", "medium"} and awareness_score >= 0.8:
+            reasons.append("crypto_quality_supports_aggressive_mode")
+            return "aggressive", reasons
+        if liquidity_regime in {"tradable", "strong"} and trend_regime == "trending" and awareness_score >= 0.7:
+            if category in {"crypto", "sports"} and session_state == "active" and volatility_class in {"low", "medium"}:
+                reasons.append("quality_trend_supports_opportunistic_mode")
+                return "opportunistic", reasons
+            reasons.append("quality_trend_supports_normal_mode")
+            return "normal", reasons
+        if volatility_class == "high" and trend_regime == "choppy":
+            reasons.append("high_volatility_chop_sets_defensive_mode")
+            return "defensive", reasons
+        if volatility_class == "unknown" or trend_regime == "unknown" or session_state == "unknown":
+            reasons.append("insufficient_environment_data_defaults_to_defensive_mode")
+            return "defensive", reasons
+        reasons.append("default_normal_mode")
+        return "normal", reasons
+
+    def compute_adaptive_score(self, market, awareness_profile=None, adaptive_mode=None):
+        market = market if isinstance(market, dict) else {}
+        profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        category = str(profile.get("category") or self.safe_get_category(market) or "unknown").strip().lower()
+        liquidity_regime = str(profile.get("liquidity_regime") or "unknown").strip().lower()
+        volatility_class = str(profile.get("volatility_class") or "unknown").strip().lower()
+        trend_regime = str(profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(profile.get("session_state") or "unknown").strip().lower()
+        awareness_score = self._clamp(self.to_float(profile.get("realm_ix_awareness_score", profile.get("awareness_score")), 0.0))
+        liquidity_weights = {"dead": 0.0, "thin": 0.22, "tradable": 0.66, "strong": 0.9, "unknown": 0.35}
+        trend_weights = {"trending": 0.9, "choppy": 0.3, "flat": 0.55, "unknown": 0.35}
+        volatility_weights = {"low": 0.78, "medium": 0.82, "high": 0.42, "unknown": 0.35}
+        session_weights = {"active": 0.88, "quiet": 0.52, "closing_soon": 0.34, "unknown": 0.4}
+        category_weights = {"crypto": 0.84, "sports": 0.76, "general": 0.56, "weather": 0.42, "unknown": 0.5}
+        liquidity_component = liquidity_weights.get(liquidity_regime, 0.35)
+        trend_component = trend_weights.get(trend_regime, 0.35)
+        volatility_component = volatility_weights.get(volatility_class, 0.35)
+        session_component = session_weights.get(session_state, 0.4)
+        category_component = category_weights.get(category, 0.5)
+        combined = (
+            awareness_score * 0.45
+            + liquidity_component * 0.20
+            + trend_component * 0.15
+            + volatility_component * 0.10
+            + session_component * 0.05
+            + category_component * 0.05
+        )
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_liquidity_collapses_score")
+            combined = min(combined, 0.05)
+        elif liquidity_regime == "thin":
+            reasons.append("thin_liquidity_penalty")
+            combined -= 0.15
+        elif liquidity_regime == "strong":
+            reasons.append("strong_liquidity_bonus")
+            combined += 0.08
+        if trend_regime == "trending":
+            reasons.append("trend_clarity_bonus")
+            combined += 0.05
+        elif trend_regime == "choppy":
+            reasons.append("trend_chop_penalty")
+            combined -= 0.10
+        if volatility_class == "high":
+            reasons.append("high_volatility_penalty")
+            combined -= 0.08
+        elif volatility_class == "medium":
+            reasons.append("medium_volatility_useful")
+            combined += 0.03
+        if session_state == "active":
+            reasons.append("active_session_bonus")
+            combined += 0.04
+        elif session_state == "quiet":
+            reasons.append("quiet_session_penalty")
+            combined -= 0.05
+        elif session_state == "closing_soon":
+            reasons.append("closing_soon_penalty")
+            combined -= 0.12
+        if category == "crypto" and trend_regime == "trending" and liquidity_regime in {"tradable", "strong"}:
+            reasons.append("crypto_momentum_bonus")
+            combined += 0.03
+        if category == "sports" and session_state == "active" and liquidity_regime in {"tradable", "strong"}:
+            reasons.append("sports_session_bonus")
+            combined += 0.02
+        if adaptive_mode == "avoid":
+            reasons.append("avoid_mode_caps_score")
+            combined = min(combined, 0.08)
+        elif adaptive_mode == "defensive":
+            reasons.append("defensive_mode_soft_penalty")
+            combined -= 0.04
+        elif adaptive_mode == "opportunistic":
+            reasons.append("opportunistic_mode_soft_bonus")
+            combined += 0.04
+        elif adaptive_mode == "aggressive":
+            reasons.append("aggressive_mode_soft_bonus")
+            combined += 0.05
+        return {
+            "adaptive_score": round(self._clamp(combined), 4),
+            "adaptive_reasons": reasons,
+            "liquidity_component": round(liquidity_component, 4),
+            "trend_component": round(trend_component, 4),
+            "volatility_component": round(volatility_component, 4),
+            "session_component": round(session_component, 4),
+            "category_component": round(category_component, 4),
+            "awareness_component": round(awareness_score, 4),
+        }
+
+    def build_adaptive_behavior_profile(self, market, q=None, awareness_profile=None, adaptive_score_hint=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        category = str(awareness_profile.get("category") or self.safe_get_category(market) or "unknown").strip().lower()
+        family = str(awareness_profile.get("family") or self.get_market_family(market) or "").strip().upper() or None
+        series_ticker = str(awareness_profile.get("series_ticker") or self._safe_get_series_ticker(market) or "").strip().upper() or None
+        realm_ix_awareness_score = self.to_float(awareness_profile.get("awareness_score"), 0.0)
+        awareness_base = dict(awareness_profile)
+        awareness_base["realm_ix_awareness_score"] = realm_ix_awareness_score
+        adaptive_mode, adaptive_mode_reasons = self.determine_adaptive_mode(market, awareness_base)
+        entry_strictness, entry_reasons = self.determine_entry_strictness(market, awareness_base, adaptive_mode=adaptive_mode)
+        spread_tolerance_mode, spread_reasons = self.determine_spread_tolerance_mode(market, awareness_base, adaptive_mode=adaptive_mode)
+        category_mode, aggression_level, category_reasons = self.determine_category_aggression(market, awareness_base)
+        take_profit_mode, take_profit_reasons = self.determine_take_profit_mode(market, awareness_base, adaptive_mode=adaptive_mode)
+        stop_behavior_mode, stop_reasons = self.determine_stop_behavior_mode(market, awareness_base, adaptive_mode=adaptive_mode)
+        timing_mode, timing_reasons = self.determine_timing_mode(market, awareness_base, adaptive_mode=adaptive_mode)
+        adaptive_score_payload = self.compute_adaptive_score(market, awareness_base, adaptive_mode=adaptive_mode)
+        adaptive_score = adaptive_score_payload.get("adaptive_score", 0.0)
+        if adaptive_score_hint is not None:
+            hint_value = self.to_float(adaptive_score_hint, adaptive_score)
+            if 0.0 <= hint_value <= 1.0:
+                adaptive_score = max(adaptive_score, self._clamp(hint_value))
+        reasons = []
+        reasons.extend(awareness_profile.get("awareness_reasons", []) or [])
+        reasons.extend(adaptive_mode_reasons or [])
+        reasons.extend(entry_reasons or [])
+        reasons.extend(spread_reasons or [])
+        reasons.extend(category_reasons or [])
+        reasons.extend(take_profit_reasons or [])
+        reasons.extend(stop_reasons or [])
+        reasons.extend(timing_reasons or [])
+        reasons.extend(adaptive_score_payload.get("adaptive_reasons", []) or [])
+        reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason is not None and str(reason).strip()))
+        profile = {
+            "ticker": ticker,
+            "category": category,
+            "family": family,
+            "series_ticker": series_ticker,
+            "realm_ix_awareness_score": round(realm_ix_awareness_score, 4),
+            "volatility_class": str(awareness_profile.get("volatility_class") or "unknown").strip().lower(),
+            "liquidity_regime": str(awareness_profile.get("liquidity_regime") or "unknown").strip().lower(),
+            "trend_regime": str(awareness_profile.get("trend_regime") or "unknown").strip().lower(),
+            "session_state": str(awareness_profile.get("session_state") or "unknown").strip().lower(),
+            "adaptive_mode": adaptive_mode,
+            "entry_strictness": entry_strictness,
+            "spread_tolerance_mode": spread_tolerance_mode,
+            "aggression_level": aggression_level,
+            "take_profit_mode": take_profit_mode,
+            "stop_behavior_mode": stop_behavior_mode,
+            "timing_mode": timing_mode,
+            "adaptive_score": round(self._clamp(adaptive_score), 4),
+            "adaptive_reasons": reasons,
+            "category_mode": category_mode,
+            "adaptive_score_components": adaptive_score_payload,
+        }
+        return profile
+
+    def profile_adaptive_behavior(self, markets, awareness_candidates):
+        markets = markets or []
+        awareness_candidates = awareness_candidates or []
+        market_lookup = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+        awareness_lookup = getattr(self, "market_awareness_profiles", {}) if isinstance(getattr(self, "market_awareness_profiles", {}), dict) else {}
+        profiled_candidates = []
+        profile_map = {}
+        summary_counts = {"avoid": 0, "defensive": 0, "normal": 0, "opportunistic": 0, "aggressive": 0, "unknown": 0}
+        total_score = 0.0
+        top_candidates = []
+        for score, q, spread, family in awareness_candidates:
+            ticker = getattr(q, "ticker", "") or ""
+            market = market_lookup.get(str(ticker or "").strip(), {})
+            awareness_profile = awareness_lookup.get(str(ticker or "").strip(), {})
+            if not isinstance(awareness_profile, dict) or not awareness_profile:
+                try:
+                    awareness_profile = self.build_market_awareness_profile(
+                        market,
+                        q=q,
+                        spread=spread,
+                        family=family,
+                        raw_rank_score=score,
+                    )
+                except Exception as exc:
+                    awareness_profile = {
+                        "ticker": ticker,
+                        "title": self._safe_get_market_title(market),
+                        "category": self.safe_get_category(market),
+                        "family": family,
+                        "series_ticker": self._safe_get_series_ticker(market),
+                        "volatility_class": "unknown",
+                        "liquidity_regime": "unknown",
+                        "trend_regime": "unknown",
+                        "session_state": "unknown",
+                        "awareness_score": 0.0,
+                        "awareness_reasons": [f"profile_error:{exc.__class__.__name__}"],
+                    }
+            adaptive_profile = self.build_adaptive_behavior_profile(
+                market,
+                q=q,
+                awareness_profile=awareness_profile,
+                adaptive_score_hint=score,
+            )
+            adaptive_mode = str(adaptive_profile.get("adaptive_mode") or "normal").strip().lower()
+            summary_counts[adaptive_mode] = summary_counts.get(adaptive_mode, 0) + 1
+            total_score += self.to_float(adaptive_profile.get("adaptive_score"), 0.0)
+            top_candidates.append((self.to_float(adaptive_profile.get("adaptive_score"), 0.0), str(ticker or "").strip()))
+            print(
+                f"[REALM-X-ENTRY-STRICTNESS] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} liquidity_regime={adaptive_profile.get('liquidity_regime')} volatility_class={adaptive_profile.get('volatility_class')} trend_regime={adaptive_profile.get('trend_regime')} session_state={adaptive_profile.get('session_state')} entry_strictness={adaptive_profile.get('entry_strictness')} adaptive_mode={adaptive_profile.get('adaptive_mode')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            print(
+                f"[REALM-X-SPREAD-TOLERANCE] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} liquidity_regime={adaptive_profile.get('liquidity_regime')} volatility_class={adaptive_profile.get('volatility_class')} trend_regime={adaptive_profile.get('trend_regime')} session_state={adaptive_profile.get('session_state')} spread_tolerance_mode={adaptive_profile.get('spread_tolerance_mode')} adaptive_mode={adaptive_profile.get('adaptive_mode')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            print(
+                f"[REALM-X-CATEGORY] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} aggression_level={adaptive_profile.get('aggression_level')} adaptive_mode={adaptive_profile.get('adaptive_mode')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            print(
+                f"[REALM-X-TAKE-PROFIT] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} take_profit_mode={adaptive_profile.get('take_profit_mode')} adaptive_mode={adaptive_profile.get('adaptive_mode')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            print(
+                f"[REALM-X-STOP] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} stop_behavior_mode={adaptive_profile.get('stop_behavior_mode')} adaptive_mode={adaptive_profile.get('adaptive_mode')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            print(
+                f"[REALM-X-SESSION] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} session_state={adaptive_profile.get('session_state')} timing_mode={adaptive_profile.get('timing_mode')} adaptive_mode={adaptive_profile.get('adaptive_mode')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            print(
+                f"[REALM-X-SCORE] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} realm_ix_awareness_score={adaptive_profile.get('realm_ix_awareness_score')} adaptive_score={adaptive_profile.get('adaptive_score')} adaptive_mode={adaptive_profile.get('adaptive_mode')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            print(
+                f"[REALM-X-PROFILE] ticker={adaptive_profile.get('ticker')} category={adaptive_profile.get('category')} adaptive_mode={adaptive_profile.get('adaptive_mode')} entry_strictness={adaptive_profile.get('entry_strictness')} spread_tolerance_mode={adaptive_profile.get('spread_tolerance_mode')} aggression_level={adaptive_profile.get('aggression_level')} take_profit_mode={adaptive_profile.get('take_profit_mode')} stop_behavior_mode={adaptive_profile.get('stop_behavior_mode')} timing_mode={adaptive_profile.get('timing_mode')} adaptive_score={adaptive_profile.get('adaptive_score')} reasons={adaptive_profile.get('adaptive_reasons', [])}"
+            )
+            adjusted_score = self._apply_market_awareness_adjustment(score, awareness_profile)
+            adaptive_score_delta = (self.to_float(adaptive_profile.get("adaptive_score"), 0.0) - 0.5) * 10.0
+            if adaptive_profile.get("adaptive_mode") == "avoid":
+                adjusted_score -= 35.0
+            elif adaptive_profile.get("adaptive_mode") == "defensive":
+                adjusted_score -= 4.0
+            elif adaptive_profile.get("adaptive_mode") == "normal":
+                adjusted_score += adaptive_score_delta * 0.25
+            elif adaptive_profile.get("adaptive_mode") == "opportunistic":
+                adjusted_score += adaptive_score_delta * 0.45 + 2.0
+            elif adaptive_profile.get("adaptive_mode") == "aggressive":
+                adjusted_score += adaptive_score_delta * 0.55 + 3.0
+            profiled_candidates.append((round(adjusted_score, 4), q, spread, family))
+            profile_map[str(ticker or "").strip()] = adaptive_profile
+        average_adaptive = round(total_score / float(len(awareness_candidates)), 4) if awareness_candidates else 0.0
+        top_adaptive_tickers = [ticker for _score, ticker in sorted(top_candidates, key=lambda item: item[0], reverse=True)[:5] if ticker]
+        summary = {
+            "profiled_candidates": len(awareness_candidates),
+            "avoid": summary_counts.get("avoid", 0),
+            "defensive": summary_counts.get("defensive", 0),
+            "normal": summary_counts.get("normal", 0),
+            "opportunistic": summary_counts.get("opportunistic", 0),
+            "aggressive": summary_counts.get("aggressive", 0),
+            "unknown": summary_counts.get("unknown", 0),
+            "average_adaptive_score": average_adaptive,
+            "top_adaptive_candidates": top_adaptive_tickers,
+        }
+        self.market_adaptive_profiles = profile_map
+        self.last_market_adaptive_summary = summary
+        print(
+            f"[REALM-X-SUMMARY] total_candidates_profiled={summary['profiled_candidates']} avoid_count={summary['avoid']} defensive_count={summary['defensive']} normal_count={summary['normal']} opportunistic_count={summary['opportunistic']} aggressive_count={summary['aggressive']} average_adaptive_score={summary['average_adaptive_score']} top_adaptive_candidate_tickers={summary['top_adaptive_candidates']}"
+        )
+        return profiled_candidates, summary
+
+
+    def _normalize_predictive_mode(self, value, fallback="unknown"):
+        mode = str(value or fallback or "unknown").strip().lower()
+        if mode not in {"up", "down", "neutral", "unknown"}:
+            return fallback
+        return mode
+
+
+    def _extract_predictive_price_series(self, market, q=None, awareness_profile=None, adaptive_profile=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        family = str(adaptive_profile.get("family") or awareness_profile.get("family") or self.get_market_family(market) or "").strip().upper()
+        timing_history_key = self._build_phase55_timing_history_key(market, q, family=family)
+        rolling_history = list(self.phase55_rolling_price_history.get(str(timing_history_key or "").strip(), []))
+        series = [self.to_float(price, None) for price in rolling_history if self.to_float(price, None) is not None and self.to_float(price, None) > 0]
+        if len(series) >= 2:
+            return series, "rolling_history", timing_history_key
+        awareness_series = self._extract_market_awareness_price_series(market, q=q)
+        extracted_series = awareness_series.get("series", []) if isinstance(awareness_series, dict) else []
+        extracted_series = [self.to_float(price, None) for price in extracted_series if self.to_float(price, None) is not None and self.to_float(price, None) > 0]
+        if len(extracted_series) >= 2:
+            return extracted_series, awareness_series.get("source", "market_payload"), timing_history_key
+        snapshot_context = self._build_phase55_snapshot_series(market, q)
+        snapshot_series = snapshot_context.get("series", []) if isinstance(snapshot_context, dict) else []
+        snapshot_series = [self.to_float(price, None) for price in snapshot_series if self.to_float(price, None) is not None and self.to_float(price, None) > 0]
+        if len(snapshot_series) >= 2:
+            return snapshot_series, snapshot_context.get("stochastic_source", "market_snapshot"), timing_history_key
+        return [], "unavailable", timing_history_key
+
+    def detect_momentum_direction(self, market, q=None, awareness_profile=None, adaptive_profile=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        prices, _price_source, _timing_history_key = self._extract_predictive_price_series(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile)
+        if len(prices) < 2:
+            return "unknown", ["insufficient_price_history"]
+        early_window = prices[:-2] if len(prices) >= 4 else prices[:-1]
+        recent_window = prices[-2:] if len(prices) >= 2 else prices
+        early_delta = (early_window[-1] - early_window[0]) if len(early_window) >= 2 else (prices[min(1, len(prices) - 1)] - prices[0])
+        recent_delta = recent_window[-1] - recent_window[0] if len(recent_window) >= 2 else 0.0
+        net_delta = prices[-1] - prices[0]
+        reasons = []
+        if net_delta > 0:
+            direction = "up"
+        elif net_delta < 0:
+            direction = "down"
+        else:
+            direction = "neutral"
+        if abs(recent_delta) >= abs(early_delta) * 1.25 and abs(recent_delta) > 0.0:
+            reasons.append("recent_move_outpaces_earlier_move")
+        elif abs(recent_delta) < abs(early_delta) * 0.75:
+            reasons.append("recent_move_slowing_vs_earlier_move")
+        else:
+            reasons.append("movement_stable")
+        if abs(net_delta) < 0.005:
+            direction = "neutral"
+            reasons.append("net_move_flat")
+        if direction == "up":
+            reasons.append("positive_price_bias")
+        elif direction == "down":
+            reasons.append("negative_price_bias")
+        else:
+            reasons.append("balanced_price_bias")
+        return direction, reasons
+
+    def detect_momentum_acceleration(self, market, q=None, awareness_profile=None, adaptive_profile=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        prices, _price_source, _timing_history_key = self._extract_predictive_price_series(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile)
+        if len(prices) < 4:
+            return "unknown", ["insufficient_price_history"]
+        midpoint = max(2, len(prices) // 2)
+        earlier = prices[:midpoint]
+        recent = prices[midpoint - 1:]
+        if len(earlier) < 2 or len(recent) < 2:
+            return "unknown", ["insufficient_split_history"]
+        earlier_delta = earlier[-1] - earlier[0]
+        recent_delta = recent[-1] - recent[0]
+        earlier_step = abs(earlier_delta) / float(max(len(earlier) - 1, 1))
+        recent_step = abs(recent_delta) / float(max(len(recent) - 1, 1))
+        reasons = []
+        if recent_step > earlier_step * 1.25:
+            state = "accelerating"
+            reasons.append("recent_step_outpaces_earlier_step")
+        elif recent_step < earlier_step * 0.75:
+            state = "decelerating"
+            reasons.append("recent_step_slows_vs_earlier_step")
+        else:
+            state = "stable"
+            reasons.append("recent_step_matches_earlier_step")
+        if abs(recent_delta) < 0.0025 and abs(earlier_delta) < 0.0025:
+            state = "stable"
+            reasons.append("low_movement_flat")
+        return state, reasons
+
+    def analyze_orderbook_pressure(self, market, q=None, adaptive_profile=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        family = str(adaptive_profile.get("family") or self.get_market_family(market) or "").strip().upper()
+        quote_values = self.get_market_quote_values(market)
+        yes_bid = quote_values.get("yes_bid")
+        yes_ask = quote_values.get("yes_ask")
+        no_bid = quote_values.get("no_bid")
+        no_ask = quote_values.get("no_ask")
+        spread = None
+        if yes_bid is not None and yes_ask is not None:
+            try:
+                spread = float(yes_ask) - float(yes_bid)
+            except (TypeError, ValueError):
+                spread = None
+        cached = self.targeted_orderbook_cache.get(str(getattr(q, "ticker", "") or "").strip(), {}) if hasattr(self, "targeted_orderbook_cache") else {}
+        if not isinstance(cached, dict):
+            cached = {}
+        yes_top_size = self.to_float(cached.get("yes_top_size"), 0.0)
+        no_top_size = self.to_float(cached.get("no_top_size"), 0.0)
+        yes_top_price = cached.get("yes_top_price")
+        no_top_price = cached.get("no_top_price")
+        if yes_top_size <= 0 and no_top_size <= 0:
+            if yes_bid is None and yes_ask is None and no_bid is None and no_ask is None:
+                return "unknown", ["missing_quotes_and_orderbook"]
+            if yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None:
+                yes_imbalance = max(0.0, float(yes_ask) - float(yes_bid))
+                no_imbalance = max(0.0, float(no_ask) - float(no_bid))
+                if yes_imbalance > no_imbalance:
+                    return "yes_pressure", ["quote_imbalance_favors_yes"]
+                if no_imbalance > yes_imbalance:
+                    return "no_pressure", ["quote_imbalance_favors_no"]
+                return "balanced", ["quote_imbalance_balanced"]
+            return "unknown", ["insufficient_orderbook_depth"]
+        pressure_score = (yes_top_size or 0.0) - (no_top_size or 0.0)
+        pressure_ratio = abs(pressure_score) / float(max((yes_top_size or 0.0) + (no_top_size or 0.0), 1e-9))
+        reasons = []
+        if yes_top_size <= 0 and no_top_size > 0:
+            reasons.append("no_side_top_book_only")
+            return "no_pressure", reasons
+        if no_top_size <= 0 and yes_top_size > 0:
+            reasons.append("yes_side_top_book_only")
+            return "yes_pressure", reasons
+        if pressure_ratio < 0.10:
+            reasons.append("balanced_top_book_depth")
+            return "balanced", reasons
+        if pressure_score > 0:
+            reasons.append("yes_depth_exceeds_no_depth")
+            return "yes_pressure", reasons
+        reasons.append("no_depth_exceeds_yes_depth")
+        return "no_pressure", reasons
+
+    def classify_price_velocity(self, market, q=None, awareness_profile=None, adaptive_profile=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        prices, _price_source, _timing_history_key = self._extract_predictive_price_series(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile)
+        if len(prices) < 2:
+            return "unknown", ["insufficient_price_history"]
+        deltas = [prices[idx] - prices[idx - 1] for idx in range(1, len(prices))]
+        avg_abs_delta = sum(abs(delta) for delta in deltas) / float(max(len(deltas), 1))
+        last_delta = deltas[-1]
+        reasons = []
+        if avg_abs_delta < 0.002:
+            reasons.append("flat_price_action")
+            return "flat", reasons
+        if abs(last_delta) >= avg_abs_delta * 1.5 and abs(last_delta) >= 0.004:
+            if last_delta > 0:
+                reasons.append("last_move_accelerated_up")
+                return "rising_fast", reasons
+            reasons.append("last_move_accelerated_down")
+            return "falling_fast", reasons
+        if avg_abs_delta >= 0.01:
+            if last_delta > 0:
+                reasons.append("elevated_positive_velocity")
+                return "rising_fast", reasons
+            if last_delta < 0:
+                reasons.append("elevated_negative_velocity")
+                return "falling_fast", reasons
+        reasons.append("moderate_velocity")
+        return "slow", reasons
+
+    def detect_breakout_state(self, market, q=None, awareness_profile=None, adaptive_profile=None, momentum_direction=None, acceleration_state=None, velocity_state=None, orderbook_pressure=None):
+        market = market if isinstance(market, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        liquidity_regime = str(adaptive_profile.get("liquidity_regime") or awareness_profile.get("liquidity_regime") or "unknown").strip().lower()
+        trend_regime = str(adaptive_profile.get("trend_regime") or awareness_profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(adaptive_profile.get("session_state") or awareness_profile.get("session_state") or "unknown").strip().lower()
+        spread = self.to_float(getattr(q, "yes_ask", None), None)
+        if spread is not None and getattr(q, "yes_bid", None) is not None:
+            try:
+                spread = float(getattr(q, "yes_ask", 0.0)) - float(getattr(q, "yes_bid", 0.0))
+            except (TypeError, ValueError):
+                spread = None
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_liquidity_blocks_breakout")
+            return "none", reasons
+        if trend_regime == "choppy":
+            reasons.append("choppy_trend_blocks_breakout")
+            return "failed_breakout", reasons
+        if momentum_direction in {"up", "down"} and acceleration_state == "accelerating" and velocity_state in {"rising_fast", "falling_fast"}:
+            if liquidity_regime in {"tradable", "strong"} and session_state != "closing_soon" and orderbook_pressure in {"yes_pressure", "no_pressure"}:
+                if momentum_direction == "up" and orderbook_pressure == "yes_pressure":
+                    reasons.append("aligned_upside_pressure")
+                    return "pre_breakout", reasons
+                if momentum_direction == "down" and orderbook_pressure == "no_pressure":
+                    reasons.append("aligned_downside_pressure")
+                    return "pre_breakout", reasons
+                reasons.append("momentum_pressure_misaligned")
+                return "none", reasons
+        if orderbook_pressure in {"yes_pressure", "no_pressure"} and velocity_state in {"rising_fast", "falling_fast"} and liquidity_regime in {"tradable", "strong"}:
+            reasons.append("orderbook_velocity_supports_breakout")
+            return "pre_breakout", reasons
+        if session_state == "active" and trend_regime == "trending" and velocity_state in {"rising_fast", "falling_fast"} and acceleration_state in {"accelerating", "stable"}:
+            reasons.append("active_trend_supports_breakout_confirmation")
+            return "confirmed_breakout", reasons
+        if momentum_direction in {"up", "down"} and acceleration_state == "decelerating":
+            reasons.append("momentum_slowing")
+            return "failed_breakout", reasons
+        if spread is not None and spread > MAX_ENTRY_SPREAD:
+            reasons.append("wide_spread_blocks_breakout")
+            return "none", reasons
+        reasons.append("no_breakout_signal")
+        return "none", reasons
+
+    def detect_regime_shift(self, market, q=None, awareness_profile=None, adaptive_profile=None, momentum_direction=None, velocity_state=None):
+        market = market if isinstance(market, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        current_liquidity = str(adaptive_profile.get("liquidity_regime") or awareness_profile.get("liquidity_regime") or "unknown").strip().lower()
+        current_trend = str(adaptive_profile.get("trend_regime") or awareness_profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(adaptive_profile.get("session_state") or awareness_profile.get("session_state") or "unknown").strip().lower()
+        recent_shift = []
+        if current_trend == "trending":
+            recent_shift.append("trend_strengthening")
+        elif current_trend == "choppy" and momentum_direction in {"up", "down"} and velocity_state in {"rising_fast", "falling_fast"}:
+            recent_shift.append("chop_to_directional")
+        elif current_trend == "flat" and momentum_direction in {"up", "down"} and velocity_state in {"rising_fast", "falling_fast"}:
+            recent_shift.append("flat_to_trending")
+        if session_state == "active":
+            recent_shift.append("session_activity_increasing")
+        if current_liquidity in {"tradable", "strong"}:
+            recent_shift.append("liquidity_support_improving")
+        if not recent_shift:
+            return "unknown", ["no_regime_shift"]
+        return "shifted", recent_shift
+
+    def compute_confluence_count(self, market, q=None, awareness_profile=None, adaptive_profile=None, predictive_context=None):
+        market = market if isinstance(market, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_context = predictive_context if isinstance(predictive_context, dict) else {}
+        confluence = 0
+        reasons = []
+        if self.to_float(awareness_profile.get("awareness_score"), 0.0) >= 0.75:
+            confluence += 1
+            reasons.append("realm_ix_strong_awareness")
+        if adaptive_profile.get("adaptive_mode") in {"opportunistic", "aggressive"}:
+            confluence += 1
+            reasons.append("realm_x_positive_mode")
+        if str(awareness_profile.get("trend_regime") or "").strip().lower() == "trending" or str(adaptive_profile.get("trend_regime") or "").strip().lower() == "trending":
+            confluence += 1
+            reasons.append("trending_regime")
+        if str(adaptive_profile.get("liquidity_regime") or awareness_profile.get("liquidity_regime") or "").strip().lower() in {"tradable", "strong"}:
+            confluence += 1
+            reasons.append("quality_liquidity")
+        if predictive_context.get("orderbook_pressure") in {"yes_pressure", "no_pressure"}:
+            confluence += 1
+            reasons.append("orderbook_pressure")
+        if predictive_context.get("acceleration_state") == "accelerating":
+            confluence += 1
+            reasons.append("accelerating_momentum")
+        if predictive_context.get("velocity_state") in {"rising_fast", "falling_fast"}:
+            confluence += 1
+            reasons.append("velocity_confirmation")
+        if str(adaptive_profile.get("session_state") or awareness_profile.get("session_state") or "").strip().lower() == "active":
+            confluence += 1
+            reasons.append("active_session")
+        if self.to_float(predictive_context.get("candidate_confidence"), 0.0) >= 0.7:
+            confluence += 1
+            reasons.append("candidate_confidence")
+        return confluence, reasons
+
+    def compute_predictive_score(self, market, awareness_profile=None, adaptive_profile=None, predictive_context=None):
+        market = market if isinstance(market, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_context = predictive_context if isinstance(predictive_context, dict) else {}
+        liquidity_regime = str(adaptive_profile.get("liquidity_regime") or awareness_profile.get("liquidity_regime") or "unknown").strip().lower()
+        trend_regime = str(adaptive_profile.get("trend_regime") or awareness_profile.get("trend_regime") or "unknown").strip().lower()
+        session_state = str(adaptive_profile.get("session_state") or awareness_profile.get("session_state") or "unknown").strip().lower()
+        momentum_strength = str(predictive_context.get("momentum_strength") or "unknown").strip().lower()
+        acceleration_state = str(predictive_context.get("acceleration_state") or "unknown").strip().lower()
+        orderbook_pressure = str(predictive_context.get("orderbook_pressure") or "unknown").strip().lower()
+        velocity_state = str(predictive_context.get("velocity_state") or "unknown").strip().lower()
+        breakout_state = str(predictive_context.get("breakout_state") or "unknown").strip().lower()
+        awareness_score = self._clamp(self.to_float(awareness_profile.get("awareness_score"), 0.0))
+        adaptive_score = self._clamp(self.to_float(adaptive_profile.get("adaptive_score", adaptive_profile.get("realm_x_adaptive_score")), 0.0))
+        liquidity_weights = {"dead": 0.0, "thin": 0.18, "tradable": 0.66, "strong": 0.92, "unknown": 0.35}
+        trend_weights = {"trending": 0.9, "choppy": 0.28, "flat": 0.52, "unknown": 0.35}
+        session_weights = {"active": 0.9, "quiet": 0.5, "closing_soon": 0.22, "unknown": 0.35}
+        momentum_weights = {"strong": 0.9, "moderate": 0.72, "weak": 0.42, "unknown": 0.35}
+        acceleration_weights = {"accelerating": 0.9, "stable": 0.6, "decelerating": 0.2, "unknown": 0.35}
+        orderbook_weights = {"yes_pressure": 0.85, "no_pressure": 0.85, "balanced": 0.55, "unknown": 0.35}
+        velocity_weights = {"rising_fast": 0.88, "falling_fast": 0.88, "slow": 0.58, "flat": 0.32, "unknown": 0.35}
+        breakout_weights = {"pre_breakout": 0.95, "confirmed_breakout": 1.0, "failed_breakout": 0.1, "none": 0.45, "unknown": 0.35}
+        liquidity_component = liquidity_weights.get(liquidity_regime, 0.35)
+        trend_component = trend_weights.get(trend_regime, 0.35)
+        session_component = session_weights.get(session_state, 0.35)
+        momentum_component = momentum_weights.get(momentum_strength, 0.35)
+        acceleration_component = acceleration_weights.get(acceleration_state, 0.35)
+        orderbook_component = orderbook_weights.get(orderbook_pressure, 0.35)
+        velocity_component = velocity_weights.get(velocity_state, 0.35)
+        breakout_component = breakout_weights.get(breakout_state, 0.35)
+        confluence_count = self.to_float(predictive_context.get("confluence_count"), 0.0)
+        confluence_component = self._clamp(confluence_count / 9.0)
+        combined = (
+            awareness_score * 0.20
+            + adaptive_score * 0.20
+            + momentum_component * 0.15
+            + acceleration_component * 0.10
+            + orderbook_component * 0.10
+            + velocity_component * 0.10
+            + breakout_component * 0.10
+            + confluence_component * 0.10
+            + session_component * 0.03
+            + liquidity_component * 0.02
+        )
+        reasons = []
+        if liquidity_regime == "dead":
+            reasons.append("dead_liquidity_caps_predictive_score")
+            combined = min(combined, 0.05)
+        elif liquidity_regime == "thin":
+            reasons.append("thin_liquidity_penalty")
+            combined -= 0.10
+        elif liquidity_regime == "strong":
+            reasons.append("strong_liquidity_bonus")
+            combined += 0.05
+        if trend_regime == "trending":
+            reasons.append("trend_bonus")
+            combined += 0.04
+        elif trend_regime == "choppy":
+            reasons.append("chop_penalty")
+            combined -= 0.08
+        if acceleration_state == "accelerating":
+            reasons.append("acceleration_bonus")
+            combined += 0.06
+        elif acceleration_state == "decelerating":
+            reasons.append("deceleration_penalty")
+            combined -= 0.08
+        if orderbook_pressure in {"yes_pressure", "no_pressure"}:
+            reasons.append("orderbook_pressure_bonus")
+            combined += 0.04
+        if velocity_state in {"rising_fast", "falling_fast"}:
+            reasons.append("velocity_bonus")
+            combined += 0.04
+        elif velocity_state == "flat":
+            reasons.append("flat_velocity_penalty")
+            combined -= 0.05
+        if breakout_state == "pre_breakout":
+            reasons.append("pre_breakout_bonus")
+            combined += 0.08
+        elif breakout_state == "confirmed_breakout":
+            reasons.append("confirmed_breakout_bonus")
+            combined += 0.10
+        elif breakout_state == "failed_breakout":
+            reasons.append("failed_breakout_penalty")
+            combined -= 0.12
+        if session_state == "active":
+            reasons.append("active_session_bonus")
+            combined += 0.03
+        elif session_state == "closing_soon":
+            reasons.append("closing_soon_penalty")
+            combined -= 0.08
+        if confluence_count >= 6:
+            reasons.append("high_confluence_bonus")
+            combined += 0.05
+        elif confluence_count <= 2:
+            reasons.append("low_confluence_penalty")
+            combined -= 0.05
+        if momentum_strength == "strong":
+            reasons.append("strong_momentum_bonus")
+            combined += 0.04
+        elif momentum_strength == "weak":
+            reasons.append("weak_momentum_penalty")
+            combined -= 0.04
+        if any(value == "unknown" for value in (momentum_strength, acceleration_state, orderbook_pressure, velocity_state, breakout_state)):
+            reasons.append("unknown_signal_cap")
+            combined = min(combined, 0.55 if liquidity_regime != "dead" else 0.05)
+        if awareness_score < 0.35 or adaptive_score < 0.25:
+            reasons.append("low_prior_layer_cap")
+            combined = min(combined, 0.45)
+        return {
+            "predictive_score": round(self._clamp(combined), 4),
+            "predictive_reasons": reasons,
+            "liquidity_component": round(liquidity_component, 4),
+            "trend_component": round(trend_component, 4),
+            "session_component": round(session_component, 4),
+            "momentum_component": round(momentum_component, 4),
+            "acceleration_component": round(acceleration_component, 4),
+            "orderbook_component": round(orderbook_component, 4),
+            "velocity_component": round(velocity_component, 4),
+            "breakout_component": round(breakout_component, 4),
+            "confluence_component": round(confluence_component, 4),
+            "awareness_component": round(awareness_score, 4),
+            "adaptive_component": round(adaptive_score, 4),
+        }
+
+    def build_predictive_momentum_profile(self, market, q=None, awareness_profile=None, adaptive_profile=None, candidate_confidence=None):
+        market = market if isinstance(market, dict) else {}
+        q = q if q is not None else self.build_quote(market)
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        ticker = str((getattr(q, "ticker", "") or market.get("ticker", "") or "")).strip()
+        category = str(adaptive_profile.get("category") or awareness_profile.get("category") or self.safe_get_category(market) or "unknown").strip().lower()
+        family = str(adaptive_profile.get("family") or awareness_profile.get("family") or self.get_market_family(market) or "").strip().upper() or None
+        realm_ix_awareness_score = self.to_float(awareness_profile.get("awareness_score"), 0.0)
+        realm_x_adaptive_score = self.to_float(adaptive_profile.get("adaptive_score"), 0.0)
+        momentum_direction, momentum_direction_reasons = self.detect_momentum_direction(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile)
+        acceleration_state, acceleration_reasons = self.detect_momentum_acceleration(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile)
+        orderbook_pressure, orderbook_reasons = self.analyze_orderbook_pressure(market, q=q, adaptive_profile=adaptive_profile)
+        velocity_state, velocity_reasons = self.classify_price_velocity(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile)
+        breakout_state, breakout_reasons = self.detect_breakout_state(
+            market,
+            q=q,
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            momentum_direction=momentum_direction,
+            acceleration_state=acceleration_state,
+            velocity_state=velocity_state,
+            orderbook_pressure=orderbook_pressure,
+        )
+        regime_shift_state, regime_shift_reasons = self.detect_regime_shift(
+            market,
+            q=q,
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            momentum_direction=momentum_direction,
+            velocity_state=velocity_state,
+        )
+        normalized_candidate_confidence = self._clamp(self.to_float(candidate_confidence, 0.0) / 100.0)
+        predictive_context = {
+            "momentum_strength": "unknown",
+            "acceleration_state": acceleration_state,
+            "orderbook_pressure": orderbook_pressure,
+            "velocity_state": velocity_state,
+            "breakout_state": breakout_state,
+            "candidate_confidence": normalized_candidate_confidence,
+        }
+        confluence_count, confluence_reasons = self.compute_confluence_count(
+            market,
+            q=q,
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_context=predictive_context,
+        )
+        momentum_strength = "unknown"
+        if momentum_direction in {"up", "down"} and acceleration_state == "accelerating" and velocity_state in {"rising_fast", "falling_fast"}:
+            momentum_strength = "strong"
+        elif momentum_direction in {"up", "down"} and velocity_state in {"slow", "rising_fast", "falling_fast"}:
+            momentum_strength = "moderate"
+        elif momentum_direction == "neutral":
+            momentum_strength = "weak"
+        predictive_context["momentum_strength"] = momentum_strength
+        predictive_score_payload = self.compute_predictive_score(
+            market,
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_context={**predictive_context, "confluence_count": confluence_count},
+        )
+        predictive_score = predictive_score_payload.get("predictive_score", 0.0)
+        reasons = []
+        reasons.extend(awareness_profile.get("awareness_reasons", []) or [])
+        reasons.extend(adaptive_profile.get("adaptive_reasons", []) or [])
+        reasons.extend(momentum_direction_reasons or [])
+        reasons.extend(acceleration_reasons or [])
+        reasons.extend(orderbook_reasons or [])
+        reasons.extend(velocity_reasons or [])
+        reasons.extend(breakout_reasons or [])
+        reasons.extend(regime_shift_reasons or [])
+        reasons.extend(confluence_reasons or [])
+        reasons.extend(predictive_score_payload.get("predictive_reasons", []) or [])
+        reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason is not None and str(reason).strip()))
+        profile = {
+            "ticker": ticker,
+            "category": category,
+            "family": family,
+            "series_ticker": adaptive_profile.get("series_ticker") or awareness_profile.get("series_ticker"),
+            "realm_ix_awareness_score": round(realm_ix_awareness_score, 4),
+            "realm_x_adaptive_score": round(realm_x_adaptive_score, 4),
+            "adaptive_mode": adaptive_profile.get("adaptive_mode", "unknown"),
+            "volatility_class": str(adaptive_profile.get("volatility_class") or awareness_profile.get("volatility_class") or "unknown").strip().lower(),
+            "liquidity_regime": str(adaptive_profile.get("liquidity_regime") or awareness_profile.get("liquidity_regime") or "unknown").strip().lower(),
+            "trend_regime": str(adaptive_profile.get("trend_regime") or awareness_profile.get("trend_regime") or "unknown").strip().lower(),
+            "session_state": str(adaptive_profile.get("session_state") or awareness_profile.get("session_state") or "unknown").strip().lower(),
+            "momentum_direction": momentum_direction,
+            "momentum_strength": momentum_strength,
+            "acceleration_state": acceleration_state,
+            "orderbook_pressure": orderbook_pressure,
+            "velocity_state": velocity_state,
+            "breakout_state": breakout_state,
+            "regime_shift_state": regime_shift_state,
+            "confluence_count": confluence_count,
+            "predictive_score": round(self._clamp(predictive_score), 4),
+            "predictive_reasons": reasons,
+            "predictive_score_components": predictive_score_payload,
+        }
+        return profile
+
+    def profile_predictive_momentum(self, markets, adaptive_candidates):
+        markets = markets or []
+        adaptive_candidates = adaptive_candidates or []
+        market_lookup = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+        awareness_lookup = getattr(self, "market_awareness_profiles", {}) if isinstance(getattr(self, "market_awareness_profiles", {}), dict) else {}
+        adaptive_lookup = getattr(self, "market_adaptive_profiles", {}) if isinstance(getattr(self, "market_adaptive_profiles", {}), dict) else {}
+        profiled_candidates = []
+        profile_map = {}
+        summary_counts = {"pre_breakout": 0, "confirmed_breakout": 0, "unknown": 0}
+        total_score = 0.0
+        top_candidates = []
+        strongest_confluence = []
+        for score, q, spread, family in adaptive_candidates:
+            ticker = getattr(q, "ticker", "") or ""
+            market = market_lookup.get(str(ticker or "").strip(), {})
+            awareness_profile = awareness_lookup.get(str(ticker or "").strip(), {})
+            adaptive_profile = adaptive_lookup.get(str(ticker or "").strip(), {})
+            if not isinstance(adaptive_profile, dict) or not adaptive_profile:
+                try:
+                    awareness_profile = awareness_profile if isinstance(awareness_profile, dict) and awareness_profile else self.build_market_awareness_profile(
+                        market,
+                        q=q,
+                        spread=spread,
+                        family=family,
+                        raw_rank_score=score,
+                    )
+                    adaptive_profile = self.build_adaptive_behavior_profile(
+                        market,
+                        q=q,
+                        awareness_profile=awareness_profile,
+                        adaptive_score_hint=score,
+                    )
+                except Exception as exc:
+                    adaptive_profile = {
+                        "ticker": ticker,
+                        "category": self.safe_get_category(market),
+                        "family": family,
+                        "series_ticker": self._safe_get_series_ticker(market),
+                        "realm_ix_awareness_score": 0.0,
+                        "realm_x_adaptive_score": 0.0,
+                        "adaptive_mode": "defensive",
+                        "volatility_class": "unknown",
+                        "liquidity_regime": "unknown",
+                        "trend_regime": "unknown",
+                        "session_state": "unknown",
+                        "predictive_score": 0.0,
+                        "predictive_reasons": [f"profile_error:{exc.__class__.__name__}"],
+                    }
+            predictive_profile = self.build_predictive_momentum_profile(
+                market,
+                q=q,
+                awareness_profile=awareness_profile,
+                adaptive_profile=adaptive_profile,
+                candidate_confidence=score,
+            )
+            breakout_state = str(predictive_profile.get("breakout_state") or "unknown").strip().lower()
+            confluence_count = int(self.to_float(predictive_profile.get("confluence_count"), 0.0) or 0)
+            if breakout_state in {"pre_breakout", "confirmed_breakout", "unknown"}:
+                summary_counts[breakout_state] = summary_counts.get(breakout_state, 0) + 1
+            else:
+                summary_counts["unknown"] += 1
+            total_score += self.to_float(predictive_profile.get("predictive_score"), 0.0)
+            top_candidates.append((self.to_float(predictive_profile.get("predictive_score"), 0.0), str(ticker or "").strip()))
+            strongest_confluence.append((confluence_count, str(ticker or "").strip()))
+            print(
+                f"[REALM-XI-MOMENTUM] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} momentum_direction={predictive_profile.get('momentum_direction')} momentum_strength={predictive_profile.get('momentum_strength')} acceleration_state={predictive_profile.get('acceleration_state')} adaptive_mode={predictive_profile.get('adaptive_mode')} predictive_reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            print(
+                f"[REALM-XI-ORDERBOOK-PRESSURE] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} orderbook_pressure={predictive_profile.get('orderbook_pressure')} liquidity_regime={predictive_profile.get('liquidity_regime')} predictive_reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            print(
+                f"[REALM-XI-VELOCITY] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} velocity_state={predictive_profile.get('velocity_state')} momentum_direction={predictive_profile.get('momentum_direction')} predictive_reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            print(
+                f"[REALM-XI-CONFLUENCE] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} confluence_count={predictive_profile.get('confluence_count')} adaptive_mode={predictive_profile.get('adaptive_mode')} predictive_reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            print(
+                f"[REALM-XI-BREAKOUT] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} breakout_state={predictive_profile.get('breakout_state')} predictive_reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            print(
+                f"[REALM-XI-REGIME-SHIFT] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} regime_shift_state={predictive_profile.get('regime_shift_state')} predictive_reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            print(
+                f"[REALM-XI-SCORE] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} realm_ix_awareness_score={predictive_profile.get('realm_ix_awareness_score')} realm_x_adaptive_score={predictive_profile.get('realm_x_adaptive_score')} predictive_score={predictive_profile.get('predictive_score')} breakout_state={predictive_profile.get('breakout_state')} predictive_reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            print(
+                f"[REALM-XI-PROFILE] ticker={predictive_profile.get('ticker')} category={predictive_profile.get('category')} momentum_direction={predictive_profile.get('momentum_direction')} momentum_strength={predictive_profile.get('momentum_strength')} acceleration_state={predictive_profile.get('acceleration_state')} orderbook_pressure={predictive_profile.get('orderbook_pressure')} velocity_state={predictive_profile.get('velocity_state')} breakout_state={predictive_profile.get('breakout_state')} confluence_count={predictive_profile.get('confluence_count')} predictive_score={predictive_profile.get('predictive_score')} reasons={predictive_profile.get('predictive_reasons', [])}"
+            )
+            adjusted_score = self._apply_market_awareness_adjustment(score, awareness_profile)
+            adaptive_mode = str(adaptive_profile.get("adaptive_mode") or "unknown").strip().lower()
+            predictive_score = self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0)
+            predictive_delta = (predictive_score - 0.5) * 12.0
+            if adaptive_mode == "avoid" or breakout_state == "failed_breakout":
+                adjusted_score -= 50.0
+            elif adaptive_mode == "defensive":
+                adjusted_score -= 6.0
+            elif breakout_state == "confirmed_breakout":
+                adjusted_score += predictive_delta * 0.7 + 4.0
+            elif breakout_state == "pre_breakout":
+                adjusted_score += predictive_delta * 0.55 + 2.5
+            elif predictive_score >= 0.75:
+                adjusted_score += predictive_delta * 0.4 + 1.0
+            elif predictive_score <= 0.25:
+                adjusted_score -= 3.0
+            profiled_candidates.append((round(adjusted_score, 4), q, spread, family))
+            profile_map[str(ticker or "").strip()] = predictive_profile
+        average_predictive = round(total_score / float(len(adaptive_candidates)), 4) if adaptive_candidates else 0.0
+        top_predictive_tickers = [ticker for _score, ticker in sorted(top_candidates, key=lambda item: item[0], reverse=True)[:5] if ticker]
+        strongest_confluence_tickers = [ticker for count, ticker in sorted(strongest_confluence, key=lambda item: item[0], reverse=True)[:5] if ticker]
+        summary = {
+            "profiled_candidates": len(adaptive_candidates),
+            "pre_breakout": summary_counts.get("pre_breakout", 0),
+            "confirmed_breakout": summary_counts.get("confirmed_breakout", 0),
+            "unknown": summary_counts.get("unknown", 0),
+            "average_predictive_score": average_predictive,
+            "top_predictive_candidates": top_predictive_tickers,
+            "strongest_confluence_tickers": strongest_confluence_tickers,
+        }
+        self.market_predictive_profiles = profile_map
+        self.last_market_predictive_summary = summary
+        print(
+            f"[REALM-XI-SUMMARY] total_candidates_profiled={summary['profiled_candidates']} pre_breakout_count={summary['pre_breakout']} confirmed_breakout_count={summary['confirmed_breakout']} unknown_count={summary['unknown']} average_predictive_score={summary['average_predictive_score']} top_predictive_candidate_tickers={summary['top_predictive_candidates']} strongest_confluence_tickers={summary['strongest_confluence_tickers']}"
+        )
+        return profiled_candidates, summary
+
+
+    def _safe_position_intel_mode(self, value, fallback="unknown"):
+        mode = str(value or fallback or "unknown").strip().lower()
+        return mode if mode in {"excellent", "good", "neutral", "weak", "danger", "unknown", "low", "medium", "high", "protect", "hold", "press", "reduce", "exit_watch", "yes", "no", "blocked", "unknown"} else fallback
+
+    def detect_exposure_cluster(self, position_summary=None, open_positions=None, market=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        open_positions = open_positions or self._get_open_live_positions()
+        market = market if isinstance(market, dict) else {}
+        ticker = str(position_summary.get("ticker") or market.get("ticker") or "").strip()
+        family = str(position_summary.get("family") or self.get_market_family({"ticker": ticker}) if ticker else position_summary.get("family") or "UNKNOWN").strip().upper()
+        category = str(position_summary.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower()
+        side = self._normalize_live_side(position_summary.get("side")) if hasattr(self, "_normalize_live_side") else str(position_summary.get("side") or "").strip().lower()
+        family_counts = {}
+        category_counts = {}
+        side_counts = {}
+        game_counts = {}
+        related = False
+        for raw_position in open_positions or []:
+            if not isinstance(raw_position, dict):
+                continue
+            summary = raw_position if "count" in raw_position and "ticker" in raw_position and "status" in raw_position else self.extract_position_summary(raw_position)
+            pos_ticker = str(summary.get("ticker") or "").strip()
+            if not pos_ticker:
+                continue
+            pos_family = self.get_market_family({"ticker": pos_ticker})
+            pos_category = self.get_market_discovery_category(pos_family)
+            pos_side = self._normalize_live_side(summary.get("side")) if hasattr(self, "_normalize_live_side") else str(summary.get("side") or "").strip().lower()
+            family_counts[pos_family] = family_counts.get(pos_family, 0) + 1
+            category_counts[pos_category] = category_counts.get(pos_category, 0) + 1
+            if pos_side:
+                side_counts[pos_side] = side_counts.get(pos_side, 0) + 1
+            if pos_category == "sports":
+                game_key = self._extract_sports_game_key(pos_ticker)
+                if game_key:
+                    game_counts[game_key] = game_counts.get(game_key, 0) + 1
+            if ticker and pos_ticker == ticker:
+                related = True
+            elif family and pos_family == family:
+                related = True
+            elif category and pos_category == category:
+                related = True
+        same_family_count = family_counts.get(family, 0)
+        same_category_count = category_counts.get(category, 0)
+        same_side_count = side_counts.get(side, 0) if side else 0
+        same_game_count = game_counts.get(self._extract_sports_game_key(ticker), 0) if ticker and category == "sports" else 0
+        warning = False
+        reasons = []
+        if same_family_count >= 2:
+            warning = True
+            reasons.append("family_cluster")
+        if same_category_count >= 3:
+            warning = True
+            reasons.append("category_cluster")
+        if same_side_count >= 3:
+            warning = True
+            reasons.append("same_side_cluster")
+        if same_game_count >= 2:
+            warning = True
+            reasons.append("same_game_cluster")
+        if not open_positions:
+            reasons.append("no_open_positions")
+        if not reasons:
+            reasons.append("cluster_clear")
+        return {
+            "warning": warning,
+            "related": related,
+            "family_counts": family_counts,
+            "category_counts": category_counts,
+            "side_counts": side_counts,
+            "game_counts": game_counts,
+            "same_family_count": same_family_count,
+            "same_category_count": same_category_count,
+            "same_side_count": same_side_count,
+            "same_game_count": same_game_count,
+            "reasons": reasons,
+        }
+
+    def classify_position_health(self, position_summary=None, q=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, decision=None, cluster_snapshot=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        cluster_snapshot = cluster_snapshot if isinstance(cluster_snapshot, dict) else {}
+        pnl = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        if pnl is None:
+            pnl = self.to_float(decision.get("unrealized_pnl_cents"), None)
+            if pnl is not None:
+                pnl = pnl / 100.0
+        current_price = self.to_float(position_summary.get("current_price"), None)
+        entry_price = self.to_float(position_summary.get("entry_price"), None)
+        if entry_price is None:
+            entry_price = self.to_float(position_summary.get("avg_price"), None)
+        side = str(position_summary.get("side") or "").strip().lower()
+        if pnl is None and current_price is not None and entry_price is not None:
+            pnl = (current_price - entry_price) if side != "no" else (entry_price - current_price)
+        momentum_direction = str(predictive_profile.get("momentum_direction") or "unknown").strip().lower()
+        momentum_strength = str(predictive_profile.get("momentum_strength") or "unknown").strip().lower()
+        predictive_score = self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0)
+        adaptive_mode = str(adaptive_profile.get("adaptive_mode") or "unknown").strip().lower()
+        liquidity_regime = str(adaptive_profile.get("liquidity_regime") or awareness_profile.get("liquidity_regime") or "unknown").strip().lower()
+        trend_regime = str(adaptive_profile.get("trend_regime") or awareness_profile.get("trend_regime") or "unknown").strip().lower()
+        reasons = []
+        if entry_price is None or current_price is None:
+            if predictive_score >= 0.75 and adaptive_mode in {"opportunistic", "aggressive"}:
+                return "good", ["insufficient_price_but_strong_support"]
+            return "unknown", ["insufficient_price_data"]
+        if pnl is None:
+            if predictive_score >= 0.8 and momentum_strength == "strong":
+                return "good", ["insufficient_pnl_but_strong_support"]
+            return "unknown", ["missing_unrealized_pnl"]
+        if liquidity_regime == "dead":
+            return "danger", ["dead_liquidity"]
+        if cluster_snapshot.get("warning"):
+            reasons.extend(cluster_snapshot.get("reasons", []) or [])
+        if pnl > 0 and predictive_score >= 0.75 and momentum_strength == "strong" and trend_regime == "trending":
+            return "excellent", reasons + ["profitable_strong_momentum"]
+        if pnl > 0 and predictive_score >= 0.55 and adaptive_mode in {"opportunistic", "aggressive"}:
+            return "good", reasons + ["profitable_and_supported"]
+        if pnl <= -0.08:
+            return "danger", reasons + ["adverse_move"]
+        if pnl <= -0.04 or momentum_direction == "down" or momentum_strength == "weak":
+            return "weak", reasons + ["soft_or_negative_pressure"]
+        if predictive_score < 0.35 or adaptive_mode in {"avoid", "defensive"}:
+            return "neutral", reasons + ["low_support"]
+        return "neutral", reasons + ["balanced_conditions"]
+
+    def determine_conviction_level(self, position_summary=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, cluster_snapshot=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        cluster_snapshot = cluster_snapshot if isinstance(cluster_snapshot, dict) else {}
+        if cluster_snapshot.get("warning") and str(predictive_profile.get("momentum_strength") or "unknown").strip().lower() == "unknown":
+            return "low", ["cluster_warning_without_momentum"]
+        awareness_score = self.to_float(awareness_profile.get("awareness_score"), 0.0)
+        adaptive_score = self.to_float(adaptive_profile.get("adaptive_score", adaptive_profile.get("realm_x_adaptive_score")), 0.0)
+        predictive_score = self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0)
+        momentum_strength = str(predictive_profile.get("momentum_strength") or "unknown").strip().lower()
+        health = str(position_summary.get("position_health") or "unknown").strip().lower()
+        pnl = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        reasons = []
+        combined = awareness_score * 0.3 + adaptive_score * 0.3 + predictive_score * 0.4
+        if pnl is not None and pnl > 0:
+            combined += 0.05
+            reasons.append("profitable")
+        if momentum_strength == "strong":
+            combined += 0.08
+            reasons.append("strong_momentum")
+        elif momentum_strength == "moderate":
+            combined += 0.03
+            reasons.append("moderate_momentum")
+        elif momentum_strength == "weak":
+            combined -= 0.05
+            reasons.append("weak_momentum")
+        if health in {"excellent", "good"}:
+            combined += 0.05
+            reasons.append("healthy_position")
+        elif health in {"weak", "danger"}:
+            combined -= 0.10
+            reasons.append("unhealthy_position")
+        if cluster_snapshot.get("warning"):
+            combined -= 0.08
+            reasons.append("cluster_warning")
+        if combined >= 0.78:
+            return "high", reasons
+        if combined >= 0.5:
+            return "medium", reasons
+        if combined > 0:
+            return "low", reasons
+        return "unknown", ["insufficient_conviction"]
+
+    def determine_management_mode(self, position_health=None, conviction_level=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, cluster_snapshot=None):
+        position_health = str(position_health or "unknown").strip().lower()
+        conviction_level = str(conviction_level or "unknown").strip().lower()
+        adaptive_mode = str((adaptive_profile or {}).get("adaptive_mode") or "unknown").strip().lower()
+        take_profit_mode = str((adaptive_profile or {}).get("take_profit_mode") or "unknown").strip().lower()
+        breakout_state = str((predictive_profile or {}).get("breakout_state") or "unknown").strip().lower()
+        momentum_strength = str((predictive_profile or {}).get("momentum_strength") or "unknown").strip().lower()
+        reasons = []
+        if position_health == "danger" or adaptive_mode == "avoid" or breakout_state == "failed_breakout":
+            return "exit_watch", ["danger_or_failed_breakout"]
+        if position_health == "weak" and conviction_level in {"low", "unknown"}:
+            return "reduce", ["weak_position_low_conviction"]
+        if position_health in {"excellent", "good"} and conviction_level == "high" and momentum_strength in {"strong", "moderate"} and not (cluster_snapshot or {}).get("warning"):
+            return "press", ["healthy_high_conviction"]
+        if position_health in {"excellent", "good"} and conviction_level in {"medium", "high"}:
+            return "hold", ["acceptable_position"]
+        if position_health == "neutral" and conviction_level in {"low", "medium"}:
+            return "hold", ["neutral_conditions"]
+        if take_profit_mode in {"quick_profit", "defensive_take_profit"}:
+            return "protect", ["defensive_take_profit_mode"]
+        if adaptive_mode in {"defensive", "avoid"}:
+            return "protect", ["defensive_adaptive_mode"]
+        return "unknown", ["insufficient_management_signal"]
+
+    def recommend_partial_profit(self, position_summary=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, decision=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        pnl = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        hold_seconds = self.to_float(position_summary.get("hold_seconds"), None)
+        take_profit_mode = str(adaptive_profile.get("take_profit_mode") or "unknown").strip().lower()
+        momentum_strength = str(predictive_profile.get("momentum_strength") or "unknown").strip().lower()
+        acceleration_state = str(predictive_profile.get("acceleration_state") or "unknown").strip().lower()
+        breakout_state = str(predictive_profile.get("breakout_state") or "unknown").strip().lower()
+        if pnl is None:
+            return "unknown", ["missing_pnl"]
+        if pnl > 0 and (take_profit_mode in {"quick_profit", "defensive_take_profit"} or acceleration_state == "decelerating" or momentum_strength == "weak" or breakout_state == "failed_breakout" or (hold_seconds is not None and hold_seconds > 30 * 60)):
+            return "yes", ["profit_protection_trigger"]
+        return "no", ["partial_profit_not_needed"]
+
+    def recommend_trailing_exit(self, position_summary=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        pnl = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        take_profit_mode = str(adaptive_profile.get("take_profit_mode") or "unknown").strip().lower()
+        momentum_strength = str(predictive_profile.get("momentum_strength") or "unknown").strip().lower()
+        breakout_state = str(predictive_profile.get("breakout_state") or "unknown").strip().lower()
+        if pnl is None:
+            return "unknown", ["missing_pnl"]
+        if pnl > 0 and momentum_strength in {"strong", "moderate"} and breakout_state in {"pre_breakout", "confirmed_breakout"} and take_profit_mode in {"extended_runner", "normal_profit"}:
+            return "yes", ["continuation_supported"]
+        return "no", ["trailing_exit_not_supported"]
+
+    def recommend_scale_in(self, position_summary=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, cluster_snapshot=None, exposure_snapshot=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        cluster_snapshot = cluster_snapshot if isinstance(cluster_snapshot, dict) else {}
+        exposure_snapshot = exposure_snapshot if isinstance(exposure_snapshot, dict) else {}
+        pnl = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        liquidity_regime = str(adaptive_profile.get("liquidity_regime") or awareness_profile.get("liquidity_regime") or "unknown").strip().lower()
+        trend_regime = str(adaptive_profile.get("trend_regime") or awareness_profile.get("trend_regime") or "unknown").strip().lower()
+        adaptive_mode = str(adaptive_profile.get("adaptive_mode") or "unknown").strip().lower()
+        predictive_score = self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0)
+        momentum_direction = str(predictive_profile.get("momentum_direction") or "unknown").strip().lower()
+        side = str(position_summary.get("side") or "").strip().lower()
+        if cluster_snapshot.get("warning"):
+            return "blocked", ["cluster_warning"]
+        if exposure_snapshot.get("uncertain"):
+            return "blocked", ["exposure_uncertain"]
+        if pnl is None or pnl <= 0:
+            return "blocked", ["not_profitable"]
+        if liquidity_regime not in {"tradable", "strong"}:
+            return "blocked", ["insufficient_liquidity"]
+        if trend_regime == "choppy" or trend_regime == "unknown":
+            return "blocked", ["trend_not_clear"]
+        if adaptive_mode not in {"opportunistic", "aggressive"}:
+            return "no", ["adaptive_mode_not_supportive"]
+        if predictive_score < 0.7:
+            return "no", ["predictive_score_too_low"]
+        if side and momentum_direction in {"up", "down"}:
+            if side == "yes" and momentum_direction != "up":
+                return "no", ["direction_mismatch"]
+            if side == "no" and momentum_direction != "down":
+                return "no", ["direction_mismatch"]
+        return "yes", ["safe_scale_in_conditions_met"]
+
+    def recommend_scale_out(self, position_summary=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, cluster_snapshot=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        cluster_snapshot = cluster_snapshot if isinstance(cluster_snapshot, dict) else {}
+        pnl = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        conviction_level = str(position_summary.get("conviction_level") or "unknown").strip().lower()
+        management_mode = str(position_summary.get("management_mode") or "unknown").strip().lower()
+        breakout_state = str(predictive_profile.get("breakout_state") or "unknown").strip().lower()
+        acceleration_state = str(predictive_profile.get("acceleration_state") or "unknown").strip().lower()
+        session_state = str(adaptive_profile.get("session_state") or "unknown").strip().lower()
+        if pnl is None:
+            return "unknown", ["missing_pnl"]
+        if pnl > 0 and (conviction_level in {"low", "medium"} or management_mode in {"reduce", "exit_watch", "protect"} or breakout_state == "failed_breakout" or acceleration_state == "decelerating" or session_state in {"quiet", "closing_soon"} or cluster_snapshot.get("warning")):
+            return "yes", ["scale_out_triggered"]
+        return "no", ["scale_out_not_needed"]
+
+    def compute_position_score(self, position_summary=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, cluster_snapshot=None, conviction_level=None, health=None):
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        cluster_snapshot = cluster_snapshot if isinstance(cluster_snapshot, dict) else {}
+        conviction_level = str(conviction_level or "unknown").strip().lower()
+        health = str(health or "unknown").strip().lower()
+        awareness_score = self._clamp(self.to_float(awareness_profile.get("awareness_score"), 0.0))
+        adaptive_score = self._clamp(self.to_float(adaptive_profile.get("adaptive_score", adaptive_profile.get("realm_x_adaptive_score")), 0.0))
+        predictive_score = self._clamp(self.to_float(predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score")), 0.0))
+        pnl = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        pnl_component = 0.5 if pnl is None else self._clamp(0.5 + pnl * 2.0)
+        conviction_weights = {"low": 0.25, "medium": 0.55, "high": 0.85, "unknown": 0.35}
+        health_weights = {"excellent": 0.95, "good": 0.8, "neutral": 0.55, "weak": 0.3, "danger": 0.05, "unknown": 0.35}
+        cluster_component = 0.2 if cluster_snapshot.get("warning") else 0.85
+        combined = (
+            awareness_score * 0.16
+            + adaptive_score * 0.16
+            + predictive_score * 0.22
+            + conviction_weights.get(conviction_level, 0.35) * 0.16
+            + health_weights.get(health, 0.35) * 0.20
+            + pnl_component * 0.10
+        ) * cluster_component
+        reasons = []
+        if health == "danger":
+            reasons.append("danger_health_cap")
+            combined = min(combined, 0.20)
+        if cluster_snapshot.get("warning"):
+            reasons.append("cluster_warning_penalty")
+        if any(value == "unknown" for value in (health, conviction_level)):
+            reasons.append("unknown_cap")
+            combined = min(combined, 0.55)
+        if predictive_score >= 0.75 and health in {"excellent", "good"} and conviction_level == "high":
+            reasons.append("high_quality_support")
+            combined += 0.05
+        if pnl is not None and pnl > 0:
+            reasons.append("positive_pnl_support")
+        return {
+            "position_score": round(self._clamp(combined), 4),
+            "position_reasons": reasons,
+        }
+
+    def build_position_intelligence_profile(self, market=None, position_summary=None, q=None, awareness_profile=None, adaptive_profile=None, predictive_profile=None, decision=None, open_positions=None, current_price=None, hold_seconds=None, exposure_snapshot=None):
+        market = market if isinstance(market, dict) else {}
+        position_summary = position_summary if isinstance(position_summary, dict) else {}
+        q = q if q is not None else self.build_quote(market) if market else None
+        awareness_profile = awareness_profile if isinstance(awareness_profile, dict) else {}
+        adaptive_profile = adaptive_profile if isinstance(adaptive_profile, dict) else {}
+        predictive_profile = predictive_profile if isinstance(predictive_profile, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        ticker = str(position_summary.get("ticker") or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = str(position_summary.get("family") or adaptive_profile.get("family") or awareness_profile.get("family") or self.get_market_family({"ticker": ticker}) if ticker else position_summary.get("family") or "UNKNOWN").strip().upper()
+        category = str(position_summary.get("category") or adaptive_profile.get("category") or awareness_profile.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower()
+        side = self._normalize_live_side(position_summary.get("side")) if hasattr(self, "_normalize_live_side") else str(position_summary.get("side") or "").strip().lower()
+        entry_price = self.to_float(position_summary.get("entry_price"), None)
+        if entry_price is None:
+            entry_price = self.to_float(position_summary.get("avg_price"), None)
+        if current_price is None and decision:
+            current_price = decision.get("current_price")
+        if current_price is None and q is not None:
+            current_price = self.to_float(getattr(q, "yes_bid", None), None)
+            if current_price is None:
+                current_price = self.to_float(getattr(q, "last_price", None), None)
+            if current_price is None:
+                current_price = self.to_float(getattr(q, "yes_ask", None), None)
+        if hold_seconds is None:
+            hold_seconds = self.to_float(position_summary.get("hold_seconds"), None)
+        if hold_seconds is None:
+            updated_ts = self.to_float(position_summary.get("updated_ts"), None)
+            if updated_ts is not None:
+                hold_seconds = max(0.0, time.time() - updated_ts)
+        if self.to_float(position_summary.get("unrealized_pnl_delta"), None) is None and current_price is not None and entry_price is not None:
+            unrealized_pnl_delta = (current_price - entry_price) if side != "no" else (entry_price - current_price)
+        else:
+            unrealized_pnl_delta = self.to_float(position_summary.get("unrealized_pnl_delta"), None)
+        if unrealized_pnl_delta is None:
+            unrealized_pnl_delta = self.to_float(decision.get("unrealized_pnl_cents"), None)
+            if unrealized_pnl_delta is not None:
+                unrealized_pnl_delta = unrealized_pnl_delta / 100.0
+        cluster_snapshot = self.detect_exposure_cluster(position_summary={"ticker": ticker, "family": family, "category": category, "side": side}, open_positions=open_positions, market=market)
+        position_health, health_reasons = self.classify_position_health(
+            {**position_summary, "entry_price": entry_price, "current_price": current_price, "unrealized_pnl_delta": unrealized_pnl_delta, "hold_seconds": hold_seconds},
+            q=q,
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+            decision=decision,
+            cluster_snapshot=cluster_snapshot,
+        )
+        conviction_level, conviction_reasons = self.determine_conviction_level(
+            {**position_summary, "unrealized_pnl_delta": unrealized_pnl_delta, "position_health": position_health},
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+            cluster_snapshot=cluster_snapshot,
+        )
+        management_mode, management_reasons = self.determine_management_mode(
+            position_health=position_health,
+            conviction_level=conviction_level,
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+            cluster_snapshot=cluster_snapshot,
+        )
+        partial_profit_recommendation, partial_profit_reasons = self.recommend_partial_profit(
+            {**position_summary, "unrealized_pnl_delta": unrealized_pnl_delta, "hold_seconds": hold_seconds},
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+            decision=decision,
+        )
+        trailing_exit_recommendation, trailing_exit_reasons = self.recommend_trailing_exit(
+            {**position_summary, "unrealized_pnl_delta": unrealized_pnl_delta},
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+        )
+        if not isinstance(exposure_snapshot, dict):
+            exposure_snapshot = self.get_live_exposure_snapshot(candidate_ticker=ticker, candidate_family=family)
+        scale_in_recommendation, scale_in_reasons = self.recommend_scale_in(
+            {**position_summary, "unrealized_pnl_delta": unrealized_pnl_delta, "side": side},
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+            cluster_snapshot=cluster_snapshot,
+            exposure_snapshot=exposure_snapshot,
+        )
+        scale_out_recommendation, scale_out_reasons = self.recommend_scale_out(
+            {**position_summary, "unrealized_pnl_delta": unrealized_pnl_delta, "conviction_level": conviction_level, "management_mode": management_mode},
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+            cluster_snapshot=cluster_snapshot,
+        )
+        score_payload = self.compute_position_score(
+            {**position_summary, "unrealized_pnl_delta": unrealized_pnl_delta},
+            awareness_profile=awareness_profile,
+            adaptive_profile=adaptive_profile,
+            predictive_profile=predictive_profile,
+            cluster_snapshot=cluster_snapshot,
+            conviction_level=conviction_level,
+            health=position_health,
+        )
+        reasons = []
+        for bucket in (
+            health_reasons,
+            conviction_reasons,
+            management_reasons,
+            partial_profit_reasons,
+            trailing_exit_reasons,
+            scale_in_reasons,
+            scale_out_reasons,
+            cluster_snapshot.get("reasons", []),
+            score_payload.get("position_reasons", []),
+        ):
+            reasons.extend(bucket or [])
+        reasons = list(dict.fromkeys(str(reason) for reason in reasons if reason is not None and str(reason).strip()))
+        if position_health == "danger":
+            management_mode = "exit_watch"
+        if conviction_level == "unknown" and management_mode == "unknown":
+            management_mode = "unknown"
+        profile = {
+            "ticker": ticker,
+            "category": category,
+            "family": family,
+            "series_ticker": position_summary.get("series_ticker") or adaptive_profile.get("series_ticker") or awareness_profile.get("series_ticker"),
+            "side": side or "unknown",
+            "entry_price": entry_price,
+            "current_price": current_price,
+            "unrealized_pnl_delta": unrealized_pnl_delta,
+            "hold_seconds": hold_seconds,
+            "realm_ix_awareness_score": self.to_float(awareness_profile.get("awareness_score"), 0.0),
+            "realm_x_adaptive_score": self.to_float(
+                adaptive_profile.get("adaptive_score", adaptive_profile.get("realm_x_adaptive_score", adaptive_profile.get("realm_x_adaptive_score_hint"))),
+                0.0,
+            ),
+            "realm_x_adaptive_mode": adaptive_profile.get("adaptive_mode", "unknown"),
+            "realm_x_take_profit_mode": adaptive_profile.get("take_profit_mode", "unknown"),
+            "realm_x_stop_behavior_mode": adaptive_profile.get("stop_behavior_mode", "unknown"),
+            "realm_x_timing_mode": adaptive_profile.get("timing_mode", "unknown"),
+            "realm_xi_predictive_score": self.to_float(
+                predictive_profile.get("predictive_score", predictive_profile.get("realm_xi_predictive_score", predictive_profile.get("realm_xi_predictive_score_hint"))),
+                0.0,
+            ),
+            "realm_xi_momentum_direction": predictive_profile.get("momentum_direction", "unknown"),
+            "realm_xi_momentum_strength": predictive_profile.get("momentum_strength", "unknown"),
+            "realm_xi_breakout_state": predictive_profile.get("breakout_state", "unknown"),
+            "position_health": position_health,
+            "conviction_level": conviction_level,
+            "management_mode": management_mode,
+            "scale_in_recommendation": scale_in_recommendation,
+            "scale_out_recommendation": scale_out_recommendation,
+            "partial_profit_recommendation": partial_profit_recommendation,
+            "trailing_exit_recommendation": trailing_exit_recommendation,
+            "exposure_cluster_warning": "yes" if cluster_snapshot.get("warning") else "no" if cluster_snapshot.get("warning") is False else "unknown",
+            "position_score": score_payload.get("position_score", 0.0),
+            "position_reasons": reasons,
+            "cluster_snapshot": cluster_snapshot,
+        }
+        return profile
+
+    def summarize_position_intelligence(self, profiles):
+        profiles = profiles or []
+        counts = {"excellent": 0, "good": 0, "neutral": 0, "weak": 0, "danger": 0, "unknown": 0, "protect": 0, "hold": 0, "press": 0, "reduce": 0, "exit_watch": 0, "mgmt_unknown": 0}
+        partial_profit_count = 0
+        trailing_exit_count = 0
+        scale_in_count = 0
+        scale_out_count = 0
+        cluster_warning_count = 0
+        total_score = 0.0
+        top_candidates = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            health = str(profile.get("position_health") or "unknown").strip().lower()
+            management = str(profile.get("management_mode") or "unknown").strip().lower()
+            counts[health if health in counts else "unknown"] = counts.get(health if health in counts else "unknown", 0) + 1
+            counts[management if management in counts else "mgmt_unknown"] = counts.get(management if management in counts else "mgmt_unknown", 0) + 1
+            partial_profit_count += 1 if str(profile.get("partial_profit_recommendation") or "no").strip().lower() == "yes" else 0
+            trailing_exit_count += 1 if str(profile.get("trailing_exit_recommendation") or "no").strip().lower() == "yes" else 0
+            scale_in_count += 1 if str(profile.get("scale_in_recommendation") or "no").strip().lower() == "yes" else 0
+            scale_out_count += 1 if str(profile.get("scale_out_recommendation") or "no").strip().lower() == "yes" else 0
+            cluster_warning_count += 1 if str(profile.get("exposure_cluster_warning") or "no").strip().lower() == "yes" else 0
+            total_score += self.to_float(profile.get("position_score"), 0.0)
+            top_candidates.append((self.to_float(profile.get("position_score"), 0.0), str(profile.get("ticker") or "").strip()))
+        average_score = round(total_score / float(len(profiles)), 4) if profiles else 0.0
+        summary = {
+            "total_positions_profiled": len(profiles),
+            "excellent": counts.get("excellent", 0),
+            "good": counts.get("good", 0),
+            "neutral": counts.get("neutral", 0),
+            "weak": counts.get("weak", 0),
+            "danger": counts.get("danger", 0),
+            "unknown": counts.get("unknown", 0),
+            "protect": counts.get("protect", 0),
+            "hold": counts.get("hold", 0),
+            "press": counts.get("press", 0),
+            "reduce": counts.get("reduce", 0),
+            "exit_watch": counts.get("exit_watch", 0),
+            "mgmt_unknown": counts.get("mgmt_unknown", 0),
+            "partial_profit_recommendations": partial_profit_count,
+            "trailing_exit_recommendations": trailing_exit_count,
+            "scale_in_recommendations": scale_in_count,
+            "scale_out_recommendations": scale_out_count,
+            "cluster_warnings": cluster_warning_count,
+            "average_position_score": average_score,
+            "top_position_tickers": [ticker for _score, ticker in sorted(top_candidates, key=lambda item: item[0], reverse=True)[:5] if ticker],
+        }
+        print(
+            f"[REALM-XII-SUMMARY] total_positions_profiled={summary['total_positions_profiled']} excellent_count={summary['excellent']} good_count={summary['good']} neutral_count={summary['neutral']} weak_count={summary['weak']} danger_count={summary['danger']} unknown_count={summary['unknown']} protect_count={summary['protect']} hold_count={summary['hold']} press_count={summary['press']} reduce_count={summary['reduce']} exit_watch_count={summary['exit_watch']} partial_profit_recommendations={summary['partial_profit_recommendations']} trailing_exit_recommendations={summary['trailing_exit_recommendations']} scale_in_recommendations={summary['scale_in_recommendations']} scale_out_recommendations={summary['scale_out_recommendations']} cluster_warnings={summary['cluster_warnings']} average_position_score={summary['average_position_score']} top_position_tickers={summary['top_position_tickers']}"
+        )
+        return summary
+
+    def profile_position_intelligence(self, markets, predictive_candidates, open_positions=None):
+        markets = markets or []
+        predictive_candidates = predictive_candidates or []
+        open_positions = open_positions if open_positions is not None else self._get_open_live_positions()
+        market_lookup = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+        awareness_lookup = self.market_awareness_profiles if isinstance(self.market_awareness_profiles, dict) else {}
+        adaptive_lookup = self.market_adaptive_profiles if isinstance(self.market_adaptive_profiles, dict) else {}
+        predictive_lookup = self.market_predictive_profiles if isinstance(self.market_predictive_profiles, dict) else {}
+        profiled_candidates = []
+        profiles = []
+        for score, q, spread, family in predictive_candidates:
+            ticker = str(getattr(q, "ticker", "") or "").strip()
+            market = market_lookup.get(ticker, {})
+            awareness_profile = awareness_lookup.get(ticker, {}) if isinstance(awareness_lookup.get(ticker, {}), dict) else {}
+            adaptive_profile = adaptive_lookup.get(ticker, {}) if isinstance(adaptive_lookup.get(ticker, {}), dict) else {}
+            predictive_profile = predictive_lookup.get(ticker, {}) if isinstance(predictive_lookup.get(ticker, {}), dict) else {}
+            if not awareness_profile:
+                awareness_profile = self.build_market_awareness_profile(market, q=q, spread=spread, family=family, raw_rank_score=score)
+            if not adaptive_profile:
+                adaptive_profile = self.build_adaptive_behavior_profile(market, q=q, awareness_profile=awareness_profile, adaptive_score_hint=score)
+            if not predictive_profile:
+                predictive_profile = self.build_predictive_momentum_profile(market, q=q, awareness_profile=awareness_profile, adaptive_profile=adaptive_profile, candidate_confidence=score)
+            position_summary = {
+                "ticker": ticker,
+                "category": adaptive_profile.get("category") or awareness_profile.get("category") or self.get_market_discovery_category(family),
+                "family": adaptive_profile.get("family") or awareness_profile.get("family") or family,
+                "series_ticker": adaptive_profile.get("series_ticker") or awareness_profile.get("series_ticker"),
+                "side": None,
+                "entry_price": None,
+                "current_price": self.to_float(getattr(q, "yes_bid", None), None) or self.to_float(getattr(q, "last_price", None), None) or self.to_float(getattr(q, "yes_ask", None), None),
+            }
+            cluster_snapshot = self.detect_exposure_cluster(position_summary={"ticker": ticker, "family": position_summary.get("family") or family, "category": position_summary.get("category")}, open_positions=open_positions, market=market)
+            exposure_snapshot = {
+                "ok": True,
+                "uncertain": bool(cluster_snapshot.get("warning")),
+                "uncertain_reasons": list(cluster_snapshot.get("reasons", []) or []),
+                "candidate_family": position_summary.get("family") or family,
+                "open_total_positions": len(open_positions or []),
+            }
+            profile = self.build_position_intelligence_profile(
+                market=market,
+                position_summary=position_summary,
+                q=q,
+                awareness_profile=awareness_profile,
+                adaptive_profile=adaptive_profile,
+                predictive_profile=predictive_profile,
+                open_positions=open_positions,
+                current_price=position_summary.get("current_price"),
+                hold_seconds=None,
+                exposure_snapshot=exposure_snapshot,
+            )
+            print(
+                f"[REALM-XII-POSITION-HEALTH] ticker={profile.get('ticker')} category={profile.get('category')} position_health={profile.get('position_health')} current_price={profile.get('current_price')} entry_price={profile.get('entry_price')} unrealized_pnl_delta={profile.get('unrealized_pnl_delta')} hold_seconds={profile.get('hold_seconds')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-CONVICTION] ticker={profile.get('ticker')} category={profile.get('category')} conviction_level={profile.get('conviction_level')} realm_ix_awareness_score={profile.get('realm_ix_awareness_score')} realm_x_adaptive_score={profile.get('realm_x_adaptive_score')} realm_xi_predictive_score={profile.get('realm_xi_predictive_score')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-MANAGEMENT-MODE] ticker={profile.get('ticker')} category={profile.get('category')} management_mode={profile.get('management_mode')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-PARTIAL-PROFIT] ticker={profile.get('ticker')} category={profile.get('category')} partial_profit_recommendation={profile.get('partial_profit_recommendation')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-TRAILING-EXIT] ticker={profile.get('ticker')} category={profile.get('category')} trailing_exit_recommendation={profile.get('trailing_exit_recommendation')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-SCALE-IN] ticker={profile.get('ticker')} category={profile.get('category')} scale_in_recommendation={profile.get('scale_in_recommendation')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-SCALE-OUT] ticker={profile.get('ticker')} category={profile.get('category')} scale_out_recommendation={profile.get('scale_out_recommendation')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-EXPOSURE-CLUSTER] ticker={profile.get('ticker')} category={profile.get('category')} exposure_cluster_warning={profile.get('exposure_cluster_warning')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-SCORE] ticker={profile.get('ticker')} category={profile.get('category')} position_score={profile.get('position_score')} conviction_level={profile.get('conviction_level')} position_health={profile.get('position_health')} reasons={profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-PROFILE] ticker={profile.get('ticker')} position_health={profile.get('position_health')} conviction_level={profile.get('conviction_level')} management_mode={profile.get('management_mode')} partial_profit_recommendation={profile.get('partial_profit_recommendation')} trailing_exit_recommendation={profile.get('trailing_exit_recommendation')} scale_in_recommendation={profile.get('scale_in_recommendation')} scale_out_recommendation={profile.get('scale_out_recommendation')} exposure_cluster_warning={profile.get('exposure_cluster_warning')} position_score={profile.get('position_score')} reasons={profile.get('position_reasons', [])}"
+            )
+            adjusted_score = self.to_float(score, 0.0)
+            if profile.get("management_mode") == "press" and profile.get("position_score", 0.0) >= 0.7:
+                adjusted_score += 3.0
+            elif profile.get("management_mode") in {"protect", "hold"}:
+                adjusted_score += 1.0
+            elif profile.get("management_mode") in {"reduce", "exit_watch"}:
+                adjusted_score -= 6.0
+            if str(profile.get("scale_in_recommendation") or "").strip().lower() == "yes":
+                adjusted_score += 2.0
+            if str(profile.get("scale_out_recommendation") or "").strip().lower() == "yes":
+                adjusted_score -= 2.0
+            if str(profile.get("exposure_cluster_warning") or "").strip().lower() == "yes":
+                adjusted_score -= 4.0
+            if str(profile.get("position_health") or "").strip().lower() == "danger":
+                adjusted_score -= 8.0
+            profiles.append(profile)
+            profiled_candidates.append((round(adjusted_score, 4), q, spread, family))
+        summary = self.summarize_position_intelligence(profiles)
+        self.market_position_profiles = {profile.get("ticker"): profile for profile in profiles if profile.get("ticker")}
+        self.last_market_position_summary = summary
+        return profiled_candidates, summary
 
     def fetch_market_batch(self, cursor=None):
         params = {
@@ -1108,8 +7277,12 @@ class KalshiSniperBot:
                 ),
             )
             previous_distance_threshold = float("inf")
+            family_contract_cap = self._get_targeted_contract_cap_for_family(
+                series_ticker,
+                utc_hour=time.gmtime().tm_hour,
+            )
             if ranked_family_entries:
-                cutoff_index = min(len(ranked_family_entries), MAX_TARGETED_CONTRACTS_PER_FAMILY) - 1
+                cutoff_index = min(len(ranked_family_entries), family_contract_cap) - 1
                 previous_distance_threshold = ranked_family_entries[cutoff_index][1]["distance"]
             new_distance_threshold = previous_distance_threshold
             if previous_distance_threshold != float("inf"):
@@ -1117,7 +7290,7 @@ class KalshiSniperBot:
             widened_family_entries = []
             additional_distance_pass_count = 0
             for index, (market, rank_info) in enumerate(ranked_family_entries, start=1):
-                within_original_cap = index <= MAX_TARGETED_CONTRACTS_PER_FAMILY
+                within_original_cap = index <= family_contract_cap
                 within_distance_buffer = rank_info["distance"] <= new_distance_threshold
                 if within_original_cap or within_distance_buffer:
                     widened_family_entries.append((market, rank_info))
@@ -1141,7 +7314,7 @@ class KalshiSniperBot:
             print(
                 f"[LIVE-SELECT-DEBUG] targeted_contract_cap family={series_ticker} "
                 f"previous_cap={BASE_MAX_TARGETED_CONTRACTS_PER_FAMILY} "
-                f"new_cap={MAX_TARGETED_CONTRACTS_PER_FAMILY}"
+                f"new_cap={family_contract_cap}"
             )
             print(
                 f"[LIVE-SELECT-DEBUG] targeted_contract_distance_threshold family={series_ticker} "
@@ -1149,7 +7322,7 @@ class KalshiSniperBot:
                 f"additional_candidates_pass={additional_distance_pass_count}"
             )
             for index, (market, rank_info) in enumerate(ranked_family_entries, start=1):
-                selected = index <= MAX_TARGETED_CONTRACTS_PER_FAMILY
+                selected = index <= family_contract_cap
                 passed_due_to_adjustment = rank_info["distance"] > previous_distance_threshold and rank_info["distance"] <= new_distance_threshold
                 print(
                     f"[LIVE-SELECT-DEBUG] targeted_contract_rank family={series_ticker} "
@@ -1172,7 +7345,7 @@ class KalshiSniperBot:
             total_rejected_after_cap += rejected_family_markets
             print(
                 f"[LIVE-SELECT-DEBUG] targeted_family_selected family={series_ticker} "
-                f"selected={len(selected_family_markets)} cap={MAX_TARGETED_CONTRACTS_PER_FAMILY}"
+                f"selected={len(selected_family_markets)} cap={family_contract_cap}"
             )
             print(
                 f"[LIVE-SELECT-DEBUG] targeted_contract_cap_result family={series_ticker} "
@@ -1194,6 +7367,50 @@ class KalshiSniperBot:
             f"rejected={total_rejected_after_cap} final_selected_candidates={len(markets)}"
         )
         return markets
+
+    def _get_targeted_contract_cap_for_family(self, family, utc_hour=None):
+        family = str(family or "")
+        if family in HIGH_LIQUIDITY_PRIORITY_FAMILIES:
+            return 15
+        if self.get_market_discovery_category(family) == "sports":
+            return 12
+        return MAX_TARGETED_CONTRACTS_PER_FAMILY
+
+    def _get_live_time_routing_mode(self, utc_hour=None):
+        if utc_hour is None:
+            utc_hour = time.gmtime().tm_hour
+        return "sports" if 16 <= int(utc_hour) or int(utc_hour) < 4 else "crypto"
+
+    def _apply_time_routed_family_priority(self, families, utc_hour=None):
+        families = list(families or [])
+        if not families:
+            hour_utc = time.gmtime().tm_hour if utc_hour is None else int(utc_hour)
+            print(f"[LIVE-TIME-ROUTING] hour_utc={hour_utc} mode={self._get_live_time_routing_mode(hour_utc)} priority_family=none")
+            return families
+        hour_utc = time.gmtime().tm_hour if utc_hour is None else int(utc_hour)
+        mode = self._get_live_time_routing_mode(hour_utc)
+        def is_btc_family(family):
+            return str(family or "") == "KXBTC15M"
+        def is_sports_family(family):
+            return self.get_market_discovery_category(str(family or "")) == "sports"
+        sports_families = [family for family in families if is_sports_family(family)]
+        btc_families = [family for family in families if is_btc_family(family)]
+        other_families = [family for family in families if family not in sports_families and family not in btc_families]
+        if mode == "sports":
+            routed = sports_families + btc_families + other_families
+        else:
+            routed = []
+            balanced_groups = [sports_families, btc_families, other_families]
+            max_len = max((len(group) for group in balanced_groups), default=0)
+            for idx in range(max_len):
+                for group in balanced_groups:
+                    if idx < len(group):
+                        routed.append(group[idx])
+            if not routed:
+                routed = btc_families + sports_families + other_families
+            print(f"[BROAD-MODE] trading across families | top_family={routed[0] if routed else 'none'}")
+        print(f"[LIVE-TIME-ROUTING] hour_utc={hour_utc} mode={mode} priority_family={routed[0] if routed else 'none'}")
+        return routed
 
     def get_prioritized_targeted_series(self):
         utc_hour = time.gmtime().tm_hour
@@ -1288,7 +7505,7 @@ class KalshiSniperBot:
                 base_rank_map.get(family, 999),
             ),
         )
-        ordered = quality_adjusted_order + deprioritized
+        ordered = self._apply_time_routed_family_priority(quality_adjusted_order + deprioritized, utc_hour=utc_hour)
         self.last_targeted_priority_adaptation = {
             "hour_utc": utc_hour,
             "base_order": base_order,
@@ -1364,7 +7581,280 @@ class KalshiSniperBot:
         response.raise_for_status()
         return response.json()
 
+    def _extract_orderbook_side_levels_with_source(self, payload, side):
+        if not isinstance(payload, dict):
+            return [], "none"
+        side = "no" if str(side).lower() == "no" else "yes"
+        direct_dollars_key = "yes_dollars" if side == "yes" else "no_dollars"
+        direct_side_key = "yes" if side == "yes" else "no"
+        direct_orders_key = "yes_orders" if side == "yes" else "no_orders"
+        alternate_side_keys = (
+            ("yes_bids", "yes_asks", "yes_book", "yes_levels", "yes_side")
+            if side == "yes"
+            else ("no_bids", "no_asks", "no_book", "no_levels", "no_side")
+        )
+        fp_container = payload.get("orderbook_fp") if isinstance(payload.get("orderbook_fp"), dict) else None
+        if isinstance(fp_container, dict):
+            value = fp_container.get(direct_dollars_key)
+            if isinstance(value, (list, dict)) and value:
+                return value, "orderbook_fp"
+            value = fp_container.get(direct_side_key)
+            if isinstance(value, (list, dict)) and value:
+                return value, "orderbook_fp"
+            for alternate_key in alternate_side_keys:
+                value = fp_container.get(alternate_key)
+                if isinstance(value, (list, dict)) and value:
+                    return value, "orderbook_fp_alt"
+        value = payload.get(direct_dollars_key)
+        if isinstance(value, (list, dict)) and value:
+            return value, "root_dollars"
+        for alternate_key in alternate_side_keys:
+            value = payload.get(alternate_key)
+            if isinstance(value, (list, dict)) and value:
+                return value, "root_side_alt"
+        container = payload.get("orderbook") if isinstance(payload.get("orderbook"), dict) else None
+        if isinstance(container, dict):
+            value = container.get(direct_side_key)
+            if isinstance(value, (list, dict)) and value:
+                return value, "orderbook"
+            value = container.get(direct_orders_key)
+            if isinstance(value, (list, dict)) and value:
+                return value, "orderbook"
+            value = container.get(direct_dollars_key)
+            if isinstance(value, (list, dict)) and value:
+                return value, "orderbook"
+            for alternate_key in alternate_side_keys:
+                value = container.get(alternate_key)
+                if isinstance(value, (list, dict)) and value:
+                    return value, "orderbook_alt"
+            generic_key = "bids" if side == "yes" else "asks"
+            value = container.get(generic_key)
+            if isinstance(value, (list, dict)) and value:
+                return value, "orderbook_generic_bid_ask"
+        value = payload.get(direct_side_key)
+        if isinstance(value, (list, dict)) and value:
+            return value, "root_side"
+        value = payload.get(direct_orders_key)
+        if isinstance(value, (list, dict)) and value:
+            return value, "root_side"
+        generic_key = "bids" if side == "yes" else "asks"
+        value = payload.get(generic_key)
+        if isinstance(value, (list, dict)) and value:
+            return value, "root_generic_bid_ask"
+        queue = []
+        for nested_key in ("book", "book_fp", "levels", "orders", "sides", "data", "market", "markets", "payload"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict):
+                queue.append(nested)
+        seen = set()
+        while queue:
+            current = queue.pop(0)
+            if not isinstance(current, dict):
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            nested_value, nested_source = self._extract_orderbook_side_levels_with_source(current, side)
+            if isinstance(nested_value, (list, dict)) and nested_value:
+                return nested_value, nested_source or "nested"
+            for nested_key in ("book", "book_fp", "levels", "orders", "sides", "data", "market", "markets", "payload"):
+                nested = current.get(nested_key)
+                if isinstance(nested, dict):
+                    queue.append(nested)
+        return [], "none"
+
+    def _extract_orderbook_fp_top_level(self, payload, side):
+        if not isinstance(payload, dict):
+            return {"price": None, "size": 0.0, "source": "fallback"}
+        side = "no" if str(side).lower() == "no" else "yes"
+        dollars_key = "yes_dollars" if side == "yes" else "no_dollars"
+        fp_container = payload.get("orderbook_fp") if isinstance(payload.get("orderbook_fp"), dict) else None
+        levels = None
+        source = "fallback"
+        if isinstance(fp_container, dict):
+            levels = fp_container.get(dollars_key)
+            if levels not in (None, "", [], {}):
+                source = "orderbook_fp"
+        if levels in (None, "", [], {}):
+            levels = payload.get(dollars_key)
+            if levels not in (None, "", [], {}):
+                source = "root_dollars"
+        if isinstance(levels, list) and levels:
+            first = levels[0]
+            if isinstance(first, dict):
+                return {
+                    "price": self.to_float(first.get("price") or first.get("price_dollars") or first.get("price_fp"), None),
+                    "size": self.to_float(first.get("size") or first.get("size_fp") or first.get("count") or first.get("quantity") or first.get("quantity_fp") or first.get("qty") or first.get("contracts") or first.get("contracts_fp") or first.get("contract_count") or first.get("num_contracts") or first.get("available") or first.get("remaining"), 0.0),
+                    "source": source,
+                }
+            if isinstance(first, (list, tuple)) and len(first) >= 2:
+                return {
+                    "price": self.to_float(first[0], None),
+                    "size": self.to_float(first[1], 0.0),
+                    "source": source,
+                }
+            extracted = self._extract_orderbook_top_level(levels)
+            extracted["source"] = source
+            return extracted
+        if isinstance(levels, dict) and levels:
+            extracted = self._extract_orderbook_top_level(levels)
+            extracted["source"] = source
+            return extracted
+        return {"price": None, "size": 0.0, "source": source}
+
+    def _extract_orderbook_side_levels(self, payload, side):
+        levels, _source = self._extract_orderbook_side_levels_with_source(payload, side)
+        return levels
+
+    def _extract_orderbook_side_size_hint(self, payload, side):
+        if not isinstance(payload, dict):
+            return None
+        fp_top = self._extract_orderbook_fp_top_level(payload, side)
+        fp_size = self.to_float(fp_top.get("size"), None)
+        if fp_size is not None and fp_size > 0:
+            return fp_size
+        levels, levels_source = self._extract_orderbook_side_levels_with_source(payload, side)
+        level_top = self._extract_orderbook_top_level(levels)
+        level_size = self.to_float(level_top.get("size"), None)
+        if level_size is not None and level_size > 0:
+            return level_size
+        side = "no" if str(side).lower() == "no" else "yes"
+        size_keys = (
+            (
+                "yes_top_size", "best_yes_bid_size", "yes_bid_size", "best_yes_ask_size",
+                "yes_ask_size", "yes_size", "best_yes_size", "yes_contracts", "yes_quantity",
+                "yes_qty", "yes_contract_count", "yes_available", "bid_size", "bid_quantity", "bid_qty",
+            )
+            if side == "yes"
+            else (
+                "no_top_size", "best_no_bid_size", "no_bid_size", "best_no_ask_size",
+                "no_ask_size", "no_size", "best_no_size", "no_contracts", "no_quantity",
+                "no_qty", "no_contract_count", "no_available", "ask_size", "ask_quantity", "ask_qty",
+            )
+        )
+        queue = [payload]
+        seen = set()
+        best_positive = None
+        best_any = None
+        while queue:
+            current = queue.pop(0)
+            if not isinstance(current, dict):
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            for key in size_keys:
+                value = self.to_float(current.get(key), None)
+                if value is None:
+                    continue
+                if best_any is None:
+                    best_any = value
+                if value > 0 and (best_positive is None or value > best_positive):
+                    best_positive = value
+            for nested_key in ("orderbook", "orderbook_fp", "book", "book_fp", "levels", "orders", "sides", "data"):
+                nested = current.get(nested_key)
+                if isinstance(nested, dict):
+                    queue.append(nested)
+        return best_positive if best_positive is not None else best_any
+
+    def _extract_orderbook_side_price_hint(self, payload, side):
+        if not isinstance(payload, dict):
+            return None
+        fp_top = self._extract_orderbook_fp_top_level(payload, side)
+        fp_price = self.to_float(fp_top.get("price"), None)
+        if fp_price is not None:
+            return fp_price
+        levels, _levels_source = self._extract_orderbook_side_levels_with_source(payload, side)
+        level_top = self._extract_orderbook_top_level(levels)
+        level_price = self.to_float(level_top.get("price"), None)
+        if level_price is not None:
+            return level_price
+        side = "no" if str(side).lower() == "no" else "yes"
+        price_keys = (
+            (
+                "yes_top_price", "best_yes_bid", "yes_bid", "best_yes_ask", "yes_ask",
+                "yes_price", "yes_bid_dollars", "yes_ask_dollars", "bid",
+            )
+            if side == "yes"
+            else (
+                "no_top_price", "best_no_bid", "no_bid", "best_no_ask", "no_ask",
+                "no_price", "no_bid_dollars", "no_ask_dollars", "ask",
+            )
+        )
+        queue = [payload]
+        seen = set()
+        while queue:
+            current = queue.pop(0)
+            if not isinstance(current, dict):
+                continue
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            for key in price_keys:
+                value = self.to_float(current.get(key), None)
+                if value is not None:
+                    return value
+            for nested_key in ("orderbook", "orderbook_fp", "book", "book_fp", "levels", "orders", "sides", "data"):
+                nested = current.get(nested_key)
+                if isinstance(nested, dict):
+                    queue.append(nested)
+        return None
+
     def _extract_orderbook_top_level(self, levels):
+        if isinstance(levels, dict):
+            for key in (
+                "levels", "orders", "bids", "asks", "yes", "no", "yes_orders", "no_orders",
+                "yes_dollars", "no_dollars", "orderbook", "orderbook_fp",
+            ):
+                nested = levels.get(key)
+                if isinstance(nested, (list, dict)) and nested:
+                    extracted = self._extract_orderbook_top_level(nested)
+                    if extracted.get("price") is not None or extracted.get("size", 0.0) > 0:
+                        return extracted
+            direct_price = self.to_float(
+                levels.get("price")
+                or levels.get("price_dollars")
+                or levels.get("price_fp")
+                or levels.get("yes_price")
+                or levels.get("no_price")
+                or levels.get("bid")
+                or levels.get("ask"),
+                None,
+            )
+            direct_size = self.to_float(
+                levels.get("size")
+                or levels.get("size_fp")
+                or levels.get("count")
+                or levels.get("quantity")
+                or levels.get("quantity_fp")
+                or levels.get("qty")
+                or levels.get("contracts")
+                or levels.get("contracts_fp")
+                or levels.get("contract_count")
+                or levels.get("num_contracts")
+                or levels.get("available")
+                or levels.get("remaining")
+                or levels.get("volume")
+                or levels.get("shares"),
+                0.0,
+            )
+            if direct_price is not None or direct_size > 0:
+                return {"price": direct_price, "size": direct_size}
+            first_items = list(levels.items())
+            if first_items:
+                first_key, first_value = first_items[0]
+                first_price = self.to_float(first_key, None)
+                if first_price is not None and hasattr(self, "normalize_contract_price"):
+                    first_price = self.normalize_contract_price(first_price, ticker=None, source="orderbook_fp.first_key")
+                nested_extracted = self._extract_orderbook_top_level(first_value) if isinstance(first_value, (list, dict)) else {"price": None, "size": self.to_float(first_value, 0.0)}
+                if nested_extracted.get("price") is not None and first_price is None:
+                    first_price = nested_extracted.get("price")
+                first_size = nested_extracted.get("size", 0.0)
+                return {"price": first_price, "size": self.to_float(first_size, 0.0)}
+            return {"price": None, "size": 0.0}
         if not isinstance(levels, list) or not levels:
             return {"price": None, "size": 0.0}
         level = levels[0]
@@ -1373,15 +7863,28 @@ class KalshiSniperBot:
                 "price": self.to_float(
                     level.get("price")
                     or level.get("price_dollars")
+                    or level.get("price_fp")
                     or level.get("yes_price")
-                    or level.get("no_price"),
+                    or level.get("no_price")
+                    or level.get("bid")
+                    or level.get("ask"),
                     None,
                 ),
                 "size": self.to_float(
                     level.get("size")
+                    or level.get("size_fp")
                     or level.get("count")
                     or level.get("quantity")
-                    or level.get("contracts"),
+                    or level.get("quantity_fp")
+                    or level.get("qty")
+                    or level.get("contracts")
+                    or level.get("contracts_fp")
+                    or level.get("contract_count")
+                    or level.get("num_contracts")
+                    or level.get("available")
+                    or level.get("remaining")
+                    or level.get("volume")
+                    or level.get("shares"),
                     0.0,
                 ),
             }
@@ -1409,8 +7912,45 @@ class KalshiSniperBot:
         if liquidity_original is None:
             liquidity_original = self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0)
         liquidity_original = self.to_float(liquidity_original, 0.0)
-        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), None)
-        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), None)
+
+        def first_numeric(*values):
+            for value in values:
+                numeric_value = self.to_float(value, None)
+                if numeric_value is not None:
+                    return numeric_value
+            return None
+
+        yes_levels, yes_levels_source = self._extract_orderbook_side_levels_with_source(market, "yes")
+        no_levels, no_levels_source = self._extract_orderbook_side_levels_with_source(market, "no")
+        yes_fp_top = self._extract_orderbook_fp_top_level(market, "yes")
+        no_fp_top = self._extract_orderbook_fp_top_level(market, "no")
+        yes_level_top = yes_fp_top if self.to_float(yes_fp_top.get("size"), 0.0) > 0 else self._extract_orderbook_top_level(yes_levels)
+        no_level_top = no_fp_top if self.to_float(no_fp_top.get("size"), 0.0) > 0 else self._extract_orderbook_top_level(no_levels)
+        final_extract_source = yes_fp_top.get("source") if yes_fp_top.get("source") in {"orderbook_fp", "root_dollars"} else (no_fp_top.get("source") if no_fp_top.get("source") in {"orderbook_fp", "root_dollars"} else "fallback")
+        yes_top_size = first_numeric(
+            liquidity_priority.get("yes_top_size"),
+            market.get("yes_top_size"),
+            yes_level_top.get("size"),
+            self._extract_orderbook_side_size_hint(market, "yes"),
+            market.get("best_yes_bid_size"),
+            market.get("yes_bid_size"),
+            market.get("best_yes_ask_size"),
+            market.get("yes_ask_size"),
+            market.get("yes_size"),
+            market.get("bid_size"),
+        )
+        no_top_size = first_numeric(
+            liquidity_priority.get("no_top_size"),
+            market.get("no_top_size"),
+            no_level_top.get("size"),
+            self._extract_orderbook_side_size_hint(market, "no"),
+            market.get("best_no_bid_size"),
+            market.get("no_bid_size"),
+            market.get("best_no_ask_size"),
+            market.get("no_ask_size"),
+            market.get("no_size"),
+            market.get("ask_size"),
+        )
         quote_values = self.get_market_quote_values(market) if market else {}
         both_sides_quoted = liquidity_priority.get("both_sides_quoted")
         if both_sides_quoted is None:
@@ -1443,6 +7983,9 @@ class KalshiSniperBot:
         liquidity_final = effective_top_size if fallback_used else liquidity_original
         effective_source = "effective_top_size" if fallback_used else "reported_liquidity_dollars"
         ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        if self.is_debug_live_enabled():
+            success = bool((yes_top_size or 0.0) > 0 and (no_top_size or 0.0) > 0)
+            print(f"[ORDERBOOK-FINAL-EXTRACT] ticker={ticker} yes_top={yes_top_size} no_top={no_top_size} source={final_extract_source} success={success}")
         print(
             f"[LIVE-LIQUIDITY-FIX] ticker={ticker} family={family} liquidity_original={liquidity_original} "
             f"yes_top_size={yes_top_size} no_top_size={no_top_size} effective_top_size={effective_top_size} "
@@ -1478,6 +8021,357 @@ class KalshiSniperBot:
             "KXTENNISMATCH",
         }
 
+    def _is_sports_spread_family(self, family):
+        family = str(family or "").strip().upper()
+        return bool("SPREAD" in family and self.get_market_discovery_category(family) == "sports")
+
+    def _normalize_live_side(self, side):
+        side = str(side or "").strip().lower()
+        if side in {"yes", "y"}:
+            return "yes"
+        if side in {"no", "n"}:
+            return "no"
+        return None
+
+    def _extract_sports_game_key(self, ticker, market=None):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return "UNKNOWN"
+        family = self.get_market_family({"ticker": ticker})
+        market = market if isinstance(market, dict) else {}
+        event_ticker = str(market.get("event_ticker") or "").strip()
+        if event_ticker:
+            event_parts = event_ticker.split("-")
+            if len(event_parts) >= 2:
+                return f"{family}-{event_parts[1]}"
+            return event_ticker
+        parts = ticker.split("-")
+        if len(parts) >= 2:
+            return f"{family}-{parts[1]}"
+        return ticker
+
+    def _extract_spread_line(self, ticker):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return None
+        parts = ticker.split("-")
+        search_text = "-".join(parts[2:]) if len(parts) > 2 else ticker
+        matches = re.findall(r"[-+]?\d+(?:\.\d+)?", search_text)
+        if not matches and len(parts) > 1:
+            matches = re.findall(r"[-+]?\d+(?:\.\d+)?", parts[-1])
+        if not matches:
+            return None
+        try:
+            return float(matches[-1])
+        except (TypeError, ValueError):
+            return None
+
+    def _get_open_live_positions(self):
+        return [
+            pos for pos in (self.live_positions or [])
+            if isinstance(pos, dict)
+            and str(pos.get("status", "open") or "open").strip().lower() == "open"
+        ]
+
+    def _get_correlated_sports_positions(self, ticker, family=None, market=None):
+        ticker = str(ticker or "").strip()
+        family = str(family or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip()
+        game_key = self._extract_sports_game_key(ticker, market=market)
+        matches = []
+        if not ticker or self.get_market_discovery_category(family) != "sports":
+            return game_key, matches
+        for position in self._get_open_live_positions():
+            position_ticker = str(position.get("ticker", "") or "").strip()
+            if not position_ticker:
+                continue
+            position_family = self.get_market_family({"ticker": position_ticker})
+            if self.get_market_discovery_category(position_family) != "sports":
+                continue
+            if self._extract_sports_game_key(position_ticker) == game_key:
+                matches.append(position)
+        return game_key, matches
+
+    def _check_sports_correlated_entry_guard(self, ticker, side=None, family=None, market=None):
+        ticker = str(ticker or "").strip()
+        family = str(family or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip()
+        side = self._normalize_live_side(side) or self._normalize_live_side(DEFAULT_LIVE_ORDER_SIDE) or "yes"
+        game_key, correlated_positions = self._get_correlated_sports_positions(ticker, family=family, market=market)
+        active_count = len(correlated_positions)
+        max_allowed = max(1, int(MAX_CORRELATED_SPORTS_POSITIONS_PER_GAME or 2))
+        line = self._extract_spread_line(ticker)
+        if self.get_market_discovery_category(family) != "sports":
+            return True, "non_sports_candidate", {
+                "family": family,
+                "event_game_key": game_key,
+                "active_count": active_count,
+                "max_allowed": max_allowed,
+                "side": side,
+                "line": line,
+            }
+        reason = "within_correlated_limit"
+        blocked = False
+        conflict_detail = None
+        if active_count >= max_allowed:
+            blocked = True
+            reason = "max_correlated_positions_per_game"
+        if not blocked and self._is_sports_spread_family(family):
+            for position in correlated_positions:
+                position_ticker = str(position.get("ticker", "") or "").strip()
+                if not self._is_sports_spread_family(self.get_market_family({"ticker": position_ticker})):
+                    continue
+                position_side = self._normalize_live_side(position.get("side")) or "yes"
+                position_line = self._extract_spread_line(position_ticker)
+                opposite_side = bool(position_side and side and position_side != side)
+                nearby_line = (
+                    line is not None
+                    and position_line is not None
+                    and abs(float(line) - float(position_line)) <= SPORTS_SPREAD_LADDER_CONFLICT_LINE_DISTANCE
+                )
+                unknown_related_line = line is None or position_line is None
+                if opposite_side and (nearby_line or unknown_related_line):
+                    blocked = True
+                    reason = "opposite_same_game_spread_ladder"
+                    conflict_detail = {
+                        "ticker": position_ticker,
+                        "side": position_side,
+                        "line": position_line,
+                    }
+                    break
+        print(
+            f"[LIVE-CORRELATION-CHECK] ticker={ticker} family={family} event_game_key={game_key} "
+            f"active_count={active_count} max_allowed={max_allowed} side={side} line={line} reason={reason}"
+        )
+        if conflict_detail:
+            print(
+                f"[LIVE-SPREAD-LADDER-CONFLICT] ticker={ticker} family={family} event_game_key={game_key} "
+                f"active_count={active_count} max_allowed={max_allowed} side={side} line={line} "
+                f"reason={reason} existing_ticker={conflict_detail.get('ticker')} "
+                f"existing_side={conflict_detail.get('side')} existing_line={conflict_detail.get('line')}"
+            )
+        if blocked:
+            print(
+                f"[LIVE-CORRELATION-BLOCKED] ticker={ticker} family={family} event_game_key={game_key} "
+                f"active_count={active_count} max_allowed={max_allowed} side={side} line={line} reason={reason}"
+            )
+        else:
+            print(
+                f"[LIVE-CORRELATION-ALLOWED] ticker={ticker} family={family} event_game_key={game_key} "
+                f"active_count={active_count} max_allowed={max_allowed} side={side} line={line} reason={reason}"
+            )
+        return (not blocked), reason, {
+            "family": family,
+            "event_game_key": game_key,
+            "active_count": active_count,
+            "max_allowed": max_allowed,
+            "side": side,
+            "line": line,
+        }
+
+    def _emit_live_correlation_snapshot(self, ticker, family=None, side=None, market=None):
+        ticker = str(ticker or "").strip()
+        family = str(family or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip()
+        if self.get_market_discovery_category(family) != "sports":
+            return {}
+        event_key, same_game_positions = self._get_correlated_sports_positions(ticker, family=family, market=market)
+        open_positions = self._get_open_live_positions()
+        family_exposure = {}
+        sports_positions = []
+        same_side_count = 0
+        normalized_side = self._normalize_live_side(side)
+        for position in open_positions:
+            position_ticker = str(position.get("ticker", "") or "").strip()
+            position_family = self.get_market_family({"ticker": position_ticker}) if position_ticker else "UNKNOWN"
+            family_exposure[position_family] = family_exposure.get(position_family, 0) + 1
+            if self.get_market_discovery_category(position_family) == "sports":
+                sports_positions.append(position)
+                if normalized_side and self._normalize_live_side(position.get("side")) == normalized_side:
+                    same_side_count += 1
+        snapshot = {
+            "active_family_exposure": sorted(family_exposure.items()),
+            "current_sports_concentration": len(sports_positions),
+            "same_game_exposure": len(same_game_positions),
+            "same_side_directional_clustering": same_side_count,
+            "event_key": event_key,
+        }
+        print(
+            f"[LIVE-CORRELATION-SNAPSHOT] ticker={ticker} family={family} event_key={event_key} "
+            f"active_family_exposure={snapshot['active_family_exposure']} "
+            f"current_sports_concentration={snapshot['current_sports_concentration']} "
+            f"same_game_exposure={snapshot['same_game_exposure']} "
+            f"same_side_directional_clustering={snapshot['same_side_directional_clustering']}"
+        )
+        return snapshot
+
+    def _get_correlated_sports_exposure_count(self, ticker, family=None):
+        family = family or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")
+        if self.get_market_discovery_category(family) != "sports":
+            return 0
+        _game_key, positions = self._get_correlated_sports_positions(ticker, family=family)
+        return len(positions)
+
+    def _get_trusted_sports_context(self, ticker, family=None, market=None):
+        return {
+            "trusted": False,
+            "status": "context_unavailable",
+            "reason": "no_trusted_real_time_sports_feed_configured",
+            "event_status": "unknown",
+            "live_state": "unknown",
+            "live_score": None,
+            "time_remaining": None,
+            "period": None,
+            "game_clock": None,
+            "recent_scoring_momentum": None,
+            "injury_news_flags": [],
+            "weather_flags": [],
+            "lineup_pitcher_player_changes": [],
+            "market_vs_reality_mismatch": None,
+        }
+
+    def _classify_sports_signal_strength(self, ticker, q=None, family=None, market=None, payload=None):
+        ticker = str(ticker or "").strip()
+        family = str(family or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip()
+        q = q or (self.build_quote(market) if isinstance(market, dict) else None)
+        weak_reasons = []
+        spread = None
+        yes_bid = getattr(q, "yes_bid", 0.0) if q is not None else 0.0
+        yes_ask = getattr(q, "yes_ask", 0.0) if q is not None else 0.0
+        no_bid = getattr(q, "no_bid", 0.0) if q is not None else 0.0
+        no_ask = getattr(q, "no_ask", 0.0) if q is not None else 0.0
+        if yes_bid and yes_ask:
+            spread = float(yes_ask) - float(yes_bid)
+            if spread >= min(MAX_ENTRY_SPREAD, 0.04):
+                weak_reasons.append("wide_ish_allowed_spread")
+            if spread >= 0.035:
+                weak_reasons.append("low_edge")
+        else:
+            weak_reasons.append("missing_yes_quote_for_signal_strength")
+        volume = getattr(q, "volume", 0.0) if q is not None else 0.0
+        liquidity = getattr(q, "liquidity", 0.0) if q is not None else 0.0
+        if (volume or 0.0) < SMART_ENTRY_PRIORITY_VOLUME_THRESHOLD or (liquidity or 0.0) < MIN_ENTRY_LIQUIDITY:
+            weak_reasons.append("low_confidence")
+        if not (yes_bid and yes_ask and no_bid and no_ask):
+            weak_reasons.append("partial_quote_confidence")
+        correlated_count = self._get_correlated_sports_exposure_count(ticker, family=family)
+        if correlated_count > 0:
+            weak_reasons.append("correlated_same_game_exposure")
+        gate_record = dict(self.phase55_live_execution_gate_by_ticker.get(ticker, {}) or {})
+        phase55_status = gate_record.get("phase55_status")
+        entry_ready_reason = str(gate_record.get("entry_ready_reason") or gate_record.get("decision_reason") or "").strip()
+        if phase55_status and phase55_status != "entry_ready":
+            weak_reasons.append(f"phase55_{phase55_status}")
+        if any(marker in entry_ready_reason for marker in ("fallback", "borderline", "pullback_wait", "trigger_wait")):
+            weak_reasons.append("borderline_phase55_entry")
+        signal_strength = "weak" if weak_reasons else "strong"
+        return signal_strength, {
+            "ticker": ticker,
+            "family": family,
+            "spread": round(spread, 4) if spread is not None else None,
+            "volume": volume,
+            "liquidity": liquidity,
+            "correlated_count": correlated_count,
+            "weak_reasons": weak_reasons,
+        }
+
+    def sports_context_check(self, candidate):
+        candidate = candidate if isinstance(candidate, dict) else {}
+        ticker = str(candidate.get("ticker") or "").strip()
+        family = str(candidate.get("family") or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip()
+        if not SPORTS_CONTEXT_GATE_ENABLED or self.get_market_discovery_category(family) != "sports":
+            return True, "sports_context_not_applicable", {
+                "ticker": ticker,
+                "family": family,
+                "context_status": "not_applicable",
+                "signal_strength": "not_applicable",
+            }
+        market = candidate.get("market") if isinstance(candidate.get("market"), dict) else {"ticker": ticker}
+        q = candidate.get("quote")
+        payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
+        event_key = self._extract_sports_game_key(ticker, market=market)
+        self._emit_live_correlation_snapshot(ticker, family=family, side=payload.get("side"), market=market)
+        signal_strength, signal_details = self._classify_sports_signal_strength(
+            ticker,
+            q=q,
+            family=family,
+            market=market,
+            payload=payload,
+        )
+        context = self._get_trusted_sports_context(ticker, family=family, market=market)
+        context_status = context.get("status") or ("trusted" if context.get("trusted") else "context_unavailable")
+        reason = context.get("reason") or context_status
+        print(
+            f"[LIVE-SPORTS-CONTEXT-CHECK] ticker={ticker} family={family} event_key={event_key} "
+            f"signal_strength={signal_strength} context_status={context_status} reason={reason} "
+            f"event_status={context.get('event_status', 'unknown')} live_state={context.get('live_state', 'unknown')} "
+            f"scoring_momentum={context.get('recent_scoring_momentum')} injury_news={context.get('injury_news_flags')} "
+            f"weather={context.get('weather_flags')}"
+        )
+        if not context.get("trusted"):
+            print(
+                f"[LIVE-SPORTS-CONTEXT-UNAVAILABLE] ticker={ticker} family={family} event_key={event_key} "
+                f"signal_strength={signal_strength} context_status={context_status} reason={reason}"
+            )
+            if signal_strength == "weak" and SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS:
+                block_reason = "sports_context_required_for_weak_signal"
+                print(
+                    f"[LIVE-SPORTS-CONTEXT-BLOCKED] ticker={ticker} family={family} event_key={event_key} "
+                    f"signal_strength={signal_strength} context_status={context_status} reason={block_reason}:{signal_details.get('weak_reasons')}"
+                )
+                return False, block_reason, {
+                    "ticker": ticker,
+                    "family": family,
+                    "event_key": event_key,
+                    "signal_strength": signal_strength,
+                    "context_status": context_status,
+                    "reason": block_reason,
+                    "signal_details": signal_details,
+                }
+            if signal_strength == "strong" and SPORTS_CONTEXT_ALLOW_STRONG_SIGNAL_WITHOUT_DATA:
+                allow_reason = "strong_market_structure_without_context"
+                print(
+                    f"[LIVE-SPORTS-CONTEXT-WARN] ticker={ticker} family={family} event_key={event_key} "
+                    f"signal_strength={signal_strength} context_status={context_status} reason={allow_reason}"
+                )
+                print(
+                    f"[LIVE-SPORTS-CONTEXT-ALLOWED] ticker={ticker} family={family} event_key={event_key} "
+                    f"signal_strength={signal_strength} context_status={context_status} reason={allow_reason}"
+                )
+                return True, allow_reason, {
+                    "ticker": ticker,
+                    "family": family,
+                    "event_key": event_key,
+                    "signal_strength": signal_strength,
+                    "context_status": context_status,
+                    "reason": allow_reason,
+                    "signal_details": signal_details,
+                }
+            block_reason = "sports_context_unavailable"
+            print(
+                f"[LIVE-SPORTS-CONTEXT-BLOCKED] ticker={ticker} family={family} event_key={event_key} "
+                f"signal_strength={signal_strength} context_status={context_status} reason={block_reason}"
+            )
+            return False, block_reason, {
+                "ticker": ticker,
+                "family": family,
+                "event_key": event_key,
+                "signal_strength": signal_strength,
+                "context_status": context_status,
+                "reason": block_reason,
+                "signal_details": signal_details,
+            }
+        print(
+            f"[LIVE-SPORTS-CONTEXT-ALLOWED] ticker={ticker} family={family} event_key={event_key} "
+            f"signal_strength={signal_strength} context_status={context_status} reason=trusted_context_available"
+        )
+        return True, "trusted_context_available", {
+            "ticker": ticker,
+            "family": family,
+            "event_key": event_key,
+            "signal_strength": signal_strength,
+            "context_status": context_status,
+            "reason": "trusted_context_available",
+            "signal_details": signal_details,
+        }
+
     def _get_sports_priority_profile(self, market, liquidity_priority=None, spread=None):
         family = self.get_market_family(market)
         q = self.build_quote(market)
@@ -1490,7 +8384,13 @@ class KalshiSniperBot:
             yes_ask = getattr(q, "yes_ask", 0.0) or 0.0
             spread = (yes_ask - yes_bid) if yes_bid > 0 and yes_ask > 0 else None
         spread_value = self.to_float(spread, None)
-        spread_tight = bool(spread_value is not None and 0.0 <= spread_value <= 0.05)
+        adaptive_spread_limit = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=spread_value,
+            liquidity=(liquidity_priority or {}).get("effective_liquidity_value"),
+            context="sports_priority_profile",
+        ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
+        spread_tight = bool(spread_value is not None and 0.0 <= spread_value <= adaptive_spread_limit)
         both_sides_quoted = bool(liquidity_priority.get("both_sides_quoted"))
         both_sizes_meet_threshold = yes_top_size >= min_top_size and no_top_size >= min_top_size
         larger_side_size = max(yes_top_size, no_top_size)
@@ -1526,12 +8426,81 @@ class KalshiSniperBot:
             "moderate_imbalance": moderate_imbalance,
             "reason": reason,
             "spread": round(spread_value, 4) if spread_value is not None else None,
+            "adaptive_spread_limit": round(adaptive_spread_limit, 4),
             "spread_tight": spread_tight,
             "both_sides_quoted": both_sides_quoted,
             "yes_top_size": yes_top_size,
             "no_top_size": no_top_size,
             "min_top_size_threshold": min_top_size,
         }
+
+    def _get_sports_edge_score(self, market, q=None, spread=None, liquidity_priority=None, context="generic"):
+        family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
+        if family == "KXBTC15M" or not self._is_sports_market_or_family(family):
+            return {"score": 0.0, "components": {}, "reason": "not_sports"}
+        q = q or self.build_quote(market)
+        liquidity_priority = liquidity_priority or self.get_market_liquidity_priority(market)
+        if spread is None:
+            spread = (getattr(q, "yes_ask", 0.0) or 0.0) - (getattr(q, "yes_bid", 0.0) or 0.0)
+        yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
+        no_top_size = self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0
+        min_depth = min(yes_top_size, no_top_size) if yes_top_size > 0.0 and no_top_size > 0.0 else max(yes_top_size, no_top_size)
+        open_interest = self.to_float((market or {}).get("open_interest_fp", (market or {}).get("open_interest")), 0.0) or 0.0
+        volume = self.to_float((market or {}).get("volume_fp", (market or {}).get("volume")), 0.0) or 0.0
+        minutes_to_event = self.get_minutes_to_event(market)
+        spread_info = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=spread,
+            liquidity=getattr(q, "liquidity", 0.0) or 0.0,
+            yes_top_size=yes_top_size,
+            no_top_size=no_top_size,
+            context=f"edge_score:{context}",
+        )
+        adaptive_spread = spread_info.get("adaptive_threshold", MAX_ENTRY_SPREAD)
+        spread_quality = max(0.0, (adaptive_spread - max(spread or 0.0, 0.0)) / max(adaptive_spread, 0.0001)) * 22.0
+        liquidity_depth = min(22.0, max(0.0, min_depth / max(self.get_market_min_top_of_book_size(market), 1.0)) * 4.0)
+        open_interest_score = min(12.0, open_interest / max(SPORTS_ADAPTIVE_STRONG_OPEN_INTEREST, 1.0) * 6.0)
+        recent_cache = self.sports_quote_continuity_cache.get(str((market or {}).get("ticker", "") or "").strip(), {}) or {}
+        stability_cycles = int(recent_cache.get("stable_cycles", 0) or 0)
+        stability_score = min(10.0, stability_cycles * 2.5)
+        proximity_score = 0.0
+        if minutes_to_event is not None:
+            if MIN_MINUTES_TO_EVENT <= minutes_to_event <= self.get_effective_max_minutes_to_event():
+                proximity_score = 12.0
+            elif 0.0 <= minutes_to_event < MIN_MINUTES_TO_EVENT:
+                proximity_score = 4.0
+            else:
+                proximity_score = 6.0
+        momentum = self.compute_live_sports_momentum(
+            market,
+            q=q,
+            liquidity_priority=liquidity_priority,
+            spread=spread,
+            context=f"edge_score:{context}",
+        )
+        momentum_score = max(-10.0, min(10.0, self.to_float(momentum.get("momentum_score"), 0.0) * 10.0))
+        category_score = 12.0 if self._is_priority_sports_family(family) else 5.0
+        volume_score = min(10.0, volume / max(MIN_ENTRY_VOLUME, 1.0) * 3.0)
+        total = round(spread_quality + liquidity_depth + open_interest_score + stability_score + proximity_score + momentum_score + category_score + volume_score, 4)
+        components = {
+            "spread_quality": round(spread_quality, 4),
+            "liquidity_depth": round(liquidity_depth, 4),
+            "open_interest": round(open_interest_score, 4),
+            "quote_stability": round(stability_score, 4),
+            "event_proximity": round(proximity_score, 4),
+            "momentum": round(momentum_score, 4),
+            "category_strength": round(category_score, 4),
+            "volume": round(volume_score, 4),
+        }
+        print(
+            f"[LIVE-SPORTS-EDGE-SCORE] ticker={str((market or {}).get('ticker', '') or '').strip()} family={family} "
+            f"score={total} components={components} spread={spread} adaptive_spread={round(adaptive_spread, 4)} "
+            f"yes_top_size={yes_top_size} no_top_size={no_top_size} open_interest={open_interest} "
+            f"stability_cycles={stability_cycles} minutes_to_event={round(minutes_to_event, 4) if minutes_to_event is not None else None} "
+            f"momentum_score={momentum.get('momentum_score')} directional_bias={momentum.get('directional_bias')} "
+            f"context={context}"
+        )
+        return {"score": total, "components": components, "adaptive_spread": adaptive_spread}
 
     def _apply_post_strict_sports_priority(self, ranked, markets):
         if not ranked:
@@ -1579,9 +8548,16 @@ class KalshiSniperBot:
                     quote_values = self.get_market_quote_values(market)
                     both_sides_quoted = self.has_complete_quote_side(quote_values.get("yes_bid"), quote_values.get("yes_ask")) and self.has_complete_quote_side(quote_values.get("no_bid"), quote_values.get("no_ask"))
                     safe_price = bool((getattr(q, "yes_ask", 0.0) or 0.0) > MIN_ENTRY_PRICE and (getattr(q, "yes_ask", 0.0) or 0.0) < MAX_ENTRY_PRICE)
+                    adaptive_spread_limit = self._get_sports_adaptive_spread_threshold(
+                        market,
+                        spread=spread,
+                        yes_top_size=yes_top_size,
+                        no_top_size=no_top_size,
+                        context="post_strict_priority",
+                    ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
                     if not both_sides_quoted:
                         reason = "missing_two_sided_quotes"
-                    elif spread is None or spread < 0.0 or spread > 0.05:
+                    elif spread is None or spread < 0.0 or spread > adaptive_spread_limit:
                         reason = "spread_above_sports_priority_limit"
                     elif yes_top_size < 5.0 or no_top_size < 5.0:
                         reason = "top_size_below_priority_floor"
@@ -1590,7 +8566,13 @@ class KalshiSniperBot:
                     else:
                         boost_applied = True
                         sports_candidates_boosted += 1
-                        sports_priority_rank_boost = 1000.0
+                        edge_score = self._get_sports_edge_score(
+                            market,
+                            q=q,
+                            spread=spread,
+                            context="post_strict_priority",
+                        ).get("score", 0.0)
+                        sports_priority_rank_boost = 1000.0 + min(300.0, edge_score * 3.0)
                         reason = "strict_pass_high_quality_sports_boost"
             print(
                 f"[LIVE-SPORTS-PRIORITY] ticker={ticker} family={family} spread={round(spread, 4) if spread is not None else None} "
@@ -1700,6 +8682,80 @@ class KalshiSniperBot:
         )
         return balanced_ranked
 
+    def _apply_execution_diversity_bonus(self, ranked, markets):
+        if not ranked:
+            print("[LIVE-EXECUTION-DIVERSITY] candidates=0 reason=no_ranked_candidates")
+            return ranked
+        market_by_ticker = {
+            str(item.get("ticker", "") or "").strip(): item
+            for item in (markets or [])
+            if isinstance(item, dict)
+        }
+        family_counts = {}
+        for _score, _q, _spread, family in ranked:
+            family_counts[family] = family_counts.get(family, 0) + 1
+        active_family_counts = {}
+        for position in self._get_open_live_positions():
+            family = self.get_market_family({"ticker": position.get("ticker", "")})
+            active_family_counts[family] = active_family_counts.get(family, 0) + 1
+        now_ts = time.time()
+        adjusted = []
+        for index, (score, q, spread, family) in enumerate(ranked):
+            ticker = getattr(q, "ticker", "") or ""
+            market = market_by_ticker.get(ticker)
+            is_sports = self._is_sports_market_or_family(family) and family != "KXBTC15M"
+            last_attempt_age = None
+            if family in ENTRY_ATTEMPT_FAMILY_LAST_SEEN:
+                last_attempt_age = now_ts - float(ENTRY_ATTEMPT_FAMILY_LAST_SEEN.get(family, 0.0) or 0.0)
+            fresh_family_bonus = 0.0
+            rotation_bonus = 0.0
+            category_bonus = 0.0
+            concentration_penalty = 0.0
+            reasons = []
+            if is_sports:
+                category_bonus = 8.0
+                reasons.append("sports_category_promotion")
+                if family_counts.get(family, 0) == 1:
+                    fresh_family_bonus += 5.0
+                    reasons.append("fresh_family_singleton")
+                if last_attempt_age is None or last_attempt_age > ENTRY_ATTEMPT_FAMILY_COOLDOWN_SECONDS:
+                    rotation_bonus += 6.0
+                    reasons.append("family_rotation_available")
+                if active_family_counts.get(family, 0) > 0:
+                    concentration_penalty -= min(8.0, active_family_counts.get(family, 0) * 4.0)
+                    reasons.append("active_family_concentration_penalty")
+                if market:
+                    edge = self._get_sports_edge_score(market, q=q, spread=spread, context="execution_diversity").get("score", 0.0)
+                    rotation_bonus += min(10.0, edge * 0.10)
+                    reasons.append("sports_edge_rotation_bonus")
+                    momentum = self.compute_live_sports_momentum(market, q=q, spread=spread, context="execution_diversity")
+                    momentum_bonus = max(-6.0, min(5.0, self.to_float(momentum.get("momentum_score"), 0.0) * 6.0))
+                    rotation_bonus += momentum_bonus
+                    reasons.append("sports_momentum_rotation_adjustment")
+            elif family == "KXBTC15M" and any(self._is_sports_market_or_family(candidate_family) and candidate_family != "KXBTC15M" for candidate_family in family_counts):
+                concentration_penalty -= 5.0
+                reasons.append("sports_available_reduce_btc_dominance")
+            total_bonus = fresh_family_bonus + rotation_bonus + category_bonus + concentration_penalty
+            adjusted_score = score + total_bonus
+            print(
+                f"[LIVE-EXECUTION-DIVERSITY] ticker={ticker} family={family} raw_score={round(score, 4)} "
+                f"adjusted_score={round(adjusted_score, 4)} rotation_bonus={round(rotation_bonus, 4)} "
+                f"category_diversification_bonus={round(category_bonus, 4)} fresh_family_promotion={round(fresh_family_bonus, 4)} "
+                f"concentration_penalty={round(concentration_penalty, 4)} active_family_exposure={active_family_counts.get(family, 0)} "
+                f"family_rank_count={family_counts.get(family, 0)} reasons={reasons}"
+            )
+            adjusted.append((adjusted_score, index, (adjusted_score, q, spread, family)))
+        adjusted.sort(
+            key=lambda item: (
+                -item[0],
+                item[2][2],
+                -getattr(item[2][1], "liquidity", 0.0),
+                -getattr(item[2][1], "volume", 0.0),
+                item[1],
+            )
+        )
+        return [item[2] for item in adjusted]
+
     def _collect_topbook_candidate_state(self, market):
         state = {
             "raw_orderbook_container_present": False,
@@ -1715,7 +8771,7 @@ class KalshiSniperBot:
             return state
         relevant_keys = [
             key for key in (
-                "orderbook", "yes", "no", "yes_orders", "no_orders",
+                "orderbook", "orderbook_fp", "yes", "no", "yes_orders", "no_orders", "yes_dollars", "no_dollars",
                 "yes_bid_size", "yes_ask_size", "no_bid_size", "no_ask_size",
                 "best_yes_bid_size", "best_yes_ask_size", "best_no_bid_size", "best_no_ask_size",
                 "yes_size", "no_size", "bid_size", "ask_size",
@@ -1727,10 +8783,10 @@ class KalshiSniperBot:
         ]
         state["relevant_keys"] = relevant_keys
         container = market.get("orderbook") if isinstance(market.get("orderbook"), dict) else None
-        state["raw_orderbook_container_present"] = bool(container)
+        fp_container = market.get("orderbook_fp") if isinstance(market.get("orderbook_fp"), dict) else None
+        state["raw_orderbook_container_present"] = bool(container or fp_container)
         state["yes_no_arrays_exist"] = bool(
-            market.get("yes") or market.get("no") or market.get("yes_orders") or market.get("no_orders")
-            or (isinstance(container, dict) and (container.get("yes") or container.get("no") or container.get("yes_orders") or container.get("no_orders")))
+            self._extract_orderbook_side_levels(market, "yes") or self._extract_orderbook_side_levels(market, "no")
         )
         size_field_names = [
             key for key in (
@@ -1740,7 +8796,7 @@ class KalshiSniperBot:
             )
             if market.get(key) not in (None, "", [], {})
         ]
-        state["raw_field_names"] = size_field_names + (["orderbook"] if container else [])
+        state["raw_field_names"] = size_field_names + (["orderbook"] if container else []) + (["orderbook_fp"] if fp_container else []) + (["yes_dollars"] if market.get("yes_dollars") not in (None, "", [], {}) else []) + (["no_dollars"] if market.get("no_dollars") not in (None, "", [], {}) else [])
         state["size_fields_exist"] = bool(size_field_names)
         state["best_bid_ask_fields_exist"] = any(
             market.get(key) not in (None, "", [], {})
@@ -1749,12 +8805,14 @@ class KalshiSniperBot:
         mapped_size_values = [
             self.to_float(market.get(key), None) for key in ("yes_top_size", "no_top_size")
         ]
-        state["mapped_topbook_fields_present"] = any(value is not None for value in mapped_size_values) or any(
+        derived_yes_size = self._extract_orderbook_side_size_hint(market, "yes")
+        derived_no_size = self._extract_orderbook_side_size_hint(market, "no")
+        state["mapped_topbook_fields_present"] = any(value is not None for value in mapped_size_values + [derived_yes_size, derived_no_size]) or any(
             market.get(key) not in (None, "", [], {}) for key in ("yes_top_price", "no_top_price")
         )
         raw_size_values = [self.to_float(market.get(key), None) for key in size_field_names]
         state["non_zero_size_fields_present"] = any(
-            value is not None and value > 0 for value in mapped_size_values + raw_size_values
+            value is not None and value > 0 for value in mapped_size_values + raw_size_values + [derived_yes_size, derived_no_size]
         )
         return state
 
@@ -1884,9 +8942,13 @@ class KalshiSniperBot:
             "yes_bid", "yes_ask", "no_bid", "no_ask",
             "best_yes_bid", "best_yes_ask", "best_no_bid", "best_no_ask",
             "yes_bid_size", "yes_ask_size", "no_bid_size", "no_ask_size",
+            "yes_bid_size_fp", "yes_ask_size_fp", "no_bid_size_fp", "no_ask_size_fp",
             "best_yes_bid_size", "best_yes_ask_size", "best_no_bid_size", "best_no_ask_size",
-            "yes_size", "no_size", "bid_size", "ask_size",
-            "volume", "liquidity", "orderbook", "yes", "no", "yes_orders", "no_orders",
+            "yes_size", "no_size", "yes_quantity", "no_quantity", "yes_qty", "no_qty",
+            "yes_contract_count", "no_contract_count", "bid_size", "ask_size",
+            "bid_quantity", "ask_quantity", "bid_qty", "ask_qty",
+            "volume", "liquidity", "liquidity_dollars", "open_interest_fp",
+            "orderbook", "orderbook_fp", "yes", "no", "yes_orders", "no_orders",
             "quote_age", "quote_ts", "quote_timestamp", "updated_at", "updated_at_ts",
             "last_updated", "last_updated_ts", "timestamp", "ts", "age_seconds", "staleness_seconds",
         )
@@ -1907,6 +8969,8 @@ class KalshiSniperBot:
             "raw_no_sizes": {},
             "yes_top_size": None,
             "no_top_size": None,
+            "yes_top_price": None,
+            "no_top_price": None,
             "yes_bid_size": None,
             "yes_ask_size": None,
             "no_bid_size": None,
@@ -1921,33 +8985,33 @@ class KalshiSniperBot:
             return snapshot
         container = market.get("orderbook") if isinstance(market.get("orderbook"), dict) else None
         fp_container = market.get("orderbook_fp") if isinstance(market.get("orderbook_fp"), dict) else None
-        yes_levels = []
-        no_levels = []
-        if isinstance(container, dict):
-            yes_levels = container.get("yes") or container.get("yes_orders") or []
-            no_levels = container.get("no") or container.get("no_orders") or []
-            snapshot["raw_orderbook_container_present"] = True
-            snapshot["source_path"] = "orderbook_container"
-        elif isinstance(fp_container, dict):
-            yes_levels = fp_container.get("yes_dollars") or fp_container.get("yes") or []
-            no_levels = fp_container.get("no_dollars") or fp_container.get("no") or []
-            snapshot["raw_orderbook_container_present"] = True
+        yes_levels, yes_source = self._extract_orderbook_side_levels_with_source(market, "yes")
+        no_levels, no_source = self._extract_orderbook_side_levels_with_source(market, "no")
+        snapshot["raw_orderbook_container_present"] = bool(container or fp_container or yes_levels or no_levels)
+        resolved_source = yes_source if yes_source != "none" else no_source
+        if resolved_source == "orderbook_fp":
             snapshot["source_path"] = "orderbook_fp_container"
-        elif (
-            market.get("yes") or market.get("no") or market.get("yes_orders") or market.get("no_orders")
-            or market.get("yes_dollars") or market.get("no_dollars")
-        ):
-            yes_levels = market.get("yes") or market.get("yes_orders") or market.get("yes_dollars") or []
-            no_levels = market.get("no") or market.get("no_orders") or market.get("no_dollars") or []
-            snapshot["raw_orderbook_container_present"] = True
+        elif resolved_source == "root_dollars":
+            snapshot["source_path"] = "root_dollars"
+        elif resolved_source == "orderbook":
+            snapshot["source_path"] = "orderbook_container"
+        elif resolved_source == "root_side":
             snapshot["source_path"] = "root_orderbook"
-        yes_top = self._extract_orderbook_top_level(yes_levels)
-        no_top = self._extract_orderbook_top_level(no_levels)
+        yes_fp_top = self._extract_orderbook_fp_top_level(market, "yes")
+        no_fp_top = self._extract_orderbook_fp_top_level(market, "no")
+        yes_top = yes_fp_top if self.to_float(yes_fp_top.get("size"), 0.0) > 0 else self._extract_orderbook_top_level(yes_levels)
+        no_top = no_fp_top if self.to_float(no_fp_top.get("size"), 0.0) > 0 else self._extract_orderbook_top_level(no_levels)
         yes_size_fields = (
-            "yes_bid_size", "best_yes_bid_size", "yes_size", "bid_size",
+            "yes_bid_size", "best_yes_bid_size", "best_yes_ask_size", "yes_ask_size",
+            "yes_bid_size_fp", "yes_ask_size_fp",
+            "yes_size", "yes_quantity", "yes_qty", "yes_contract_count", "yes_available",
+            "bid_size", "bid_quantity", "bid_qty",
         )
         no_size_fields = (
-            "no_bid_size", "best_no_bid_size", "no_size", "ask_size",
+            "no_bid_size", "best_no_bid_size", "best_no_ask_size", "no_ask_size",
+            "no_bid_size_fp", "no_ask_size_fp",
+            "no_size", "no_quantity", "no_qty", "no_contract_count", "no_available",
+            "ask_size", "ask_quantity", "ask_qty",
         )
         for key in yes_size_fields:
             value = self.to_float(market.get(key), None)
@@ -1957,28 +9021,70 @@ class KalshiSniperBot:
             value = self.to_float(market.get(key), None)
             if value is not None:
                 snapshot["raw_no_sizes"][key] = value
+        size_hint_yes = self._extract_orderbook_side_size_hint(market, "yes")
+        size_hint_no = self._extract_orderbook_side_size_hint(market, "no")
+        if size_hint_yes is not None:
+            snapshot["raw_yes_sizes"].setdefault("derived_size_hint", size_hint_yes)
+        if size_hint_no is not None:
+            snapshot["raw_no_sizes"].setdefault("derived_size_hint", size_hint_no)
         raw_names = list(snapshot["raw_yes_sizes"].keys()) + list(snapshot["raw_no_sizes"].keys())
         if isinstance(container, dict):
             raw_names.append("orderbook")
         if isinstance(fp_container, dict):
             raw_names.append("orderbook_fp")
+        if market.get("yes") not in (None, "", [], {}):
+            raw_names.append("yes")
+        if market.get("no") not in (None, "", [], {}):
+            raw_names.append("no")
+        if market.get("yes_orders") not in (None, "", [], {}):
+            raw_names.append("yes_orders")
+        if market.get("no_orders") not in (None, "", [], {}):
+            raw_names.append("no_orders")
         if market.get("yes_dollars") not in (None, "", [], {}):
             raw_names.append("yes_dollars")
         if market.get("no_dollars") not in (None, "", [], {}):
             raw_names.append("no_dollars")
         snapshot["raw_field_names"] = sorted(set(raw_names))
-        if yes_top.get("size", 0.0) > 0 or no_top.get("size", 0.0) > 0:
-            snapshot["yes_top_size"] = yes_top.get("size", 0.0)
-            snapshot["no_top_size"] = no_top.get("size", 0.0)
-        else:
-            yes_candidates = list(snapshot["raw_yes_sizes"].values())
-            no_candidates = list(snapshot["raw_no_sizes"].values())
-            if yes_candidates:
-                snapshot["yes_top_size"] = max(yes_candidates)
-            if no_candidates:
-                snapshot["no_top_size"] = max(no_candidates)
-            if yes_candidates or no_candidates:
-                snapshot["source_path"] = "raw_size_fields"
+        snapshot["yes_top_size"] = yes_top.get("size") if yes_top.get("size", 0.0) > 0 else size_hint_yes
+        snapshot["no_top_size"] = no_top.get("size") if no_top.get("size", 0.0) > 0 else size_hint_no
+        snapshot["yes_top_price"] = yes_top.get("price") if yes_top.get("price") is not None else self._extract_orderbook_side_price_hint(market, "yes")
+        snapshot["no_top_price"] = no_top.get("price") if no_top.get("price") is not None else self._extract_orderbook_side_price_hint(market, "no")
+        quote_values = self.get_market_quote_values(market)
+        yes_bid = quote_values.get("yes_bid")
+        yes_ask = quote_values.get("yes_ask")
+        no_bid = quote_values.get("no_bid")
+        no_ask = quote_values.get("no_ask")
+        yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        spread = None
+        if yes_bid is not None and yes_ask is not None:
+            try:
+                spread = float(yes_ask) - float(yes_bid)
+            except (TypeError, ValueError):
+                spread = None
+        sports_size_map = self._extract_sports_size_map(
+            market,
+            yes_price=snapshot["yes_top_price"] if snapshot["yes_top_price"] is not None else yes_ask,
+            no_price=snapshot["no_top_price"] if snapshot["no_top_price"] is not None else no_ask,
+            spread=spread,
+        )
+        if self._is_sports_market_or_family(self.get_market_family(market)):
+            snapshot["sports_size_map"] = sports_size_map
+            if sports_size_map.get("yes_size") is not None:
+                snapshot["yes_top_size"] = sports_size_map.get("yes_size")
+            if sports_size_map.get("no_size") is not None:
+                snapshot["no_top_size"] = sports_size_map.get("no_size")
+            if sports_size_map.get("yes_path"):
+                snapshot["raw_yes_sizes"].setdefault(sports_size_map.get("yes_path"), sports_size_map.get("yes_size"))
+            if sports_size_map.get("no_path"):
+                snapshot["raw_no_sizes"].setdefault(sports_size_map.get("no_path"), sports_size_map.get("no_size"))
+            if snapshot["source_path"] == "none" and sports_size_map.get("fallback_source") != "none":
+                snapshot["source_path"] = sports_size_map.get("fallback_source")
+        if snapshot["yes_top_size"] is None and snapshot["raw_yes_sizes"]:
+            snapshot["yes_top_size"] = max(snapshot["raw_yes_sizes"].values())
+        if snapshot["no_top_size"] is None and snapshot["raw_no_sizes"]:
+            snapshot["no_top_size"] = max(snapshot["raw_no_sizes"].values())
+        if snapshot["source_path"] == "none" and (snapshot["raw_yes_sizes"] or snapshot["raw_no_sizes"]):
+            snapshot["source_path"] = "raw_size_fields"
         snapshot["yes_bid_size"] = snapshot["yes_top_size"]
         snapshot["no_bid_size"] = snapshot["no_top_size"]
         if snapshot["yes_top_size"] is None and snapshot["no_top_size"] is None:
@@ -1996,10 +9102,16 @@ class KalshiSniperBot:
             f"parser_path=non_targeted_snapshot source_path={snapshot.get('source_path')} "
             f"raw_orderbook_container_present={'yes' if snapshot.get('raw_orderbook_container_present') else 'no'} "
             f"raw_field_names={snapshot.get('raw_field_names')} raw_yes_sizes={snapshot.get('raw_yes_sizes')} raw_no_sizes={snapshot.get('raw_no_sizes')} "
+            f"normalized_yes_top_price={snapshot.get('yes_top_price')} normalized_no_top_price={snapshot.get('no_top_price')} "
             f"normalized_yes_top_size={snapshot.get('yes_top_size')} normalized_no_top_size={snapshot.get('no_top_size')} "
             f"failure_stage={snapshot.get('failure_stage')} failure_reason={snapshot.get('failure_reason')} "
             f"candidate_raw_fields={self._get_raw_liquidity_candidate_fields(market)}"
         )
+        if self.is_debug_live_enabled() and snapshot.get('source_path') in {'orderbook_fp_container', 'root_dollars'}:
+            success = bool((snapshot.get('yes_top_size') or 0.0) > 0 and (snapshot.get('no_top_size') or 0.0) > 0)
+            print(
+                f"[ORDERBOOK-FP-EXTRACT] ticker={str(market.get('ticker', '') or '').strip()} yes_size={snapshot.get('yes_top_size')} no_size={snapshot.get('no_top_size')} success={success}"
+            )
         return snapshot
 
     def _emit_strict_liquidity_trace(self, market, q, family, validation_snapshot, orderbook_snapshot, reject_reason):
@@ -2045,39 +9157,63 @@ class KalshiSniperBot:
         detail = self.get_live_market_detail(ticker)
         if not isinstance(detail, dict) or not detail:
             return None, "market_detail_empty"
-        container = detail.get("orderbook") if isinstance(detail.get("orderbook"), dict) else None
-        if isinstance(container, dict):
-            yes_levels = container.get("yes") or container.get("yes_orders") or []
-            no_levels = container.get("no") or container.get("no_orders") or []
-            source = "market_detail.orderbook"
-        else:
-            yes_levels = detail.get("yes") if isinstance(detail, dict) else []
-            no_levels = detail.get("no") if isinstance(detail, dict) else []
-            source = "market_detail.root"
-        if not isinstance(yes_levels, list):
-            yes_levels = []
-        if not isinstance(no_levels, list):
-            no_levels = []
-        if not yes_levels and not no_levels:
-            return None, "market_detail_no_orderbook_levels"
+        yes_levels, yes_source = self._extract_orderbook_side_levels_with_source(detail, "yes")
+        no_levels, no_source = self._extract_orderbook_side_levels_with_source(detail, "no")
         yes_top = self._extract_orderbook_top_level(yes_levels)
         no_top = self._extract_orderbook_top_level(no_levels)
+        yes_top_price = yes_top["price"] if yes_top["price"] is not None else self._extract_orderbook_side_price_hint(detail, "yes")
+        no_top_price = no_top["price"] if no_top["price"] is not None else self._extract_orderbook_side_price_hint(detail, "no")
+        yes_top_size = yes_top["size"] if yes_top["size"] > 0 else self._extract_orderbook_side_size_hint(detail, "yes")
+        no_top_size = no_top["size"] if no_top["size"] > 0 else self._extract_orderbook_side_size_hint(detail, "no")
+        sports_size_map = self._extract_sports_size_map(
+            detail,
+            yes_price=yes_top_price,
+            no_price=no_top_price,
+            spread=spread,
+        )
+        if self._is_sports_market_or_family(self.get_market_family(detail)):
+            if sports_size_map.get("yes_size") is not None:
+                yes_top_size = sports_size_map.get("yes_size")
+            if sports_size_map.get("no_size") is not None:
+                no_top_size = sports_size_map.get("no_size")
+        if not yes_levels and not no_levels and yes_top_size in (None, 0.0) and no_top_size in (None, 0.0):
+            return None, "market_detail_no_orderbook_levels"
+        resolved_source = yes_source if yes_source != "none" else no_source
+        if resolved_source == "orderbook_fp":
+            source = "market_detail.orderbook_fp"
+        elif resolved_source == "root_dollars":
+            source = "market_detail.root_dollars"
+        elif resolved_source == "orderbook":
+            source = "market_detail.orderbook"
+        elif resolved_source == "root_side":
+            source = "market_detail.root"
+        else:
+            source = "market_detail.size_fields"
+        if sports_size_map.get("fallback_source") not in (None, "none"):
+            source = sports_size_map.get("fallback_source")
         hydrated = {
-            "yes_top_price": yes_top["price"],
-            "yes_top_size": yes_top["size"],
-            "no_top_price": no_top["price"],
-            "no_top_size": no_top["size"],
+            "yes_top_price": yes_top_price,
+            "yes_top_size": yes_top_size or 0.0,
+            "no_top_price": no_top_price,
+            "no_top_size": no_top_size or 0.0,
             "min_top_size": min_top_size,
             "orderbook_source": source,
             "yes_raw_top_level": yes_levels[0] if yes_levels else None,
             "no_raw_top_level": no_levels[0] if no_levels else None,
             "top_book_bucket": self._classify_targeted_orderbook_bucket(
-                yes_top["size"],
-                no_top["size"],
+                yes_top_size or 0.0,
+                no_top_size or 0.0,
                 min_top_size,
                 spread,
             ),
         }
+        if self.is_debug_live_enabled():
+            print(
+                f"[LIVE-SELECT-TOPBOOK-NORMALIZE] ticker={ticker} family={self.get_market_family(market)} "
+                f"parser_path=targeted_zero_book_hydration source_path={source} "
+                f"yes_levels_present={'yes' if bool(yes_levels) else 'no'} no_levels_present={'yes' if bool(no_levels) else 'no'} "
+                f"yes_top_price={yes_top_price} yes_top_size={yes_top_size} no_top_price={no_top_price} no_top_size={no_top_size}"
+            )
         self.targeted_orderbook_cache[ticker] = hydrated
         return hydrated, source
 
@@ -2125,13 +9261,22 @@ class KalshiSniperBot:
         top_level_fields = sorted(payload.keys())[:12] if isinstance(payload, dict) else []
         detail_fields = sorted(detail.keys())[:12] if isinstance(detail, dict) else []
         has_orderbook_container = isinstance(detail.get("orderbook"), dict) if isinstance(detail, dict) else False
-        has_root_yes = bool(detail.get("yes") or detail.get("yes_orders")) if isinstance(detail, dict) else False
-        has_root_no = bool(detail.get("no") or detail.get("no_orders")) if isinstance(detail, dict) else False
+        has_orderbook_fp_container = isinstance(detail.get("orderbook_fp"), dict) if isinstance(detail, dict) else False
+        has_root_yes = bool(detail.get("yes") or detail.get("yes_orders") or detail.get("yes_dollars")) if isinstance(detail, dict) else False
+        has_root_no = bool(detail.get("no") or detail.get("no_orders") or detail.get("no_dollars")) if isinstance(detail, dict) else False
         print(
             f"[LIVE-SELECT-HYDRATION-RESPONSE] ticker={ticker} event_ticker={event_ticker} status={status_code} "
             f"response_present={'yes' if bool(detail) else 'no'} payload_fields={top_level_fields} detail_fields={detail_fields} "
-            f"orderbook_container_present={'yes' if has_orderbook_container else 'no'} "
-            f"expected_orderbook_fields_present={'yes' if (has_orderbook_container or has_root_yes or has_root_no) else 'no'}"
+            f"orderbook_container_present={'yes' if (has_orderbook_container or has_orderbook_fp_container) else 'no'} "
+            f"expected_orderbook_fields_present={'yes' if (has_orderbook_container or has_orderbook_fp_container or has_root_yes or has_root_no) else 'no'}"
+        )
+        self._emit_topbook_trace(
+            "[LIVE-TOPBOOK-RAW]",
+            detail if isinstance(detail, dict) else market,
+            family=family,
+            reason="market_detail_hydration_response",
+            ticker=ticker,
+            detected_fields=self._get_raw_liquidity_candidate_fields(detail if isinstance(detail, dict) else market),
         )
         if not isinstance(detail, dict) or not detail:
             print(
@@ -2152,9 +9297,12 @@ class KalshiSniperBot:
             "yes_bid", "yes_ask", "no_bid", "no_ask",
             "yes_bid_dollars", "yes_ask_dollars", "no_bid_dollars", "no_ask_dollars",
             "best_yes_bid", "best_yes_ask", "best_no_bid", "best_no_ask",
+            "best_yes_bid_size", "best_yes_ask_size", "best_no_bid_size", "best_no_ask_size",
+            "yes_bid_size", "yes_ask_size", "no_bid_size", "no_ask_size",
+            "yes_size", "no_size", "bid_size", "ask_size",
             "last_price", "last_price_dollars", "volume", "volume_fp",
-            "liquidity", "liquidity_dollars", "orderbook", "yes", "no",
-            "yes_orders", "no_orders", "updated_at", "updated_at_ts",
+            "liquidity", "liquidity_dollars", "orderbook", "orderbook_fp", "yes", "no",
+            "yes_orders", "no_orders", "yes_dollars", "no_dollars", "updated_at", "updated_at_ts",
             "last_updated", "last_updated_ts", "quote_timestamp", "quote_ts",
             "timestamp", "ts",
         )
@@ -2166,7 +9314,10 @@ class KalshiSniperBot:
                 copied_keys.append(key)
         source = "market_detail_snapshot"
         source_reason = "copied_market_detail_fields_only"
-        if has_orderbook_container:
+        if has_orderbook_fp_container:
+            source = "market_detail.orderbook_fp"
+            source_reason = "market_detail_contains_orderbook_fp_container"
+        elif has_orderbook_container:
             source = "market_detail.orderbook"
             source_reason = "market_detail_contains_orderbook_container"
         elif has_root_yes or has_root_no:
@@ -2186,15 +9337,29 @@ class KalshiSniperBot:
                 )
                 orderbook_payload = None
             container = orderbook_payload.get("orderbook") if isinstance(orderbook_payload, dict) and isinstance(orderbook_payload.get("orderbook"), dict) else None
-            if isinstance(container, dict):
+            fp_container = orderbook_payload.get("orderbook_fp") if isinstance(orderbook_payload, dict) and isinstance(orderbook_payload.get("orderbook_fp"), dict) else None
+            if isinstance(fp_container, dict):
+                hydrated_market["orderbook_fp"] = fp_container
+                hydrated_market["yes"] = self._extract_orderbook_side_levels({"orderbook_fp": fp_container}, "yes")
+                hydrated_market["no"] = self._extract_orderbook_side_levels({"orderbook_fp": fp_container}, "no")
+                if fp_container.get("yes_dollars") is not None:
+                    hydrated_market["yes_dollars"] = fp_container.get("yes_dollars")
+                if fp_container.get("no_dollars") is not None:
+                    hydrated_market["no_dollars"] = fp_container.get("no_dollars")
+                source = "orderbook_endpoint.fp_container"
+                source_reason = "market_detail_missing_size_payload_fallback_to_orderbook_endpoint"
+            elif isinstance(container, dict):
                 hydrated_market["orderbook"] = container
-                hydrated_market["yes"] = container.get("yes") or container.get("yes_orders") or []
-                hydrated_market["no"] = container.get("no") or container.get("no_orders") or []
+                hydrated_market["yes"] = self._extract_orderbook_side_levels({"orderbook": container}, "yes")
+                hydrated_market["no"] = self._extract_orderbook_side_levels({"orderbook": container}, "no")
                 source = "orderbook_endpoint.container"
                 source_reason = "market_detail_missing_size_payload_fallback_to_orderbook_endpoint"
-            elif isinstance(orderbook_payload, dict) and (orderbook_payload.get("yes") or orderbook_payload.get("no") or orderbook_payload.get("yes_orders") or orderbook_payload.get("no_orders")):
-                hydrated_market["yes"] = orderbook_payload.get("yes") or orderbook_payload.get("yes_orders") or []
-                hydrated_market["no"] = orderbook_payload.get("no") or orderbook_payload.get("no_orders") or []
+            elif isinstance(orderbook_payload, dict) and (
+                orderbook_payload.get("yes") or orderbook_payload.get("no") or orderbook_payload.get("yes_orders") or orderbook_payload.get("no_orders")
+                or orderbook_payload.get("yes_dollars") or orderbook_payload.get("no_dollars")
+            ):
+                hydrated_market["yes"] = self._extract_orderbook_side_levels(orderbook_payload, "yes")
+                hydrated_market["no"] = self._extract_orderbook_side_levels(orderbook_payload, "no")
                 source = "orderbook_endpoint.root"
                 source_reason = "market_detail_missing_size_payload_fallback_to_orderbook_endpoint"
             else:
@@ -2270,86 +9435,192 @@ class KalshiSniperBot:
         )
         ticker = str(market.get("ticker", "") or "").strip()
         min_top_size = self.get_market_min_top_of_book_size(market)
-        cached = self.targeted_orderbook_cache.get(ticker)
-        if cached is None:
-            try:
-                orderbook = self.get_live_market_orderbook(ticker)
-            except Exception:
-                print(f"[LIVE-SELECT-DEBUG] targeted_orderbook ticker={ticker} result=fail reason=request_error")
-                return False, {
-                    "yes_top_price": None,
-                    "yes_top_size": 0.0,
-                    "no_top_price": None,
-                    "no_top_size": 0.0,
-                    "min_top_size": min_top_size,
-                    "spread": spread,
-                    "top_book_bucket": "both_sides_zero",
-                }
-            container = orderbook.get("orderbook") if isinstance(orderbook, dict) else None
-            fp_container = orderbook.get("orderbook_fp") if isinstance(orderbook, dict) else None
+        initial_state = self._collect_topbook_candidate_state(market)
+        enriched_market = dict(market) if isinstance(market, dict) else {"ticker": ticker}
+        family = self.get_market_family(enriched_market)
+        initial_liquidity = self._resolve_effective_liquidity_signal(
+            enriched_market,
+            family=family,
+            spread=spread,
+            source="targeted_gate_initial",
+        )
+        initial_yes_top_size = self.to_float(initial_liquidity.get("yes_top_size"), 0.0)
+        initial_no_top_size = self.to_float(initial_liquidity.get("no_top_size"), 0.0)
+        initial_pass = (
+            initial_yes_top_size >= min_top_size
+            and initial_no_top_size >= min_top_size
+            and spread <= MAX_ENTRY_SPREAD
+        )
+        orderbook = None
+        try:
+            orderbook = self.get_live_market_orderbook(ticker)
+        except Exception as exc:
+            print(f"[LIVE-SELECT-DEBUG] targeted_orderbook ticker={ticker} result=fetch_error reason={exc.__class__.__name__}")
+        if isinstance(orderbook, dict):
+            self._emit_topbook_trace(
+                "[LIVE-TOPBOOK-RAW]",
+                orderbook,
+                family=family,
+                reason="targeted_orderbook_endpoint_response",
+                ticker=ticker,
+                detected_fields=self._get_raw_liquidity_candidate_fields(orderbook),
+            )
+            fp_container = orderbook.get("orderbook_fp") if isinstance(orderbook.get("orderbook_fp"), dict) else None
+            container = orderbook.get("orderbook") if isinstance(orderbook.get("orderbook"), dict) else None
+            yes_levels, yes_levels_source = self._extract_orderbook_side_levels_with_source(orderbook, "yes")
+            no_levels, no_levels_source = self._extract_orderbook_side_levels_with_source(orderbook, "no")
+            resolved_source = yes_levels_source if yes_levels_source != "none" else no_levels_source
+            if isinstance(fp_container, dict):
+                enriched_market["orderbook_fp"] = fp_container
+                if fp_container.get("yes_dollars") is not None:
+                    enriched_market["yes_dollars"] = fp_container.get("yes_dollars")
+                if fp_container.get("no_dollars") is not None:
+                    enriched_market["no_dollars"] = fp_container.get("no_dollars")
             if isinstance(container, dict):
-                yes_levels = container.get("yes") or container.get("yes_orders") or []
-                no_levels = container.get("no") or container.get("no_orders") or []
-                orderbook_source = "orderbook"
-                if isinstance(market, dict):
-                    market["orderbook"] = container
-                    market["yes"] = yes_levels
-                    market["no"] = no_levels
-            elif isinstance(fp_container, dict):
-                yes_levels = fp_container.get("yes_dollars") or fp_container.get("yes") or []
-                no_levels = fp_container.get("no_dollars") or fp_container.get("no") or []
-                orderbook_source = "orderbook_fp"
-                if isinstance(market, dict):
-                    market["orderbook_fp"] = fp_container
-                    market["yes"] = yes_levels if isinstance(yes_levels, list) else []
-                    market["no"] = no_levels if isinstance(no_levels, list) else []
-                    if fp_container.get("yes_dollars") is not None:
-                        market["yes_dollars"] = fp_container.get("yes_dollars")
-                    if fp_container.get("no_dollars") is not None:
-                        market["no_dollars"] = fp_container.get("no_dollars")
-            else:
-                yes_levels = (orderbook.get("yes") or orderbook.get("yes_orders") or orderbook.get("yes_dollars")) if isinstance(orderbook, dict) else []
-                no_levels = (orderbook.get("no") or orderbook.get("no_orders") or orderbook.get("no_dollars")) if isinstance(orderbook, dict) else []
-                orderbook_source = "root"
-                if isinstance(market, dict):
-                    if isinstance(orderbook, dict):
-                        market["yes"] = yes_levels if isinstance(yes_levels, list) else []
-                        market["no"] = no_levels if isinstance(no_levels, list) else []
-                        if orderbook.get("yes_orders") is not None:
-                            market["yes_orders"] = orderbook.get("yes_orders")
-                        if orderbook.get("no_orders") is not None:
-                            market["no_orders"] = orderbook.get("no_orders")
-                        if orderbook.get("yes_dollars") is not None:
-                            market["yes_dollars"] = orderbook.get("yes_dollars")
-                        if orderbook.get("no_dollars") is not None:
-                            market["no_dollars"] = orderbook.get("no_dollars")
+                enriched_market["orderbook"] = container
+            if isinstance(yes_levels, list):
+                enriched_market["yes"] = yes_levels
+            if isinstance(no_levels, list):
+                enriched_market["no"] = no_levels
+            if orderbook.get("yes_orders") is not None:
+                enriched_market["yes_orders"] = orderbook.get("yes_orders")
+            if orderbook.get("no_orders") is not None:
+                enriched_market["no_orders"] = orderbook.get("no_orders")
+            if resolved_source == "root_dollars":
+                if orderbook.get("yes_dollars") is not None:
+                    enriched_market["yes_dollars"] = orderbook.get("yes_dollars")
+                if orderbook.get("no_dollars") is not None:
+                    enriched_market["no_dollars"] = orderbook.get("no_dollars")
+        final_liquidity = self._resolve_effective_liquidity_signal(
+            enriched_market,
+            family=family,
+            spread=spread,
+            source="targeted_gate_final",
+        )
+        yes_levels, yes_levels_source = self._extract_orderbook_side_levels_with_source(enriched_market, "yes")
+        no_levels, no_levels_source = self._extract_orderbook_side_levels_with_source(enriched_market, "no")
+        yes_top = self._extract_orderbook_fp_top_level(enriched_market, "yes")
+        no_top = self._extract_orderbook_fp_top_level(enriched_market, "no")
+        if self.to_float(yes_top.get("size"), 0.0) <= 0:
             yes_top = self._extract_orderbook_top_level(yes_levels)
+        if self.to_float(no_top.get("size"), 0.0) <= 0:
             no_top = self._extract_orderbook_top_level(no_levels)
-            cached = {
-                "yes_top_price": yes_top["price"],
-                "yes_top_size": yes_top["size"],
-                "no_top_price": no_top["price"],
-                "no_top_size": no_top["size"],
-                "min_top_size": min_top_size,
-                "orderbook_source": orderbook_source,
-                "yes_raw_top_level": yes_levels[0] if isinstance(yes_levels, list) and yes_levels else None,
-                "no_raw_top_level": no_levels[0] if isinstance(no_levels, list) and no_levels else None,
-            }
-            self.targeted_orderbook_cache[ticker] = cached
-        yes_top_size = cached["yes_top_size"]
-        no_top_size = cached["no_top_size"]
+        yes_top_price = yes_top.get("price") if yes_top.get("price") is not None else self._extract_orderbook_side_price_hint(enriched_market, "yes")
+        no_top_price = no_top.get("price") if no_top.get("price") is not None else self._extract_orderbook_side_price_hint(enriched_market, "no")
+        yes_top_size = final_liquidity.get("yes_top_size")
+        no_top_size = final_liquidity.get("no_top_size")
+        if yes_top_size in (None, ""):
+            yes_top_size = yes_top.get("size") if yes_top.get("size") not in (None, "") else initial_liquidity.get("yes_top_size")
+        if no_top_size in (None, ""):
+            no_top_size = no_top.get("size") if no_top.get("size") not in (None, "") else initial_liquidity.get("no_top_size")
+        yes_top_size = self.to_float(yes_top_size, 0.0)
+        no_top_size = self.to_float(no_top_size, 0.0)
+        orderbook_source = yes_top.get("source") if yes_top.get("source") in {"orderbook_fp", "root_dollars"} else (
+            no_top.get("source") if no_top.get("source") in {"orderbook_fp", "root_dollars"} else (
+                yes_levels_source if yes_levels_source != "none" else no_levels_source
+            )
+        )
+        cached = {
+            "yes_top_price": yes_top_price,
+            "yes_top_size": yes_top_size,
+            "no_top_price": no_top_price,
+            "no_top_size": no_top_size,
+            "min_top_size": min_top_size,
+            "orderbook_source": orderbook_source or "fallback",
+            "yes_raw_top_level": yes_levels[0] if isinstance(yes_levels, list) and yes_levels else None,
+            "no_raw_top_level": no_levels[0] if isinstance(no_levels, list) and no_levels else None,
+        }
+        self.targeted_orderbook_cache[ticker] = cached
         top_book_bucket = self._classify_targeted_orderbook_bucket(
             yes_top_size,
             no_top_size,
             min_top_size,
             spread,
         )
-        passed = (
+        reported_liquidity = self.to_float(final_liquidity.get("liquidity_original"), 0.0) or 0.0
+        effective_top_size = self.to_float(final_liquidity.get("effective_top_size"), 0.0) or 0.0
+        both_sides_quoted = bool(final_liquidity.get("both_sides_quoted"))
+        btc15m_overnight_mode = self._is_btc15m_overnight_mode(family)
+        if btc15m_overnight_mode:
+            print(
+                f"[LIVE-BTC15M-OVERNIGHT-MODE] ticker={ticker} family={family} "
+                f"hour_utc={int(time.gmtime().tm_hour)} active=yes"
+            )
+        has_orderbook_fp = bool(
+            isinstance(enriched_market.get("orderbook_fp"), dict)
+            or isinstance(market.get("orderbook_fp"), dict)
+            or cached.get("orderbook_source") in {"orderbook_fp", "root_dollars"}
+        )
+        has_root_dollars = bool(
+            enriched_market.get("yes_dollars") is not None
+            or enriched_market.get("no_dollars") is not None
+            or market.get("yes_dollars") is not None
+            or market.get("no_dollars") is not None
+        )
+        forced_mapped_topbook_present = bool(
+            has_orderbook_fp
+            or has_root_dollars
+            or yes_top_size > 0
+            or no_top_size > 0
+            or effective_top_size > 0
+        )
+        effective_min_top_size = 3.0 if family == "KXBTC15M" else min_top_size
+        if btc15m_overnight_mode:
+            effective_min_top_size = max(1.5, effective_min_top_size * 0.5)
+        standard_pass = (
             cached["yes_top_price"] is not None
             and cached["no_top_price"] is not None
-            and yes_top_size >= min_top_size
-            and no_top_size >= min_top_size
+            and yes_top_size >= effective_min_top_size
+            and no_top_size >= effective_min_top_size
+            and (not btc15m_overnight_mode or both_sides_quoted)
             and spread <= MAX_ENTRY_SPREAD
+        )
+        soft_pass = False
+        soft_pass_reason = None
+        soft_pass_top_size = effective_top_size if effective_top_size > 0 else max(yes_top_size, no_top_size)
+        if not standard_pass:
+            if (
+                btc15m_overnight_mode
+                and both_sides_quoted
+                and spread <= MAX_ENTRY_SPREAD
+                and (
+                    reported_liquidity >= 4.0
+                    or effective_top_size >= 1.5
+                    or (yes_top_size >= 1.0 and no_top_size >= 1.0)
+                )
+            ):
+                soft_pass = True
+                soft_pass_reason = "btc15m_overnight_two_sided_soft_liquidity"
+                soft_pass_top_size = max(soft_pass_top_size, effective_top_size, yes_top_size, no_top_size)
+                print(
+                    f"[LIVE-BTC15M-OVERNIGHT-LIQUIDITY-SOFTENED] ticker={ticker} family={family} "
+                    f"reported_liquidity={reported_liquidity} effective_top_size={effective_top_size} "
+                    f"yes_top_size={yes_top_size} no_top_size={no_top_size} "
+                    f"min_top_size={min_top_size} effective_min_top_size={effective_min_top_size} "
+                    f"both_sides_quoted={'yes' if both_sides_quoted else 'no'} spread={spread}"
+                )
+            elif not btc15m_overnight_mode and family == "KXBTC15M" and (reported_liquidity >= 8.0 or effective_top_size >= 3.0 or yes_top_size > 0 or no_top_size > 0):
+                soft_pass = True
+                soft_pass_reason = "btc_any_size_or_liquidity"
+                soft_pass_top_size = max(soft_pass_top_size, effective_top_size, yes_top_size, no_top_size)
+            elif not btc15m_overnight_mode and forced_mapped_topbook_present:
+                soft_pass = True
+                soft_pass_reason = "targeted_any_size_present"
+                soft_pass_top_size = max(soft_pass_top_size, effective_top_size, yes_top_size, no_top_size, reported_liquidity / 10.0 if reported_liquidity > 0 else 0.0)
+                if effective_top_size <= 0.0 and soft_pass_top_size > 0.0:
+                    effective_top_size = soft_pass_top_size
+        passed = bool(standard_pass or soft_pass)
+        if soft_pass:
+            print(
+                f"[LIQUIDITY-SOFT-PASS] ticker={ticker} liquidity={reported_liquidity} "
+                f"reason={soft_pass_reason} top_size={soft_pass_top_size}"
+            )
+            if self._register_entry_attempt_event(ticker, family=family, reason="liquidity_soft_pass"):
+                print(f"[ENTRY-ATTEMPT] ticker={ticker} reason=liquidity_soft_pass")
+        print(
+            f"[TARGETED-GATE-FORCE] ticker={ticker} "
+            f"raw={'yes' if initial_state.get('raw_orderbook_container_present') else 'no'} "
+            f"forced=yes yes_top={yes_top_size} no_top={no_top_size} passed={passed}"
         )
         print(
             f"[LIVE-SELECT-DEBUG] targeted_orderbook ticker={ticker} "
@@ -2413,6 +9684,11 @@ class KalshiSniperBot:
         yes_ask = quote_values.get("yes_ask")
         no_bid = quote_values.get("no_bid")
         no_ask = quote_values.get("no_ask")
+        if self._is_sports_market_or_family(family):
+            yes_bid = yes_bid if yes_bid is not None else (getattr(q, "yes_bid", None) if getattr(q, "yes_bid", 0.0) > 0 else None)
+            yes_ask = yes_ask if yes_ask is not None else (getattr(q, "yes_ask", None) if getattr(q, "yes_ask", 0.0) > 0 else None)
+            no_bid = no_bid if no_bid is not None else (getattr(q, "no_bid", None) if getattr(q, "no_bid", 0.0) > 0 else None)
+            no_ask = no_ask if no_ask is not None else (getattr(q, "no_ask", None) if getattr(q, "no_ask", 0.0) > 0 else None)
         both_sides_quoted = self.has_complete_quote_side(yes_bid, yes_ask) and self.has_complete_quote_side(no_bid, no_ask)
         spread = yes_ask - yes_bid if self.has_complete_quote_side(yes_bid, yes_ask) else None
         recent_activity = volume > 0
@@ -2457,6 +9733,39 @@ class KalshiSniperBot:
             if details.get("yes_top_price") is not None and details.get("no_top_price") is not None:
                 score += 3.0
                 reasons.append("both_sides_top_book_quoted")
+            if self._is_sports_market_or_family(family):
+                self._emit_topbook_trace(
+                    "[LIVE-TOPBOOK-MAP]",
+                    market,
+                    family=family,
+                    reason=self._topbook_reject_reason(
+                        yes_price=details.get("yes_top_price"),
+                        yes_size=yes_top_size,
+                        no_price=details.get("no_top_price"),
+                        no_size=no_top_size,
+                        spread=spread,
+                        max_spread=self._get_sports_adaptive_spread_threshold(
+                            market,
+                            spread=spread,
+                            liquidity=liquidity,
+                            yes_top_size=yes_top_size,
+                            no_top_size=no_top_size,
+                            context="targeted_topbook_map",
+                        ).get("adaptive_threshold", MAX_ENTRY_SPREAD),
+                    ),
+                    ticker=ticker,
+                    yes_bid=yes_bid,
+                    yes_ask=yes_ask,
+                    no_bid=no_bid,
+                    no_ask=no_ask,
+                    yes_price=details.get("yes_top_price"),
+                    no_price=details.get("no_top_price"),
+                    yes_size=yes_top_size,
+                    no_size=no_top_size,
+                    spread=spread,
+                    top_book_state=top_book_state,
+                    source_path=details.get("orderbook_source"),
+                )
         else:
             topbook_snapshot = self._extract_non_targeted_topbook_snapshot(market)
             yes_top_size = topbook_snapshot.get("yes_top_size")
@@ -2481,6 +9790,45 @@ class KalshiSniperBot:
                 reasons.append("missing_two_sided_quote")
                 top_book_state = "zero_top_book"
                 empty_book = True
+            if self._is_sports_market_or_family(family):
+                map_reason = self._topbook_reject_reason(
+                    yes_price=topbook_snapshot.get("yes_top_price") or yes_ask,
+                    yes_size=yes_top_size,
+                    no_price=topbook_snapshot.get("no_top_price") or no_ask,
+                    no_size=no_top_size,
+                    spread=spread,
+                    max_spread=self._get_sports_adaptive_spread_threshold(
+                        market,
+                        spread=spread,
+                        liquidity=liquidity,
+                        yes_top_size=yes_top_size,
+                        no_top_size=no_top_size,
+                        context="topbook_map",
+                    ).get("adaptive_threshold", MAX_ENTRY_SPREAD),
+                )
+                prefix = "[LIVE-TOPBOOK-CONVERTED]" if map_reason == "converted" else (
+                    "[LIVE-TOPBOOK-ZERO-SIZE]" if "zero" in map_reason else "[LIVE-TOPBOOK-MISSING-FIELD]"
+                )
+                self._emit_topbook_trace(
+                    prefix,
+                    market,
+                    family=family,
+                    reason=map_reason,
+                    ticker=str(market.get("ticker", "") or "").strip(),
+                    yes_bid=yes_bid,
+                    yes_ask=yes_ask,
+                    no_bid=no_bid,
+                    no_ask=no_ask,
+                    yes_price=topbook_snapshot.get("yes_top_price") or yes_ask,
+                    no_price=topbook_snapshot.get("no_top_price") or no_ask,
+                    yes_size=yes_top_size,
+                    no_size=no_top_size,
+                    spread=spread,
+                    top_book_state=top_book_state,
+                    source_path=topbook_snapshot.get("source_path"),
+                    failure_stage=topbook_snapshot.get("failure_stage"),
+                    failure_reason=topbook_snapshot.get("failure_reason"),
+                )
         if recent_activity:
             activity_score = min(volume, 100.0) / 20.0
             score += activity_score
@@ -2589,10 +9937,25 @@ class KalshiSniperBot:
         yes_ask = quote_values.get("yes_ask")
         no_bid = quote_values.get("no_bid")
         no_ask = quote_values.get("no_ask")
+        family = self.get_market_family(market)
+        if self._is_sports_market_or_family(family):
+            yes_bid = yes_bid if yes_bid is not None else (getattr(q, "yes_bid", None) if getattr(q, "yes_bid", 0.0) > 0 else None)
+            yes_ask = yes_ask if yes_ask is not None else (getattr(q, "yes_ask", None) if getattr(q, "yes_ask", 0.0) > 0 else None)
+            no_bid = no_bid if no_bid is not None else (getattr(q, "no_bid", None) if getattr(q, "no_bid", 0.0) > 0 else None)
+            no_ask = no_ask if no_ask is not None else (getattr(q, "no_ask", None) if getattr(q, "no_ask", 0.0) > 0 else None)
         spread = yes_ask - yes_bid if self.has_complete_quote_side(yes_bid, yes_ask) else 1.0
         both_sides_quoted = self.has_complete_quote_side(yes_bid, yes_ask) and self.has_complete_quote_side(no_bid, no_ask)
         recent_activity = (getattr(q, "volume", 0.0) or 0.0) > 0
-        narrow_spread = spread >= 0 and spread <= (MAX_ENTRY_SPREAD / 2.0)
+        adaptive_spread_info = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=spread,
+            liquidity=getattr(q, "liquidity", 0.0) or 0.0,
+            yes_top_size=liquidity_priority.get("yes_top_size"),
+            no_top_size=liquidity_priority.get("no_top_size"),
+            context="market_quality",
+        ) if self._is_sports_market_or_family(family) else {"adaptive_threshold": MAX_ENTRY_SPREAD}
+        adaptive_spread_threshold = adaptive_spread_info.get("adaptive_threshold", MAX_ENTRY_SPREAD)
+        narrow_spread = spread >= 0 and spread <= min(MAX_ENTRY_SPREAD / 2.0, adaptive_spread_threshold)
         score = 0.0
         reasons = []
         if liquidity_priority.get("top_book_state") == "both_non_zero":
@@ -2610,7 +9973,7 @@ class KalshiSniperBot:
         if narrow_spread:
             score += 4.0
             reasons.append("lower_spread")
-        elif spread > MAX_ENTRY_SPREAD:
+        elif spread > adaptive_spread_threshold:
             score -= 4.0
             reasons.append("wide_spread")
         if recent_activity:
@@ -2627,6 +9990,7 @@ class KalshiSniperBot:
             "recent_activity": recent_activity,
             "top_book_state": liquidity_priority.get("top_book_state"),
             "spread": round(spread, 4),
+            "adaptive_spread_threshold": round(adaptive_spread_threshold, 4),
         }
 
     def evaluate_broad_prefilter_grace(self, market, original_reason, liquidity_priority=None, market_quality=None):
@@ -2636,7 +10000,16 @@ class KalshiSniperBot:
         yes_top_size = liquidity_priority.get("yes_top_size")
         no_top_size = liquidity_priority.get("no_top_size")
         one_sided_top_book = top_book_state == "one_non_zero"
-        spread_threshold = round(MAX_ENTRY_SPREAD * 1.25, 4)
+        spread_threshold = round(
+            self._get_sports_adaptive_spread_threshold(
+                market,
+                yes_top_size=yes_top_size,
+                no_top_size=no_top_size,
+                context="broad_prefilter_grace",
+            ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
+            if self._is_sports_market_or_family(self.get_market_family(market)) else MAX_ENTRY_SPREAD * 1.25,
+            4,
+        )
         liquidity = self.to_float(market.get("liquidity_dollars"), 0.0)
         liquidity_threshold = self.get_market_min_entry_liquidity(market)
         both_sides_quoted = bool(market_quality.get("both_sides_quoted"))
@@ -2680,7 +10053,7 @@ class KalshiSniperBot:
         if spread is None or spread < 0:
             return False, "invalid_spread", metrics
         near_miss_margin = round(MAX_ENTRY_SPREAD * 0.1, 4)
-        grace_spread_limit = MAX_ENTRY_SPREAD * 1.25
+        grace_spread_limit = spread_threshold
         if spread > grace_spread_limit:
             if spread <= grace_spread_limit + near_miss_margin:
                 metrics["near_miss_reasons"].append("spread_near_threshold")
@@ -2705,7 +10078,12 @@ class KalshiSniperBot:
         adjusted_thresholds = dict(original_thresholds)
         family = self.get_market_family(market)
         if family != "KXBTC15M" and self.get_market_discovery_category(market) == "sports":
-            adjusted_thresholds["max_spread"] = round(MAX_ENTRY_SPREAD * 1.2, 4)
+            spread_info = self._get_sports_adaptive_spread_threshold(
+                market,
+                liquidity=market.get("liquidity_dollars", market.get("liquidity")),
+                context="prefilter_thresholds",
+            )
+            adjusted_thresholds["max_spread"] = round(spread_info.get("adaptive_threshold", MAX_ENTRY_SPREAD), 4)
             adjusted_thresholds["min_top_size"] = round(max(1.0, original_thresholds["min_top_size"] * 0.6), 4)
             adjusted_thresholds["min_liquidity"] = round(max(10.0, original_thresholds["min_liquidity"] * 0.5), 4)
             adjusted_thresholds["require_both_sides_quote"] = False
@@ -2716,6 +10094,7 @@ class KalshiSniperBot:
         ticker = str(market.get("ticker", "") or "").strip()
         original_thresholds, adjusted_thresholds = self._get_adaptive_prefilter_thresholds(market)
         liquidity_priority = self.get_market_liquidity_priority(market)
+        liquidity = self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0) or 0.0
         effective_liquidity_value = liquidity_priority.get("effective_liquidity_value")
         if effective_liquidity_value is None:
             effective_liquidity_value = liquidity
@@ -2808,6 +10187,302 @@ class KalshiSniperBot:
             "prefilter_survivors": family_survivors,
             "denied_reasons": denied_reasons,
         }
+
+    def _get_btc15m_raw_book_present(self, ticker, market, cached=None):
+        cached = cached if isinstance(cached, dict) else self.targeted_orderbook_cache.get(ticker, {})
+        if cached and cached.get("orderbook_source") and cached.get("orderbook_source") != "fallback":
+            return True
+        state = self._collect_topbook_candidate_state(market if isinstance(market, dict) else {"ticker": ticker})
+        return bool(
+            state.get("raw_orderbook_container_present")
+            or state.get("size_fields_exist")
+            or state.get("yes_no_arrays_exist")
+            or state.get("raw_field_names")
+        )
+
+    def _update_btc15m_rotation_persistence(self, ticker, executable, raw_book_present, yes_top, no_top, spread):
+        now_ts = time.time()
+        cycle_id = self._get_phase55_cycle_id()
+        state = dict(self.btc15m_rotation_quality_state.get(ticker, {}) or {})
+        if state.get("last_cycle_id") == cycle_id:
+            return state
+        recent = list(state.get("recent", []) or [])
+        previous_usable = bool(state.get("last_usable_top_book"))
+        usable_top_book = bool(executable)
+        current_zero = bool((yes_top or 0.0) <= 0.0 and (no_top or 0.0) <= 0.0)
+        topbook_disappeared = bool(previous_usable and current_zero)
+        recent.append({
+            "cycle_id": cycle_id,
+            "ts": now_ts,
+            "executable": bool(executable),
+            "raw_book_present": bool(raw_book_present),
+            "yes_top": yes_top,
+            "no_top": no_top,
+            "spread": spread,
+        })
+        recent = recent[-max(2, int(BTC15M_ROTATION_HISTORY_CYCLES or 5)):]
+        consecutive_executable = int(state.get("consecutive_executable", 0) or 0) + 1 if executable else 0
+        consecutive_dead = int(state.get("consecutive_dead", 0) or 0) + 1 if current_zero else 0
+        missing_raw_cycles = int(state.get("missing_raw_cycles", 0) or 0) + 1 if not raw_book_present else 0
+        zero_size_cycles = int(state.get("zero_size_cycles", 0) or 0) + 1 if current_zero else 0
+        disappeared_cycles = int(state.get("disappeared_cycles", 0) or 0) + 1 if topbook_disappeared else 0
+        executable_recent = sum(1 for item in recent if item.get("executable"))
+        raw_recent = sum(1 for item in recent if item.get("raw_book_present"))
+        continuity_score = round(executable_recent / float(len(recent) or 1), 4)
+        persistence_score = min(consecutive_executable, max(1, int(BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES or 2)))
+        state.update({
+            "last_cycle_id": cycle_id,
+            "recent": recent,
+            "consecutive_executable": consecutive_executable,
+            "consecutive_dead": consecutive_dead,
+            "missing_raw_cycles": missing_raw_cycles,
+            "zero_size_cycles": zero_size_cycles,
+            "disappeared_cycles": disappeared_cycles,
+            "last_usable_top_book": usable_top_book,
+            "last_yes_top": yes_top,
+            "last_no_top": no_top,
+            "last_spread": spread,
+            "persistence_score": persistence_score,
+            "continuity_score": continuity_score,
+            "executable_recent_cycles": executable_recent,
+            "raw_recent_cycles": raw_recent,
+            "updated_ts": now_ts,
+        })
+        self.btc15m_rotation_quality_state[ticker] = state
+        print(
+            f"[LIVE-BTC15M-PERSISTENCE] ticker={ticker} persistence_score={persistence_score} "
+            f"required={BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES} consecutive_executable={consecutive_executable} "
+            f"continuity_score={continuity_score} executable_recent_cycles={executable_recent} "
+            f"raw_recent_cycles={raw_recent} missing_raw_cycles={missing_raw_cycles} "
+            f"zero_size_cycles={zero_size_cycles} disappeared_cycles={disappeared_cycles}"
+        )
+        return state
+
+    def _set_btc15m_dead_contract_cooldown(self, ticker, reason):
+        cooldown_until = time.time() + max(1, int(BTC15M_DEAD_CONTRACT_COOLDOWN_SECONDS or 300))
+        previous_until = float(self.btc15m_dead_contract_cooldowns.get(ticker, 0.0) or 0.0)
+        if cooldown_until > previous_until:
+            self.btc15m_dead_contract_cooldowns[ticker] = cooldown_until
+        return self.btc15m_dead_contract_cooldowns.get(ticker), reason
+
+    def _get_btc15m_rotation_quality(self, market, q=None, spread=None):
+        ticker = str((market or {}).get("ticker", "") or "").strip()
+        q = q or self.build_quote(market)
+        if spread is None:
+            spread = (getattr(q, "yes_ask", 0.0) or 0.0) - (getattr(q, "yes_bid", 0.0) or 0.0)
+        now_ts = time.time()
+        cooldown_until = float(self.btc15m_dead_contract_cooldowns.get(ticker, 0.0) or 0.0)
+        liquidity_priority = self.get_market_liquidity_priority(market)
+        market_quality = self.get_market_quality_preference(market, liquidity_priority=liquidity_priority)
+        yes_top = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
+        no_top = self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0
+        both_sides_quoted = bool(market_quality.get("both_sides_quoted"))
+        usable_top_book = bool(
+            liquidity_priority.get("top_book_state") == "both_non_zero"
+            and yes_top > 0.0
+            and no_top > 0.0
+        )
+        recent_activity = bool(market_quality.get("recent_activity"))
+        narrow_spread = bool(market_quality.get("narrow_spread"))
+        cached = self.targeted_orderbook_cache.get(ticker, {})
+        orderbook_source = cached.get("orderbook_source")
+        orderbook_present = bool(orderbook_source and orderbook_source != "fallback")
+        raw_book_present = self._get_btc15m_raw_book_present(ticker, market, cached=cached)
+        safe_spread = bool(spread is not None and 0.0 <= spread <= MAX_ENTRY_SPREAD)
+        executable = bool(both_sides_quoted and usable_top_book and raw_book_present and safe_spread)
+        state = self._update_btc15m_rotation_persistence(
+            ticker,
+            executable=executable,
+            raw_book_present=raw_book_present,
+            yes_top=yes_top,
+            no_top=no_top,
+            spread=round(spread, 4) if spread is not None else None,
+        )
+        persistence_score = int(state.get("persistence_score", 0) or 0)
+        continuity_score = float(state.get("continuity_score", 0.0) or 0.0)
+        reason = "executable_book"
+        stale_reject = False
+        if cooldown_until > now_ts:
+            stale_reject = True
+            reason = "dead_contract_cooldown"
+        elif not raw_book_present:
+            reason = "missing_raw_orderbook_payload"
+        elif not both_sides_quoted:
+            reason = "missing_both_sides_quote"
+        elif not usable_top_book:
+            if (cached.get("yes_raw_top_level") is not None or cached.get("no_raw_top_level") is not None):
+                reason = "raw_arrays_zero_executable_size"
+            else:
+                reason = "dead_top_book"
+        elif not safe_spread:
+            reason = "wide_spread"
+        elif persistence_score < int(BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES or 2):
+            reason = "liquidity_persistence_pending"
+        if (
+            state.get("missing_raw_cycles", 0) >= BTC15M_MISSING_RAW_BOOK_COOLDOWN_CYCLES
+            or state.get("zero_size_cycles", 0) >= BTC15M_ZERO_SIZE_COOLDOWN_CYCLES
+            or state.get("disappeared_cycles", 0) > 0
+        ):
+            stale_reject = True
+            cooldown_until, reason = self._set_btc15m_dead_contract_cooldown(ticker, reason)
+        executable_for_entry = bool(
+            executable
+            and not stale_reject
+            and persistence_score >= int(BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES or 2)
+        )
+        score = 0.0
+        spread_score = max(0.0, (MAX_ENTRY_SPREAD - float(spread or 0.0)) / max(MAX_ENTRY_SPREAD, 0.0001)) * 250.0 if safe_spread else 0.0
+        size_score = min(250.0, min(yes_top, no_top) * 25.0)
+        both_sides_score = 150.0 if both_sides_quoted else 0.0
+        persistence_component = min(200.0, persistence_score * 100.0)
+        freshness_score = 75.0 if recent_activity else 0.0
+        continuity_component = continuity_score * 125.0
+        if executable_for_entry:
+            score += 1000.0
+        score += spread_score + size_score + both_sides_score + persistence_component + freshness_score + continuity_component
+        if both_sides_quoted:
+            score += 25.0
+        if usable_top_book:
+            score += 25.0
+        if narrow_spread:
+            score += 25.0
+        if stale_reject:
+            score -= 1000.0
+        if not raw_book_present:
+            score -= 300.0
+        elif not orderbook_present:
+            score -= 50.0
+        if not executable_for_entry and reason == "liquidity_persistence_pending":
+            score -= 100.0
+        print(
+            f"[LIVE-BTC15M-QUALITY-SCORE] ticker={ticker} total_score={round(score, 4)} "
+            f"spread_score={round(spread_score, 4)} executable_size_score={round(size_score, 4)} "
+            f"both_sides_score={round(both_sides_score, 4)} persistence_score={round(persistence_component, 4)} "
+            f"freshness_score={round(freshness_score, 4)} continuity_score={round(continuity_component, 4)} "
+            f"spread={round(spread, 4) if spread is not None else None} yes_top={yes_top} no_top={no_top} "
+            f"raw_book_present={'yes' if raw_book_present else 'no'} orderbook_source={orderbook_source or 'none'} "
+            f"executable={'yes' if executable_for_entry else 'no'} reason={reason}"
+        )
+        if stale_reject or not executable_for_entry:
+            print(
+                f"[LIVE-BTC15M-STALE-REJECT] ticker={ticker} spread={round(spread, 4) if spread is not None else None} "
+                f"yes_top={yes_top} no_top={no_top} both_sides_quoted={'yes' if both_sides_quoted else 'no'} "
+                f"raw_book_present={'yes' if raw_book_present else 'no'} missing_raw_cycles={state.get('missing_raw_cycles', 0)} "
+                f"zero_size_cycles={state.get('zero_size_cycles', 0)} disappeared_cycles={state.get('disappeared_cycles', 0)} "
+                f"cooldown_seconds={int(max(0, (float(self.btc15m_dead_contract_cooldowns.get(ticker, 0.0) or 0.0) - now_ts)))} "
+                f"reason={reason}"
+            )
+        return {
+            "ticker": ticker,
+            "spread": round(spread, 4) if spread is not None else None,
+            "yes_top": yes_top,
+            "no_top": no_top,
+            "both_sides_quoted": both_sides_quoted,
+            "usable_top_book": usable_top_book,
+            "narrow_spread": narrow_spread,
+            "recent_activity": recent_activity,
+            "orderbook_present": orderbook_present,
+            "raw_book_present": raw_book_present,
+            "persistence_score": persistence_score,
+            "continuity_score": continuity_score,
+            "executable": executable_for_entry,
+            "reason": reason,
+            "score": round(score, 4),
+        }
+
+    def _apply_btc15m_contract_rotation(self, ranked, markets):
+        btc_ranked = [candidate for candidate in ranked if candidate[3] == "KXBTC15M"]
+        if not btc_ranked:
+            return ranked
+        market_by_ticker = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+        print(
+            f"[LIVE-BTC15M-ROTATION-SCAN] ticker=summary spread=None yes_top=None no_top=None "
+            f"both_sides_quoted=None usable_top_book=None reason=candidates={len(btc_ranked)} "
+            f"min_persistence_cycles={BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES}"
+        )
+        scored_btc = []
+        skipped_tickers = set()
+        for score, q, spread, family in btc_ranked:
+            market = market_by_ticker.get(q.ticker)
+            if market is None:
+                quality = {
+                    "ticker": q.ticker,
+                    "spread": round(spread, 4) if spread is not None else None,
+                    "yes_top": None,
+                    "no_top": None,
+                    "both_sides_quoted": False,
+                    "usable_top_book": False,
+                    "executable": False,
+                    "reason": "market_lookup_failed",
+                    "score": -999.0,
+                }
+            else:
+                quality = self._get_btc15m_rotation_quality(market, q=q, spread=spread)
+            print(
+                f"[LIVE-BTC15M-ROTATION-CANDIDATE] ticker={quality.get('ticker')} spread={quality.get('spread')} "
+                f"yes_top={quality.get('yes_top')} no_top={quality.get('no_top')} "
+                f"both_sides_quoted={'yes' if quality.get('both_sides_quoted') else 'no'} "
+                f"usable_top_book={'yes' if quality.get('usable_top_book') else 'no'} "
+                f"raw_book_present={'yes' if quality.get('raw_book_present') else 'no'} "
+                f"persistence_score={quality.get('persistence_score')} continuity_score={quality.get('continuity_score')} "
+                f"quality_score={quality.get('score')} reason={quality.get('reason')}"
+            )
+            if not quality.get("executable"):
+                skipped_tickers.add(q.ticker)
+                print(
+                    f"[LIVE-BTC15M-ROTATION-SKIP] ticker={q.ticker} spread={quality.get('spread')} "
+                    f"yes_top={quality.get('yes_top')} no_top={quality.get('no_top')} "
+                    f"both_sides_quoted={'yes' if quality.get('both_sides_quoted') else 'no'} "
+                    f"usable_top_book={'yes' if quality.get('usable_top_book') else 'no'} "
+                    f"raw_book_present={'yes' if quality.get('raw_book_present') else 'no'} "
+                    f"persistence_score={quality.get('persistence_score')} reason={quality.get('reason')}"
+                )
+                continue
+            scored_btc.append((quality.get("score", 0.0), score, q, spread, family, quality))
+        if not scored_btc:
+            print(
+                f"[LIVE-BTC15M-ROTATION-NO-BOOK] ticker=summary spread=None yes_top=None no_top=None "
+                f"both_sides_quoted=no usable_top_book=no reason=no_executable_btc15m_book"
+            )
+            return [candidate for candidate in ranked if candidate[3] != "KXBTC15M"]
+        scored_btc.sort(key=lambda item: item[0], reverse=True)
+        selected_quality = scored_btc[0][5]
+        print(
+            f"[LIVE-BTC15M-ROTATION-SELECTED] ticker={selected_quality.get('ticker')} spread={selected_quality.get('spread')} "
+            f"yes_top={selected_quality.get('yes_top')} no_top={selected_quality.get('no_top')} "
+            f"both_sides_quoted={'yes' if selected_quality.get('both_sides_quoted') else 'no'} "
+            f"usable_top_book={'yes' if selected_quality.get('usable_top_book') else 'no'} "
+            f"raw_book_present={'yes' if selected_quality.get('raw_book_present') else 'no'} "
+            f"persistence_score={selected_quality.get('persistence_score')} "
+            f"continuity_score={selected_quality.get('continuity_score')} "
+            f"quality_score={selected_quality.get('score')} reason={selected_quality.get('reason')}"
+        )
+        _selected_quality_score, selected_score, selected_q, selected_spread, selected_family, _selected_quality = scored_btc[0]
+        rotated_btc = [(selected_score, selected_q, selected_spread, selected_family)]
+        rotated_tickers = {candidate[1].ticker for candidate in rotated_btc}
+        rotated_used = set()
+        rebuilt = []
+        inserted_btc = False
+        for candidate in ranked:
+            _score, q, _spread, family = candidate
+            if family != "KXBTC15M":
+                rebuilt.append(candidate)
+                continue
+            if q.ticker in skipped_tickers:
+                continue
+            if not inserted_btc:
+                rebuilt.extend(rotated_btc)
+                rotated_used.update(rotated_tickers)
+                inserted_btc = True
+            elif q.ticker not in rotated_used:
+                rebuilt.append(candidate)
+        if not inserted_btc:
+            rebuilt.extend(rotated_btc)
+        return rebuilt
 
     def _resolve_selector_family_order(self, fetched_family_counts):
         available_families = [family for family in fetched_family_counts if family not in BLOCKED_MARKET_FAMILIES]
@@ -3162,6 +10837,12 @@ class KalshiSniperBot:
         yes_ask = quote_values.get("yes_ask")
         no_bid = quote_values.get("no_bid")
         no_ask = quote_values.get("no_ask")
+        if self._is_sports_market_or_family(family):
+            continuity_q = self.build_quote(market)
+            yes_bid = yes_bid if yes_bid is not None else (continuity_q.yes_bid if continuity_q.yes_bid > 0 else None)
+            yes_ask = yes_ask if yes_ask is not None else (continuity_q.yes_ask if continuity_q.yes_ask > 0 else None)
+            no_bid = no_bid if no_bid is not None else (continuity_q.no_bid if continuity_q.no_bid > 0 else None)
+            no_ask = no_ask if no_ask is not None else (continuity_q.no_ask if continuity_q.no_ask > 0 else None)
         has_complete_yes_side = self.has_complete_quote_side(yes_bid, yes_ask)
         volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0)
         liquidity = self.to_float(market.get("liquidity_dollars"), 0.0)
@@ -3173,7 +10854,13 @@ class KalshiSniperBot:
                 return True, None, family
             return False, "missing_quotes", family
         spread = yes_ask - yes_bid
-        if spread < 0 or spread > MAX_ENTRY_SPREAD:
+        adaptive_spread_limit = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=spread,
+            liquidity=liquidity,
+            context="coarse_prefilter",
+        ).get("adaptive_threshold", MAX_ENTRY_SPREAD) if self._is_sports_market_or_family(family) and series_ticker != "KXBTC15M" else MAX_ENTRY_SPREAD
+        if spread < 0 or spread > adaptive_spread_limit:
             adaptive_allowed, _adaptive_reason = self._evaluate_adaptive_prefilter(market, "wide_spread")
             if adaptive_allowed:
                 return True, None, family
@@ -3246,6 +10933,10 @@ class KalshiSniperBot:
             mid_price = (yes_bid + yes_ask) / 2
         spread_component = max(0.0, MAX_ENTRY_SPREAD - spread) * 40
         volume_component = min(volume, 500) / 40
+        if volume > SMART_ENTRY_PRIORITY_VOLUME_THRESHOLD and 0 <= spread <= SMART_ENTRY_PRIORITY_TIGHT_SPREAD:
+            volume_component += 6.0
+            if 0.70 <= yes_ask <= 0.92:
+                volume_component += 4.0
         price_component = max(0.0, 0.25 - abs(mid_price - 0.5)) * 8
         family_component = 0.0
         market_category = self.get_market_discovery_category(market)
@@ -3275,6 +10966,14 @@ class KalshiSniperBot:
                 sports_priority_component += 28.0
             elif sports_priority_profile.get("moderate_imbalance"):
                 sports_priority_component += 10.0
+        sports_edge = self._get_sports_edge_score(
+            market,
+            q=None,
+            spread=spread,
+            liquidity_priority=liquidity_priority,
+            context="prescore",
+        ) if market_category == "sports" else {"score": 0.0, "components": {}}
+        sports_edge_component = min(24.0, sports_edge.get("score", 0.0) * 0.30)
         has_top_book = bool(
             (liquidity_priority.get("yes_top_size") or 0.0) > 0
             or (liquidity_priority.get("no_top_size") or 0.0) > 0
@@ -3307,6 +11006,7 @@ class KalshiSniperBot:
             + market_quality_component
             + top_book_signal_component
             + sports_priority_component
+            + sports_edge_component
         )
         return {
             "score": round(score, 4),
@@ -3331,8 +11031,10 @@ class KalshiSniperBot:
                 "market_quality": round(market_quality_component, 4),
                 "top_book_signal": round(top_book_signal_component, 4),
                 "sports_priority": round(sports_priority_component, 4),
+                "sports_edge": round(sports_edge_component, 4),
             },
             "sports_priority_profile": sports_priority_profile,
+            "sports_edge_profile": sports_edge,
         }
 
     def get_minutes_to_event(self, market):
@@ -3926,7 +11628,23 @@ class KalshiSniperBot:
         min_liquidity = self.get_market_min_entry_liquidity(market) if market is not None else MIN_ENTRY_LIQUIDITY
         liquidity_priority = self.get_market_liquidity_priority(market) if market is not None else {}
         liquidity_seen = getattr(q, "liquidity", 0.0) or 0.0
-        spread_acceptable = bool(spread is not None and 0.0 <= spread <= MAX_ENTRY_SPREAD)
+        sports_momentum = self.compute_live_sports_momentum(
+            market,
+            q=q,
+            liquidity_priority=liquidity_priority,
+            spread=spread,
+            context=f"entry_timing:{stage_label}",
+        ) if self._is_sports_market_or_family(family) and family != "KXBTC15M" else {"momentum_score": 0.0}
+        sports_momentum_score = self.to_float(sports_momentum.get("momentum_score"), 0.0) or 0.0
+        entry_spread_limit = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=spread,
+            liquidity=liquidity_seen,
+            yes_top_size=liquidity_priority.get("yes_top_size"),
+            no_top_size=liquidity_priority.get("no_top_size"),
+            context=f"entry_timing:{stage_label}",
+        ).get("adaptive_threshold", MAX_ENTRY_SPREAD) if self._is_sports_market_or_family(family) and family != "KXBTC15M" else MAX_ENTRY_SPREAD
+        spread_acceptable = bool(spread is not None and 0.0 <= spread <= entry_spread_limit)
         liquidity_acceptable = bool(
             liquidity_priority.get("top_book_state") == "both_non_zero"
             and (
@@ -3938,14 +11656,16 @@ class KalshiSniperBot:
             spread is not None
             and 0.0 <= spread <= 0.03
             and liquidity_priority.get("both_sides_quoted")
+            and sports_momentum_score >= -0.45
         )
         sports_stochastic_bypass_eligible = bool(
             self._is_priority_sports_family(family)
             and spread is not None
-            and 0.0 <= spread <= 0.03
+            and 0.0 <= spread <= min(0.04, entry_spread_limit)
             and liquidity_priority.get("both_sides_quoted")
             and (self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0) >= 5.0
             and (self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0) >= 5.0
+            and sports_momentum_score >= -0.45
         )
         stochastic_context = self._get_phase55_stochastic_context(market, q, stage_label=stage_label, family=family)
         stochastic_k = stochastic_context.get("stochastic_k")
@@ -4059,6 +11779,8 @@ class KalshiSniperBot:
                 adaptive_pullback_reason = "spread_not_acceptable"
             elif not liquidity_acceptable:
                 adaptive_pullback_reason = "liquidity_not_acceptable"
+            elif sports_momentum_score <= -0.55:
+                adaptive_pullback_reason = "negative_sports_momentum"
             else:
                 adaptive_pullback_override_applied = True
                 adaptive_pullback_reason = "recent_crossover_momentum_override"
@@ -4095,6 +11817,14 @@ class KalshiSniperBot:
                 f"no_top_size={self.to_float(liquidity_priority.get('no_top_size'), 0.0) or 0.0} "
                 f"stochastic_k={stochastic_k} stochastic_d={stochastic_d} "
                 f"reason=sports_no_stochastic_bypass"
+            )
+        if self._is_sports_market_or_family(family) and family != "KXBTC15M":
+            print(
+                f"[LIVE-MOMENTUM-DECISION] ticker={trace_ticker} family={family} original_score={phase55_status if 'phase55_status' in locals() else 'pending'} "
+                f"momentum_adjustment={round(sports_momentum_score, 4)} final_score=entry_timing_pending "
+                f"momentum_score={round(sports_momentum_score, 4)} directional_bias={sports_momentum.get('directional_bias')} "
+                f"volatility_state={sports_momentum.get('volatility_state')} contribution_context=entry_timing "
+                f"spread_limit={round(entry_spread_limit, 4)} spread_acceptable={'yes' if spread_acceptable else 'no'}"
             )
         if sports_stochastic_bypass_applied:
             phase55_status = "entry_ready"
@@ -4264,7 +11994,13 @@ class KalshiSniperBot:
             }
         print(f"[LIVE-SELECT-DEBUG] spread_threshold_used={MAX_ENTRY_SPREAD}")
         print(f"[LIVE-SELECT-DEBUG] candidate_spread_seen={spread}")
-        if spread < 0 or spread > MAX_ENTRY_SPREAD:
+        decision_spread_info = self._get_sports_adaptive_spread_threshold(
+            market,
+            spread=spread,
+            context="final_decision_hard_filter",
+        ) if self._is_sports_market_or_family(family) and family != "KXBTC15M" else {"adaptive_threshold": MAX_ENTRY_SPREAD}
+        decision_spread_limit = decision_spread_info.get("adaptive_threshold", MAX_ENTRY_SPREAD)
+        if spread < 0 or spread > decision_spread_limit:
             print("[LIVE-SELECT-DEBUG] final_spread_reject_reason=wide_spread")
             debug_context["hard_reject_reason"] = "wide_spread"
             return {
@@ -4342,7 +12078,7 @@ class KalshiSniperBot:
             if self._is_priority_sports_family(family) and seen_liquidity <= 0.0:
                 if not orderbook_ok:
                     sports_hard_filter_reason = "targeted_orderbook_not_ok"
-                elif spread is None or spread < 0.0 or spread > 0.05:
+                elif spread is None or spread < 0.0 or spread > decision_spread_limit:
                     sports_hard_filter_reason = "spread_above_sports_liquidity_limit"
                 elif sports_hard_filter_yes_top_size >= 5.0 and sports_hard_filter_no_top_size >= 5.0:
                     targeted_liquidity_fallback_used = True
@@ -4413,7 +12149,7 @@ class KalshiSniperBot:
             sports_liquidity_signal = decision_liquidity_fix.get("effective_top_size")
             if yes_top_size is None or no_top_size is None or yes_top_size <= 0.0 or no_top_size <= 0.0:
                 sports_liquidity_reason = "missing_or_zero_top_book_side"
-            elif spread is None or spread < 0.0 or spread > 0.05:
+            elif spread is None or spread < 0.0 or spread > decision_spread_limit:
                 sports_liquidity_reason = "spread_above_sports_liquidity_limit"
             elif yes_top_size >= 5.0 and no_top_size >= 5.0 and decision_liquidity_fix.get("fallback_used"):
                 sports_liquidity_fallback_applied = True
@@ -4431,6 +12167,8 @@ class KalshiSniperBot:
         debug_context["liquidity_priority"] = liquidity_priority
         debug_context["decision_liquidity_source"] = effective_liquidity_source
         debug_context["decision_liquidity_value"] = effective_liquidity_value
+        family_perf_adjustment = self._get_family_performance_weight(family)
+        debug_context["family_perf_adjustment"] = round(family_perf_adjustment, 4)
         print(
             f"[LIVE-SELECT-DECISION-LIQUIDITY] ticker={ticker} family={family} "
             f"api_liquidity_dollars={(market or {}).get('liquidity_dollars')} api_liquidity={(market or {}).get('liquidity')} "
@@ -4455,13 +12193,30 @@ class KalshiSniperBot:
                 f"field_source={effective_liquidity_source} pass={'yes' if effective_liquidity_value > min_liquidity else 'no'}"
             )
         liquidity_score = min(25.0, max(0.0, (effective_liquidity_value / max(min_liquidity, 1.0)) * 12.5))
-        spread_score = min(25.0, max(0.0, ((MAX_ENTRY_SPREAD - spread) / MAX_ENTRY_SPREAD) * 25.0))
+        spread_score = min(25.0, max(0.0, ((decision_spread_limit - spread) / max(decision_spread_limit, 0.0001)) * 25.0))
         sports_priority_score = 0.0
         if sports_priority_profile:
             if sports_priority_profile.get("priority_boost_applied"):
                 sports_priority_score = 24.0
             elif sports_priority_profile.get("moderate_imbalance"):
                 sports_priority_score = 8.0
+        sports_edge = self._get_sports_edge_score(
+            market,
+            q=q,
+            spread=spread,
+            liquidity_priority=liquidity_priority,
+            context="decision",
+        ) if self.get_market_discovery_category(family) == "sports" else {"score": 0.0, "components": {}}
+        sports_edge_score = min(18.0, sports_edge.get("score", 0.0) * 0.22)
+        sports_momentum = self.compute_live_sports_momentum(
+            market,
+            q=q,
+            liquidity_priority=liquidity_priority,
+            spread=spread,
+            context="decision_confidence",
+        ) if self.get_market_discovery_category(family) == "sports" else {"momentum_score": 0.0}
+        raw_momentum_score = self.to_float(sports_momentum.get("momentum_score"), 0.0) or 0.0
+        momentum_adjustment = max(-10.0, min(8.0, raw_momentum_score * 10.0))
         structure_score = 8.0
         if self.is_targeted_series_market(market):
             if orderbook_ok:
@@ -4487,8 +12242,19 @@ class KalshiSniperBot:
             15.0,
             max(0.0, (min(volume, 100.0) / 100.0) * 7.5 + (spread_score / 25.0) * 7.5),
         )
+        pre_session_original_score = liquidity_score + spread_score + structure_score + timing_score + confidence_score + sports_priority_score + sports_edge_score + family_perf_adjustment
+        pre_session_total_score = pre_session_original_score + momentum_adjustment
+        if self.get_market_discovery_category(family) == "sports":
+            print(
+                f"[LIVE-MOMENTUM-DECISION] ticker={ticker} family={family} original_score={round(pre_session_original_score, 4)} "
+                f"momentum_adjustment={round(momentum_adjustment, 4)} final_score={round(pre_session_total_score, 4)} "
+                f"momentum_score={round(raw_momentum_score, 4)} directional_bias={sports_momentum.get('directional_bias')} "
+                f"volatility_state={sports_momentum.get('volatility_state')} contribution_context=buy_confidence"
+            )
+        borderline_setup = bool(pre_session_total_score < (PHASE5_BUY_SCORE_THRESHOLD + 5.0))
+        session_adjustment = self._get_live_session_entry_adjustment(adaptive_entry=False, borderline=borderline_setup)
         total_score = round(
-            liquidity_score + spread_score + structure_score + timing_score + confidence_score + sports_priority_score,
+            pre_session_total_score - session_adjustment.get("score_penalty", 0.0),
             4,
         )
         score_breakdown = {
@@ -4498,6 +12264,10 @@ class KalshiSniperBot:
             "timing": round(timing_score, 4),
             "confidence": round(confidence_score, 4),
             "sports_priority": round(sports_priority_score, 4),
+            "sports_edge": round(sports_edge_score, 4),
+            "sports_momentum": round(momentum_adjustment, 4),
+            "family_performance": round(family_perf_adjustment, 4),
+            "session_penalty": round(session_adjustment.get("score_penalty", 0.0), 4),
         }
         if total_score >= PHASE5_BUY_SCORE_THRESHOLD:
             decision = "BUY"
@@ -4525,6 +12295,18 @@ class KalshiSniperBot:
             f"low_liquidity_rule_triggered={'yes' if decision_reason == 'low_liquidity_score' else 'no'} "
             f"decision={decision} reason={decision_reason} candidate_score={total_score}"
         )
+        if decision == "BUY" and session_adjustment.get("score_penalty", 0.0) > 0:
+            print(
+                f"[LIVE-ENTRY-QUALITY-PASS] ticker={ticker} family={family} "
+                f"mode={session_adjustment.get('mode')} candidate_score={total_score} "
+                f"session_penalty={round(session_adjustment.get('score_penalty', 0.0), 4)}"
+            )
+        elif decision != "BUY" and session_adjustment.get("score_penalty", 0.0) > 0 and borderline_setup:
+            print(
+                f"[LIVE-ENTRY-BORDERLINE-REQUIRES-CONFIRMATION] ticker={ticker} family={family} "
+                f"mode={session_adjustment.get('mode')} pre_session_score={round(pre_session_total_score, 4)} "
+                f"post_session_score={total_score} reason={session_adjustment.get('reason')}"
+            )
         return {
             "decision": decision,
             "decision_reason": decision_reason,
@@ -5593,6 +13375,24 @@ class KalshiSniperBot:
             }
             print("[LIVE-SELECT] no_markets_in_time_window")
             print("[LIVE-SELECT-DEBUG] early_return_reason=no_markets_in_time_window")
+            print(
+                "[REALM-IX-SUMMARY] profiled_candidates=0 dead_markets=0 thin_markets=0 tradable_markets=0 strong_markets=0 average_awareness_score=0.0 top_awareness_candidate_tickers=[]"
+            )
+            print(
+                "[REALM-X-SUMMARY] total_candidates_profiled=0 avoid_count=0 defensive_count=0 normal_count=0 opportunistic_count=0 aggressive_count=0 average_adaptive_score=0.0 top_adaptive_candidate_tickers=[]"
+            )
+            print(
+                "[REALM-XI-SUMMARY] total_candidates_profiled=0 pre_breakout_count=0 confirmed_breakout_count=0 unknown_count=0 average_predictive_score=0.0 top_predictive_candidate_tickers=[] strongest_confluence_tickers=[]"
+            )
+            print(
+                "[REALM-XIII-SUMMARY] total_memory_records=0 candidates_with_memory=0 candidates_without_memory=0 positive_memory_count=0 negative_memory_count=0 neutral_memory_count=0 weak_patterns_detected=0 strong_patterns_detected=0 average_memory_score=0.5 top_memory_supported_tickers=[] top_memory_penalized_tickers=[]"
+            )
+            print(
+                "[REALM-XII-SUMMARY] total_positions_profiled=0 excellent_count=0 good_count=0 neutral_count=0 weak_count=0 danger_count=0 unknown_count=0 protect_count=0 hold_count=0 press_count=0 reduce_count=0 exit_watch_count=0 partial_profit_recommendations=0 trailing_exit_recommendations=0 scale_in_recommendations=0 scale_out_recommendations=0 cluster_warnings=0 average_position_score=0.0 top_position_tickers=[]"
+            )
+            print(
+                "[REALM-XIV-SUMMARY] total_candidates_profiled=0 avoid_count=0 observe_count=0 eligible_count=0 preferred_count=0 high_conviction_count=0 guardian_blocked_count=0 disagreement_count=0 average_council_score=0.5 top_council_tickers=[] top_blocked_tickers=[]"
+            )
             emit_phase5_observation_logs(0, "no_markets_in_time_window")
             emit_full_select_cycle_timing()
             return None, None
@@ -8009,7 +15809,13 @@ class KalshiSniperBot:
             f"[LIVE-SELECT-FUNNEL] candidates_entering_strict_validation={len(strict_pool)} "
             f"candidates_surviving_strict_validation={len(candidates)}"
         )
-        ranked = self.rank_final_candidates(candidates)
+        awareness_candidates, awareness_summary = self.profile_market_awareness(markets, candidates)
+        adaptive_candidates, adaptive_summary = self.profile_adaptive_behavior(markets, awareness_candidates)
+        predictive_candidates, predictive_summary = self.profile_predictive_momentum(markets, adaptive_candidates)
+        position_candidates, position_summary = self.profile_position_intelligence(markets, predictive_candidates, open_positions=self._get_open_live_positions())
+        memory_candidates, memory_summary = self.profile_memory_intelligence(markets, position_candidates)
+        multi_agent_candidates, multi_agent_summary = self.profile_multi_agent_network(markets, memory_candidates)
+        ranked = self.rank_final_candidates(multi_agent_candidates)
         print(
             f"[LIVE-SELECT-SUMMARY] entering_strict_validation={len(strict_pool)} "
             f"surviving_strict_validation={len(candidates)} candidates_found={len(ranked)}"
@@ -8278,6 +16084,8 @@ class KalshiSniperBot:
             ranked,
             prefilter_survivor_family_counts,
         )
+        ranked = self._apply_btc15m_contract_rotation(ranked, markets)
+        ranked = self._apply_execution_diversity_bonus(ranked, markets)
         for rank_position, (score, q, spread, family) in enumerate(ranked[:10], start=1):
             market = next((item for item in markets if str(item.get("ticker", "") or "").strip() == q.ticker), None)
             print(
@@ -8476,6 +16284,24 @@ class KalshiSniperBot:
                 "candidates_found": 0,
             }
             print("[LIVE-SELECT] no_valid_candidates_after_filters")
+            print(
+                "[REALM-IX-SUMMARY] profiled_candidates=0 dead_markets=0 thin_markets=0 tradable_markets=0 strong_markets=0 average_awareness_score=0.0 top_awareness_candidate_tickers=[]"
+            )
+            print(
+                "[REALM-X-SUMMARY] total_candidates_profiled=0 avoid_count=0 defensive_count=0 normal_count=0 opportunistic_count=0 aggressive_count=0 average_adaptive_score=0.0 top_adaptive_candidate_tickers=[]"
+            )
+            print(
+                "[REALM-XI-SUMMARY] total_candidates_profiled=0 pre_breakout_count=0 confirmed_breakout_count=0 unknown_count=0 average_predictive_score=0.0 top_predictive_candidate_tickers=[] strongest_confluence_tickers=[]"
+            )
+            print(
+                "[REALM-XIII-SUMMARY] total_memory_records=0 candidates_with_memory=0 candidates_without_memory=0 positive_memory_count=0 negative_memory_count=0 neutral_memory_count=0 weak_patterns_detected=0 strong_patterns_detected=0 average_memory_score=0.5 top_memory_supported_tickers=[] top_memory_penalized_tickers=[]"
+            )
+            print(
+                "[REALM-XII-SUMMARY] total_positions_profiled=0 excellent_count=0 good_count=0 neutral_count=0 weak_count=0 danger_count=0 unknown_count=0 protect_count=0 hold_count=0 press_count=0 reduce_count=0 exit_watch_count=0 partial_profit_recommendations=0 trailing_exit_recommendations=0 scale_in_recommendations=0 scale_out_recommendations=0 cluster_warnings=0 average_position_score=0.0 top_position_tickers=[]"
+            )
+            print(
+                "[REALM-XIV-SUMMARY] total_candidates_profiled=0 avoid_count=0 observe_count=0 eligible_count=0 preferred_count=0 high_conviction_count=0 guardian_blocked_count=0 disagreement_count=0 average_council_score=0.5 top_council_tickers=[] top_blocked_tickers=[]"
+            )
             emit_phase5_observation_logs(0, final_no_candidate_reason)
             emit_full_select_cycle_timing()
             return None, None
@@ -8508,10 +16334,17 @@ class KalshiSniperBot:
             fallback_has_real_liquidity = bool(liquidity_priority.get("has_real_liquidity"))
             fallback_activated = False
             fallback_reason = None
+            fallback_spread_limit = self._get_sports_adaptive_spread_threshold(
+                market,
+                spread=spread,
+                yes_top_size=fallback_yes_top_size,
+                no_top_size=fallback_no_top_size,
+                context="entry_timing_fallback",
+            ).get("adaptive_threshold", MAX_ENTRY_SPREAD) if self._is_sports_market_or_family(family) and family != "KXBTC15M" else MAX_ENTRY_SPREAD
             if (
                 decision == "BUY"
                 and candidate_score >= 85.0
-                and 0.0 <= spread <= MAX_ENTRY_SPREAD
+                and 0.0 <= spread <= fallback_spread_limit
                 and fallback_both_sides_quoted
                 and fallback_yes_top_size > 0.0
                 and fallback_no_top_size > 0.0
@@ -8825,6 +16658,9 @@ class KalshiSniperBot:
                 "candidates_found": 0,
             }
             print("[LIVE-SELECT] no_valid_candidates_after_filters")
+            print(
+                "[REALM-XIV-SUMMARY] total_candidates_profiled=0 avoid_count=0 observe_count=0 eligible_count=0 preferred_count=0 high_conviction_count=0 guardian_blocked_count=0 disagreement_count=0 average_council_score=0.5 top_council_tickers=[] top_blocked_tickers=[]"
+            )
             emit_phase5_observation_logs(0, final_no_candidate_reason)
             emit_full_select_cycle_timing()
             return None, None
@@ -9198,6 +17034,27 @@ class KalshiSniperBot:
             return "sports"
         return "other"
 
+    def _get_active_family_snapshot(self, positions=None):
+        source_positions = self.live_positions if positions is None else positions
+        active_families = []
+        active_count = 0
+        for position in source_positions or []:
+            if not isinstance(position, dict):
+                continue
+            try:
+                count = float(position.get("count") or position.get("size") or 0.0)
+            except Exception:
+                count = 0.0
+            status = str(position.get("status", "open") or "open").strip().lower()
+            if status != "open" and abs(count) <= 0:
+                continue
+            ticker = str(position.get("ticker", "") or "").strip()
+            if not ticker:
+                continue
+            active_count += 1
+            active_families.append(self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")
+        return active_count, sorted(set(active_families))
+
     def get_live_exposure_snapshot(self, candidate_ticker=None, candidate_family=None):
         snapshot = {
             "ok": True,
@@ -9397,8 +17254,13 @@ class KalshiSniperBot:
             "action": DEFAULT_LIVE_ORDER_ACTION,
             "count": count,
             "type": "limit",
-            "is_dry_run": DRY_RUN_LIVE_ORDERS or not (
-                globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
+            "is_dry_run": compute_effective_live_dry_run(),
+            "entry_context": self._build_entry_context(
+                q=q,
+                market={"ticker": ticker},
+                strategy_label="live_order",
+                timing_state=self.phase55_live_execution_gate_by_ticker.get(ticker, {}),
+                source="build_live_order_payload",
             ),
         }
         if intended_side == "yes":
@@ -9415,8 +17277,90 @@ class KalshiSniperBot:
         payload["no_price"] = max(1, min(99, no_price))
         return payload
 
+    def _family_has_positive_recent_pnl(self, family, now_ts=None, lookback_seconds=4 * 3600):
+        family = str(family or "")
+        now_ts = now_ts or time.time()
+        cutoff = float(now_ts) - float(lookback_seconds)
+        events = []
+        total = 0.0
+        for event in list(getattr(self, "live_recent_family_pnl_events", []) or []):
+            try:
+                event_ts = float(event.get("ts"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if event_ts < cutoff:
+                continue
+            events.append(event)
+            if str(event.get("family") or "") == family:
+                try:
+                    total += float(event.get("pnl") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+        self.live_recent_family_pnl_events = events
+        return total > 0.0, round(total, 4)
+
+    def _record_recent_family_pnl_event(self, family, pnl_value, now_ts=None):
+        try:
+            pnl_numeric = float(pnl_value)
+        except (TypeError, ValueError):
+            return
+        now_ts = now_ts or time.time()
+        events = list(getattr(self, "live_recent_family_pnl_events", []) or [])
+        cutoff = float(now_ts) - float(4 * 3600)
+        filtered = []
+        for event in events:
+            try:
+                event_ts = float(event.get("ts"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if event_ts >= cutoff:
+                filtered.append(event)
+        filtered.append({"ts": float(now_ts), "family": str(family or ""), "pnl": pnl_numeric})
+        self.live_recent_family_pnl_events = filtered
+
+    def _btc15m_has_recent_activity(self, now_ts=None, lookback_hours=2):
+        now_struct = time.gmtime(now_ts or time.time())
+        current_hour = int(now_struct.tm_hour)
+        recent_hours = {(current_hour - offset) % 24 for offset in range(max(1, int(lookback_hours)))}
+        hourly_map = getattr(self, "targeted_family_hourly_stats", {}).get("KXBTC15M", {}) if isinstance(getattr(self, "targeted_family_hourly_stats", {}), dict) else {}
+        for hour_utc in recent_hours:
+            stats = hourly_map.get(hour_utc, {}) if isinstance(hourly_map, dict) else {}
+            if (
+                int(stats.get("quote_alive_cycles", 0) or 0) > 0
+                or int(stats.get("in_window_cycles", 0) or 0) > 0
+                or int(stats.get("prefilter_survivor_cycles", 0) or 0) > 0
+            ):
+                return True
+        current_cycle_stats = getattr(self, "targeted_family_activity", {}).get("KXBTC15M", {}) if isinstance(getattr(self, "targeted_family_activity", {}), dict) else {}
+        return bool(
+            int(current_cycle_stats.get("recent_activity_count", 0) or 0) > 0
+            or int(current_cycle_stats.get("both_sides_quoted", 0) or 0) > 0
+            or int(current_cycle_stats.get("non_empty_top_book", 0) or 0) > 0
+        )
+
+    def _is_btc15m_overnight_mode(self, family=None, now_ts=None):
+        family = str(family or "").strip()
+        hour_utc = int(time.gmtime(now_ts or time.time()).tm_hour)
+        return bool(family == "KXBTC15M" and 7 <= hour_utc <= 12)
+
+    def _get_effective_negative_edge_threshold(self, family, now_ts=None):
+        family = str(family or "")
+        hour_utc = int(time.gmtime(now_ts or time.time()).tm_hour)
+        if family == "KXBTC15M":
+            return -0.06
+        return MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS
+
+    def _get_effective_min_hold_seconds(self, family, now_ts=None):
+        family = str(family or "")
+        hour_utc = int(time.gmtime(now_ts or time.time()).tm_hour)
+        if family == "KXBTC15M":
+            return 60
+        return MIN_HOLD_SECONDS
+
     def _evaluate_live_entry_negative_edge_guard(self, q, payload=None):
         ticker = getattr(q, "ticker", "") or ""
+        family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+        now_ts = time.time()
         payload = payload or self.build_live_order_payload(q)
         side = (payload or {}).get("side") if isinstance(payload, dict) else None
         yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.yes_bid")
@@ -9428,13 +17372,15 @@ class KalshiSniperBot:
         decision = "allow"
         reason = "guard_disabled"
         allowed = True
+        adaptive_reduced_size = None
+        max_acceptable_edge_loss = self._get_effective_negative_edge_threshold(family, now_ts=now_ts)
         if not ENABLE_NEGATIVE_EDGE_ENTRY_GUARD:
             print(
                 f"[LIVE-ENTRY-NEGATIVE-EDGE-GUARD] ticker={ticker} side={side} intended_entry_price={intended_entry_price} "
-                f"estimated_immediate_edge={estimated_immediate_edge} max_acceptable_edge_loss={MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS} "
+                f"estimated_immediate_edge={estimated_immediate_edge} max_acceptable_edge_loss={max_acceptable_edge_loss} "
                 f"reason={reason} decision={decision}"
             )
-            return True, reason, {"estimated_immediate_edge": estimated_immediate_edge}
+            return True, reason, {"estimated_immediate_edge": estimated_immediate_edge, "max_acceptable_edge_loss": max_acceptable_edge_loss}
         if side == "yes":
             intended_entry_price = yes_ask
             if intended_entry_price is None or intended_entry_price <= 0 or yes_bid is None or yes_bid <= 0:
@@ -9452,22 +17398,36 @@ class KalshiSniperBot:
         else:
             allowed = False
             reason = "invalid_side"
-        if allowed and estimated_immediate_edge is not None and estimated_immediate_edge < MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS:
-            allowed = False
-            reason = "immediate_negative_edge"
+        if allowed and estimated_immediate_edge is not None and estimated_immediate_edge < max_acceptable_edge_loss:
+            if family == "KXBTC15M" and abs(float(estimated_immediate_edge)) < 0.035 and self._btc15m_has_recent_activity(now_ts=now_ts, lookback_hours=2):
+                adaptive_reduced_size = 1
+                reason = "adaptive_btc_recent_activity"
+                print(f"[LIVE-ENTRY-LOOSEN] ticker={ticker} reason=relaxed_edge")
+                if self._register_entry_attempt_event(ticker, family=family, reason="edge_relaxed"):
+                    print(f"[ENTRY-ATTEMPT] ticker={ticker} reason=edge_relaxed")
+                print(f"[ENTRY-LOOSEN] ticker={ticker} reason=edge passed")
+                print(f"[FIRST-TRADE-ATTEMPT] ticker={ticker} reason=edge_loosened")
+            else:
+                allowed = False
+                reason = "immediate_negative_edge"
         if allowed and reason == "guard_disabled":
             reason = "acceptable_immediate_edge"
+        if allowed and family == "KXBTC15M" and estimated_immediate_edge is not None and estimated_immediate_edge <= 0:
+            print(f"[ENTRY-PASSED] ticker={ticker} reason=relaxed_edge family=KXBTC15M")
         decision = "allow" if allowed else "skip"
         print(
             f"[LIVE-ENTRY-NEGATIVE-EDGE-GUARD] ticker={ticker} side={side} intended_entry_price={intended_entry_price} "
-            f"estimated_immediate_edge={estimated_immediate_edge} max_acceptable_edge_loss={MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS} "
+            f"estimated_immediate_edge={estimated_immediate_edge} max_acceptable_edge_loss={max_acceptable_edge_loss} "
             f"reason={reason} decision={decision}"
         )
         return allowed, reason, {
             "ticker": ticker,
+            "family": family,
             "side": side,
             "intended_entry_price": intended_entry_price,
             "estimated_immediate_edge": estimated_immediate_edge,
+            "max_acceptable_edge_loss": max_acceptable_edge_loss,
+            "adaptive_reduced_size": adaptive_reduced_size,
         }
 
     def _evaluate_live_entry_stale_signal_guard(self, q, payload=None):
@@ -9484,6 +17444,11 @@ class KalshiSniperBot:
         latest_spread = None
         decision = "allow"
         reason = "guard_disabled"
+        original_yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.original_yes_bid")
+        original_yes_ask = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.original_yes_ask_for_spread")
+        original_spread = round(float(original_yes_ask) - float(original_yes_bid), 4) if original_yes_ask and original_yes_bid else None
+        stale_spread_limit = 0.04
+        tight_spread_fallback = bool(original_spread is not None and original_spread <= stale_spread_limit)
         if not ENABLE_STALE_SIGNAL_GUARD:
             print(
                 f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
@@ -9493,12 +17458,26 @@ class KalshiSniperBot:
         try:
             latest_market = self.get_live_market_detail(ticker)
         except Exception as exc:
+            if tight_spread_fallback:
+                print(f"[ENTRY-LOOSEN] ticker={ticker} reason=stale passed")
+                print(
+                    f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                    f"latest_price={latest_price} latest_spread={latest_spread} reason=tight_spread_fetch_fallback decision=allow"
+                )
+                return True, "stale_signal_tight_spread_fallback", {"latest_price": latest_price, "latest_spread": latest_spread}
             print(
                 f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
                 f"latest_price={latest_price} latest_spread={latest_spread} reason=market_detail_fetch_{exc.__class__.__name__} decision=skip"
             )
             return False, f"stale_signal_market_detail_fetch_{exc.__class__.__name__}", {"latest_price": latest_price, "latest_spread": latest_spread}
         if not isinstance(latest_market, dict) or not latest_market:
+            if tight_spread_fallback:
+                print(f"[ENTRY-LOOSEN] ticker={ticker} reason=stale passed")
+                print(
+                    f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                    f"latest_price={latest_price} latest_spread={latest_spread} reason=tight_spread_missing_detail_fallback decision=allow"
+                )
+                return True, "stale_signal_tight_spread_missing_detail_fallback", {"latest_price": latest_price, "latest_spread": latest_spread}
             print(
                 f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
                 f"latest_price={latest_price} latest_spread={latest_spread} reason=missing_latest_market_detail decision=skip"
@@ -9540,6 +17519,13 @@ class KalshiSniperBot:
             original_entry_price = self.normalize_contract_price(getattr(q, "no_ask", 0.0) or 0.0, ticker=ticker, source="stale_signal_guard.original_no_ask")
             latest_entry_price = latest_no_ask
         if latest_spread is None or latest_spread > MAX_ENTRY_SPREAD:
+            if tight_spread_fallback and (latest_spread is None or latest_spread <= stale_spread_limit):
+                print(f"[ENTRY-LOOSEN] ticker={ticker} reason=stale passed")
+                print(
+                    f"[LIVE-ENTRY-STALE-SIGNAL-GUARD] ticker={ticker} family={family} original_score={original_score} "
+                    f"latest_price={latest_price} latest_spread={latest_spread} reason=tight_spread_stale_fallback decision=allow"
+                )
+                return True, "stale_signal_tight_spread_fallback", {"latest_price": latest_price, "latest_spread": latest_spread}
             reason = "latest_spread_deteriorated"
             decision = "skip"
             print(
@@ -10224,6 +18210,10 @@ class KalshiSniperBot:
                     zero_value = numeric_value
             return zero_value
 
+        raw_ticker = first_value("ticker")
+        market_ticker = first_value("market_ticker")
+        outcome_ticker = first_value("outcome_ticker")
+        normalized_ticker = first_value("outcome_ticker", "ticker", "market_ticker")
         count = prioritized_num_value(
             "position",
             "count",
@@ -10253,14 +18243,17 @@ class KalshiSniperBot:
             avg_price = total_traded / abs(count)
         avg_price = self.normalize_contract_price(
             avg_price,
-            ticker=first_value("ticker", "market_ticker"),
+            ticker=normalized_ticker or market_ticker or raw_ticker,
             source="extract_position_summary.avg_price",
         )
         updated_ts = num_value("opened_at_ts", "entry_ts", "created_ts", "last_updated_ts", "updated_ts")
         if updated_ts is not None and updated_ts > 1e12:
             updated_ts = updated_ts / 1000.0
         return {
-            "ticker": first_value("ticker", "market_ticker"),
+            "ticker": normalized_ticker,
+            "raw_ticker": raw_ticker,
+            "market_ticker": market_ticker,
+            "outcome_ticker": outcome_ticker,
             "count": count,
             "side": side,
             "avg_price": avg_price,
@@ -10358,6 +18351,108 @@ class KalshiSniperBot:
         except requests.RequestException as exc:
             return {"ok": False, "reason": exc.__class__.__name__, "positions": []}
 
+    def check_live_duplicate_position_api(self, ticker):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return {"ok": False, "blocked": True, "reason": "missing_ticker", "position_size": None}
+        candidate_family = self.get_market_family({"ticker": ticker})
+        positions_result = self.get_live_position_summaries()
+        if not positions_result.get("ok"):
+            return {
+                "ok": False,
+                "blocked": True,
+                "reason": f"api_error:{positions_result.get('reason')}",
+                "position_size": None,
+            }
+        active_size = 0.0
+        active_summaries = []
+        for summary in positions_result.get("positions") or []:
+            try:
+                count = float(summary.get("count") or 0.0)
+            except Exception:
+                count = 0.0
+            if count is None or abs(count) <= 0:
+                continue
+            active_summaries.append(summary)
+            if str(summary.get("ticker") or "").strip() == ticker:
+                active_size = abs(float(count))
+        active_count, active_families = self._get_active_family_snapshot(active_summaries)
+        max_allowed = MAX_SIMULTANEOUS_LIVE_POSITIONS
+        if active_size > 0:
+            if candidate_family == "KXBTC15M":
+                print(
+                    f"[LIVE-BTC15M-EXECUTION-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                    f"max_allowed={max_allowed} active_families={active_families} reason=already_active_position"
+                )
+                print(
+                    f"[LIVE-BTC15M-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                    f"max_allowed={max_allowed} active_families={active_families} reason=already_active_position"
+                )
+            return {
+                "ok": True,
+                "blocked": True,
+                "reason": "already_active_position",
+                "position_size": active_size,
+                "active_count": active_count,
+                "max_allowed": max_allowed,
+                "active_families": active_families,
+            }
+        same_family_active = bool(candidate_family == "KXBTC15M" and candidate_family in active_families)
+        if same_family_active:
+            print(
+                f"[LIVE-BTC15M-EXECUTION-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                f"max_allowed={max_allowed} active_families={active_families} reason=same_family_active_position"
+            )
+            print(
+                f"[LIVE-BTC15M-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                f"max_allowed={max_allowed} active_families={active_families} reason=same_family_active_position"
+            )
+            return {
+                "ok": True,
+                "blocked": True,
+                "reason": "same_family_active_position",
+                "position_size": 0.0,
+                "active_count": active_count,
+                "max_allowed": max_allowed,
+                "active_families": active_families,
+            }
+        if candidate_family == "KXBTC15M" and active_count > 0:
+            if active_count >= max_allowed:
+                print(
+                    f"[LIVE-BTC15M-EXECUTION-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                    f"max_allowed={max_allowed} active_families={active_families} reason=max_total_live_positions"
+                )
+                print(
+                    f"[LIVE-BTC15M-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                    f"max_allowed={max_allowed} active_families={active_families} reason=max_total_live_positions"
+                )
+                return {
+                    "ok": True,
+                    "blocked": True,
+                    "reason": "max_total_live_positions",
+                    "position_size": 0.0,
+                    "active_count": active_count,
+                    "max_allowed": max_allowed,
+                    "active_families": active_families,
+                }
+            print(
+                f"[LIVE-BTC15M-EXECUTION-MULTIPOSITION-ALLOW] ticker={ticker} active_count={active_count} "
+                f"max_allowed={max_allowed} active_families={active_families} reason=btc15m_allowed_with_non_btc_active_position"
+            )
+            print(
+                f"[LIVE-BTC15M-MULTIPOSITION-ALLOW] ticker={ticker} active_count={active_count} "
+                f"max_allowed={max_allowed} active_families={active_families} reason=btc15m_allowed_with_non_btc_active_position"
+            )
+        return {
+            "ok": True,
+            "blocked": False,
+            "reason": "clear",
+            "position_size": 0.0,
+            "active_count": active_count,
+            "max_allowed": max_allowed,
+            "active_families": active_families,
+        }
+
     def get_live_quote_for_ticker(self, ticker):
         target_ticker = str(ticker or "").strip()
         if not target_ticker:
@@ -10420,10 +18515,10 @@ class KalshiSniperBot:
     def _get_live_exit_max_hold_seconds(self, family):
         family = str(family or "UNKNOWN").strip().upper()
         if family == "KXBTC15M":
-            return min(12 * 60, FAST_TURNOVER_MAX_HOLD_SECONDS)
+            return min(10 * 60, FAST_TURNOVER_MAX_HOLD_SECONDS)
         if self.get_market_discovery_category(family) == "sports":
-            return min(45 * 60, FAST_TURNOVER_MAX_HOLD_SECONDS)
-        return min(MAX_HOLD_SECONDS, FAST_TURNOVER_MAX_HOLD_SECONDS)
+            return min(FAST_MARKET_MAX_HOLD_SECONDS, FAST_TURNOVER_MAX_HOLD_SECONDS)
+        return min(FAST_MARKET_MAX_HOLD_SECONDS, FAST_TURNOVER_MAX_HOLD_SECONDS)
 
     def _mark_tracked_live_position_closed(self, ticker, reason=None):
         ticker = str(ticker or "").strip()
@@ -10441,6 +18536,166 @@ class KalshiSniperBot:
                 position["exit_reason"] = reason
         self.remove_live_entry_metadata(ticker)
 
+    def _compute_mark_to_market_pnl_cents(self, entry_price, exit_price, size, side=None):
+        try:
+            normalized_entry = self.normalize_contract_price(entry_price, source="mark_to_market.entry_price")
+            normalized_exit = self.normalize_contract_price(exit_price, source="mark_to_market.exit_price")
+            normalized_size = abs(float(size))
+            if normalized_entry is None or normalized_exit is None or normalized_size <= 0:
+                return None
+            return round((float(normalized_exit) - float(normalized_entry)) * normalized_size * 100.0, 4)
+        except (TypeError, ValueError):
+            return None
+
+    def get_tracked_entry_price_for_exit(self, ticker):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            print(
+                "[LIVE-EXIT-TRACKED-ENTRY-LOOKUP] ticker= found=no tracked_entry_price=None "
+                "source_store=missing active_position_keys=[] reason=missing_ticker"
+            )
+            return {"tracked_entry_price": None, "source_store": "missing", "found": False, "reason": "missing_ticker", "active_position_keys": []}
+        matching_positions = [
+            position
+            for position in self.live_positions
+            if str(position.get("ticker", "") or "").strip() == ticker
+        ]
+        open_positions = [
+            position
+            for position in matching_positions
+            if str(position.get("status", "open") or "open").strip().lower() == "open"
+        ]
+        candidate_position = open_positions[0] if open_positions else (matching_positions[0] if matching_positions else None)
+        active_position_keys = sorted(list(candidate_position.keys())) if isinstance(candidate_position, dict) else []
+        if isinstance(candidate_position, dict):
+            normalized_entry = self.normalize_contract_price(
+                candidate_position.get("entry"),
+                ticker=ticker,
+                source="tracked_entry_for_exit.live_positions",
+            )
+            if normalized_entry is not None and 0 < normalized_entry <= 1:
+                reason = "open_live_position_entry" if candidate_position in open_positions else "live_position_entry_non_open_fallback"
+                print(
+                    f"[LIVE-EXIT-TRACKED-ENTRY-LOOKUP] ticker={ticker} found=yes tracked_entry_price={normalized_entry} "
+                    f"source_store=live_positions active_position_keys={active_position_keys} reason={reason}"
+                )
+                return {
+                    "tracked_entry_price": normalized_entry,
+                    "source_store": "live_positions",
+                    "found": True,
+                    "reason": reason,
+                    "active_position_keys": active_position_keys,
+                }
+        persisted_entry = self.get_live_entry_metadata(ticker)
+        if isinstance(persisted_entry, dict):
+            normalized_entry = self.normalize_contract_price(
+                persisted_entry.get("entry_price"),
+                ticker=ticker,
+                source="tracked_entry_for_exit.state",
+            )
+            if normalized_entry is not None and 0 < normalized_entry <= 1:
+                print(
+                    f"[LIVE-EXIT-TRACKED-ENTRY-LOOKUP] ticker={ticker} found=yes tracked_entry_price={normalized_entry} "
+                    f"source_store=live_position_state active_position_keys={active_position_keys} reason=persisted_entry_price"
+                )
+                return {
+                    "tracked_entry_price": normalized_entry,
+                    "source_store": "live_position_state",
+                    "found": True,
+                    "reason": "persisted_entry_price",
+                    "active_position_keys": active_position_keys,
+                }
+        tracker_entry = self.live_position_closure_tracker.get(ticker) if isinstance(self.live_position_closure_tracker.get(ticker), dict) else None
+        if isinstance(tracker_entry, dict):
+            normalized_entry = self.normalize_contract_price(
+                tracker_entry.get("entry_price"),
+                ticker=ticker,
+                source="tracked_entry_for_exit.closure_tracker",
+            )
+            if normalized_entry is not None and 0 < normalized_entry <= 1:
+                print(
+                    f"[LIVE-EXIT-TRACKED-ENTRY-LOOKUP] ticker={ticker} found=yes tracked_entry_price={normalized_entry} "
+                    f"source_store=closure_tracker active_position_keys={active_position_keys} reason=tracker_entry_price"
+                )
+                return {
+                    "tracked_entry_price": normalized_entry,
+                    "source_store": "closure_tracker",
+                    "found": True,
+                    "reason": "tracker_entry_price",
+                    "active_position_keys": active_position_keys,
+                }
+        print(
+            f"[LIVE-EXIT-TRACKED-ENTRY-LOOKUP] ticker={ticker} found=no tracked_entry_price=None "
+            f"source_store=missing active_position_keys={active_position_keys} reason=no_tracked_entry_price"
+        )
+        return {
+            "tracked_entry_price": None,
+            "source_store": "missing",
+            "found": False,
+            "reason": "no_tracked_entry_price",
+            "active_position_keys": active_position_keys,
+        }
+
+    def _get_tracked_live_entry_price(self, ticker):
+        details = self.get_tracked_entry_price_for_exit(ticker)
+        return details.get("tracked_entry_price")
+
+    def _resolve_live_exit_entry_price(self, position_summary, ticker=None):
+        ticker = str(ticker or position_summary.get("ticker") or "").strip()
+        tracked_entry_hint = self.normalize_contract_price(
+            (position_summary or {}).get("tracked_entry_price"),
+            ticker=ticker,
+            source="resolve_live_exit_entry_price.tracked_entry_hint",
+        )
+        tracked_lookup = self.get_tracked_entry_price_for_exit(ticker)
+        tracked_entry_price = tracked_lookup.get("tracked_entry_price")
+        if tracked_entry_price is None and tracked_entry_hint is not None:
+            tracked_entry_price = tracked_entry_hint
+            tracked_lookup = dict(tracked_lookup)
+            tracked_lookup["source_store"] = "position_summary_tracked_hint"
+        tracked_source_store = tracked_lookup.get("source_store")
+        api_derived_entry_price = self.normalize_contract_price(
+            (position_summary or {}).get("avg_price"),
+            ticker=ticker,
+            source="resolve_live_exit_entry_price.api_avg_price",
+        )
+        selected_entry_price = None
+        source_used = "missing"
+        reason = "missing_entry_price"
+        tracked_valid = tracked_entry_price is not None and 0 < tracked_entry_price <= 1
+        api_valid = api_derived_entry_price is not None and 0 < api_derived_entry_price <= 1
+        if tracked_valid and api_valid:
+            if abs(float(tracked_entry_price) - float(api_derived_entry_price)) > 0.03:
+                selected_entry_price = tracked_entry_price
+                source_used = "tracked_entry_price"
+                reason = "entry_price_mismatch_gt_0.03_prefer_tracked"
+            else:
+                selected_entry_price = tracked_entry_price
+                source_used = "tracked_entry_price"
+                reason = "tracked_entry_price_preferred"
+        elif tracked_valid:
+            selected_entry_price = tracked_entry_price
+            source_used = "tracked_entry_price"
+            reason = "tracked_entry_price_only"
+        elif api_valid:
+            selected_entry_price = api_derived_entry_price
+            source_used = "api_derived_entry_price"
+            reason = "tracked_entry_price_missing_use_api"
+        print(
+            f"[LIVE-EXIT-ENTRY-PRICE-SOURCE] ticker={ticker} tracked_entry_price={tracked_entry_price} "
+            f"api_derived_entry_price={api_derived_entry_price} selected_entry_price={selected_entry_price} "
+            f"source_used={source_used} tracked_source_store={tracked_source_store} reason={reason}"
+        )
+        return {
+            "tracked_entry_price": tracked_entry_price,
+            "api_derived_entry_price": api_derived_entry_price,
+            "selected_entry_price": selected_entry_price,
+            "source_used": source_used,
+            "reason": reason,
+            "tracked_entry_price_reliable": tracked_valid,
+            "tracked_source_store": tracked_source_store,
+        }
+
     def _update_live_position_closure_tracker(
         self,
         ticker,
@@ -10454,6 +18709,9 @@ class KalshiSniperBot:
         exit_submit_state=None,
         source=None,
         seen_ts=None,
+        resolution_pnl_cents=None,
+        entry_price_source=None,
+        entry_context=None,
     ):
         ticker = str(ticker or "").strip()
         if not ticker:
@@ -10493,9 +18751,24 @@ class KalshiSniperBot:
             normalized_exit = self.normalize_contract_price(exit_price, ticker=ticker, source=f"{source or 'tracker'}.exit_price")
             if normalized_exit is not None and 0 < normalized_exit <= 1:
                 tracker["last_exit_price"] = normalized_exit
+        if resolution_pnl_cents is not None:
+            tracker["resolution_pnl_cents"] = resolution_pnl_cents
+        effective_exit_price = tracker.get("last_exit_price")
+        if effective_exit_price is None:
+            effective_exit_price = tracker.get("last_known_price")
+        tracker["estimated_pnl_cents"] = self._compute_mark_to_market_pnl_cents(
+            tracker.get("entry_price"),
+            effective_exit_price,
+            tracker.get("size"),
+            side=tracker.get("side"),
+        )
         if exit_submit_state:
             tracker["last_exit_submit_state"] = str(exit_submit_state)
             tracker["last_exit_submit_ts"] = now_ts
+        if entry_price_source:
+            tracker["entry_price_source"] = str(entry_price_source)
+        if isinstance(entry_context, dict):
+            tracker["entry_context"] = entry_context
         if source:
             tracker["last_update_source"] = source
         self.live_position_closure_tracker[ticker] = tracker
@@ -10561,7 +18834,8 @@ class KalshiSniperBot:
                 closure_type = "external_or_manual_exit"
                 source = "tracker_no_bot_exit"
         entry_price = tracker.get("entry_price") if isinstance(tracker, dict) else None
-        last_known_price = tracker.get("last_exit_price") if isinstance(tracker, dict) and tracker.get("last_exit_price") is not None else (tracker.get("last_known_price") if isinstance(tracker, dict) else None)
+        exit_price = tracker.get("last_exit_price") if isinstance(tracker, dict) and tracker.get("last_exit_price") is not None else None
+        last_known_price = exit_price if exit_price is not None else (tracker.get("last_known_price") if isinstance(tracker, dict) else None)
         side = tracker.get("side") if isinstance(tracker, dict) else None
         size = tracker.get("size") if isinstance(tracker, dict) else None
         first_seen_ts = tracker.get("first_seen_ts") if isinstance(tracker, dict) else None
@@ -10572,11 +18846,16 @@ class KalshiSniperBot:
             except (TypeError, ValueError):
                 hold_seconds = None
         last_exit_reason = tracker.get("last_exit_decision_reason") if isinstance(tracker, dict) else None
-        estimated_pnl = tracker.get("last_exit_pnl") if isinstance(tracker, dict) else None
+        estimated_pnl_cents = tracker.get("estimated_pnl_cents") if isinstance(tracker, dict) else None
+        resolution_pnl_cents = tracker.get("resolution_pnl_cents") if isinstance(tracker, dict) else None
+        entry_price_source = tracker.get("entry_price_source") if isinstance(tracker, dict) else None
         print(
             f"[LIVE-POSITION-CLOSED] ticker={ticker} closure_type={closure_type} "
-            f"entry_price={entry_price} last_known_price={last_known_price} side={side} size={size} "
-            f"hold_seconds={hold_seconds} last_exit_reason={last_exit_reason} estimated_pnl={estimated_pnl} source={source}"
+            f"entry_price_source={entry_price_source} selected_entry_price={entry_price} exit_price={exit_price} "
+            f"pnl_method=mark_to_market pnl_units=cents pnl_cents={estimated_pnl_cents} "
+            f"last_known_price={last_known_price} side={side} size={size} hold_seconds={hold_seconds} "
+            f"last_exit_reason={last_exit_reason} estimated_pnl_cents={estimated_pnl_cents} "
+            f"resolution_pnl_cents={resolution_pnl_cents} source={source}"
         )
         self.live_position_closure_tracker.pop(ticker, None)
         return {"ticker": ticker, "closure_type": closure_type, "source": source}
@@ -10585,7 +18864,9 @@ class KalshiSniperBot:
         ticker = position_summary.get("ticker")
         family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
         side = (position_summary.get("side") or "").lower()
-        avg_price = self.normalize_contract_price(position_summary.get("avg_price"), ticker=ticker, source="evaluate_exit_decision.entry_price")
+        entry_price_details = self._resolve_live_exit_entry_price(position_summary, ticker=ticker)
+        avg_price = entry_price_details.get("selected_entry_price")
+        entry_price_source = entry_price_details.get("source_used")
         now_ts = now_ts or time.time()
         updated_ts = position_summary.get("updated_ts")
         if updated_ts is None:
@@ -10606,18 +18887,28 @@ class KalshiSniperBot:
                 f"[LIVE-EXIT-TIME] ticker={position_summary.get('ticker')} "
                 f"hold_minutes={hold_minutes} source=state"
             )
+        effective_min_hold_seconds = self._get_effective_min_hold_seconds(family, now_ts=now_ts)
+        if family == "KXBTC15M" and effective_min_hold_seconds < MIN_HOLD_SECONDS:
+            print(f"[LIVE-ENTRY-LOOSEN] ticker={ticker} reason=btc_night_mode")
+            if self._register_entry_attempt_event(ticker, family=family, reason="btc_night_mode"):
+                print(f"[ENTRY-ATTEMPT] ticker={ticker} reason=btc_night_mode")
+            print(f"[ENTRY-LOOSEN] ticker={ticker} reason=hold_time passed")
+            print(f"[FIRST-TRADE-ATTEMPT] ticker={ticker} reason=btc_night_mode")
         result = {
             "should_exit": False,
             "reason": "hold",
             "hold_reason": "awaiting_signal",
             "target_side": side or None,
-            "min_hold_seconds": MIN_HOLD_SECONDS,
+            "min_hold_seconds": effective_min_hold_seconds,
             "loss_exit_confirmation_checks": LOSS_EXIT_CONFIRMATION_CHECKS,
             "expected_exit_price": None,
             "spread": None,
             "hold_minutes": hold_minutes,
             "hold_seconds": hold_seconds,
             "entry_price": avg_price,
+            "entry_price_source": entry_price_source,
+            "tracked_entry_price": entry_price_details.get("tracked_entry_price"),
+            "api_derived_entry_price": entry_price_details.get("api_derived_entry_price"),
             "current_price": None,
             "contract_move": None,
             "unrealized_pnl_cents": None,
@@ -10658,9 +18949,15 @@ class KalshiSniperBot:
             result["reason"] = "invalid_current_price"
             return result
         result["current_price"] = current_price
+        result["exit_price"] = current_price
         try:
             contract_move = round(float(current_price) - float(avg_price), 4)
-            pnl_cents = round(contract_move * 100.0, 4)
+            pnl_cents = self._compute_mark_to_market_pnl_cents(
+                avg_price,
+                current_price,
+                position_summary.get("count", 1),
+                side=side,
+            )
             pnl_percent = round((contract_move / float(avg_price)) * 100.0, 4) if float(avg_price) > 0 else None
         except (TypeError, ValueError, ZeroDivisionError):
             contract_move = None
@@ -10671,7 +18968,35 @@ class KalshiSniperBot:
         result["unrealized_pnl_percent"] = pnl_percent
         family_max_hold_seconds = self._get_live_exit_max_hold_seconds(family)
         result["fast_turnover_max_hold_seconds"] = family_max_hold_seconds
+        family_take_profit_delta = FAST_TURNOVER_TAKE_PROFIT_DELTA
+        family_stop_loss_delta = FAST_TURNOVER_STOP_LOSS_DELTA
+        if family == "KXMLBTOTAL":
+            family_stop_loss_delta = min(FAST_TURNOVER_STOP_LOSS_DELTA, MLB_TOTAL_STOP_LOSS_DELTA)
+            print(
+                f"[LIVE-MLB-STOP-THRESHOLD] ticker={ticker} stop_delta={family_stop_loss_delta} "
+                f"early_adverse_delta={MLB_TOTAL_EARLY_ADVERSE_DELTA} early_hold_seconds={MLB_TOTAL_EARLY_ADVERSE_HOLD_SECONDS}"
+            )
+        correlated_sports_count = self._get_correlated_sports_exposure_count(ticker, family=family)
+        result["correlated_sports_count"] = correlated_sports_count
+        if self.get_market_discovery_category(family) == "sports" and correlated_sports_count > 1:
+            family_take_profit_delta = min(family_take_profit_delta, CORRELATED_SPORTS_TAKE_PROFIT_DELTA)
+            family_stop_loss_delta = min(family_stop_loss_delta, CORRELATED_SPORTS_STOP_LOSS_DELTA)
+            family_max_hold_seconds = min(family_max_hold_seconds, CORRELATED_SPORTS_MAX_HOLD_SECONDS)
+            result["fast_turnover_take_profit_delta"] = family_take_profit_delta
+            result["fast_turnover_max_hold_seconds"] = family_max_hold_seconds
+            print(
+                f"[LIVE-CORRELATION-EXIT-ADJUST] ticker={ticker} family={family} "
+                f"correlated_count={correlated_sports_count} take_profit_delta={family_take_profit_delta} "
+                f"stop_loss_delta={family_stop_loss_delta} max_hold_seconds={family_max_hold_seconds}"
+            )
+        result["fast_turnover_stop_loss_delta"] = family_stop_loss_delta
         if spread is not None and spread > MAX_EXIT_SPREAD:
+            if contract_move is not None and contract_move <= -family_stop_loss_delta:
+                print(
+                    f"[LIVE-EXIT-WIDE-SPREAD-LOSS-WARN] ticker={ticker} family={family} "
+                    f"hold_seconds={hold_seconds} contract_move={contract_move} "
+                    f"stop_threshold={family_stop_loss_delta} spread={spread}"
+                )
             result["reason"] = "spread_too_wide"
             result["hold_reason"] = "spread_too_wide"
             return result
@@ -10686,14 +19011,30 @@ class KalshiSniperBot:
             current_price <= avg_price - STOP_LOSS_DELTA
             or (pnl_percent is not None and pnl_percent <= -15.0)
         )
-        normal_loss_trigger = bool(contract_move is not None and contract_move <= -FAST_TURNOVER_STOP_LOSS_DELTA)
+        if (
+            family == "KXMLBTOTAL"
+            and hold_seconds is not None
+            and hold_seconds < MLB_TOTAL_EARLY_ADVERSE_HOLD_SECONDS
+            and contract_move is not None
+            and contract_move <= -MLB_TOTAL_EARLY_ADVERSE_DELTA
+        ):
+            result["should_exit"] = True
+            result["reason"] = "mlb_early_adverse_exit"
+            print(
+                f"[LIVE-MLB-EARLY-ADVERSE-EXIT] ticker={ticker} hold_seconds={hold_seconds} "
+                f"contract_move={contract_move} threshold={MLB_TOTAL_EARLY_ADVERSE_DELTA}"
+            )
+            print(f"[EXIT-TRIGGER] ticker={ticker} reason=stop_loss pnl={pnl_cents}")
+            print(f"[EXIT] ticker={ticker} reason=stop_loss pnl={pnl_cents}")
+            return result
+        normal_loss_trigger = bool(contract_move is not None and contract_move <= -family_stop_loss_delta)
         if normal_loss_trigger or severe_loss_trigger:
             is_emergency_loss_exit = bool(severe_loss_trigger)
-            if not is_emergency_loss_exit and hold_seconds is not None and hold_seconds < MIN_HOLD_SECONDS:
+            if not is_emergency_loss_exit and hold_seconds is not None and hold_seconds < effective_min_hold_seconds:
                 result["hold_reason"] = "min_hold_guard"
                 result["reason"] = "fast_stop_loss"
                 print(
-                    f"[LIVE-EXIT-MIN-HOLD-GUARD] ticker={ticker} hold_seconds={hold_seconds} min_hold_seconds={MIN_HOLD_SECONDS} "
+                    f"[LIVE-EXIT-MIN-HOLD-GUARD] ticker={ticker} hold_seconds={hold_seconds} min_hold_seconds={effective_min_hold_seconds} "
                     f"unrealized_pnl={pnl_cents} exit_reason=fast_stop_loss decision=hold"
                 )
                 self.live_loss_exit_confirmation_counts[ticker] = 0
@@ -10711,21 +19052,47 @@ class KalshiSniperBot:
                     result["reason"] = "fast_stop_loss"
                     return result
             print(
-                f"[LIVE-EXIT-MIN-HOLD-GUARD] ticker={ticker} hold_seconds={hold_seconds} min_hold_seconds={MIN_HOLD_SECONDS} "
+                f"[LIVE-EXIT-MIN-HOLD-GUARD] ticker={ticker} hold_seconds={hold_seconds} min_hold_seconds={effective_min_hold_seconds} "
                 f"unrealized_pnl={pnl_cents} exit_reason={'stop_loss' if is_emergency_loss_exit else 'fast_stop_loss'} decision=exit"
             )
             self.live_loss_exit_confirmation_counts[ticker] = 0
             result["should_exit"] = True
             result["reason"] = "stop_loss" if is_emergency_loss_exit else "fast_stop_loss"
+            print(f"[EXIT-TRIGGER] ticker={ticker} reason=stop_loss pnl={pnl_cents}")
+            print(f"[EXIT] ticker={ticker} reason=stop_loss pnl={pnl_cents}")
             return result
         self.live_loss_exit_confirmation_counts[ticker] = 0
-        if contract_move is not None and contract_move >= FAST_TURNOVER_TAKE_PROFIT_DELTA:
+        if contract_move is not None and contract_move >= family_take_profit_delta and pnl_cents is not None and pnl_cents > 0:
+            if not entry_price_details.get("tracked_entry_price_reliable"):
+                guard_reason = "missing_tracked_entry_price" if entry_price_details.get("tracked_entry_price") is None else "unreliable_entry_price_for_profit_exit"
+                print(
+                    f"[LIVE-EXIT-PNL-SOURCE-GUARD] ticker={ticker} decision=hold reason={guard_reason}"
+                )
+                result["hold_reason"] = "unreliable_entry_price_for_profit_exit"
+                result["reason"] = "hold"
+                return result
             result["should_exit"] = True
             result["reason"] = "quick_profit"
+            print(f"[EXIT-TRIGGER] ticker={ticker} reason=take_profit pnl={pnl_cents}")
+            print(f"[EXIT] ticker={ticker} reason=take_profit pnl={pnl_cents}")
             return result
-        if current_price >= avg_price + TAKE_PROFIT_DELTA or (pnl_percent is not None and pnl_percent >= 15.0):
+        if current_price >= avg_price + min(TAKE_PROFIT_DELTA, family_take_profit_delta) or (pnl_percent is not None and pnl_percent >= 15.0):
+            if pnl_cents is None or pnl_cents <= 0:
+                result["hold_reason"] = "non_positive_pnl_for_take_profit"
+                result["reason"] = "hold"
+                return result
+            if not entry_price_details.get("tracked_entry_price_reliable"):
+                guard_reason = "missing_tracked_entry_price" if entry_price_details.get("tracked_entry_price") is None else "unreliable_entry_price_for_profit_exit"
+                print(
+                    f"[LIVE-EXIT-PNL-SOURCE-GUARD] ticker={ticker} decision=hold reason={guard_reason}"
+                )
+                result["hold_reason"] = "unreliable_entry_price_for_profit_exit"
+                result["reason"] = "hold"
+                return result
             result["should_exit"] = True
             result["reason"] = "take_profit"
+            print(f"[EXIT-TRIGGER] ticker={ticker} reason=take_profit pnl={pnl_cents}")
+            print(f"[EXIT] ticker={ticker} reason=take_profit pnl={pnl_cents}")
             return result
         if hold_seconds is not None and hold_seconds >= family_max_hold_seconds:
             if strongly_improving:
@@ -10733,6 +19100,8 @@ class KalshiSniperBot:
                 return result
             result["should_exit"] = True
             result["reason"] = "fast_max_hold"
+            print(f"[EXIT-TRIGGER] ticker={ticker} reason=time pnl={pnl_cents}")
+            print(f"[EXIT] ticker={ticker} reason=time pnl={pnl_cents}")
             return result
         result["hold_reason"] = "fast_turnover_hold"
         return result
@@ -11171,7 +19540,7 @@ class KalshiSniperBot:
             return {"ok": False, "reason": "no_live_ticker_found", "ticker": None}
         return {"ok": True, "reason": reason, "ticker": ticker}
 
-    def _check_phase55_live_execution_gate(self, ticker, family=None, decision=None):
+    def _check_phase55_live_execution_gate(self, ticker, family=None, decision=None, override_block_reason=None):
         gate_record = dict(self.phase55_live_execution_gate_by_ticker.get(ticker, {}) or {})
         phase55_status = gate_record.get("phase55_status")
         entry_timing_pass = gate_record.get("entry_timing_pass")
@@ -11180,7 +19549,10 @@ class KalshiSniperBot:
         effective_decision = decision or recorded_decision or "unknown"
         blocked = False
         reason = "approved"
-        if phase55_status is None or not isinstance(phase55_status, str) or not phase55_status.strip():
+        if override_block_reason:
+            blocked = True
+            reason = str(override_block_reason)
+        elif phase55_status is None or not isinstance(phase55_status, str) or not phase55_status.strip():
             blocked = True
             reason = "missing_phase55_status"
         else:
@@ -11191,11 +19563,16 @@ class KalshiSniperBot:
         if not blocked and entry_timing_pass is not True:
             blocked = True
             reason = "entry_timing_pass_not_explicit"
-        print(
-            f"[LIVE-EXECUTION-PHASE55-GATE] ticker={ticker} family={effective_family} "
-            f"phase55_status={phase55_status} entry_timing_pass={entry_timing_pass} "
-            f"decision={effective_decision} blocked={'yes' if blocked else 'no'} reason={reason}"
-        )
+        cycle_marker = int(self.cycle_count or 0)
+        log_marker = (cycle_marker, effective_family, effective_decision, bool(blocked), str(reason))
+        previous_marker = self.phase55_gate_log_markers.get(ticker)
+        if previous_marker != log_marker:
+            print(
+                f"[LIVE-EXECUTION-PHASE55-GATE] ticker={ticker} family={effective_family} "
+                f"phase55_status={phase55_status} entry_timing_pass={entry_timing_pass} "
+                f"decision={effective_decision} blocked={'yes' if blocked else 'no'} reason={reason}"
+            )
+            self.phase55_gate_log_markers[ticker] = log_marker
         return (not blocked), reason, {
             "ticker": ticker,
             "family": effective_family,
@@ -11208,8 +19585,11 @@ class KalshiSniperBot:
     def place_live_order(self, payload):
         ticker = payload.get("ticker", "")
         if (
-            not payload.get("ticker")
+            not isinstance(payload, dict)
+            or not payload.get("ticker")
             or not payload.get("count")
+            or payload.get("action") not in {"buy", "sell"}
+            or payload.get("side") not in {"yes", "no"}
             or (payload.get("yes_price") is None and payload.get("no_price") is None)
         ):
             print(f"[LIVE-ERROR] {ticker} error=invalid_payload")
@@ -11218,6 +19598,28 @@ class KalshiSniperBot:
                 "status_code": None,
                 "response": None,
                 "reason": "invalid_payload",
+            }
+        authz = self.get_live_submit_authorization(payload)
+        if not authz.get("ok"):
+            print(
+                f"[LIVE-EXECUTION-SAFETY] ticker={ticker} blocked=yes reason={authz.get('reason')} "
+                f"live_mode={'yes' if authz.get('flags', {}).get('live_mode') else 'no'} "
+                f"live_armed={'yes' if authz.get('flags', {}).get('live_armed') else 'no'} "
+                f"live_env_confirmed={'yes' if authz.get('flags', {}).get('live_env_confirmed') else 'no'}"
+            )
+            return {
+                "ok": False,
+                "status_code": None,
+                "response": None,
+                "reason": authz.get("reason"),
+            }
+        if payload.get("is_dry_run"):
+            print(f"[LIVE-EXECUTION-SAFETY] ticker={ticker} blocked=yes reason=payload_marked_dry_run")
+            return {
+                "ok": False,
+                "status_code": None,
+                "response": None,
+                "reason": "payload_marked_dry_run",
             }
         path = "/trade-api/v2/portfolio/orders"
         auth_result = self.build_live_auth_headers("POST", path)
@@ -11309,92 +19711,139 @@ class KalshiSniperBot:
                 f"[LIVE-ENTRY-BLOCK-COOLDOWN] ticker={ticker} reason=immediate_negative_edge "
                 f"seconds_remaining={seconds_remaining} decision=skip"
             )
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=negative_edge")
+            self._log_live_execution_final_blocked(ticker, "immediate_negative_edge_block_cooldown")
             return {"ok": False, "reason": "immediate_negative_edge_block_cooldown", "submitted": False}
+
+        payload = self.build_live_order_payload(q, size=size)
+        if payload is None:
+            print(f"[LIVE-SKIP] {ticker} reason=invalid_payload")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason('invalid_payload')}")
+            self._log_live_execution_final_blocked(ticker, "invalid_payload")
+            return {"ok": False, "reason": "invalid_payload", "submitted": False}
+        smart_allowed, smart_reason, _smart_details = self._evaluate_smart_entry_gate({"ticker": ticker}, q, payload=payload)
+        if not smart_allowed:
+            self._check_phase55_live_execution_gate(
+                ticker,
+                family=self.get_market_family({"ticker": ticker}) if ticker else None,
+                override_block_reason=smart_reason,
+            )
+            print(f"[LIVE-SKIP] {ticker} reason={smart_reason}")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(smart_reason)}")
+            self._log_live_execution_final_blocked(ticker, smart_reason)
+            return {"ok": False, "reason": smart_reason, "submitted": False}
         phase55_allowed, phase55_reason, _phase55_details = self._check_phase55_live_execution_gate(
             ticker,
             family=self.get_market_family({"ticker": ticker}) if ticker else None,
         )
         if not phase55_allowed:
             print(f"[LIVE-SKIP] {ticker} reason={phase55_reason}")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(phase55_reason)}")
+            self._log_live_execution_final_blocked(ticker, phase55_reason)
             return {"ok": False, "reason": phase55_reason, "submitted": False}
+        sports_context_allowed, sports_context_reason, _sports_context_details = self.sports_context_check({
+            "ticker": ticker,
+            "family": self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN",
+            "quote": q,
+            "market": {"ticker": ticker},
+            "payload": payload,
+        })
+        if not sports_context_allowed:
+            print(f"[LIVE-SKIP] {ticker} reason={sports_context_reason}")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            self._log_live_execution_final_blocked(ticker, sports_context_reason)
+            return {"ok": False, "reason": sports_context_reason, "submitted": False}
         live_check = getattr(self, "can_place_live_order", None)
         if callable(live_check):
             allowed, reason = live_check(q)
             if not allowed:
                 print(f"[LIVE-SKIP] {ticker} reason={reason}")
+                print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(reason)}")
+                self._log_live_execution_final_blocked(ticker, reason)
                 return {"ok": False, "reason": reason, "submitted": False}
-
-        payload = self.build_live_order_payload(q, size=size)
-        if payload is None:
-            print(f"[LIVE-SKIP] {ticker} reason=invalid_payload")
-            return {"ok": False, "reason": "invalid_payload", "submitted": False}
         edge_allowed, edge_reason, _edge_details = self._evaluate_live_entry_negative_edge_guard(q, payload=payload)
+        adaptive_reduced_size = (_edge_details or {}).get("adaptive_reduced_size")
+        if edge_allowed and adaptive_reduced_size is not None:
+            payload["count"] = min(adaptive_reduced_size, MAX_LIVE_ORDER_SIZE)
         if not edge_allowed:
-            if edge_reason == "immediate_negative_edge":
-                self.live_entry_block_cooldowns[ticker] = time.time() + IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS
-                print(
-                    f"[LIVE-ENTRY-BLOCK-COOLDOWN] ticker={ticker} reason={edge_reason} "
-                    f"seconds_remaining={IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS} decision=skip"
-                )
-            print(f"[LIVE-SKIP] {ticker} reason={edge_reason}")
-            return {"ok": False, "reason": edge_reason, "submitted": False}
+            candidate_ok, candidate_details = self._is_high_prob_submission_candidate(q, market={"ticker": ticker})
+            estimated_immediate_edge = (_edge_details or {}).get("estimated_immediate_edge")
+            max_edge_loss = (_edge_details or {}).get("max_acceptable_edge_loss")
+            if (
+                edge_reason == "immediate_negative_edge"
+                and candidate_ok
+                and estimated_immediate_edge is not None
+                and max_edge_loss is not None
+                and float(estimated_immediate_edge) >= float(max_edge_loss) - 0.01
+            ):
+                edge_allowed = True
+                print(f"[ENTRY-LOOSEN] ticker={ticker} reason=edge_relaxed")
+            else:
+                if edge_reason == "immediate_negative_edge":
+                    self.live_entry_block_cooldowns[ticker] = time.time() + IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS
+                    print(
+                        f"[LIVE-ENTRY-BLOCK-COOLDOWN] ticker={ticker} reason={edge_reason} "
+                        f"seconds_remaining={IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS} decision=skip"
+                    )
+                print(f"[LIVE-SKIP] {ticker} reason={edge_reason}")
+                print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(edge_reason)}")
+                self._log_live_execution_final_blocked(ticker, edge_reason)
+                return {"ok": False, "reason": edge_reason, "submitted": False}
         stale_allowed, stale_reason, _stale_details = self._evaluate_live_entry_stale_signal_guard(q, payload=payload)
         if not stale_allowed:
-            print(f"[LIVE-SKIP] {ticker} reason={stale_reason}")
-            return {"ok": False, "reason": stale_reason, "submitted": False}
+            candidate_ok, candidate_details = self._is_high_prob_submission_candidate(q, market={"ticker": ticker})
+            candidate_spread = candidate_details.get("spread") if isinstance(candidate_details, dict) else None
+            candidate_yes_ask = candidate_details.get("yes_ask") if isinstance(candidate_details, dict) else None
+            if candidate_spread is not None and candidate_spread <= 0.04 and candidate_yes_ask is not None and 0.68 <= float(candidate_yes_ask) <= 0.93:
+                stale_allowed = True
+                print(f"[ENTRY-LOOSEN] ticker={ticker} reason=stale passed")
+            else:
+                print(f"[LIVE-SKIP] {ticker} reason={stale_reason}")
+                print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(stale_reason)}")
+                self._log_live_execution_final_blocked(ticker, stale_reason)
+                return {"ok": False, "reason": stale_reason, "submitted": False}
 
-        live_mode = bool(globals().get("LIVE_MODE", False))
-        live_armed = bool(globals().get("LIVE_ARMED", False))
-        live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
-        internal_execution_enabled = bool(live_mode and live_armed and live_env_confirmed)
-        effective_live_dry_run = not internal_execution_enabled
-        payload["is_dry_run"] = effective_live_dry_run
+        authz = self.get_live_submit_authorization(payload)
+        flags = authz.get("flags") or {}
+        payload["is_dry_run"] = bool(flags.get("effective_live_dry_run"))
         print(
             f"[LIVE-EXECUTION-DRYRUN-CHECK] ticker={ticker} "
-            f"live_mode={'yes' if live_mode else 'no'} "
-            f"live_armed={'yes' if live_armed else 'no'} "
-            f"live_env_confirmed={'yes' if live_env_confirmed else 'no'} "
+            f"live_mode={'yes' if flags.get('live_mode') else 'no'} "
+            f"live_armed={'yes' if flags.get('live_armed') else 'no'} "
+            f"live_env_confirmed={'yes' if flags.get('live_env_confirmed') else 'no'} "
             f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} "
-            f"internal_execution_flag={'enabled' if internal_execution_enabled else 'disabled'} "
-            f"effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
+            f"internal_execution_flag={'enabled' if flags.get('all_live_switches_on') else 'disabled'} "
+            f"effective_dry_run={'yes' if flags.get('effective_live_dry_run') else 'no'}"
         )
 
-        if effective_live_dry_run:
+        if flags.get("effective_live_dry_run"):
             self.print_live_order_preview(q, size=size)
             print(
                 f"[LIVE-EXECUTION-RESPONSE] ticker={ticker} ok=yes submitted=no "
                 f"reason=dry_run_only status_code=None"
             )
+            self._log_live_execution_final_blocked(ticker, "dry_run_only")
             return {"ok": True, "reason": "dry_run_only", "submitted": False, "payload": payload}
 
-        supplied_ticker = globals().get("LIVE_TEST_TICKER")
-        authorized_canary_ticker = getattr(self, "live_canary_authorized_ticker", None)
-        allowed_ticker = authorized_canary_ticker or supplied_ticker
-        normal_live_service_mode = bool(live_mode and live_armed and live_env_confirmed and not supplied_ticker)
         print(
             f"[LIVE-CANARY-STATUS] ticker={ticker} live_canary_submitted={'yes' if self.live_canary_submitted else 'no'} "
-            f"authorized_ticker={authorized_canary_ticker or 'none'} supplied_ticker={supplied_ticker or 'none'} "
-            f"normal_live_service_mode={'yes' if normal_live_service_mode else 'no'} persisted_state=no"
+            f"authorized_ticker={authz.get('authorized_canary_ticker') or 'none'} supplied_ticker={authz.get('supplied_ticker') or 'none'} "
+            f"normal_live_service_mode={'yes' if authz.get('normal_live_service_mode') else 'no'} persisted_state=no"
         )
-        print(
-            f"[LIVE-CANARY-CHECK] ticker={ticker} payload_ticker={payload.get('ticker')} "
-            f"allowed_ticker={allowed_ticker or 'none'} live_canary_submitted={'yes' if self.live_canary_submitted else 'no'}"
-        )
-        if not allowed_ticker and not normal_live_service_mode:
-            print("[SAFEGUARD] no live test ticker provided")
-            print(f"[LIVE-CANARY-BLOCK] ticker={ticker} reason=no_live_test_ticker")
-            self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="no_live_test_ticker")
-            return {"ok": False, "reason": "no_live_test_ticker", "submitted": False}
-        if allowed_ticker and payload.get("ticker") != allowed_ticker:
-            print("[SAFEGUARD] ticker not allowed for canary live submit")
-            print(f"[LIVE-CANARY-BLOCK] ticker={ticker} reason=ticker_not_allowed allowed_ticker={allowed_ticker}")
-            self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="ticker_not_allowed")
-            return {"ok": False, "reason": "ticker_not_allowed", "submitted": False}
-        if self.live_canary_submitted and not normal_live_service_mode:
-            print("[SAFEGUARD] canary live order already used")
-            print(f"[LIVE-CANARY-BLOCK] ticker={ticker} reason=canary_already_used mode=manual_or_canary_only")
-            self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="canary_already_used")
-            return {"ok": False, "reason": "canary_already_used", "submitted": False}
+        if not authz.get("ok"):
+            print(f"[LIVE-CANARY-BLOCK] ticker={ticker} reason={authz.get('reason')}")
+            self.append_live_audit_log(
+                "live_safeguard_block",
+                ticker=payload.get("ticker"),
+                side=payload.get("side"),
+                action=payload.get("action"),
+                count=payload.get("count"),
+                price=payload.get("price"),
+                reason=authz.get("reason"),
+            )
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(authz.get('reason'))}")
+            self._log_live_execution_final_blocked(ticker, authz.get("reason"))
+            return {"ok": False, "reason": authz.get("reason"), "submitted": False}
         candidate_family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
         exposure_allowed, exposure_reason, _exposure_snapshot = self.check_live_exposure_limits(
             ticker,
@@ -11405,7 +19854,22 @@ class KalshiSniperBot:
                 f"[LIVE-GUARD] blocked new entry reason={exposure_reason} "
                 f"ticker={ticker} family={candidate_family}"
             )
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(exposure_reason)}")
+            self._log_live_execution_final_blocked(ticker, exposure_reason)
             return {"ok": False, "reason": exposure_reason, "submitted": False}
+        correlation_allowed, correlation_reason, _correlation_snapshot = self._check_sports_correlated_entry_guard(
+            ticker,
+            side=payload.get("side"),
+            family=candidate_family,
+        )
+        if not correlation_allowed:
+            print(
+                f"[LIVE-GUARD] blocked new entry reason={correlation_reason} "
+                f"ticker={ticker} family={candidate_family}"
+            )
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(correlation_reason)}")
+            self._log_live_execution_final_blocked(ticker, correlation_reason)
+            return {"ok": False, "reason": correlation_reason, "submitted": False}
 
         now = time.time()
         self._live_order_timestamps = [
@@ -11421,6 +19885,8 @@ class KalshiSniperBot:
         if len(self._live_order_timestamps) >= LIVE_ORDER_RATE_LIMIT:
             print("[LIVE-BLOCK] rate limit exceeded")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="rate_limited")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            self._log_live_execution_final_blocked(ticker, "rate_limited")
             return {"ok": False, "reason": "rate_limited", "submitted": False}
 
         today = time.strftime("%Y-%m-%d")
@@ -11437,17 +19903,38 @@ class KalshiSniperBot:
                 f"count_today={self.live_trade_count_today} cap={MAX_LIVE_TRADES_PER_DAY}"
             )
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="daily_trade_cap")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            self._log_live_execution_final_blocked(ticker, "daily_trade_cap")
             return {"ok": False, "reason": "daily_trade_cap", "submitted": False}
 
         if not self.has_live_order_api_path():
             print(f"[LIVE-SKIP] {ticker} reason=no_order_api_path")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="no_order_api_path")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            self._log_live_execution_final_blocked(ticker, "no_order_api_path")
             return {"ok": False, "reason": "no_order_api_path", "submitted": False}
 
         auth_smoke_result = self.run_live_auth_get_smoke_test()
         if not auth_smoke_result.get("ok"):
             print("[LIVE-BLOCK] AUTH_SMOKE_REQUIRED failed; aborting live submit")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            self._log_live_execution_final_blocked(ticker, "auth_smoke_required_failed")
             return {"ok": False, "reason": "auth_smoke_required_failed", "submitted": False}
+        post_loss_allowed, post_loss_reason = self._check_post_loss_reentry_block(ticker, family=candidate_family)
+        if not post_loss_allowed:
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            self._log_live_execution_final_blocked(ticker, post_loss_reason)
+            return {"ok": False, "reason": post_loss_reason, "submitted": False}
+        api_duplicate_check = self.check_live_duplicate_position_api(ticker)
+        if api_duplicate_check.get("blocked"):
+            print(
+                f"[LIVE-EXECUTION-DUPLICATE-API-BLOCK] ticker={ticker} "
+                f"position_size={api_duplicate_check.get('position_size')} "
+                f"reason={api_duplicate_check.get('reason')}"
+            )
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=duplicate")
+            self._log_live_execution_final_blocked(ticker, api_duplicate_check.get("reason"))
+            return {"ok": False, "reason": api_duplicate_check.get("reason"), "submitted": False}
 
         print(
             f"[LIVE-EXECUTION-ATTEMPT] ticker={ticker} side={payload.get('side')} action={payload.get('action')} "
@@ -11463,13 +19950,34 @@ class KalshiSniperBot:
         if not self.confirm_live_order_submit(payload):
             print("[SAFEGUARD] live submit aborted by user")
             self.append_live_audit_log("live_user_aborted", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="user_aborted")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            self._log_live_execution_final_blocked(ticker, "user_aborted")
             return {"ok": False, "reason": "user_aborted", "submitted": False}
         self.append_live_audit_log("live_submit_attempt", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"))
+        self._log_live_execution_final_approved(ticker, reason="all_gates_passed")
+        submit_log_price = payload.get("yes_price")
+        if submit_log_price is None:
+            submit_log_price = payload.get("no_price")
+        print(
+            f"[LIVE-EXECUTION-ORDER-SUBMITTING] ticker={ticker} side={payload.get('side')} "
+            f"price={submit_log_price} "
+            f"size={payload.get('count')}"
+        )
         print(
             f"[LIVE-EXECUTION-SUBMIT] ticker={ticker} path=/trade-api/v2/portfolio/orders "
             f"side={payload.get('side')} action={payload.get('action')} count={payload.get('count')} "
             f"yes_price={payload.get('yes_price')} dry_run={'yes' if payload.get('is_dry_run') else 'no'}"
         )
+        submit_price = payload.get("yes_price")
+        if submit_price is None:
+            submit_price = payload.get("no_price")
+        if submit_price is not None:
+            try:
+                submit_price = float(submit_price) / 100.0
+            except (TypeError, ValueError):
+                pass
+        print(f"[REAL-SUBMIT-ATTEMPT] ticker={ticker} price={submit_price}")
+        print(f"[REAL-SUBMIT] ticker={ticker} price={submit_price} side={payload.get('side')} count={payload.get('count')}")
         self.live_pending_entry_ticker = ticker
         try:
             result = self.place_live_order(payload)
@@ -11501,6 +20009,15 @@ class KalshiSniperBot:
                     order_id=order_id,
                 )
             self.live_canary_submitted = True
+            submitted_status = (
+                (verified_order.get("status") if isinstance(verified_order, dict) else None)
+                or (response_data.get("status") if isinstance(response_data, dict) else None)
+                or "submitted"
+            )
+            print(
+                f"[LIVE-EXECUTION-ORDER-SUBMITTED] ticker={ticker} "
+                f"order_id={order_id or 'none'} status={submitted_status}"
+            )
             print(
                 f"[LIVE-CANARY-STATUS] ticker={ticker} live_canary_submitted=yes "
                 f"status_transition=canary_completed order_id={order_id or 'none'}"
@@ -11544,6 +20061,7 @@ class KalshiSniperBot:
         if result.get("reason") == "no_order_api_path":
             print(f"[LIVE-SKIP] {ticker} reason=no_order_api_path")
             self.append_live_audit_log("live_submit_failure", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="no_order_api_path")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
             return {"ok": False, "reason": "no_order_api_path", "submitted": False}
         self.append_live_audit_log(
             "live_submit_failure",
@@ -11569,35 +20087,69 @@ class KalshiSniperBot:
 
     def _get_live_duplicate_guard_detail(self, ticker):
         ticker = str(ticker or "").strip()
+        candidate_family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
         simulated_duplicate = any(p["ticker"] == ticker for p in self.positions)
-        open_live_matches = [
+        open_live_positions = [
             pos for pos in self.live_positions
+            if str(pos.get("status", "open") or "open").strip().lower() == "open"
+        ]
+        active_count, active_families = self._get_active_family_snapshot(open_live_positions)
+        max_allowed = MAX_SIMULTANEOUS_LIVE_POSITIONS
+        open_live_matches = [
+            pos for pos in open_live_positions
             if str(pos.get("ticker", "") or "").strip() == ticker
-            and str(pos.get("status", "open") or "open").strip().lower() == "open"
+        ]
+        same_family_matches = [
+            pos for pos in open_live_positions
+            if str(pos.get("ticker", "") or "").strip() != ticker
+            and self.get_market_family({"ticker": str(pos.get("ticker", "") or "").strip()}) == candidate_family
         ]
         closed_live_matches = [
             pos for pos in self.live_positions
             if str(pos.get("ticker", "") or "").strip() == ticker
             and str(pos.get("status", "open") or "open").strip().lower() != "open"
         ]
-        blocked = bool(simulated_duplicate or open_live_matches)
+        blocked = bool(simulated_duplicate or open_live_matches or (candidate_family == "KXBTC15M" and same_family_matches))
         if simulated_duplicate:
             reason = "sim_position_open"
         elif open_live_matches:
             reason = "live_position_open_same_ticker"
+        elif candidate_family == "KXBTC15M" and same_family_matches:
+            reason = "live_position_open_same_family"
         elif closed_live_matches:
             reason = "previous_live_position_closed"
         else:
             reason = "no_duplicate_open_position"
+        if candidate_family == "KXBTC15M" and open_live_positions:
+            if blocked:
+                print(
+                    f"[LIVE-BTC15M-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                    f"max_allowed={max_allowed} active_families={active_families} reason={reason}"
+                )
+            elif active_count >= max_allowed:
+                blocked = True
+                reason = "max_total_live_positions"
+                print(
+                    f"[LIVE-BTC15M-MULTIPOSITION-BLOCKED] ticker={ticker} active_count={active_count} "
+                    f"max_allowed={max_allowed} active_families={active_families} reason={reason}"
+                )
+            elif "KXBTC15M" not in active_families:
+                reason = "btc15m_allowed_with_non_btc_active_position"
+                print(
+                    f"[LIVE-BTC15M-MULTIPOSITION-ALLOW] ticker={ticker} active_count={active_count} "
+                    f"max_allowed={max_allowed} active_families={active_families} reason={reason}"
+                )
         return {
             "blocked": blocked,
             "reason": reason,
             "open_live_matches": len(open_live_matches),
+            "same_family_matches": len(same_family_matches),
             "closed_live_matches": len(closed_live_matches),
             "simulated_duplicate": simulated_duplicate,
         }
 
     def enter_sim_trade(self, q: Quote):
+        entry_context = self._build_entry_context(q=q, market={"ticker": q.ticker}, strategy_label="sim_entry", timing_state={"phase55_status": "sim_entry"}, source="enter_sim_trade")
         position = {
             "ticker": q.ticker,
             "side": "YES",
@@ -11605,18 +20157,20 @@ class KalshiSniperBot:
             "qty": 1,
             "size": SIM_POSITION_SIZE,
             "opened_at": time.time(),
+            "entry_context": entry_context,
         }
         self.positions.append(position)
         print(f"[SIM ENTRY] {q.ticker} YES @ {q.yes_bid:.4f}")
 
-    def record_live_position(self, q, size=None, entry_price=None):
+    def record_live_position(self, q, size=None, entry_price=None, side=None):
         """
         Record a successfully submitted live position in self.live_positions.
         This is bookkeeping only.
         """
         ticker = getattr(q, "ticker", "") or ""
         family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
-        side = "YES"
+        normalized_side = self._normalize_live_side(side) or "yes"
+        side = normalized_side.upper()
         count = size if size is not None else globals().get("MAX_LIVE_ORDER_SIZE", 1)
         raw_price = entry_price
         if raw_price is None:
@@ -11624,6 +20178,13 @@ class KalshiSniperBot:
         price = self.normalize_contract_price(raw_price, ticker=ticker, source="record_live_position.entry_price")
         if not ticker or price is None or price <= 0 or price > 1:
             return None
+        entry_context = self._build_entry_context(
+            q=q,
+            market={"ticker": ticker},
+            strategy_label="live_entry",
+            timing_state=self.phase55_live_execution_gate_by_ticker.get(ticker, {}),
+            source="record_live_position",
+        )
         position = {
             "ticker": ticker,
             "side": side,
@@ -11632,6 +20193,7 @@ class KalshiSniperBot:
             "opened_at": time.time(),
             "mode": "LIVE",
             "status": "open",
+            "entry_context": entry_context,
         }
         self.live_positions.append(position)
         self._update_live_position_closure_tracker(
@@ -11641,6 +20203,7 @@ class KalshiSniperBot:
             size=count,
             last_known_price=price,
             source="record_live_position",
+            entry_context=entry_context,
         )
         print(
             f"[LIVE-ENTRY-RECORDED] ticker={ticker} family={family} side={side} entry_price={price} "
@@ -11671,9 +20234,7 @@ class KalshiSniperBot:
             "action": "sell",
             "count": size,
             "type": "limit",
-            "is_dry_run": DRY_RUN_LIVE_ORDERS or not (
-                globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)
-            ),
+            "is_dry_run": compute_effective_live_dry_run(),
         }
         if side == "yes":
             if yes_bid <= 0:
@@ -11689,13 +20250,204 @@ class KalshiSniperBot:
             return None
         return payload
 
+    def _build_merged_active_live_positions(self, api_positions):
+        api_positions = api_positions or []
+        merged = {}
+        api_tickers = []
+        tracked_tickers = []
+        api_seen_tickers = set()
+        api_active_tickers = set()
+        api_selected_by_base = {}
+        tracked_open_tickers = {
+            str(tracked.get("ticker") or "").strip()
+            for tracked in self.live_positions
+            if isinstance(tracked, dict)
+            and str(tracked.get("ticker") or "").strip()
+            and str(tracked.get("status", "open") or "open").strip().lower() == "open"
+        }
+
+        def ticker_base(value):
+            value = str(value or "").strip()
+            return value.rsplit("-", 1)[0] if "-" in value else value
+
+        def normalized_position_size(value):
+            try:
+                numeric_value = abs(float(value))
+            except (TypeError, ValueError):
+                return 0.0
+            return numeric_value
+
+        for position_summary in api_positions:
+            if not isinstance(position_summary, dict):
+                continue
+            raw_position = position_summary.get("raw_position") or {}
+            raw_ticker = position_summary.get("raw_ticker") or raw_position.get("ticker")
+            market_ticker = position_summary.get("market_ticker") or raw_position.get("market_ticker")
+            outcome_ticker = position_summary.get("outcome_ticker") or raw_position.get("outcome_ticker")
+            ticker = str(position_summary.get("ticker") or outcome_ticker or raw_ticker or market_ticker or "").strip()
+            raw_count = position_summary.get("count")
+            normalized_count = normalized_position_size(raw_count)
+            side = position_summary.get("side")
+            raw_position_fp = raw_position.get("position_fp")
+            api_entry_price = self.normalize_contract_price(
+                position_summary.get("avg_price"),
+                ticker=ticker or outcome_ticker or raw_ticker or market_ticker,
+                source="build_merged_active_live_positions.api_entry_price",
+            )
+            has_tracked_match = ticker in tracked_open_tickers if ticker else False
+            selected_for_exit = "yes"
+            reason = "api_non_zero_position"
+            if ticker:
+                api_seen_tickers.add(ticker)
+            if not ticker:
+                selected_for_exit = "no"
+                reason = "missing_ticker"
+            elif normalized_count <= 0:
+                selected_for_exit = "no"
+                reason = "zero_size"
+            elif not has_tracked_match and (api_entry_price is None or api_entry_price < 0.05 or api_entry_price > 0.95):
+                selected_for_exit = "no"
+                reason = "suspicious_api_entry_price"
+            print(
+                f"[LIVE-EXIT-POSITION-MAPPING] raw_ticker={raw_ticker} normalized_ticker={ticker} "
+                f"market_ticker={market_ticker} outcome_ticker={outcome_ticker} side={side} "
+                f"raw_position_fp={raw_position_fp} normalized_count={normalized_count} "
+                f"selected_for_exit={selected_for_exit} reason={reason}"
+            )
+            if selected_for_exit != "yes":
+                if ticker:
+                    if reason == "suspicious_api_entry_price":
+                        print(
+                            f"[LIVE-EXIT-ACTIVE-SKIP] ticker={ticker} source=api entry_price={api_entry_price} "
+                            f"size={normalized_count} reason=suspicious_api_entry_price"
+                        )
+                    else:
+                        print(f"[LIVE-EXIT-ACTIVE-SKIP] ticker={ticker} reason={reason}")
+                continue
+            api_tickers.append(ticker)
+            api_active_tickers.add(ticker)
+            api_selected_by_base[ticker_base(ticker)] = ticker
+            merged[ticker] = dict(position_summary)
+            merged[ticker]["ticker"] = ticker
+            merged[ticker]["raw_ticker"] = raw_ticker
+            merged[ticker]["market_ticker"] = market_ticker
+            merged[ticker]["outcome_ticker"] = outcome_ticker
+            merged[ticker]["count"] = normalized_count
+            merged[ticker]["api_avg_price"] = api_entry_price
+            merged[ticker]["entry_price_source"] = "api_fallback"
+            merged[ticker]["active_position_source"] = "api"
+        for tracked in self.live_positions:
+            if not isinstance(tracked, dict):
+                continue
+            ticker = str(tracked.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            if str(tracked.get("status", "open") or "open").strip().lower() != "open":
+                continue
+            tracked_tickers.append(ticker)
+            tracked_side = str(tracked.get("side") or "").strip().lower() or None
+            tracked_entry = self.normalize_contract_price(
+                tracked.get("entry"),
+                ticker=ticker,
+                source="build_merged_active_live_positions.tracked_entry",
+            )
+            tracked_size = normalized_position_size(tracked.get("count", tracked.get("size")))
+            tracked_updated_ts = tracked.get("opened_at")
+            if tracked_size <= 0:
+                print(f"[LIVE-EXIT-ACTIVE-SKIP] ticker={ticker} reason=zero_size")
+                continue
+            if ticker in merged:
+                merged_position = merged[ticker]
+                api_entry_price = self.normalize_contract_price(
+                    merged_position.get("api_avg_price", merged_position.get("avg_price")),
+                    ticker=ticker,
+                    source="build_merged_active_live_positions.api_entry_price_compare",
+                )
+                if tracked_entry is not None:
+                    if api_entry_price is not None and abs(float(tracked_entry) - float(api_entry_price)) > 1e-9:
+                        print(
+                            f"[LIVE-EXIT-ENTRY-MISMATCH] ticker={ticker} tracked_entry={tracked_entry} "
+                            f"api_entry={api_entry_price} selected_entry=tracked"
+                        )
+                    merged_position["avg_price"] = tracked_entry
+                    merged_position["entry_price_source"] = "tracked"
+                elif merged_position.get("avg_price") in (None, 0, 0.0) and api_entry_price is not None:
+                    merged_position["avg_price"] = api_entry_price
+                    merged_position["entry_price_source"] = "api_fallback"
+                if merged_position.get("count") in (None, 0, 0.0) and tracked_size > 0:
+                    merged_position["count"] = tracked_size
+                if not merged_position.get("side") and tracked_side:
+                    merged_position["side"] = tracked_side
+                if merged_position.get("updated_ts") is None and tracked_updated_ts is not None:
+                    merged_position["updated_ts"] = tracked_updated_ts
+                merged_position["tracked_entry_price"] = tracked_entry
+                merged_position["tracked_position"] = tracked
+                merged_position["active_position_source"] = "merged"
+            else:
+                related_api_ticker = api_selected_by_base.get(ticker_base(ticker))
+                if related_api_ticker:
+                    print(
+                        f"[LIVE-EXIT-RECONCILE-MISMATCH] tracked_ticker={ticker} api_ticker={related_api_ticker} "
+                        f"reason=api_related_or_opposite_ticker_active"
+                    )
+                elif ticker in api_seen_tickers:
+                    print(
+                        f"[LIVE-EXIT-RECONCILE-MISMATCH] tracked_ticker={ticker} api_ticker={ticker} "
+                        f"reason=api_reports_zero_or_non_active_for_tracked_ticker"
+                    )
+                merged[ticker] = {
+                    "ticker": ticker,
+                    "count": tracked_size,
+                    "side": tracked_side,
+                    "avg_price": tracked_entry,
+                    "market_exposure": None,
+                    "updated_ts": tracked_updated_ts,
+                    "raw_position": dict(tracked),
+                    "raw_ticker": ticker,
+                    "market_ticker": ticker_base(ticker),
+                    "outcome_ticker": ticker,
+                    "tracked_entry_price": tracked_entry,
+                    "entry_price_source": "tracked",
+                    "tracked_position": tracked,
+                    "active_position_source": "tracked",
+                }
+        merged_positions = list(merged.values())
+        merged_tickers = sorted(list(merged.keys()))
+        self.prune_live_position_state(active_tickers=merged_tickers)
+        print(
+            f"[LIVE-EXIT-ACTIVE-SOURCE] api_positions_count={len({ticker for ticker in api_active_tickers})} "
+            f"tracked_positions_count={len({ticker for ticker in tracked_tickers})} "
+            f"merged_positions_count={len(merged_positions)} merged_tickers={merged_tickers}"
+        )
+        for merged_position in merged_positions:
+            ticker = str(merged_position.get("ticker") or "").strip()
+            entry_price_details = self._resolve_live_exit_entry_price(merged_position, ticker=ticker)
+            selected_entry_price = entry_price_details.get("selected_entry_price")
+            tracked_entry_price = entry_price_details.get("tracked_entry_price")
+            merged_entry_price = self.normalize_contract_price(
+                merged_position.get("avg_price"),
+                ticker=ticker,
+                source="build_merged_active_live_positions.active_ticker_log",
+            )
+            if tracked_entry_price is not None and merged_entry_price is not None and abs(float(tracked_entry_price) - float(merged_entry_price)) > 1e-9:
+                print(
+                    f"[LIVE-EXIT-ENTRY-MISMATCH] ticker={ticker} tracked_entry={tracked_entry_price} "
+                    f"merged_entry={merged_entry_price} selected_entry={selected_entry_price} decision=use_tracked"
+                )
+            print(
+                f"[LIVE-EXIT-ACTIVE-TICKER] ticker={ticker} entry_price={selected_entry_price} "
+                f"size={merged_position.get('count')} source={entry_price_details.get('source_used', merged_position.get('entry_price_source', merged_position.get('active_position_source')))}"
+            )
+        return merged_positions
+
     def run_live_monitor_positions_once(self):
         return self.run_live_monitor_positions_pass(allow_real_exits=False)
 
     def execute_live_exit_plan(self, ticker, payload, decision_reason, approval_required=True, position_summary=None, decision=None):
         family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
-        entry_price = (position_summary or {}).get("avg_price") if isinstance(position_summary, dict) else None
-        entry_price = self.normalize_contract_price(entry_price, ticker=ticker, source="execute_live_exit_plan.entry_price")
+        entry_price_details = self._resolve_live_exit_entry_price(position_summary or {}, ticker=ticker)
+        entry_price = entry_price_details.get("selected_entry_price")
+        entry_price_source = entry_price_details.get("source_used")
         exit_price = payload.get("yes_price")
         if exit_price is None:
             exit_price = payload.get("no_price")
@@ -11711,15 +20463,17 @@ class KalshiSniperBot:
             exit_price=exit_price,
             exit_submit_state="attempted",
             source="execute_live_exit_plan.submit",
+            entry_price_source=entry_price_source,
         )
         print(
             f"[LIVE-EXIT-SUBMIT] ticker={ticker} side={payload.get('side')} action=sell "
             f"count={payload.get('count')} price={exit_price}"
         )
         print(
-            f"[LIVE-EXIT-SELL-ATTEMPT] ticker={ticker} entry_price={entry_price} current_exit_price={exit_price} "
-            f"position_size={payload.get('count')} hold_seconds={(decision or {}).get('hold_seconds') if isinstance(decision, dict) else None} "
-            f"unrealized_pnl={(decision or {}).get('unrealized_pnl_cents') if isinstance(decision, dict) else None} exit_reason={decision_reason}"
+            f"[LIVE-EXIT-SELL-ATTEMPT] ticker={ticker} entry_price_source={entry_price_source} selected_entry_price={entry_price} "
+            f"exit_price={exit_price} pnl_method=mark_to_market pnl_units=cents "
+            f"pnl_cents={(decision or {}).get('unrealized_pnl_cents') if isinstance(decision, dict) else None} side={payload.get('side')} size={payload.get('count')} "
+            f"hold_seconds={(decision or {}).get('hold_seconds') if isinstance(decision, dict) else None} exit_reason={decision_reason}"
         )
         if approval_required:
             if not self.confirm_live_order_submit(payload):
@@ -11739,6 +20493,7 @@ class KalshiSniperBot:
             exit_price=exit_price,
             exit_submit_state="submitted" if result.get("ok") else "attempted",
             source="execute_live_exit_plan.response",
+            entry_price_source=entry_price_source,
         )
         print(
             f"[LIVE-EXIT-RESPONSE] ticker={ticker} ok={'yes' if result.get('ok') else 'no'} "
@@ -11775,6 +20530,7 @@ class KalshiSniperBot:
             exit_price=exit_price,
             exit_submit_state="confirmed" if verification.get("ok") and verify_status == "executed" else "submitted",
             source="execute_live_exit_plan.verify",
+            entry_price_source=entry_price_source,
         )
         print(f"[LIVE-EXIT-RESULT] ticker={ticker} ok={verification.get('ok')} reason={verify_status}")
         cleared = False
@@ -11788,19 +20544,26 @@ class KalshiSniperBot:
                     if count is not None and abs(count) == 0:
                         self.remove_live_entry_metadata(ticker)
                         cleared = True
+                else:
+                    cleared = True
+            self._mark_tracked_live_position_closed(ticker, reason=decision_reason)
+            self.live_exit_pending_tickers.discard(ticker)
             print(f"[LIVE-EXIT-COMPLETE] ticker={ticker} cleared={'yes' if cleared else 'no'}")
             exit_price = payload.get("yes_price")
             if exit_price is None:
                 exit_price = payload.get("no_price")
             exit_price = self.normalize_contract_price(exit_price, ticker=ticker, source="execute_live_exit_plan.executed_exit_price")
-            avg_price = self.normalize_contract_price((position_summary or {}).get("avg_price"), ticker=ticker, source="execute_live_exit_plan.executed_entry_price")
+            avg_price = entry_price
             count = (position_summary or {}).get("count")
             pnl = None
+            pnl_cents = None
             try:
                 if avg_price is not None and count is not None and exit_price is not None:
-                    pnl = round((float(exit_price) - float(avg_price)) * abs(float(count)), 4)
+                    pnl_cents = self._compute_mark_to_market_pnl_cents(avg_price, exit_price, count, side=(position_summary or {}).get("side"))
+                    pnl = round(float(pnl_cents) / 100.0, 4) if pnl_cents is not None else None
             except (TypeError, ValueError):
                 pnl = None
+                pnl_cents = None
             hold_minutes = None
             if isinstance(decision, dict):
                 hold_minutes = decision.get("hold_minutes")
@@ -11810,9 +20573,41 @@ class KalshiSniperBot:
             except (TypeError, ValueError):
                 hold_time_seconds = None
             print(
-                f"[LIVE-EXIT-PNL] ticker={ticker} family={family} side={(position_summary or {}).get('side')} "
-                f"entry_price={avg_price} exit_price={exit_price} size={count} realized_pnl={pnl} "
+                f"[LIVE-EXIT-PNL] ticker={ticker} family={family} entry_price_source={entry_price_source} "
+                f"selected_entry_price={avg_price} exit_price={exit_price} side={(position_summary or {}).get('side')} size={count} "
+                f"pnl_method=mark_to_market pnl_units=cents pnl_cents={pnl_cents} realized_pnl={pnl} "
                 f"reason={decision_reason} hold_time_seconds={hold_time_seconds} hold_time_minutes={hold_minutes}"
+            )
+            try:
+                memory_record = self.build_trade_memory_record(
+                    position_summary=position_summary or {},
+                    awareness_profile=self.market_awareness_profiles.get(ticker, {}) if isinstance(self.market_awareness_profiles, dict) else {},
+                    adaptive_profile=self.market_adaptive_profiles.get(ticker, {}) if isinstance(self.market_adaptive_profiles, dict) else {},
+                    predictive_profile=self.market_predictive_profiles.get(ticker, {}) if isinstance(self.market_predictive_profiles, dict) else {},
+                    position_profile=self.market_position_profiles.get(ticker, {}) if isinstance(self.market_position_profiles, dict) else {},
+                    decision=decision,
+                    exit_reason=decision_reason,
+                    exit_price=exit_price,
+                    realized_pnl_delta=pnl,
+                    hold_seconds=hold_time_seconds,
+                    trade_mode="live_exit",
+                    notes={"source": "execute_live_exit_plan", "verification_status": verify_status, "family": family},
+                )
+                self.record_trade_memory(memory_record)
+            except Exception as exc:
+                print(f"[REALM-XIII-MEMORY-WRITE] ok=no ticker={ticker} category={self.get_market_discovery_category(family)} family={family} reason={exc.__class__.__name__}")
+            self._update_live_position_closure_tracker(
+                ticker,
+                entry_price=avg_price,
+                side=(position_summary or {}).get("side"),
+                size=count,
+                last_known_price=exit_price,
+                last_exit_decision_reason=decision_reason,
+                last_exit_pnl=pnl_cents,
+                exit_price=exit_price,
+                exit_submit_state="confirmed",
+                source="execute_live_exit_plan.executed",
+                entry_price_source=entry_price_source,
             )
             perf_day = time.strftime("%Y-%m-%d")
             if self.live_perf_day != perf_day:
@@ -11826,6 +20621,10 @@ class KalshiSniperBot:
             realized_value = float(pnl) if pnl is not None else 0.0
             self.live_realized_pnl_today += realized_value
             self.live_realized_pnl_by_family_today[family] = round(self.live_realized_pnl_by_family_today.get(family, 0.0) + realized_value, 4)
+            self._record_recent_family_pnl_event(family, realized_value)
+            self._record_live_family_performance(family, realized_value)
+            self._record_live_session_outcome(realized_value)
+            self._record_post_loss_exit_event(ticker, family, realized_value, decision_reason)
             if realized_value > 0:
                 self.live_perf_wins_today += 1
             elif realized_value < 0:
@@ -11857,14 +20656,33 @@ class KalshiSniperBot:
         if not positions_result.get("ok"):
             return {"ok": False, "reason": positions_result.get("reason")}
         positions = positions_result.get("positions") or []
+        merged_active_positions = self._build_merged_active_live_positions(positions)
         actionable_positions = 0
         exits_planned = 0
-        for position_summary in positions:
+        position_intelligence_profiles = []
+        for position_summary in merged_active_positions:
             ticker = position_summary.get("ticker")
             count = position_summary.get("count")
             side = position_summary.get("side")
             avg_price = position_summary.get("avg_price")
             market_exposure = position_summary.get("market_exposure")
+            entry_price_details = self._resolve_live_exit_entry_price(position_summary, ticker=ticker)
+            selected_entry_price = entry_price_details.get("selected_entry_price")
+            tracked_entry_price = entry_price_details.get("tracked_entry_price")
+            merged_entry_price = self.normalize_contract_price(
+                avg_price,
+                ticker=ticker,
+                source="run_live_monitor_positions_pass.active_ticker_log",
+            )
+            if tracked_entry_price is not None and merged_entry_price is not None and abs(float(tracked_entry_price) - float(merged_entry_price)) > 1e-9:
+                print(
+                    f"[LIVE-EXIT-ENTRY-MISMATCH] ticker={ticker} tracked_entry={tracked_entry_price} "
+                    f"merged_entry={merged_entry_price} selected_entry={selected_entry_price} decision=use_tracked"
+                )
+            print(
+                f"[LIVE-EXIT-ACTIVE-TICKER] ticker={ticker} entry_price={selected_entry_price} "
+                f"size={count} source={entry_price_details.get('source_used', position_summary.get('active_position_source', 'unknown'))}"
+            )
             if not ticker:
                 continue
             raw_position = position_summary.get("raw_position") or {}
@@ -11913,14 +20731,17 @@ class KalshiSniperBot:
                 )
                 print(f"[LIVE-EXIT-SKIP] ticker={ticker} reason=missing_position_fields")
                 continue
-            if avg_price is None:
+            if selected_entry_price is None:
+                print(
+                    f"[LIVE-EXIT-PNL-SOURCE-GUARD] ticker={ticker} decision=hold reason=missing_tracked_entry_price"
+                )
                 print(
                     f"[LIVE-EXIT-POSITION-DEBUG] ticker={ticker} "
                     f"keys={sorted(list(raw_position.keys()))} "
                     f"normalized_count={count} normalized_side={side} "
                     f"normalized_avg_price={avg_price} normalized_market_exposure={market_exposure}"
                 )
-                print(f"[LIVE-EXIT-SKIP] ticker={ticker} reason=missing_avg_price")
+                print(f"[LIVE-EXIT-SKIP] ticker={ticker} reason=missing_entry_price")
                 continue
             actionable_positions += 1
             quote_result = self.resolve_live_exit_quote_for_ticker(ticker)
@@ -11936,22 +20757,79 @@ class KalshiSniperBot:
                     self._mark_tracked_live_position_closed(ticker, reason=f"market_status_{market_status}")
                     print(
                         f"[LIVE-EXIT-CHECK] ticker={ticker} family={self.get_market_family({'ticker': ticker}) if ticker else 'UNKNOWN'} side={side} "
-                        f"entry_price={avg_price} current_price=None pnl_cents=None pnl_percent=None hold_seconds=None "
+                        f"entry_price={selected_entry_price} current_price=None pnl_cents=None pnl_percent=None hold_seconds=None "
                         f"action=exit reason=market_status_{market_status}"
                     )
                     continue
                 print(
                     f"[LIVE-EXIT-CHECK] ticker={ticker} family={self.get_market_family({'ticker': ticker}) if ticker else 'UNKNOWN'} side={side} "
-                    f"entry_price={avg_price} current_price=None pnl_cents=None pnl_percent=None hold_seconds=None "
+                    f"entry_price={selected_entry_price} current_price=None pnl_cents=None pnl_percent=None hold_seconds=None "
                     f"action=hold reason={market_status_reason}"
                 )
                 continue
             quote = quote_result.get("quote")
             decision = self.evaluate_exit_decision(position_summary, quote, now_ts=time.time())
             current_price = decision.get("current_price")
+            market_lookup = {"ticker": ticker}
+            awareness_profile = self.market_awareness_profiles.get(ticker, {}) if isinstance(self.market_awareness_profiles, dict) else {}
+            adaptive_profile = self.market_adaptive_profiles.get(ticker, {}) if isinstance(self.market_adaptive_profiles, dict) else {}
+            predictive_profile = self.market_predictive_profiles.get(ticker, {}) if isinstance(self.market_predictive_profiles, dict) else {}
+            monitor_open_positions = self._get_open_live_positions()
+            monitor_cluster_snapshot = self.detect_exposure_cluster(position_summary={"ticker": ticker, "family": self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN", "category": self.get_market_discovery_category(self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")}, open_positions=monitor_open_positions, market=market_lookup)
+            position_profile = self.build_position_intelligence_profile(
+                market=market_lookup,
+                position_summary={**position_summary, "current_price": current_price, "hold_seconds": decision.get("hold_seconds"), "unrealized_pnl_delta": None if decision.get("unrealized_pnl_cents") is None else decision.get("unrealized_pnl_cents") / 100.0},
+                q=quote,
+                awareness_profile=awareness_profile if isinstance(awareness_profile, dict) else {},
+                adaptive_profile=adaptive_profile if isinstance(adaptive_profile, dict) else {},
+                predictive_profile=predictive_profile if isinstance(predictive_profile, dict) else {},
+                decision=decision,
+                open_positions=monitor_open_positions,
+                current_price=current_price,
+                hold_seconds=decision.get("hold_seconds"),
+                exposure_snapshot={
+                    "ok": True,
+                    "uncertain": bool(monitor_cluster_snapshot.get("warning")),
+                    "uncertain_reasons": list(monitor_cluster_snapshot.get("reasons", []) or []),
+                    "candidate_family": self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN",
+                    "open_total_positions": len(monitor_open_positions or []),
+                },
+            )
+            position_intelligence_profiles.append(position_profile)
+            print(
+                f"[REALM-XII-POSITION-HEALTH] ticker={position_profile.get('ticker')} category={position_profile.get('category')} position_health={position_profile.get('position_health')} current_price={position_profile.get('current_price')} entry_price={position_profile.get('entry_price')} unrealized_pnl_delta={position_profile.get('unrealized_pnl_delta')} hold_seconds={position_profile.get('hold_seconds')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-CONVICTION] ticker={position_profile.get('ticker')} category={position_profile.get('category')} conviction_level={position_profile.get('conviction_level')} realm_ix_awareness_score={position_profile.get('realm_ix_awareness_score')} realm_x_adaptive_score={position_profile.get('realm_x_adaptive_score')} realm_xi_predictive_score={position_profile.get('realm_xi_predictive_score')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-MANAGEMENT-MODE] ticker={position_profile.get('ticker')} category={position_profile.get('category')} management_mode={position_profile.get('management_mode')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-PARTIAL-PROFIT] ticker={position_profile.get('ticker')} category={position_profile.get('category')} partial_profit_recommendation={position_profile.get('partial_profit_recommendation')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-TRAILING-EXIT] ticker={position_profile.get('ticker')} category={position_profile.get('category')} trailing_exit_recommendation={position_profile.get('trailing_exit_recommendation')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-SCALE-IN] ticker={position_profile.get('ticker')} category={position_profile.get('category')} scale_in_recommendation={position_profile.get('scale_in_recommendation')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-SCALE-OUT] ticker={position_profile.get('ticker')} category={position_profile.get('category')} scale_out_recommendation={position_profile.get('scale_out_recommendation')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-EXPOSURE-CLUSTER] ticker={position_profile.get('ticker')} category={position_profile.get('category')} exposure_cluster_warning={position_profile.get('exposure_cluster_warning')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-SCORE] ticker={position_profile.get('ticker')} category={position_profile.get('category')} position_score={position_profile.get('position_score')} conviction_level={position_profile.get('conviction_level')} position_health={position_profile.get('position_health')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            print(
+                f"[REALM-XII-PROFILE] ticker={position_profile.get('ticker')} position_health={position_profile.get('position_health')} conviction_level={position_profile.get('conviction_level')} management_mode={position_profile.get('management_mode')} partial_profit_recommendation={position_profile.get('partial_profit_recommendation')} trailing_exit_recommendation={position_profile.get('trailing_exit_recommendation')} scale_in_recommendation={position_profile.get('scale_in_recommendation')} scale_out_recommendation={position_profile.get('scale_out_recommendation')} exposure_cluster_warning={position_profile.get('exposure_cluster_warning')} position_score={position_profile.get('position_score')} reasons={position_profile.get('position_reasons', [])}"
+            )
+            self.market_position_profiles[ticker] = position_profile
             self._update_live_position_closure_tracker(
                 ticker,
-                entry_price=avg_price,
+                entry_price=selected_entry_price,
                 side=side,
                 size=count,
                 last_known_price=current_price,
@@ -11959,6 +20837,7 @@ class KalshiSniperBot:
                 last_exit_pnl=decision.get("unrealized_pnl_cents"),
                 source="run_live_monitor_positions_pass.decision",
                 seen_ts=time.time(),
+                entry_price_source=decision.get("entry_price_source"),
             )
             action = "exit" if decision.get("should_exit") else "hold"
             family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
@@ -11994,7 +20873,7 @@ class KalshiSniperBot:
                 continue
             family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
             print(
-                f"[LIVE-EXIT-TRIGGER] ticker={ticker} family={family} side={side} entry_price={avg_price} "
+                f"[LIVE-EXIT-TRIGGER] ticker={ticker} family={family} side={side} entry_price={decision.get('entry_price')} "
                 f"exit_price={current_price} reason={decision.get('reason')}"
             )
             print(
@@ -12044,6 +20923,7 @@ class KalshiSniperBot:
                 )
             finally:
                 self.live_exit_pending_tickers.discard(ticker)
+        self.last_market_position_summary = self.summarize_position_intelligence(position_intelligence_profiles)
         return {
             "ok": True,
             "reason": "completed",
@@ -12078,6 +20958,7 @@ class KalshiSniperBot:
         payload = self.build_live_exit_payload(position, q)
         if payload is None:
             print(f"[LIVE-EXIT-SKIP] {ticker} reason=invalid_payload")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
             return {"ok": False, "reason": "invalid_payload", "submitted": False}
         effective_live_dry_run = compute_effective_live_dry_run()
         payload["is_dry_run"] = effective_live_dry_run
@@ -12091,13 +20972,15 @@ class KalshiSniperBot:
             return {"ok": True, "reason": "dry_run_only", "submitted": False, "payload": payload}
         if not self.has_live_order_api_path():
             print(f"[LIVE-EXIT-SKIP] {ticker} reason=no_order_api_path")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
             return {"ok": False, "reason": "no_order_api_path", "submitted": False}
         try:
             raise RuntimeError("no_order_api_path")
         except Exception as exc:
             if str(exc) == "no_order_api_path":
                 print(f"[LIVE-EXIT-SKIP] {ticker} reason=no_order_api_path")
-                return {"ok": False, "reason": "no_order_api_path", "submitted": False}
+                print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
+            return {"ok": False, "reason": "no_order_api_path", "submitted": False}
             print(f"[LIVE-EXIT-ERROR] {ticker} error={exc}")
             return {"ok": False, "reason": "submit_error", "submitted": False, "payload": payload}
 
@@ -12200,6 +21083,10 @@ class KalshiSniperBot:
                 realized_value = float(realized_pnl) if realized_pnl is not None else 0.0
                 self.live_realized_pnl_today += realized_value
                 self.live_realized_pnl_by_family_today[family] = round(self.live_realized_pnl_by_family_today.get(family, 0.0) + realized_value, 4)
+                self._record_recent_family_pnl_event(family, realized_value)
+                self._record_live_family_performance(family, realized_value)
+                self._record_live_session_outcome(realized_value)
+                self._record_post_loss_exit_event(ticker, family, realized_value, reason)
                 if realized_value > 0:
                     self.live_perf_wins_today += 1
                 elif realized_value < 0:
@@ -12210,6 +21097,31 @@ class KalshiSniperBot:
                     f"realized_pnl_today={self.live_realized_pnl_today:+.4f} "
                     f"pnl_by_family={sorted(self.live_realized_pnl_by_family_today.items(), key=lambda item: abs(item[1]), reverse=True)}"
                 )
+                try:
+                    memory_record = self.build_trade_memory_record(
+                        position_summary={
+                            "ticker": ticker,
+                            "family": family,
+                            "side": side,
+                            "entry_price": entry_price,
+                            "count": size,
+                            "mode": "live_exit",
+                            "hold_seconds": hold_time_seconds,
+                        },
+                        awareness_profile=self.market_awareness_profiles.get(ticker, {}) if isinstance(self.market_awareness_profiles, dict) else {},
+                        adaptive_profile=self.market_adaptive_profiles.get(ticker, {}) if isinstance(self.market_adaptive_profiles, dict) else {},
+                        predictive_profile=self.market_predictive_profiles.get(ticker, {}) if isinstance(self.market_predictive_profiles, dict) else {},
+                        position_profile=self.market_position_profiles.get(ticker, {}) if isinstance(self.market_position_profiles, dict) else {},
+                        exit_reason=reason,
+                        exit_price=preview_exit_price,
+                        realized_pnl_delta=realized_pnl,
+                        hold_seconds=hold_time_seconds,
+                        trade_mode="live_exit",
+                        notes={"source": "maybe_exit_live_positions", "family": family},
+                    )
+                    self.record_trade_memory(memory_record)
+                except Exception as exc:
+                    print(f"[REALM-XIII-MEMORY-WRITE] ok=no ticker={ticker} category={self.get_market_discovery_category(family)} family={family} reason={exc.__class__.__name__}")
                 send_telegram_message(
                     f"🔴 EXIT\n"
                     f"Ticker: {ticker}\n"
@@ -12233,6 +21145,8 @@ class KalshiSniperBot:
         """
         csv_path = self.trade_log_csv
         file_exists = os.path.exists(csv_path)
+        entry_context = position.get("entry_context") if isinstance(position, dict) else None
+        entry_context = entry_context if isinstance(entry_context, dict) else {}
         headers = [
             "timestamp",
             "ticker",
@@ -12249,7 +21163,24 @@ class KalshiSniperBot:
             "last_price",
             "volume",
             "liquidity",
+            "family",
+            "category",
+            "spread_bucket",
+            "liquidity_bucket",
+            "volatility_bucket",
+            "momentum_score",
+            "probabilistic_score",
+            "strategy_label",
+            "time_to_event_bucket",
+            "entry_timing_state",
+            "entry_context_json",
         ]
+        market_dict = market if isinstance(market, dict) else {}
+        family = self.get_market_family({"ticker": position.get("ticker", "")})
+        category = self.get_market_discovery_category(market_dict or {"ticker": position.get("ticker", "")})
+        spread_bucket = entry_context.get("spread_bucket") or self._spread_bucket(self.to_float(entry_context.get("spread"), None))
+        liquidity_bucket = entry_context.get("liquidity_bucket") or self._liquidity_bucket(self.to_float(entry_context.get("liquidity"), None))
+        volatility_bucket = entry_context.get("volatility_bucket") or self._volatility_bucket(self.to_float(entry_context.get("volatility"), None))
         row = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
             "ticker": position.get("ticker", ""),
@@ -12266,12 +21197,46 @@ class KalshiSniperBot:
             "last_price": getattr(market, "last_price", 0.0) if market is not None else 0.0,
             "volume": getattr(market, "volume", 0.0) if market is not None else 0.0,
             "liquidity": getattr(market, "liquidity", 0.0) if market is not None else 0.0,
+            "family": family,
+            "category": category,
+            "spread_bucket": spread_bucket,
+            "liquidity_bucket": liquidity_bucket,
+            "volatility_bucket": volatility_bucket,
+            "momentum_score": entry_context.get("momentum_score"),
+            "probabilistic_score": entry_context.get("probabilistic_score"),
+            "strategy_label": entry_context.get("strategy_label"),
+            "time_to_event_bucket": entry_context.get("time_to_event_bucket"),
+            "entry_timing_state": entry_context.get("entry_timing_state"),
+            "entry_context_json": json.dumps(entry_context, sort_keys=True, separators=(",", ":")) if entry_context else "",
         }
         with open(csv_path, "a", newline="") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=headers)
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
+        try:
+            memory_record = self.build_trade_memory_record(
+                position_summary={
+                    "ticker": position.get("ticker", ""),
+                    "family": family,
+                    "side": position.get("side", "YES"),
+                    "entry_price": position.get("entry", 0.0),
+                    "mode": "simulation",
+                },
+                awareness_profile=self.market_awareness_profiles.get(position.get("ticker", ""), {}) if isinstance(self.market_awareness_profiles, dict) else {},
+                adaptive_profile=self.market_adaptive_profiles.get(position.get("ticker", ""), {}) if isinstance(self.market_adaptive_profiles, dict) else {},
+                predictive_profile=self.market_predictive_profiles.get(position.get("ticker", ""), {}) if isinstance(self.market_predictive_profiles, dict) else {},
+                position_profile=self.market_position_profiles.get(position.get("ticker", ""), {}) if isinstance(self.market_position_profiles, dict) else {},
+                exit_reason=reason,
+                exit_price=exit_price,
+                realized_pnl_delta=realized_pnl,
+                hold_seconds=hold_seconds,
+                trade_mode="simulation",
+                notes={"source": "log_sim_trade", "family": family},
+            )
+            self.record_trade_memory(memory_record)
+        except Exception as exc:
+            print(f"[REALM-XIII-MEMORY-WRITE] ok=no ticker={position.get('ticker', '')} category={category} family={family} reason={exc.__class__.__name__}")
 
     def print_performance_summary(self):
         """
@@ -12712,17 +21677,18 @@ class KalshiSniperBot:
         markets = self.get_markets(limit=self.max_markets, status="open")
         quotes = [self.build_quote(m) for m in markets]
 
-        print("\nRAW sample markets:")
-        for m in markets[:3]:
-            print(m)
+        if self.is_debug_live_enabled():
+            print("\nRAW sample markets:")
+            for m in markets[:3]:
+                print(m)
 
-        print("\nParsed sample quotes:")
-        for q in quotes[:5]:
-            print(
-                f"{q.ticker} | yes_bid={q.yes_bid:.4f} | yes_ask={q.yes_ask:.4f} "
-                f"| no_bid={q.no_bid:.4f} | no_ask={q.no_ask:.4f} "
-                f"| last={q.last_price:.4f} | volume={q.volume} | liquidity={q.liquidity:.4f}"
-            )
+            print("\nParsed sample quotes:")
+            for q in quotes[:5]:
+                print(
+                    f"{q.ticker} | yes_bid={q.yes_bid:.4f} | yes_ask={q.yes_ask:.4f} "
+                    f"| no_bid={q.no_bid:.4f} | no_ask={q.no_ask:.4f} "
+                    f"| last={q.last_price:.4f} | volume={q.volume} | liquidity={q.liquidity:.4f}"
+                )
 
         active_quotes = [
             q for q in quotes
@@ -12771,12 +21737,28 @@ class KalshiSniperBot:
             )
 
         auto_live_ticker = None
+        auto_live_reason = None
         if globals().get("LIVE_MODE", False) and not globals().get("LIVE_TEST_TICKER"):
             auto_live_ticker, auto_live_reason = self.find_best_live_ticker_with_retries()
             if auto_live_ticker:
                 print(f"[LIVE-SELECT] using_auto_ticker={auto_live_ticker}")
                 print(f"[LIVE-SELECT] using_auto_reason={auto_live_reason}")
                 self.live_canary_authorized_ticker = auto_live_ticker
+
+        selected_context_quote = None
+        if auto_live_ticker:
+            selected_context_quote = quotes_by_ticker.get(auto_live_ticker)
+        if selected_context_quote is None and candidates:
+            selected_context_quote = candidates[0][1]
+        self.emit_ascension_v2_telemetry(
+            markets=markets,
+            quotes=quotes,
+            candidates=candidates,
+            selected_quote=selected_context_quote,
+            live_select_summary=self.last_live_select_summary or {},
+            auto_live_ticker=auto_live_ticker,
+            auto_live_reason=auto_live_reason,
+        )
 
         if len(self.positions) >= MAX_TOTAL_EXPOSURE:
             return
@@ -12803,12 +21785,6 @@ class KalshiSniperBot:
                 "execution_blocked": 0,
                 "execution_submitted": 0,
             }
-            phase55_allowed, phase55_reason, _phase55_details = self._check_phase55_live_execution_gate(auto_live_ticker, family=selected_family)
-            if not phase55_allowed:
-                execution_funnel["execution_blocked"] = 1
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={phase55_reason}")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                return
             duplicate_guard_detail = self._get_live_duplicate_guard_detail(auto_live_ticker)
             print(
                 f"[LIVE-EXECUTION-PREFLIGHT] ticker={auto_live_ticker} source={quote_source} "
@@ -12865,9 +21841,68 @@ class KalshiSniperBot:
             if (payload_preview.get('count') or 0) <= 0:
                 execution_funnel["execution_blocked"] = 1
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=order_size_below_minimum count={payload_preview.get('count')}")
+                self._log_live_execution_final_blocked(auto_live_ticker, "order_size_below_minimum")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            correlation_allowed, correlation_reason, _correlation_snapshot = self._check_sports_correlated_entry_guard(
+                auto_live_ticker,
+                side=payload_preview.get("side"),
+                family=selected_family,
+            )
+            if not correlation_allowed:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={correlation_reason}")
+                self._log_live_execution_final_blocked(auto_live_ticker, correlation_reason)
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            smart_allowed, smart_reason, _smart_details = self._evaluate_smart_entry_gate(
+                {"ticker": auto_live_ticker},
+                selected_quote,
+                payload=payload_preview,
+            )
+            execution_funnel["execution_attempted"] = 1
+            if not smart_allowed:
+                self._check_phase55_live_execution_gate(
+                    auto_live_ticker,
+                    family=selected_family,
+                    override_block_reason=smart_reason,
+                )
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={smart_reason}")
+                self._log_live_execution_final_blocked(auto_live_ticker, smart_reason)
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            phase55_allowed, phase55_reason, _phase55_details = self._check_phase55_live_execution_gate(
+                auto_live_ticker,
+                family=selected_family,
+            )
+            if not phase55_allowed:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={phase55_reason}")
+                self._log_live_execution_final_blocked(auto_live_ticker, phase55_reason)
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            sports_context_allowed, sports_context_reason, _sports_context_details = self.sports_context_check({
+                "ticker": auto_live_ticker,
+                "family": selected_family,
+                "quote": selected_quote,
+                "market": {"ticker": auto_live_ticker},
+                "payload": payload_preview,
+            })
+            if not sports_context_allowed:
+                execution_funnel["execution_blocked"] = 1
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={sports_context_reason}")
+                self._log_live_execution_final_blocked(auto_live_ticker, sports_context_reason)
                 print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
                 return
             now = time.time()
+            execution_attempt_cooldown_seconds = LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS
+            if self._is_btc15m_overnight_mode(selected_family, now_ts=now):
+                execution_attempt_cooldown_seconds = max(1.0, LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS * 0.5)
+                print(
+                    f"[LIVE-BTC15M-OVERNIGHT-COOLDOWN-SOFTENED] ticker={auto_live_ticker} family={selected_family} "
+                    f"execution_attempt_cooldown_seconds={execution_attempt_cooldown_seconds}"
+                )
             cooldown_until = self.live_execution_attempt_cooldowns.get(auto_live_ticker, 0.0)
             if cooldown_until > now:
                 remaining = int(max(0, cooldown_until - now))
@@ -12877,17 +21912,36 @@ class KalshiSniperBot:
                 )
                 execution_funnel["execution_blocked"] = 1
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=execution_attempt_cooldown remaining_seconds={remaining}")
+                self._log_live_execution_final_blocked(auto_live_ticker, "execution_attempt_cooldown")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            api_duplicate_check = self.check_live_duplicate_position_api(auto_live_ticker)
+            if api_duplicate_check.get("blocked"):
+                execution_funnel["execution_blocked"] = 1
+                print(
+                    f"[LIVE-EXECUTION-DUPLICATE-API-BLOCK] ticker={auto_live_ticker} "
+                    f"position_size={api_duplicate_check.get('position_size')} "
+                    f"reason={api_duplicate_check.get('reason')}"
+                )
+                self._log_live_execution_final_blocked(auto_live_ticker, api_duplicate_check.get("reason"))
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={api_duplicate_check.get('reason')}")
+                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                return
+            post_loss_allowed, post_loss_reason = self._check_post_loss_reentry_block(auto_live_ticker, family=selected_family)
+            if not post_loss_allowed:
+                execution_funnel["execution_blocked"] = 1
+                self._log_live_execution_final_blocked(auto_live_ticker, post_loss_reason)
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={post_loss_reason}")
                 print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
                 return
             execution_funnel["signals_passed_entry"] = 1
+            self._log_live_execution_final_approved(auto_live_ticker, reason="all_gates_passed")
             result = self.submit_live_order(selected_quote)
             if result.get("submitted"):
-                execution_funnel["execution_attempted"] = 1
-            if result.get("submitted"):
-                self.live_execution_attempt_cooldowns[auto_live_ticker] = time.time() + LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS
+                self.live_execution_attempt_cooldowns[auto_live_ticker] = time.time() + execution_attempt_cooldown_seconds
                 print(
                     f"[LIVE-EXECUTION-COOLDOWN] ticker={auto_live_ticker} active=yes "
-                    f"remaining_seconds={LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS} reason=post_execution_attempt_submitted"
+                    f"remaining_seconds={execution_attempt_cooldown_seconds} reason=post_execution_attempt_submitted"
                 )
                 execution_funnel["execution_submitted"] = 1
                 payload = result.get("payload") or payload_preview
@@ -12895,11 +21949,13 @@ class KalshiSniperBot:
                     selected_quote,
                     size=payload.get("count"),
                     entry_price=payload.get("price"),
+                    side=payload.get("side"),
                 )
             else:
                 execution_funnel["execution_blocked"] = 1
                 self.live_execution_attempt_cooldowns.pop(auto_live_ticker, None)
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={result.get('reason')}")
+                self._log_live_execution_final_blocked(auto_live_ticker, result.get("reason"))
             print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
             return
 
@@ -12945,6 +22001,7 @@ class KalshiSniperBot:
                     q,
                     size=payload.get("count"),
                     entry_price=payload.get("price"),
+                    side=payload.get("side"),
                 )
                 break
             if result.get("reason") == "dry_run_only":
@@ -13030,11 +22087,47 @@ def main():
     LIVE_ARMED = bool(args.live and args.arm_live)
     LIVE_ENV_CONFIRMED = (os.environ.get("KALSHI_ALLOW_LIVE", "") or "").strip().lower() in {"1", "true", "yes", "on"}
     LIVE_TEST_TICKER = args.live_test_ticker
-    effective_live_dry_run = DRY_RUN_LIVE_ORDERS or not (LIVE_ARMED and LIVE_ENV_CONFIRMED)
+    effective_live_dry_run = compute_effective_live_dry_run(
+        live_mode=LIVE_MODE,
+        live_armed=LIVE_ARMED,
+        live_env_confirmed=LIVE_ENV_CONFIRMED,
+        configured_dry_run=DRY_RUN_LIVE_ORDERS,
+    )
 
     bot = KalshiSniperBot()
+    if LIVE_ARMED and not effective_live_dry_run:
+        print("[LIVE-MODE-STATUS] ✅ REAL TRADING ENABLED | dry_run=False | armed=True")
+    else:
+        print(
+            f"[LIVE-MODE-STATUS] source=startup live_mode={'yes' if LIVE_MODE else 'no'} "
+            f"live_armed={'yes' if LIVE_ARMED else 'no'} live_env_confirmed={'yes' if LIVE_ENV_CONFIRMED else 'no'} "
+            f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
+        )
     send_telegram_message("🚀 Kalshi bot started and running on server")
     print("[TELEGRAM] sent=startup")
+    if LIVE_MODE and not bot.realm_ix_startup_alert_sent:
+        if send_telegram_message("🧭 REALM IX market awareness activated"):
+            bot.realm_ix_startup_alert_sent = True
+            print("[TELEGRAM] sent=realm_ix_startup")
+    if LIVE_MODE and not bot.realm_x_startup_alert_sent:
+        if send_telegram_message("SERAPH Realm X Adaptive Intelligence active."):
+            bot.realm_x_startup_alert_sent = True
+            print("[TELEGRAM] sent=realm_x_startup")
+    if LIVE_MODE and not bot.realm_xi_startup_alert_sent:
+        if send_telegram_message("SERAPH Realm XI Predictive Momentum Engine active."):
+            bot.realm_xi_startup_alert_sent = True
+            print("[TELEGRAM] sent=realm_xi_startup")
+    if LIVE_MODE and not bot.realm_xii_startup_alert_sent:
+        if send_telegram_message("Kalshi Bot / SERAPH Realm XII Position Intelligence active."):
+            bot.realm_xii_startup_alert_sent = True
+    if LIVE_MODE and not bot.realm_xiii_startup_alert_sent:
+        if send_telegram_message("Kalshi Bot / SERAPH Realm XIII Self-Learning Memory active."):
+            bot.realm_xiii_startup_alert_sent = True
+            print("[TELEGRAM] sent=realm_xiii_startup")
+    if LIVE_MODE and not bot.realm_xiv_startup_alert_sent:
+        if send_telegram_message("Kalshi Bot / SERAPH Realm XIV Multi-Agent Network active."):
+            bot.realm_xiv_startup_alert_sent = True
+            print("[TELEGRAM] sent=realm_xiv_startup")
     live_related_mode = any(
         (
             args.live,
