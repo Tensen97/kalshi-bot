@@ -6,6 +6,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+try:
+    from runtime.paths import runtime_memory_file, runtime_state_file
+except Exception:
+    runtime_memory_file = None
+    runtime_state_file = None
+
 
 REALM_XVIII_ENABLE = (os.environ.get("REALM_XVIII_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
 REALM_XVIII_SHADOW_ONLY = (os.environ.get("REALM_XVIII_SHADOW_ONLY", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -16,7 +22,10 @@ REALM_XVIII_MAX_DAILY_RISK_DOLLARS = float(os.environ.get("REALM_XVIII_MAX_DAILY
 REALM_XVIII_MIN_PORTFOLIO_HEALTH_SCORE = float(os.environ.get("REALM_XVIII_MIN_PORTFOLIO_HEALTH_SCORE", "0.60") or 0.60)
 REALM_XVIII_MAX_SCORE_PENALTY = float(os.environ.get("REALM_XVIII_MAX_SCORE_PENALTY", "0.07") or 0.07)
 REALM_XVIII_ALLOW_BLOCKS = (os.environ.get("REALM_XVIII_ALLOW_BLOCKS", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
-REALM_XVIII_STATE_FILE = os.environ.get("REALM_XVIII_STATE_FILE", "/opt/kalshi-bot/data/realm_xviii_portfolio_brain.sqlite3")
+REALM_XVIII_STATE_FILE = os.environ.get(
+    "REALM_XVIII_STATE_FILE",
+    runtime_memory_file("realm_xviii_portfolio_brain.sqlite3") if callable(runtime_memory_file) else "/opt/kalshi-bot/runtime/memory/realm_xviii_portfolio_brain.sqlite3",
+)
 REALM_XVIII_HISTORY_LIMIT = int(float(os.environ.get("REALM_XVIII_HISTORY_LIMIT", "1000") or 1000))
 
 
@@ -750,7 +759,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--replay", action="store_true")
-    parser.add_argument("--snapshot-file", default="/opt/kalshi-bot/data/simulation_snapshots.jsonl")
+    parser.add_argument(
+        "--snapshot-file",
+        default=runtime_state_file("simulation_snapshots.jsonl") if callable(runtime_state_file) else "/opt/kalshi-bot/runtime/state/simulation_snapshots.jsonl",
+    )
     parser.add_argument("--limit", type=int, default=5000)
     args = parser.parse_args()
     brain = PortfolioBrain()

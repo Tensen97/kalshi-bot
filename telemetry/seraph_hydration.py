@@ -2,13 +2,22 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+try:
+    from runtime.paths import runtime_state_file
+except Exception:
+    runtime_state_file = None
+
 from .state_registry import get_live_state_registry
 
 
 def build_hydrated_seraph_state(bot=None, interface=None, source="api"):
     registry = get_live_state_registry(
         enabled=bool(getattr(interface, "enabled", False) or getattr(interface, "api_enable", False) or getattr(interface, "ui_effective_enable", False)),
-        state_file=getattr(interface, "state_file", "/opt/kalshi-bot/data/realm_xxix_live_state.json"),
+        state_file=getattr(
+            interface,
+            "state_file",
+            runtime_state_file("realm_xxix_live_state.json") if callable(runtime_state_file) else "/opt/kalshi-bot/runtime/state/realm_xxix_live_state.json",
+        ),
         history_limit=int(getattr(interface, "alert_history_limit", 100) or 100),
     )
     snapshot = registry.snapshot()
@@ -28,4 +37,3 @@ def build_hydrated_seraph_state(bot=None, interface=None, source="api"):
     if not state.get("status"):
         state["status"] = snapshot.get("status", "waiting")
     return state
-

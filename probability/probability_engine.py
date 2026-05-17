@@ -4,6 +4,7 @@ import json
 import os
 import time
 from typing import Any, Dict, List
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_env_path, runtime_state_file, safe_atomic_json_write
 
 from .edge_scoring import score_probability_edge
 from .fair_value_engine import estimate_fair_value
@@ -30,14 +31,15 @@ def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
 class ProbabilityEngine:
     def __init__(
         self,
-        state_file: str,
+        state_file: str | None = None,
         enabled: bool = False,
         history_limit: int = 400,
         summary_interval_seconds: float = 60.0,
         max_edge_aggressiveness: float = 0.85,
         allow_blocks: bool = False,
     ):
-        self.state_file = state_file
+        self.state_file = str(state_file or runtime_state_file("realm_xxiii_probability.json"))
+        ensure_runtime_layout()
         self.enabled = bool(enabled)
         self.history_limit = max(50, int(history_limit or 400))
         self.summary_interval_seconds = max(15.0, float(summary_interval_seconds or 60.0))
@@ -71,12 +73,10 @@ class ProbabilityEngine:
 
     def _save_state(self, payload: Dict[str, Any]):
         try:
-            folder = os.path.dirname(self.state_file)
-            if folder:
-                os.makedirs(folder, exist_ok=True)
-            with open(self.state_file, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-        except Exception:
+            ok = safe_atomic_json_write(self.state_file, payload, indent=2, sort_keys=True)
+            record_persist_event(subsystem="REALM-XXIII", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+        except Exception as exc:
+            record_persist_event(subsystem="REALM-XXIII", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
             return
 
     def evaluate_market(

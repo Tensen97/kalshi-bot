@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from runtime.paths import record_persist_event, runtime_env_path, runtime_state_file, safe_atomic_json_write, ensure_runtime_layout
 from urllib.parse import parse_qs, urlparse
 
 from .command_router import CommandRouter
@@ -10,7 +11,7 @@ from .summary_builder import SummaryBuilder
 
 
 REALM_XXVII_ENABLE = (os.environ.get("REALM_XXVII_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
-REALM_XXVII_STATE_FILE = os.environ.get("REALM_XXVII_STATE_FILE", "/opt/kalshi-bot/data/realm_xxvii_command_center.json")
+REALM_XXVII_STATE_FILE = runtime_env_path("REALM_XXVII_STATE_FILE", runtime_state_file("realm_xxvii_command_center.json"))
 REALM_XXVII_SUMMARY_INTERVAL_SECONDS = float(os.environ.get("REALM_XXVII_SUMMARY_INTERVAL_SECONDS", "60") or 60)
 
 
@@ -50,6 +51,7 @@ class SeraphCommandCenterBridge:
         self.last_summary_text = ""
         self.health_aggregator = HealthAggregator()
         self.summary_builder = SummaryBuilder()
+        ensure_runtime_layout()
         self.command_router = CommandRouter(logger=self._log)
         if self.bot is not None:
             setattr(self.bot, "realm_xxvii_engine", self)
@@ -69,12 +71,13 @@ class SeraphCommandCenterBridge:
     def _persist_state(self, state):
         try:
             _ensure_dir(self.state_file)
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w") as handle:
-                json.dump(_json_safe(state), handle, sort_keys=True, indent=2)
-            os.replace(tmp_path, self.state_file)
+            ok = safe_atomic_json_write(self.state_file, _json_safe(state), sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XXVII", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed", details={"enabled": self.enabled})
+            if not ok:
+                self._log("[REALM-XXVII-DEGRADED]", reason="write_failed", action="persist_state", state_file=self.state_file)
         except Exception as exc:
-            self._log("[REALM-XXVII-ERROR]", reason=exc.__class__.__name__, action="persist_state")
+            record_persist_event(subsystem="REALM-XXVII", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__, details={"enabled": self.enabled})
+            self._log("[REALM-XXVII-DEGRADED]", reason=exc.__class__.__name__, action="persist_state", state_file=self.state_file)
 
     def collect_state(self, bot=None, source="live"):
         bot = bot or self.bot

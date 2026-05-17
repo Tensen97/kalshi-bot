@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import time
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_env_path, runtime_memory_file, runtime_state_file, safe_atomic_json_write
 from collections import Counter, deque
 from datetime import datetime, timezone
 
@@ -21,11 +22,11 @@ except Exception:
 
 
 REALM_XXVI_ENABLE = (os.environ.get("REALM_XXVI_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
-REALM_XXVI_STATE_FILE = os.environ.get("REALM_XXVI_STATE_FILE", "/opt/kalshi-bot/data/realm_xxvi_evolution.json")
+REALM_XXVI_STATE_FILE = runtime_env_path("REALM_XXVI_STATE_FILE", runtime_state_file("realm_xxvi_evolution.json"))
 REALM_XXVI_HISTORY_LIMIT = int(float(os.environ.get("REALM_XXVI_HISTORY_LIMIT", "500") or 500))
 REALM_XXVI_SUMMARY_INTERVAL_SECONDS = float(os.environ.get("REALM_XXVI_SUMMARY_INTERVAL_SECONDS", "60") or 60)
 REALM_XXVI_RECOMMENDATION_CAP = int(float(os.environ.get("REALM_XXVI_RECOMMENDATION_CAP", "10") or 10))
-REALM_XXVI_MEMORY_DB_PATH = os.environ.get("REALM_XXVI_MEMORY_DB_PATH", "/opt/kalshi-bot/seraph_memory.sqlite3")
+REALM_XXVI_MEMORY_DB_PATH = runtime_env_path("REALM_XXVI_MEMORY_DB_PATH", runtime_memory_file("seraph_memory.sqlite3"))
 
 
 def _now_iso():
@@ -69,6 +70,7 @@ class EvolutionEngine:
     ):
         self.state_file = state_file
         self.memory_db_path = memory_db_path
+        ensure_runtime_layout()
         self.enabled = bool(enabled)
         self.history_limit = max(100, int(history_limit))
         self.summary_interval_seconds = max(15.0, float(summary_interval_seconds))
@@ -135,13 +137,14 @@ class EvolutionEngine:
         try:
             _ensure_dir(self.state_file)
             self._state["updated_at"] = _now_iso()
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w") as handle:
-                json.dump(_json_safe(self._state), handle, sort_keys=True, indent=2)
-            os.replace(tmp_path, self.state_file)
-            return True
+            ok = safe_atomic_json_write(self.state_file, _json_safe(self._state), sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XXVI", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+            if not ok:
+                self._log("[REALM-XXVI-DEGRADED]", reason="write_failed", action="persist_state")
+            return bool(ok)
         except Exception as exc:
-            self._log("[REALM-XXVI-ERROR]", reason=exc.__class__.__name__, action="persist_state")
+            record_persist_event(subsystem="REALM-XXVI", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
+            self._log("[REALM-XXVI-DEGRADED]", reason=exc.__class__.__name__, action="persist_state")
             return False
 
     def _connect(self):

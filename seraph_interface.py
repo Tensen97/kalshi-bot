@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_env_path, runtime_memory_file, runtime_state_file, safe_atomic_json_write, verify_runtime_paths
 import traceback
 from collections import deque
 from dataclasses import dataclass, field
@@ -44,14 +45,14 @@ REALM_XIX_ALERT_HISTORY_LIMIT = int(float(os.environ.get("REALM_XIX_ALERT_HISTOR
 REALM_XIX_TELEMETRY_INTERVAL_SECONDS = float(os.environ.get("REALM_XIX_TELEMETRY_INTERVAL_SECONDS", "15") or 15)
 REALM_XIX_API_HOST = os.environ.get("REALM_XIX_API_HOST", "0.0.0.0")
 REALM_XIX_API_PORT = int(float(os.environ.get("REALM_XIX_API_PORT", "3002") or 3002))
-REALM_XIX_STATE_FILE = os.environ.get("REALM_XIX_STATE_FILE", "/opt/kalshi-bot/data/seraph_interface_state.json")
+REALM_XIX_STATE_FILE = runtime_env_path("REALM_XIX_STATE_FILE", runtime_state_file("seraph_interface_state.json"))
 REALM_XXVIII_ENABLE = (os.environ.get("REALM_XXVIII_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
 REALM_XXVII_ENABLE = (os.environ.get("REALM_XXVII_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
-REALM_XXVII_STATE_FILE = os.environ.get("REALM_XXVII_STATE_FILE", "/opt/kalshi-bot/data/realm_xxvii_command_center.json")
+REALM_XXVII_STATE_FILE = runtime_env_path("REALM_XXVII_STATE_FILE", runtime_state_file("realm_xxvii_command_center.json"))
 REALM_XXVII_SUMMARY_INTERVAL_SECONDS = float(os.environ.get("REALM_XXVII_SUMMARY_INTERVAL_SECONDS", "60") or 60)
 REALM_XXX_ENABLE = (os.environ.get("REALM_XXX_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
 REALM_XXIX_ENABLE = (os.environ.get("REALM_XXIX_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
-REALM_XXIX_STATE_FILE = os.environ.get("REALM_XXIX_STATE_FILE", "/opt/kalshi-bot/data/realm_xxix_live_state.json")
+REALM_XXIX_STATE_FILE = runtime_env_path("REALM_XXIX_STATE_FILE", runtime_state_file("realm_xxix_live_state.json"))
 REALM_XXIX_HISTORY_LIMIT = int(float(os.environ.get("REALM_XXIX_HISTORY_LIMIT", "120") or 120))
 
 
@@ -1138,6 +1139,8 @@ class SeraphInterfaceLayer:
         self.api_host = str(api_host or "0.0.0.0")
         self.api_port = int(api_port or 3002)
         self.state_file = state_file
+        ensure_runtime_layout()
+        verify_runtime_paths(extra_paths=[self.state_file])
         self.started_at = time.time()
         self.last_update_ts = 0.0
         self.last_state = EcosystemState().to_dict()
@@ -1200,11 +1203,12 @@ class SeraphInterfaceLayer:
     def _write_state_file(self, state):
         try:
             _ensure_dir(self.state_file)
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w") as handle:
-                json.dump(_json_safe(state), handle, sort_keys=True, indent=2)
-            os.replace(tmp_path, self.state_file)
+            ok = safe_atomic_json_write(self.state_file, _json_safe(state), sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XIX", path=self.state_file, action="write_state_file", success=bool(ok), reason=None if ok else "write_failed")
+            if not ok:
+                self._log("[REALM-XIX-DEGRADED]", reason="write_failed", action="write_state_file")
         except Exception as exc:
+            record_persist_event(subsystem="REALM-XIX", path=self.state_file, action="write_state_file", success=False, reason=exc.__class__.__name__)
             self._log("[REALM-XIX-DEGRADED]", reason=exc.__class__.__name__, action="write_state_file")
 
     def _realm_flags(self, bot):

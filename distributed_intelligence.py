@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_env_path, runtime_state_file, safe_atomic_json_write
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ REALM_XX_COUNCIL_INTERVAL_SECONDS = float(os.environ.get("REALM_XX_COUNCIL_INTER
 REALM_XX_AGENT_HEARTBEAT_MAX_AGE_SECONDS = float(os.environ.get("REALM_XX_AGENT_HEARTBEAT_MAX_AGE_SECONDS", "120") or 120)
 REALM_XX_MAX_AGENT_HISTORY = int(float(os.environ.get("REALM_XX_MAX_AGENT_HISTORY", "100") or 100))
 REALM_XX_ALLOW_LIVE_INFLUENCE = (os.environ.get("REALM_XX_ALLOW_LIVE_INFLUENCE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
-REALM_XX_STATE_FILE = os.environ.get("REALM_XX_STATE_FILE", "/opt/kalshi-bot/data/distributed_agents.json")
+REALM_XX_STATE_FILE = runtime_env_path("REALM_XX_STATE_FILE", runtime_state_file("distributed_agents.json"))
 
 
 AGENT_ROLE_DEFINITIONS = {
@@ -154,6 +155,7 @@ class DistributedIntelligenceCouncil:
         self.last_report = {}
         self.last_council_signature = None
         self._history = deque(maxlen=self.max_agent_history)
+        ensure_runtime_layout()
         self._state = self._load_state()
         self._ensure_seed_agents()
         self._persist_state()
@@ -198,13 +200,14 @@ class DistributedIntelligenceCouncil:
         try:
             _ensure_dir(self.state_file)
             self._state["updated_at"] = _now_iso()
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w") as handle:
-                json.dump(_safe_json(self._state), handle, sort_keys=True, indent=2)
-            os.replace(tmp_path, self.state_file)
-            return True
+            ok = safe_atomic_json_write(self.state_file, _safe_json(self._state), sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XX", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed", details={"agents": len(self._state.get("agents", {}) or {})})
+            if not ok:
+                self._log("[REALM-XX-DEGRADED]", reason="write_failed", action="persist_state")
+            return bool(ok)
         except Exception as exc:
-            self._log("[REALM-XX-ERROR]", reason=exc.__class__.__name__, action="persist_state")
+            record_persist_event(subsystem="REALM-XX", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
+            self._log("[REALM-XX-DEGRADED]", reason=exc.__class__.__name__, action="persist_state")
             return False
 
     def _seed_agent(self, agent_id):

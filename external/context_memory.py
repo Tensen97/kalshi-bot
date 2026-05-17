@@ -5,11 +5,13 @@ import os
 import threading
 import time
 from typing import Any, Dict, List
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_state_file, safe_atomic_json_write
 
 
 class ExternalContextMemory:
-    def __init__(self, state_file: str, history_limit: int = 200):
-        self.state_file = state_file
+    def __init__(self, state_file: str | None = None, history_limit: int = 200):
+        self.state_file = str(state_file or runtime_state_file("external_context_memory.json"))
+        ensure_runtime_layout()
         self.history_limit = max(20, int(history_limit or 200))
         self._lock = threading.RLock()
         self.state = {"updated_at": None, "contexts": [], "catalysts": [], "families": {}, "risk_windows": {}}
@@ -28,12 +30,10 @@ class ExternalContextMemory:
 
     def _save(self):
         try:
-            directory = os.path.dirname(self.state_file)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(self.state_file, "w", encoding="utf-8") as handle:
-                json.dump(self.state, handle, indent=2, sort_keys=True)
-        except Exception:
+            ok = safe_atomic_json_write(self.state_file, self.state, indent=2, sort_keys=True)
+            record_persist_event(subsystem="REALM-XXV-CONTEXT", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+        except Exception as exc:
+            record_persist_event(subsystem="REALM-XXV-CONTEXT", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
             return
 
     def record(self, item: Dict[str, Any]):

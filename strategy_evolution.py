@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import time
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_env_path, runtime_memory_file, runtime_state_file, safe_atomic_json_write
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -22,8 +23,8 @@ except Exception:
 REALM_XVII_ENABLE = (os.environ.get("REALM_XVII_ENABLE", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
 REALM_XVII_MAX_CANDIDATES = int(float(os.environ.get("REALM_XVII_MAX_CANDIDATES", "25") or 25))
 REALM_XVII_MAX_MUTATION_PERCENT = float(os.environ.get("REALM_XVII_MAX_MUTATION_PERCENT", "0.10") or 0.10)
-REALM_XVII_STATE_FILE = os.environ.get("REALM_XVII_STATE_FILE", "/opt/kalshi-bot/data/realm_xvii_strategy_evolution.sqlite3")
-REALM_XVII_EXPORT_FILE = os.environ.get("REALM_XVII_EXPORT_FILE", "/opt/kalshi-bot/data/realm_xvii_latest_report.json")
+REALM_XVII_STATE_FILE = runtime_env_path("REALM_XVII_STATE_FILE", runtime_memory_file("realm_xvii_strategy_evolution.sqlite3"))
+REALM_XVII_EXPORT_FILE = runtime_env_path("REALM_XVII_EXPORT_FILE", runtime_state_file("realm_xvii_latest_report.json"))
 REALM_XVII_SHADOW_THROTTLE_SECONDS = int(float(os.environ.get("REALM_XVII_SHADOW_THROTTLE_SECONDS", "300") or 300))
 REALM_XVII_REPLAY_SAMPLE_LIMIT = int(float(os.environ.get("REALM_XVII_REPLAY_SAMPLE_LIMIT", "2500") or 2500))
 REALM_XVII_MAX_EVALUATIONS = int(float(os.environ.get("REALM_XVII_MAX_EVALUATIONS", "2000") or 2000))
@@ -221,6 +222,7 @@ class StrategyEvolutionEngine:
     ):
         self.state_file = state_file
         self.export_file = export_file
+        ensure_runtime_layout()
         self.enabled = bool(enabled)
         self.max_candidates = max(1, int(max_candidates))
         self.max_mutation_percent = max(0.01, min(0.50, float(max_mutation_percent)))
@@ -1073,8 +1075,8 @@ class StrategyEvolutionEngine:
     def _save_report(self, report):
         try:
             _ensure_dir(self.export_file)
-            with open(self.export_file, "w") as handle:
-                json.dump(report, handle, sort_keys=True, indent=2)
+            ok = safe_atomic_json_write(self.export_file, report, sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XVII", path=self.export_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
         except Exception:
             pass
 
@@ -1492,8 +1494,8 @@ class StrategyEvolutionEngine:
         path = output_path or f"{self.export_file}.strategy_{_slugify(profile.name)}.json"
         try:
             _ensure_dir(path)
-            with open(path, "w") as handle:
-                json.dump(payload, handle, sort_keys=True, indent=2)
+            ok = safe_atomic_json_write(path, payload, sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XVII", path=path, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
         except Exception as exc:
             return {"ok": False, "reason": exc.__class__.__name__}
         return {"ok": True, "path": path, "payload": payload}
@@ -1564,7 +1566,7 @@ def main():
     parser.add_argument("--replay", action="store_true")
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--shadow", action="store_true")
-    parser.add_argument("--snapshot-file", default="/opt/kalshi-bot/data/simulation_snapshots.jsonl")
+    parser.add_argument("--snapshot-file", default=runtime_state_file("simulation_snapshots.jsonl"))
     parser.add_argument("--limit", type=int, default=REALM_XVII_REPLAY_SAMPLE_LIMIT)
     args = parser.parse_args()
     engine = StrategyEvolutionEngine()

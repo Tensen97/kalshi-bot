@@ -3,9 +3,10 @@ import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_env_path, runtime_state_file, safe_atomic_json_write
 
 
-REALM_XVI_DEFAULT_STATE_FILE = "/opt/kalshi-bot/data/cross_market_intelligence.json"
+REALM_XVI_DEFAULT_STATE_FILE = runtime_env_path("REALM_XVI_STATE_FILE", runtime_state_file("cross_market_intelligence.json"))
 REALM_XVI_ENABLE = (os.environ.get("REALM_XVI_ENABLE", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 REALM_XVI_MAX_SCORE_BOOST = float(os.environ.get("REALM_XVI_MAX_SCORE_BOOST", "0.05") or 0.05)
 REALM_XVI_MAX_SCORE_PENALTY = float(os.environ.get("REALM_XVI_MAX_SCORE_PENALTY", "0.05") or 0.05)
@@ -59,6 +60,7 @@ class CrossMarketIntelligence:
     def __init__(self, state_file=REALM_XVI_DEFAULT_STATE_FILE, enabled=REALM_XVI_ENABLE):
         self.state_file = state_file
         self.enabled = bool(enabled)
+        ensure_runtime_layout()
         self.state = self._load_state()
         self.last_cycle_summary = {}
         self.last_cycle_context = {}
@@ -125,13 +127,14 @@ class CrossMarketIntelligence:
             self._prune_state()
             self.state["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             self._ensure_parent_dir()
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w") as handle:
-                json.dump(self.state, handle, sort_keys=True, indent=2)
-            os.replace(tmp_path, self.state_file)
-            return True
+            ok = safe_atomic_json_write(self.state_file, self.state, sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XVI", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed", details={"families": len(self.state.get("families", {}) or {}), "relationships": len(self.state.get("relationships", {}) or {})})
+            if not ok:
+                self._log("[REALM-XVI-DEGRADED]", reason="write_failed")
+            return bool(ok)
         except Exception as exc:
-            self._log("[REALM-XVI-ERROR]", reason=exc.__class__.__name__)
+            record_persist_event(subsystem="REALM-XVI", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
+            self._log("[REALM-XVI-DEGRADED]", reason=exc.__class__.__name__)
             return False
 
     def _quote_mid(self, quote):

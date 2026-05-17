@@ -4,6 +4,7 @@ import json
 import os
 import time
 from typing import Any, Dict, List
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_state_file, safe_atomic_json_write
 
 from .adaptive_thresholds import compute_adaptive_thresholds
 from .personality_memory import PersonalityMemory
@@ -82,12 +83,10 @@ class PersonalityEngine:
         if not self.state_file:
             return
         try:
-            folder = os.path.dirname(self.state_file)
-            if folder:
-                os.makedirs(folder, exist_ok=True)
-            with open(self.state_file, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-        except Exception:
+            ok = safe_atomic_json_write(self.state_file, payload, indent=2, sort_keys=True)
+            record_persist_event(subsystem="REALM-XXI", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+        except Exception as exc:
+            record_persist_event(subsystem="REALM-XXI", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
             return
 
     def _family_metrics(self, market: Dict[str, Any], quote: Any, ws_snapshot: Dict[str, Any] | None = None) -> Dict[str, Any]:

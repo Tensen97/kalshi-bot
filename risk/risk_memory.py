@@ -5,11 +5,13 @@ import os
 import threading
 import time
 from typing import Any, Dict
+from runtime.paths import record_persist_event, runtime_state_file, safe_atomic_json_write, ensure_runtime_layout
 
 
 class RiskMemory:
-    def __init__(self, state_file: str, history_limit: int = 400):
-        self.state_file = state_file
+    def __init__(self, state_file: str | None = None, history_limit: int = 400):
+        self.state_file = str(state_file or runtime_state_file("realm_xxiv_risk_memory.json"))
+        ensure_runtime_layout()
         self.history_limit = max(50, int(history_limit or 400))
         self._lock = threading.Lock()
         self.state = {
@@ -37,12 +39,10 @@ class RiskMemory:
 
     def _save(self):
         try:
-            folder = os.path.dirname(self.state_file)
-            if folder:
-                os.makedirs(folder, exist_ok=True)
-            with open(self.state_file, "w", encoding="utf-8") as handle:
-                json.dump(self.state, handle, indent=2, sort_keys=True)
-        except Exception:
+            ok = safe_atomic_json_write(self.state_file, self.state, indent=2, sort_keys=True)
+            record_persist_event(subsystem="REALM-XXIV-MEMORY", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+        except Exception as exc:
+            record_persist_event(subsystem="REALM-XXIV-MEMORY", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
             return
 
     def record(self, event: Dict[str, Any], persist: bool = False):

@@ -2,6 +2,7 @@ import json
 import os
 import time
 from collections import defaultdict, deque
+from runtime.paths import record_persist_event, runtime_state_file, safe_atomic_json_write, ensure_runtime_layout
 
 
 def _now_iso():
@@ -36,8 +37,9 @@ def _json_safe(value):
 
 
 class PatternMemory:
-    def __init__(self, state_file, history_limit=500):
-        self.state_file = state_file
+    def __init__(self, state_file=None, history_limit=500):
+        self.state_file = str(state_file or runtime_state_file("pattern_memory.json"))
+        ensure_runtime_layout()
         self.history_limit = max(50, int(history_limit))
         self._state = self._load_state()
 
@@ -76,12 +78,11 @@ class PatternMemory:
         try:
             _ensure_dir(self.state_file)
             self._state["updated_at"] = _now_iso()
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w") as handle:
-                json.dump(_json_safe(self._state), handle, sort_keys=True, indent=2)
-            os.replace(tmp_path, self.state_file)
-            return True
-        except Exception:
+            ok = safe_atomic_json_write(self.state_file, _json_safe(self._state), sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XXVI-PATTERN", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+            return bool(ok)
+        except Exception as exc:
+            record_persist_event(subsystem="REALM-XXVI-PATTERN", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
             return False
 
     def update(self, analyses):

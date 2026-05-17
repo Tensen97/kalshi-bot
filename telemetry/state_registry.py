@@ -7,6 +7,7 @@ import time
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_state_file, safe_atomic_json_write
 
 from .health_snapshot import compute_global_health_snapshot
 from .live_state import LiveTelemetryState
@@ -38,9 +39,10 @@ def _ensure_dir(path):
 
 
 class LiveTelemetryRegistry:
-    def __init__(self, enabled=False, state_file="/opt/kalshi-bot/data/realm_xxix_live_state.json", history_limit=100):
+    def __init__(self, enabled=False, state_file=None, history_limit=100):
         self.enabled = bool(enabled)
-        self.state_file = str(state_file or "/opt/kalshi-bot/data/realm_xxix_live_state.json")
+        self.state_file = str(state_file or runtime_state_file("realm_xxix_live_state.json"))
+        ensure_runtime_layout()
         self.history_limit = max(10, int(history_limit or 100))
         self._lock = threading.RLock()
         self._state = LiveTelemetryState()
@@ -55,11 +57,12 @@ class LiveTelemetryRegistry:
     def _persist(self):
         try:
             _ensure_dir(self.state_file)
-            tmp_path = f"{self.state_file}.tmp"
-            with open(tmp_path, "w") as handle:
-                json.dump(self.snapshot(), handle, sort_keys=True, indent=2)
-            os.replace(tmp_path, self.state_file)
+            ok = safe_atomic_json_write(self.state_file, self.snapshot(), sort_keys=True, indent=2)
+            record_persist_event(subsystem="REALM-XXIX", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+            if not ok:
+                self._log("[REALM-XXIX-DEGRADED]", reason="write_failed", action="persist")
         except Exception as exc:
+            record_persist_event(subsystem="REALM-XXIX", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
             self._log("[REALM-XXIX-DEGRADED]", reason=exc.__class__.__name__, action="persist")
 
     def _update_history(self, entry):
@@ -139,11 +142,11 @@ _REGISTRY = None
 _REGISTRY_LOCK = threading.RLock()
 
 
-def get_live_state_registry(enabled=False, state_file="/opt/kalshi-bot/data/realm_xxix_live_state.json", history_limit=100):
+def get_live_state_registry(enabled=False, state_file=None, history_limit=100):
     global _REGISTRY
     with _REGISTRY_LOCK:
         if _REGISTRY is None:
-            _REGISTRY = LiveTelemetryRegistry(enabled=enabled, state_file=state_file, history_limit=history_limit)
+            _REGISTRY = LiveTelemetryRegistry(enabled=enabled, state_file=state_file or runtime_state_file("realm_xxix_live_state.json"), history_limit=history_limit)
         else:
             _REGISTRY.enabled = bool(enabled or _REGISTRY.enabled)
             if state_file:

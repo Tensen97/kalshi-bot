@@ -4,6 +4,11 @@ from datetime import datetime, timezone
 from collections import deque
 
 try:
+    from runtime.paths import runtime_state_file
+except Exception:
+    runtime_state_file = None
+
+try:
     from telemetry.state_registry import get_live_state_registry
 except Exception:
     get_live_state_registry = None
@@ -112,7 +117,11 @@ def build_ecosystem_state(bot=None, interface=None, source="live"):
             if registry is None:
                 registry = get_live_state_registry(
                     enabled=bool(getattr(interface, "enabled", False) or getattr(interface, "api_enable", False) or getattr(interface, "ui_effective_enable", False)),
-                    state_file=getattr(interface, "state_file", "/opt/kalshi-bot/data/realm_xxix_live_state.json"),
+                    state_file=getattr(
+                        interface,
+                        "state_file",
+                        runtime_state_file("realm_xxix_live_state.json") if callable(runtime_state_file) else "/opt/kalshi-bot/runtime/state/realm_xxix_live_state.json",
+                    ),
                     history_limit=int(getattr(interface, "alert_history_limit", 100) or 100),
                 )
             if registry is not None and hasattr(registry, "snapshot"):

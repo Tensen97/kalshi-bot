@@ -1,0 +1,12 @@
+[Unit]
+Description=AION Guardian Hourly Report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kalshi-bot
+EnvironmentFile=/opt/kalshi-bot/.env
+ExecStart=/usr/bin/python3 /opt/kalshi-bot/aion_guardian_report.py
+StandardOutput=journal
+StandardError=journal

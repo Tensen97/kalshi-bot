@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from copy import deepcopy
+from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_memory_file, safe_atomic_json_write
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -400,13 +401,10 @@ class AIONPersistentIntelligence:
             return self.snapshot()
         with self._lock:
             try:
-                path = Path(self.state_file)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = path.with_suffix(path.suffix + ".tmp")
-                with open(tmp_path, "w") as handle:
-                    json.dump(self.snapshot(), handle, indent=2, sort_keys=True, default=str)
-                os.replace(tmp_path, path)
+                ok = safe_atomic_json_write(self.state_file, self.snapshot(), indent=2, sort_keys=True, default=str)
+                record_persist_event(subsystem="AION-PERSIST", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
             except Exception as exc:
+                record_persist_event(subsystem="AION-PERSIST", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
                 builtins.print("[AION-INTELLIGENCE-MEMORY] " + json.dumps({"reason": exc.__class__.__name__, "state_file": self.state_file, "action": "persist"}, sort_keys=True))
             return self.snapshot()
 

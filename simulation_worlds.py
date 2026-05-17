@@ -6,6 +6,11 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+try:
+    from runtime.paths import runtime_state_file
+except Exception:
+    runtime_state_file = None
+
 
 HARD_SAFETY_REASONS = {
     "duplicate_position_guard",
@@ -113,7 +118,7 @@ class ReplayOutcome:
 class RealmXVSimulationWorlds:
     def __init__(
         self,
-        snapshot_path="/opt/kalshi-bot/data/simulation_snapshots.jsonl",
+        snapshot_path=runtime_state_file("simulation_snapshots.jsonl") if callable(runtime_state_file) else "/opt/kalshi-bot/runtime/state/simulation_snapshots.jsonl",
         record_enabled=False,
         max_snapshot_mb=50,
         max_snapshot_rows=50000,
@@ -513,7 +518,10 @@ class RealmXVSimulationWorlds:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--replay", action="store_true")
-    parser.add_argument("--snapshot-file", default="/opt/kalshi-bot/data/simulation_snapshots.jsonl")
+    parser.add_argument(
+        "--snapshot-file",
+        default=runtime_state_file("simulation_snapshots.jsonl") if callable(runtime_state_file) else "/opt/kalshi-bot/runtime/state/simulation_snapshots.jsonl",
+    )
     parser.add_argument("--limit", type=int, default=5000)
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--record-interval", type=float, default=10.0)
