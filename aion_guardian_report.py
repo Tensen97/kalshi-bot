@@ -996,8 +996,9 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         prefix_counts[prefix] += 1
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
         category, reason, _ticker = _classify_blocker(entry)
-        if reason:
-            blocker_counts[reason] += 1
+        reason_text = str(reason or "").strip().lower()
+        if reason_text:
+            blocker_counts[reason_text] += 1
         if prefix == "AION-PHASE55-HANDOFF-TRACE":
             if _truthy(payload.get("phase55_observation_called")):
                 phase55_observation_called += 1
@@ -1012,13 +1013,13 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
                 placeholder_overwrite += 1
             if _truthy(payload.get("stale_record")):
                 stale_records += 1
-        if "recursionerror" in reason:
+        if "recursionerror" in reason_text:
             recursion_errors += 1
-        if reason == "quote_not_usable":
+        if reason_text == "quote_not_usable":
             quote_not_usable += 1
-        if reason in {"selected_price_above_0_99", "selected_price_above_max", "selected_price_out_of_bounds"}:
+        if reason_text in {"selected_price_above_0_99", "selected_price_above_max", "selected_price_out_of_bounds"}:
             selected_price_above += 1
-        if reason == "unsafe_price_unknown":
+        if reason_text == "unsafe_price_unknown":
             unsafe_unknown += 1
     return {
         "prefix_counts": prefix_counts,
