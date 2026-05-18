@@ -1,0 +1,11 @@
+[Unit]
+Description=AION Guardian Watchdog Timer
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=5m
+Persistent=true
+Unit=aion-guardian-watchdog.service
+
+[Install]
+WantedBy=timers.target

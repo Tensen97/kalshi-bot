@@ -45,3 +45,6 @@ data/distributed_agents.json
 data/realm_xxix_live_state.json
 data/realm_xxvii_command_center.json
 data/seraph_interface_state.json
+runtime/
+__pycache__/
+*.pyc

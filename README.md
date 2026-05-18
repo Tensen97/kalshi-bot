@@ -7,7 +7,7 @@ This repository contains the live AION/Kalshi bot orchestrator and the supportin
 ## Safety Philosophy
 
 - `AION_LIVE_ARB_ENABLED` stays off by default in code.
-- Phase 5.5 stays intact.
+- Realm V.V is canonical; Phase 5.5 aliases remain compatibility-only.
 - Spread, liquidity, cooldown, duplicate, arm-live, unsafe-price, and execution protections remain unchanged.
 - New intelligence layers are telemetry-first, bounded, and reversible.
 - Sports calibration only informs ranking and diagnostics; it does not create a direct execution path.
@@ -89,9 +89,9 @@ Search telemetry tags:
 sudo journalctl -u kalshi-bot -n 200 --no-pager | grep -E "AION-|LIVE-SPORTS-|LIVE-CANARY-|LIVE-REACTIVATION-|LIVE-ENTRY-TIMING-FUSION"
 ```
 
-## Phase 5.5
+## Realm V.V
 
-Phase 5.5 remains the final entry timing and safety gate before any live execution consideration.
+Realm V.V is the final entry timing and safety gate before any live execution consideration.
 
 It is still responsible for:
 
@@ -101,7 +101,7 @@ It is still responsible for:
 - blocking unsafe prices
 - preventing execution when the market is not structurally ready
 
-No persistent intelligence layer in this repo is allowed to override Phase 5.5.
+No persistent intelligence layer in this repo is allowed to override Realm V.V.
 
 ## Sports Telemetry
 

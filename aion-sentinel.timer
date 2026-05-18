@@ -1,0 +1,12 @@
+[Unit]
+Description=AION Sentinel Auto-Patch Timer
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=30s
+AccuracySec=15s
+Persistent=true
+Unit=aion-sentinel.service
+
+[Install]
+WantedBy=timers.target

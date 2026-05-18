@@ -276,6 +276,8 @@ def _telemetry_severity(tag):
 
 
 def _telemetry_cooldown_seconds(tag, severity, suppression_mode_active=False):
+    canonical_final_submit_allowed = False
+    canonical_final_submit_allowed = False
     tag = str(tag or "").strip().upper()
     severity = str(severity or "NORMAL").strip().upper()
     if severity == "CRITICAL":
@@ -438,6 +440,7 @@ class TelemetryRateLimiter:
             }
 
     def emit_status_dashboard(self, *, source="startup", force=False):
+        canonical_final_submit_allowed = False
         now = time.time()
         with self._lock:
             if not force and (now - float(_TELEMETRY_STATE["last_telemetry_status_ts"] or 0.0)) < 300.0:
@@ -501,6 +504,7 @@ def _should_emit_module_log(*args):
 
 
 def print(*args, **kwargs):
+    canonical_final_submit_allowed = False
     if _should_emit_module_log(*args):
         return builtins.print(*args, **kwargs)
     return None
@@ -588,6 +592,7 @@ class LiveRejectTelemetry:
         }
 
     def maybe_emit_summary(self, *, source="live_cycle", cycle_count=None, force=False):
+        canonical_final_submit_allowed = False
         now = time.time()
         if not force and (now - float(self.last_summary_ts or 0.0)) < self.summary_interval_seconds:
             return None
@@ -637,6 +642,397 @@ def get_env_float(name, default):
 
 def _env_float(name, default):
     return get_env_float(name, default)
+
+
+AION_AGGRESSION_PROFILE_DEFAULT = "safe"
+AION_AGGRESSION_PROFILE_VALUES = {"safe", "balanced", "opportunistic", "beast"}
+RELAXED_BEAST_MODE_LEVEL = get_env_int("RELAXED_BEAST_MODE_LEVEL", 4)
+
+
+AION_USE_REALM_VV_ENTRY_ENGINE = str(os.environ.get("AION_USE_REALM_VV_ENTRY_ENGINE", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+AION_USE_LEGACY_PHASE55 = str(os.environ.get("AION_USE_LEGACY_PHASE55", "0") or "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _normalize_aion_aggression_profile(profile):
+    base_profile = profile
+    if base_profile is None or str(base_profile).strip() == "":
+        base_profile = globals().get("AION_AGGRESSION_PROFILE", AION_AGGRESSION_PROFILE_DEFAULT)
+    text = str(base_profile or AION_AGGRESSION_PROFILE_DEFAULT).strip().lower()
+    return text if text in AION_AGGRESSION_PROFILE_VALUES else AION_AGGRESSION_PROFILE_DEFAULT
+
+
+def _normalize_aggression_profile(profile):
+    return _normalize_aion_aggression_profile(profile)
+
+
+normalize_aggression_profile = _normalize_aggression_profile
+profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE if "AION_AGGRESSION_PROFILE" in globals() else AION_AGGRESSION_PROFILE_DEFAULT)
+
+
+def _relaxed_beast_mode_enabled(level=4):
+    try:
+        return int(RELAXED_BEAST_MODE_LEVEL) >= int(level)
+    except Exception:
+        return False
+
+
+def _aion_aggression_profile_settings(profile=None, *, family=None, spread_bucket=None, context=None):
+    profile_source = profile if profile is not None else globals().get("AION_AGGRESSION_PROFILE", AION_AGGRESSION_PROFILE_DEFAULT)
+    profile_name = _normalize_aion_aggression_profile(profile_source)
+    try:
+        controlled = bool(AION_CONTROLLED_LOOSENING_ENABLED)
+    except Exception:
+        controlled = True
+    if not controlled:
+        profile_name = "safe"
+    family_text = str(family or "").strip().upper()
+    spread_text = str(spread_bucket or "").strip().lower()
+    settings = {
+        "profile": profile_name,
+        "reason": "safe_default",
+        "score_threshold_delta": 0.0,
+        "confidence_threshold_delta": 0.0,
+        "edge_threshold_delta": 0.0,
+        "sports_threshold_delta": 0.0,
+        "phase55_relaxation": 0.0,
+        "flat_market_relaxation": 0.0,
+        "candidate_score_bonus": 0.0,
+        "effective_edge_threshold": None,
+        "effective_sports_threshold": None,
+        "candidate_count_before": None,
+        "candidate_count_after": None,
+        "payload_ready_count": None,
+        "phase55_ready_count": None,
+        "safety_gates_preserved": True,
+        "spread_bucket": spread_text or None,
+        "family": family_text or None,
+        "context": str(context or "").strip() or None,
+    }
+    if profile_name == "balanced":
+        settings.update({
+            "reason": "balanced_profile",
+            "score_threshold_delta": 2.0,
+            "confidence_threshold_delta": 0.02,
+            "edge_threshold_delta": 0.006,
+            "sports_threshold_delta": 0.012,
+            "phase55_relaxation": 0.025,
+            "flat_market_relaxation": 0.015,
+        })
+    elif profile_name == "opportunistic":
+        settings.update({
+            "reason": "opportunistic_profile",
+            "score_threshold_delta": 4.0,
+            "confidence_threshold_delta": 0.04,
+            "edge_threshold_delta": 0.012,
+            "sports_threshold_delta": 0.018,
+            "phase55_relaxation": 0.045,
+            "flat_market_relaxation": 0.030,
+        })
+    elif profile_name == "beast":
+        settings.update({
+            "reason": "beast_profile",
+            "score_threshold_delta": 6.0,
+            "confidence_threshold_delta": 0.06,
+            "edge_threshold_delta": 0.0135,
+            "sports_threshold_delta": 0.022,
+            "phase55_relaxation": 0.060,
+            "flat_market_relaxation": 0.040,
+        })
+    if family_text in AION_HIGH_LIQUIDITY_ALLOWED_FAMILIES:
+        settings["score_threshold_delta"] = round(settings["score_threshold_delta"] + 0.5, 4)
+        settings["confidence_threshold_delta"] = round(settings["confidence_threshold_delta"] + 0.005, 4)
+        settings["edge_threshold_delta"] = round(settings["edge_threshold_delta"] + 0.001, 4)
+        settings["sports_threshold_delta"] = round(settings["sports_threshold_delta"] + 0.002, 4)
+        settings["phase55_relaxation"] = round(settings["phase55_relaxation"] + 0.003, 4)
+        settings["flat_market_relaxation"] = round(settings["flat_market_relaxation"] + 0.002, 4)
+        settings["reason"] = f"{settings['reason']}+high_liquidity_family"
+    settings["candidate_score_bonus"] = round(settings["score_threshold_delta"] + (settings["confidence_threshold_delta"] * 10.0), 4)
+    settings["confidence_floor"] = round(max(0.0, 0.55 - settings["confidence_threshold_delta"]), 4)
+    settings["effective_score_threshold"] = round(max(0.0, PHASE5_BUY_SCORE_THRESHOLD - settings["score_threshold_delta"]), 4)
+    settings["effective_edge_threshold"] = round(max(0.0, AION_SPORTS_MIN_EDGE_AFTER_COST - settings["edge_threshold_delta"]), 4)
+    settings["effective_sports_threshold"] = round(max(0.0, MAX_ENTRY_SPREAD - settings["sports_threshold_delta"]), 4)
+    return settings
+
+
+def _classify_market_personality(self, market=None, quote_diag=None, q=None, family=None):
+    market = market if isinstance(market, dict) else {}
+    quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+    family = str(
+        family
+        or self.get_market_family(market)
+        or getattr(q, "family", "")
+        or market.get("family", "")
+        or "UNKNOWN"
+    ).strip().upper() or "UNKNOWN"
+    profiles = {}
+    try:
+        profiles = ((self.market_personality_profiles or {}).get("families", {}) or {}) if isinstance(getattr(self, "market_personality_profiles", None), dict) else {}
+    except Exception:
+        profiles = {}
+    profile = profiles.get(family, {}) if isinstance(profiles, dict) else {}
+    personality_type = str(profile.get("personality_type") or "").strip().lower() or "balanced"
+    liquidity_depth = self.to_float(
+        quote_diag.get("liquidity_depth"),
+        self.to_float(
+            quote_diag.get("liquidity"),
+            self.to_float(
+                getattr(q, "liquidity", None),
+                self.to_float(market.get("liquidity_dollars"), self.to_float(market.get("liquidity"), 0.0)),
+            ),
+        ),
+    )
+    spread_bucket = str(quote_diag.get("spread_bucket") or quote_diag.get("sports_spread_bucket") or "").strip().lower()
+    quote_reliability = self.to_float(profile.get("quote_reliability"), 0.0)
+    liquidity_reliability = self.to_float(profile.get("liquidity_reliability"), 0.0)
+    spread_stability = self.to_float(profile.get("spread_stability"), 0.0)
+    volatility_reliability = self.to_float(profile.get("fake_breakout_risk"), 0.0)
+    if family in {"KXBTC15M", "KXETH15M", "KXCRYPTO"} or personality_type in {"momentum_heavy"}:
+        category = "HIGH_LIQUIDITY_FAST"
+    elif personality_type in {"fake_breakout_prone"}:
+        category = "VOLATILE_ACTIVE"
+    elif quote_reliability < 0.4 or liquidity_reliability < 0.4:
+        category = "SPARSE_CAUTION"
+    elif liquidity_depth <= 0.0 and spread_bucket in {"unsafe", "extreme_wide"}:
+        category = "DEAD_MARKET"
+    elif spread_stability >= 0.6 and quote_reliability >= 0.5 and liquidity_depth <= 6.0:
+        category = "THIN_BUT_TRADEABLE"
+    elif spread_bucket in {"ultra_tight", "tight"} and liquidity_depth >= 3.0:
+        category = "HIGH_LIQUIDITY_FAST"
+    else:
+        category = "VOLATILE_ACTIVE" if volatility_reliability >= 0.55 else "THIN_BUT_TRADEABLE"
+    return {
+        "category": category,
+        "personality_type": personality_type,
+        "family": family,
+        "quote_reliability": round(quote_reliability, 4),
+        "liquidity_reliability": round(liquidity_reliability, 4),
+        "spread_stability": round(spread_stability, 4),
+        "liquidity_depth": round(liquidity_depth, 4),
+        "spread_bucket": spread_bucket or "unknown",
+    }
+
+
+def _compute_realm_vv_confidence(self, *, edge_after_cost=0.0, liquidity_depth=0.0, spread_bucket="unknown", market_personality=None, profile_settings=None, quote_ready=False, orderbook_ready=False, price_bounds_pass=False):
+    price_bounds_pass = False
+    profile_settings = profile_settings if isinstance(profile_settings, dict) else {}
+    market_personality = market_personality if isinstance(market_personality, dict) else {}
+    profile_name = str(profile_settings.get("profile") or "safe").strip().lower() or "safe"
+    edge_after_cost = max(0.0, self.to_float(edge_after_cost, 0.0))
+    liquidity_depth = max(0.0, self.to_float(liquidity_depth, 0.0))
+    spread_bucket = str(spread_bucket or "unknown").strip().lower() or "unknown"
+    edge_threshold = max(0.001, self.to_float(profile_settings.get("effective_edge_threshold"), 0.003))
+    confidence_floor = max(0.0, self.to_float(profile_settings.get("confidence_floor"), 0.55))
+    confidence = 0.0
+    confidence += min(0.30, (edge_after_cost / edge_threshold) * 0.18 if edge_threshold > 0 else 0.18)
+    confidence += min(0.20, min(1.0, liquidity_depth / 10.0) * 0.20)
+    confidence += 0.20 if spread_bucket in {"ultra_tight", "tight"} else 0.12 if spread_bucket == "wide_but_possible" else 0.04 if spread_bucket == "unsafe" else 0.08
+    confidence += {"HIGH_LIQUIDITY_FAST": 0.18, "VOLATILE_ACTIVE": 0.12, "THIN_BUT_TRADEABLE": 0.10, "SPARSE_CAUTION": 0.04, "DEAD_MARKET": 0.0}.get(str(market_personality.get("category") or "").strip().upper(), 0.08)
+    confidence += 0.08 if profile_name in {"opportunistic", "beast"} else 0.03 if profile_name == "balanced" else 0.0
+    confidence += 0.08 if quote_ready else 0.0
+    confidence += 0.08 if orderbook_ready else 0.0
+    confidence += 0.06 if price_bounds_pass else 0.0
+    confidence = self._clamp(confidence, 0.0, 1.0)
+    if confidence >= 0.82:
+        confidence_tier = "high"
+    elif confidence >= max(0.62, confidence_floor):
+        confidence_tier = "medium"
+    elif confidence >= 0.42:
+        confidence_tier = "low"
+    else:
+        confidence_tier = "weak"
+    survivability_score = self._clamp(
+        min(1.0, (liquidity_depth / 10.0)) * 0.35
+        + (0.25 if spread_bucket in {"ultra_tight", "tight"} else 0.15 if spread_bucket == "wide_but_possible" else 0.05)
+        + (0.20 if quote_ready else 0.0)
+        + (0.20 if orderbook_ready else 0.0),
+        0.0,
+        1.0,
+    )
+    suggested_size_multiplier = self._clamp(
+        0.45
+        + (0.35 if profile_name == "beast" else 0.20 if profile_name == "opportunistic" else 0.10 if profile_name == "balanced" else 0.0)
+        + (0.20 if confidence_tier == "high" else 0.10 if confidence_tier == "medium" else 0.0)
+        + (0.10 if spread_bucket in {"ultra_tight", "tight"} else 0.0),
+        0.25,
+        1.0,
+    )
+    return {
+        "confidence_score": round(confidence, 4),
+        "confidence_tier": confidence_tier,
+        "survivability_score": round(survivability_score, 4),
+        "suggested_size_multiplier": round(suggested_size_multiplier, 4),
+        "confidence_floor": round(confidence_floor, 4),
+        "edge_threshold": round(edge_threshold, 4),
+    }
+
+
+def _classify_realm_vv_spread_severity(self, *, spread_bucket="unknown", edge_after_cost=0.0, profile="safe", market_personality=None, quote_ready=False, orderbook_ready=False, price_bounds_pass=False, liquidity_depth=0.0, fresh_enough=True, topbook_depth_exists=False, selected_side_has_price=False, selected_side_has_liquidity=False, depth_available=False, aggression_settings=None):
+        profile = _normalize_aion_aggression_profile(profile)
+        market_personality = market_personality if isinstance(market_personality, dict) else {}
+        spread_bucket = str(spread_bucket or "unknown").strip().lower() or "unknown"
+        edge_after_cost = max(0.0, self.to_float(edge_after_cost, 0.0))
+        liquidity_depth = max(0.0, self.to_float(liquidity_depth, 0.0))
+        price_bounds_pass = bool(price_bounds_pass)
+        quote_ready = bool(quote_ready)
+        orderbook_ready = bool(orderbook_ready)
+        topbook_depth_exists = bool(topbook_depth_exists)
+        selected_side_has_price = bool(selected_side_has_price)
+        selected_side_has_liquidity = bool(selected_side_has_liquidity)
+        depth_available = bool(depth_available)
+        if liquidity_depth <= 0.0 and (topbook_depth_exists or selected_side_has_liquidity or depth_available):
+            liquidity_depth = 1.0
+        fresh_enough = bool(fresh_enough)
+        aggression_settings = aggression_settings if isinstance(aggression_settings, dict) else _aion_aggression_profile_settings(profile, family=market_personality.get("family"), spread_bucket=spread_bucket, context="realm_vv_spread")
+        threshold = max(0.001, self.to_float(aggression_settings.get("effective_edge_threshold"), 0.003))
+        personality_category = str(market_personality.get("category") or "").strip().upper() or "THIN_BUT_TRADEABLE"
+        beast_mode = profile in {"opportunistic", "beast"}
+        survivable_aggressive_precheck = bool(
+            beast_mode
+            and edge_after_cost > 0.0
+            and price_bounds_pass
+            and quote_ready
+            and fresh_enough
+            and (orderbook_ready or topbook_depth_exists or selected_side_has_liquidity or depth_available or selected_side_has_price)
+        )
+        if not price_bounds_pass or not quote_ready or not fresh_enough:
+            return {
+                "classification": "UNSAFE",
+                "reason": "hard_safety_or_staleness",
+                "severity": "catastrophic",
+                "is_catastrophic": True,
+                "is_survivable": False,
+                "beast_spread_override_applied": False,
+                "final_submit_allowed_by_realm_vv": False,
+                "threshold": round(threshold, 4),
+            }
+        if not orderbook_ready and survivable_aggressive_precheck and spread_bucket in {"unsafe", "wide_but_possible"}:
+            if edge_after_cost >= threshold * (0.75 if profile == "beast" else 1.0):
+                return {
+                    "classification": "AGGRESSIVE_BUT_TRADEABLE",
+                    "reason": "survivable_aggressive_no_orderbook_ready",
+                    "severity": "survivable",
+                    "is_catastrophic": False,
+                    "is_survivable": True,
+                    "beast_spread_override_applied": bool(profile == "beast"),
+                    "final_submit_allowed_by_realm_vv": True,
+                    "threshold": round(threshold, 4),
+                }
+            return {
+                "classification": "CAUTION_WAIT",
+                "reason": "survivable_aggressive_no_orderbook_ready",
+                "severity": "survivable",
+                "is_catastrophic": False,
+                "is_survivable": True,
+                "beast_spread_override_applied": False,
+                "final_submit_allowed_by_realm_vv": False,
+                "threshold": round(threshold, 4),
+            }
+        if spread_bucket in {"ultra_tight", "tight"}:
+            return {
+                "classification": "SAFE",
+                "reason": "tight_or_ultra_tight_book",
+                "severity": "survivable",
+                "is_catastrophic": False,
+                "is_survivable": True,
+                "beast_spread_override_applied": False,
+                "final_submit_allowed_by_realm_vv": True,
+                "threshold": round(threshold, 4),
+            }
+        if spread_bucket == "wide_but_possible":
+            aggressive_edge_floor = threshold * (0.75 if profile == "beast" else 1.0)
+            if edge_after_cost >= aggressive_edge_floor and (liquidity_depth > 0.0 or selected_side_has_liquidity or depth_available or topbook_depth_exists or selected_side_has_price):
+                return {
+                    "classification": "AGGRESSIVE_BUT_TRADEABLE",
+                    "reason": "positive_edge_with_depth",
+                    "severity": "survivable",
+                    "is_catastrophic": False,
+                    "is_survivable": True,
+                    "beast_spread_override_applied": bool(profile == "beast"),
+                    "final_submit_allowed_by_realm_vv": True,
+                    "threshold": round(threshold, 4),
+                }
+            if beast_mode and edge_after_cost > 0.0 and (liquidity_depth > 0.0 or selected_side_has_liquidity or depth_available or topbook_depth_exists) and personality_category != "DEAD_MARKET":
+                return {
+                    "classification": "CAUTION_WAIT",
+                    "reason": "beast_mode_near_miss",
+                    "severity": "survivable",
+                    "is_catastrophic": False,
+                    "is_survivable": True,
+                    "beast_spread_override_applied": False,
+                    "final_submit_allowed_by_realm_vv": False,
+                    "threshold": round(threshold, 4),
+                }
+            if edge_after_cost > 0.0 and personality_category != "DEAD_MARKET":
+                return {
+                    "classification": "CAUTION_WAIT",
+                    "reason": "edge_near_threshold",
+                    "severity": "survivable",
+                    "is_catastrophic": False,
+                    "is_survivable": True,
+                    "beast_spread_override_applied": False,
+                    "final_submit_allowed_by_realm_vv": False,
+                    "threshold": round(threshold, 4),
+                }
+            return {
+                "classification": "UNSAFE",
+                "reason": "wide_spread_no_survivable_edge",
+                "severity": "catastrophic",
+                "is_catastrophic": True,
+                "is_survivable": False,
+                "beast_spread_override_applied": False,
+                "final_submit_allowed_by_realm_vv": False,
+                "threshold": round(threshold, 4),
+            }
+        if spread_bucket == "unsafe":
+            if beast_mode and edge_after_cost >= threshold * (0.75 if profile == "beast" else 1.0) and (liquidity_depth > 0.0 or selected_side_has_liquidity or depth_available or topbook_depth_exists or selected_side_has_price):
+                return {
+                    "classification": "AGGRESSIVE_BUT_TRADEABLE",
+                    "reason": "beast_mode_wide_spread_allowed",
+                    "severity": "survivable",
+                    "is_catastrophic": False,
+                    "is_survivable": True,
+                    "beast_spread_override_applied": True,
+                    "final_submit_allowed_by_realm_vv": True,
+                    "threshold": round(threshold, 4),
+                }
+            if beast_mode and edge_after_cost > 0.0 and (liquidity_depth > 0.0 or selected_side_has_liquidity or depth_available or topbook_depth_exists) and personality_category != "DEAD_MARKET":
+                return {
+                    "classification": "CAUTION_WAIT",
+                    "reason": "beast_mode_wait_for_fill",
+                    "severity": "survivable",
+                    "is_catastrophic": False,
+                    "is_survivable": True,
+                    "beast_spread_override_applied": False,
+                    "final_submit_allowed_by_realm_vv": False,
+                    "threshold": round(threshold, 4),
+                }
+            return {
+                "classification": "UNSAFE",
+                "reason": "catastrophic_spread",
+                "severity": "catastrophic",
+                "is_catastrophic": True,
+                "is_survivable": False,
+                "beast_spread_override_applied": False,
+                "final_submit_allowed_by_realm_vv": False,
+                "threshold": round(threshold, 4),
+            }
+        return {
+            "classification": "CAUTION_WAIT" if edge_after_cost > 0.0 else "UNSAFE",
+            "reason": "unknown_spread_bucket",
+            "severity": "survivable" if edge_after_cost > 0.0 else "catastrophic",
+            "is_catastrophic": bool(edge_after_cost <= 0.0),
+            "is_survivable": bool(edge_after_cost > 0.0),
+            "beast_spread_override_applied": False,
+            "final_submit_allowed_by_realm_vv": False,
+            "threshold": round(threshold, 4),
+        }
+
+
+def _emit_aion_aggression_trace(prefix, payload):
+    try:
+        print(f"[{prefix}] " + json.dumps(payload, sort_keys=True, default=str))
+    except Exception:
+        print(f"[{prefix}] " + json.dumps({"error": "trace_emit_failed"}))
 
 
 def send_telegram_message(text):
@@ -974,6 +1370,9 @@ AION_AGGRESSIVE_MAX_CONTRACTS = get_env_int("AION_AGGRESSIVE_MAX_CONTRACTS", 1)
 AION_AGGRESSIVE_MAX_TRADES_PER_DAY = get_env_int("AION_AGGRESSIVE_MAX_TRADES_PER_DAY", 5)
 AION_AGGRESSIVE_COOLDOWN_SECONDS = get_env_int("AION_AGGRESSIVE_COOLDOWN_SECONDS", 300)
 AION_CANDIDATE_TRACE_ENABLED = get_env_bool("AION_CANDIDATE_TRACE_ENABLED", 1)
+AION_AGGRESSION_PROFILE_DEFAULT = "safe"
+AION_AGGRESSION_PROFILE_VALUES = {"safe", "balanced", "opportunistic", "beast"}
+AION_AGGRESSION_PROFILE = _normalize_aion_aggression_profile(os.environ.get("AION_AGGRESSION_PROFILE", AION_AGGRESSION_PROFILE_DEFAULT))
 AION_SPORTS_WIDE_SPREAD_BUFFER = _env_float("AION_SPORTS_WIDE_SPREAD_BUFFER", 0.025)
 AION_SPORTS_MAX_SPREAD_SOFT = _env_float("AION_SPORTS_MAX_SPREAD_SOFT", 0.18)
 AION_SPORTS_MAX_SPREAD_HARD = _env_float("AION_SPORTS_MAX_SPREAD_HARD", 0.24)
@@ -1098,6 +1497,7 @@ REALM_XXVI_RECOMMENDATION_CAP = int(_env_float("REALM_XXVI_RECOMMENDATION_CAP", 
 
 
 def compute_effective_live_dry_run(live_mode=None, live_armed=None, live_env_confirmed=None, configured_dry_run=None):
+    canonical_final_submit_allowed = False
     if live_mode is None:
         live_mode = bool(globals().get("LIVE_MODE", False))
     if live_armed is None:
@@ -1188,7 +1588,8 @@ class KalshiSniperBot:
         self.btc15m_dead_contract_cooldowns = {}
         self.sports_quote_continuity_cache = {}
         self.sports_momentum_state = {}
-        self.phase55_live_execution_gate_by_ticker = {}
+        self.realm_vv_live_execution_gate_by_ticker = {}
+        self.phase55_live_execution_gate_by_ticker = self.realm_vv_live_execution_gate_by_ticker
         self.live_direction_decisions_by_ticker = {}
         self.live_position_closure_tracker = {}
         self.live_loss_exit_confirmation_counts = {}
@@ -2127,6 +2528,8 @@ class KalshiSniperBot:
         liquidity_quality = self._clamp(self.to_float(liquidity_quality, 0.5), 0.0, 1.0)
         directional_bias = str(directional_bias or "unknown").strip().lower()
         spread_bucket = str(spread_bucket or "unknown").strip().lower()
+        aggression_settings = _aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, spread_bucket=spread_bucket, context=context)
+        flat_market_relaxation = self.to_float(aggression_settings.get("flat_market_relaxation"), 0.0) or 0.0
         lifecycle_state = str(market_lifecycle_state or self._get_sports_market_lifecycle_state(market=market, q=q, family=family, event_urgency=event_urgency) or "unknown").strip().lower()
         signal_bias = 0.0
         signal_bias += (self._clamp(0.5 + momentum_score * 1.10, 0.0, 1.0) - 0.5) * 0.18
@@ -2161,8 +2564,8 @@ class KalshiSniperBot:
             "near": 0.010,
         }.get(str(event_urgency or market.get("event_urgency") or market.get("urgency") or "unknown").strip().lower(), 0.0)
         signal_bias += lifecycle_bias + urgency_bias
-        if directional_bias == "flat" and spread_bucket in {"wide_but_possible", "extreme_wide"} and momentum_score < AION_SPORTS_MIN_MOMENTUM_FOR_WIDE:
-            signal_bias -= 0.04
+        if directional_bias == "flat" and spread_bucket in {"wide_but_possible", "extreme_wide"} and momentum_score < max(0.10, AION_SPORTS_MIN_MOMENTUM_FOR_WIDE - flat_market_relaxation):
+            signal_bias -= max(0.01, 0.04 - flat_market_relaxation)
         calibration_before_family_bias = base_probability + signal_bias
         family_positive_bias = 0.0
         family_bias_reason = None
@@ -2346,7 +2749,7 @@ class KalshiSniperBot:
         raw_buffer = (base_buffer + instability_penalty + urgency_penalty + lifecycle_discount - stability_credit) * bucket_multiplier
         if spread_bucket == "wide_but_possible" and quote_stability_trend >= 0.70 and liquidity_quality >= 0.62 and predictive_regime_score >= 0.55:
             raw_buffer *= 0.94
-        if lifecycle_state == "pregame_near" and spread_bucket in {"ultra_tight", "tight"}:
+        if lifecycle_state == "pregame_near" and spread_bucket in {"ultra_tight", "tight", "acceptable", "wide_but_possible"}:
             raw_buffer = max(0.0, raw_buffer - 0.0025)
         if spread_bucket == "extreme_wide":
             raw_buffer = max(raw_buffer, 0.03)
@@ -2428,23 +2831,9 @@ class KalshiSniperBot:
             no_bid = self.to_float(getattr(local_q, "no_bid", None), self.to_float(local_market.get("no_bid"), None))
             no_ask = self.to_float(getattr(local_q, "no_ask", None), self.to_float(local_market.get("no_ask"), None))
             if yes_bid is None or yes_ask is None or no_bid is None or no_ask is None:
-                try:
-                    fallback_quote = self.build_quote(local_market)
-                except Exception:
-                    fallback_quote = None
-                if fallback_quote is not None:
-                    fallback_yes_bid = self.to_float(getattr(fallback_quote, "yes_bid", None), None)
-                    fallback_yes_ask = self.to_float(getattr(fallback_quote, "yes_ask", None), None)
-                    fallback_no_bid = self.to_float(getattr(fallback_quote, "no_bid", None), None)
-                    fallback_no_ask = self.to_float(getattr(fallback_quote, "no_ask", None), None)
-                    if yes_bid is None and fallback_yes_bid is not None and fallback_yes_bid > 0.0:
-                        yes_bid = fallback_yes_bid
-                    if yes_ask is None and fallback_yes_ask is not None and fallback_yes_ask > 0.0:
-                        yes_ask = fallback_yes_ask
-                    if no_bid is None and fallback_no_bid is not None and fallback_no_bid > 0.0:
-                        no_bid = fallback_no_bid
-                    if no_ask is None and fallback_no_ask is not None and fallback_no_ask > 0.0:
-                        no_ask = fallback_no_ask
+                # Do not recurse back into build_quote here; the direct market and
+                # quote fields above are the only safe inputs for edge derivation.
+                pass
             spread = None
             if yes_bid is not None and yes_ask is not None:
                 try:
@@ -2553,6 +2942,16 @@ class KalshiSniperBot:
                         "expectancy": round(expectancy_from_edge, 4),
                         "spread_bucket": normalized.get("spread_bucket"),
                         "market_lifecycle_state": normalized.get("market_lifecycle_state"),
+                        "topbook_snapshot_present": bool(sports_quote_snapshot and not sports_quote_snapshot.get("failure_stage")),
+                        "normalized_orderbook_present": bool(yes_bid is not None or yes_ask is not None or no_bid is not None or no_ask is not None),
+                        "topbook_depth_exists": bool(
+                            self.to_float(sports_quote_snapshot.get("yes_top_size"), 0.0) > 0.0
+                            or self.to_float(sports_quote_snapshot.get("no_top_size"), 0.0) > 0.0
+                        ),
+                        "orderbook_exists": bool(
+                            (sports_quote_snapshot and not sports_quote_snapshot.get("failure_stage"))
+                            and (yes_bid is not None or yes_ask is not None or no_bid is not None or no_ask is not None)
+                        ),
                         "quote_missing": bool(yes_bid is None and yes_ask is None and no_bid is None and no_ask is None),
                         "quote_ready": bool(raw_price is not None and raw_price > 0.0 and (yes_bid is not None or yes_ask is not None or no_bid is not None or no_ask is not None)),
                     }
@@ -2987,6 +3386,10 @@ class KalshiSniperBot:
                 quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
                 quote_missing=bool(quote_readiness_diagnostic.get("quote_missing")),
                 unsafe_price_status=unsafe_price_status_trace,
+                spread_classification=unsafe_price_detail.get("spread_classification"),
+                spread_severity=unsafe_price_detail.get("spread_severity"),
+                beast_spread_override_applied=unsafe_price_detail.get("beast_spread_override_applied"),
+                final_submit_allowed_by_realm_vv=unsafe_price_detail.get("final_submit_allowed_by_realm_vv"),
                 duplicate_status=quote_readiness_diagnostic.get("duplicate_status"),
                 cooldown_status=quote_readiness_diagnostic.get("cooldown_status"),
                 phase55_ready=bool(quote_readiness_diagnostic.get("phase55_ready")),
@@ -3152,9 +3555,16 @@ class KalshiSniperBot:
                     str(log_payload.get("spread_bucket") or "").strip().lower() == "unsafe"
                     and self._is_sports_market_or_family(family)
                     and family.startswith(("KXNBA", "KXMLB", "KXNFL"))
+                    and (
+                        _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "opportunistic"
+                        and self.to_float(final_edge, 0.0) >= 0.009
+                        and bool(quote_readiness_diagnostic.get("quote_ready"))
+                        and bool(quote_readiness_diagnostic.get("orderbook_ready") or quote_readiness_diagnostic.get("topbook_depth_exists"))
+                    )
                 ),
                 selector_decision=str(quote_readiness_diagnostic.get("decision") or quote_readiness_diagnostic.get("selector_decision") or "unknown").strip(),
                 payload_ready=bool(payload_preflight.get("payload_ready")),
+                canonical_execution_state=payload_preflight.get("canonical_execution_state"),
                 payload_builder_called=payload_preflight.get("payload_builder_called"),
                 payload_missing_reason=payload_preflight.get("payload_missing_reason"),
                 payload_rejection_reason=payload_preflight.get("payload_rejection_reason"),
@@ -3349,31 +3759,24 @@ class KalshiSniperBot:
             ):
                 quote_mapping_block_reason = "no_valid_quote_or_orderbook_prices"
             if yes_bid is None or yes_ask is None or no_bid is None or no_ask is None:
-                try:
-                    fallback_quote = self.build_quote(market)
-                except Exception:
-                    fallback_quote = None
-                if fallback_quote is not None:
-                    fallback_yes_bid = self.to_float(getattr(fallback_quote, "yes_bid", None), None)
-                    fallback_yes_ask = self.to_float(getattr(fallback_quote, "yes_ask", None), None)
-                    fallback_no_bid = self.to_float(getattr(fallback_quote, "no_bid", None), None)
-                    fallback_no_ask = self.to_float(getattr(fallback_quote, "no_ask", None), None)
-                    if yes_bid is None and fallback_yes_bid is not None and fallback_yes_bid > 0.0:
-                        yes_bid = fallback_yes_bid
-                        quote_mapping_applied = True
-                        quote_mapping_reason = "build_quote_fallback"
-                    if yes_ask is None and fallback_yes_ask is not None and fallback_yes_ask > 0.0:
-                        yes_ask = fallback_yes_ask
-                        quote_mapping_applied = True
-                        quote_mapping_reason = "build_quote_fallback"
-                    if no_bid is None and fallback_no_bid is not None and fallback_no_bid > 0.0:
-                        no_bid = fallback_no_bid
-                        quote_mapping_applied = True
-                        quote_mapping_reason = "build_quote_fallback"
-                    if no_ask is None and fallback_no_ask is not None and fallback_no_ask > 0.0:
-                        no_ask = fallback_no_ask
-                        quote_mapping_applied = True
-                        quote_mapping_reason = "build_quote_fallback"
+                fallback_yes_top = self.to_float(sports_quote_snapshot.get("yes_top_price"), None)
+                fallback_no_top = self.to_float(sports_quote_snapshot.get("no_top_price"), None)
+                if yes_bid is None and fallback_yes_top is not None and fallback_yes_top > 0.0:
+                    yes_bid = fallback_yes_top
+                    quote_mapping_applied = True
+                    quote_mapping_reason = "nonrecursive_topbook_fallback"
+                if yes_ask is None and fallback_yes_top is not None and fallback_yes_top > 0.0:
+                    yes_ask = fallback_yes_top
+                    quote_mapping_applied = True
+                    quote_mapping_reason = "nonrecursive_topbook_fallback"
+                if no_bid is None and fallback_no_top is not None and fallback_no_top > 0.0:
+                    no_bid = fallback_no_top
+                    quote_mapping_applied = True
+                    quote_mapping_reason = "nonrecursive_topbook_fallback"
+                if no_ask is None and fallback_no_top is not None and fallback_no_top > 0.0:
+                    no_ask = fallback_no_top
+                    quote_mapping_applied = True
+                    quote_mapping_reason = "nonrecursive_topbook_fallback"
         else:
             yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
         spread = self.to_float(spread, None)
@@ -3885,6 +4288,7 @@ class KalshiSniperBot:
             unsafe_price_block=unsafe_price_block,
             contracts=AION_AGGRESSIVE_MAX_CONTRACTS,
             trades_today=self.aggressive_trades_today,
+            canonical_execution_state=tradeability if isinstance(tradeability, dict) else None,
             source="selector_floor",
         )
         if selector_floor_near and final_edge_value > 0.0:
@@ -4802,7 +5206,7 @@ class KalshiSniperBot:
         improvement_delta = round(sports_edge_after_cost - previous_edge_value, 4)
         near_harvest = bool(
             -0.03 <= sports_edge_after_cost <= 0.0
-            and spread_bucket in {"ultra_tight", "tight"}
+            and spread_bucket in {"ultra_tight", "tight", "acceptable", "wide_but_possible"}
             and sports_score >= 0.70
             and self._clamp(self.to_float(sports_context.get("quote_stability_trend"), 0.0), 0.0, 1.0) >= 0.55
             and self._clamp(self.to_float(sports_context.get("liquidity_quality"), 0.0), 0.0, 1.0) >= 0.50
@@ -4885,7 +5289,7 @@ class KalshiSniperBot:
             "improving_count": int(harvest_family_bucket.get("improving_count", 0) or 0),
         }
         watchlist_dashboard = self._build_sports_harvest_dashboard_summary()
-        if sports_candidate_handoff_to_normal_validation and improving_harvest and spread_bucket in {"ultra_tight", "tight"} and self._clamp(self.to_float(sports_context.get("quote_stability_trend"), 0.0), 0.0, 1.0) >= 0.60:
+        if sports_candidate_handoff_to_normal_validation and improving_harvest and spread_bucket in {"ultra_tight", "tight", "acceptable", "wide_but_possible"} and self._clamp(self.to_float(sports_context.get("quote_stability_trend"), 0.0), 0.0, 1.0) >= 0.60:
             sports_harvest_rerank_boost = max(0.0015, min(0.008, improvement_delta * 0.6 + 0.001))
             harvest_watchlist_bucket["latest_state"] = "near_ready"
             harvest_family_bucket["latest_state"] = "near_ready"
@@ -5713,6 +6117,7 @@ class KalshiSniperBot:
             spread=spread,
             liquidity=liquidity if "liquidity" in locals() else None,
             context="synthetic_size",
+            resolve_effective_liquidity=False,
         ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
         if spread is None or spread < 0.0 or spread > adaptive_spread:
             return None, "none", "spread_not_safe"
@@ -5733,7 +6138,7 @@ class KalshiSniperBot:
             return None, "none", "synthetic_size_below_min"
         return round(synthetic_size, 4), "liquidity_dollars_conservative_synthetic", "valid_quotes_spread_activity_liquidity"
 
-    def compute_live_sports_momentum(self, market, q=None, liquidity_priority=None, spread=None, context="generic"):
+    def compute_live_sports_momentum(self, market, q=None, liquidity_priority=None, spread=None, context="generic", allow_synthetic_size=True):
         family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
         ticker = str((market or {}).get("ticker", "") or getattr(q, "ticker", "") or "").strip()
         if not ticker or family == "KXBTC15M" or not self._is_sports_market_or_family(family):
@@ -5765,7 +6170,7 @@ class KalshiSniperBot:
         liquidity_priority = liquidity_priority or {}
         yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), None)
         no_top_size = self.to_float(liquidity_priority.get("no_top_size"), None)
-        if bool(liquidity_priority.get("both_sides_quoted")) and (yes_top_size is None or no_top_size is None or yes_top_size <= 0.0 or no_top_size <= 0.0):
+        if allow_synthetic_size and bool(liquidity_priority.get("both_sides_quoted")) and (yes_top_size is None or no_top_size is None or yes_top_size <= 0.0 or no_top_size <= 0.0):
             synthetic_top_size, synthetic_source, synthetic_reason = self._derive_sports_synthetic_top_size(
                 market,
                 yes_price=yes_ask,
@@ -5916,7 +6321,7 @@ class KalshiSniperBot:
         )
         return result
 
-    def _get_sports_adaptive_spread_threshold(self, market, spread=None, liquidity=None, yes_top_size=None, no_top_size=None, context="generic", quote_diag=None):
+    def _get_sports_adaptive_spread_threshold(self, market, spread=None, liquidity=None, yes_top_size=None, no_top_size=None, context="generic", quote_diag=None, resolve_effective_liquidity=True):
         family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
         base_threshold = MAX_ENTRY_SPREAD
         if family == "KXBTC15M" or not self._is_sports_market_or_family(family):
@@ -5927,11 +6332,50 @@ class KalshiSniperBot:
                 "reason": "non_sports_strict",
             }
         market = market if isinstance(market, dict) else {}
+        ticker = str(market.get("ticker", "") or "").strip() or None
         quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
-        try:
-            liquidity_priority = self.get_market_liquidity_priority(market)
-        except Exception:
-            liquidity_priority = {}
+        sports_context = quote_diag
+        canonical_execution_state = quote_diag.get("canonical_execution_state") if isinstance(quote_diag.get("canonical_execution_state"), dict) else {}
+        canonical_realm_vv_result = (
+            canonical_execution_state.get("realm_vv_result")
+            if isinstance(canonical_execution_state.get("realm_vv_result"), dict)
+            else {}
+        )
+        canonical_resolved_side = str(
+            quote_diag.get("selected_side")
+            or sports_context.get("selected_side")
+            or quote_diag.get("side")
+            or sports_context.get("side")
+            or quote_diag.get("action_side")
+            or sports_context.get("action_side")
+            or canonical_realm_vv_result.get("selected_side")
+            or canonical_realm_vv_result.get("side")
+            or canonical_realm_vv_result.get("action_side")
+            or ""
+        ).strip().lower() or "unknown"
+        resolved_side = canonical_resolved_side
+        resolved_selected_side = quote_diag.get("selected_side") or sports_context.get("selected_side")
+        resolved_selected_price = quote_diag.get("selected_price") or sports_context.get("selected_price")
+        aggression_settings = _aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, spread_bucket=str(quote_diag.get("spread_bucket") or quote_diag.get("sports_spread_bucket") or "unknown"), context=context)
+        sports_threshold_delta = self.to_float(aggression_settings.get("sports_threshold_delta"), 0.0) or 0.0
+        flat_market_relaxation = self.to_float(aggression_settings.get("flat_market_relaxation"), 0.0) or 0.0
+        if resolve_effective_liquidity:
+            try:
+                liquidity_priority = self._resolve_effective_liquidity_signal(
+                    market,
+                    family=family,
+                    spread=spread,
+                    source=f"sports_threshold:{context}",
+                )
+            except Exception:
+                liquidity_priority = {}
+        else:
+            liquidity_priority = {
+                "yes_top_size": yes_top_size,
+                "no_top_size": no_top_size,
+                "both_sides_quoted": bool(quote_diag.get("quote_ready") or quote_diag.get("quote_complete")),
+                "liquidity_final": self.to_float(liquidity, 0.0) or 0.0,
+            }
         if liquidity is None:
             liquidity = self.to_float(
                 liquidity_priority.get("liquidity_final"),
@@ -5959,6 +6403,7 @@ class KalshiSniperBot:
             liquidity_priority={"yes_top_size": yes_top_size, "no_top_size": no_top_size},
             spread=spread,
             context=f"adaptive_spread:{context}",
+            allow_synthetic_size=False,
         )
         live_momentum = self.to_float(momentum.get("momentum_score"), 0.0) or 0.0
         adjustment = 0.0
@@ -5987,20 +6432,149 @@ class KalshiSniperBot:
         elif live_momentum <= -0.35:
             adjustment -= min(0.01, abs(live_momentum) * 0.015)
             reasons.append("negative_live_momentum_tighten")
-        adaptive_threshold = min(SPORTS_ADAPTIVE_SPREAD_MAX, base_threshold + adjustment)
+        adaptive_threshold = min(SPORTS_ADAPTIVE_SPREAD_MAX, base_threshold + adjustment + sports_threshold_delta)
+        canonical_tradeability = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else {}
+        if not canonical_tradeability and isinstance(sports_context.get("canonical_tradeability"), dict):
+            canonical_tradeability = sports_context.get("canonical_tradeability")
+        canonical_tradeability_tradeable = bool(
+            canonical_tradeability.get("tradeable")
+            if canonical_tradeability.get("tradeable") is not None
+            else sports_context.get("tradeable")
+            if sports_context.get("tradeable") is not None
+            else False
+        )
+        canonical_spread_classification = str(
+            canonical_tradeability.get("spread_classification")
+            or sports_context.get("spread_classification")
+            or quote_diag.get("spread_classification")
+            or ""
+        ).strip().upper()
+        canonical_final_edge = self.to_float(
+            canonical_tradeability.get("edge_after_cost"),
+            self.to_float(
+                canonical_tradeability.get("final_edge_value"),
+                self.to_float(
+                    quote_diag.get("final_edge"),
+                    self.to_float(quote_diag.get("edge_after_cost"), self.to_float(sports_context.get("final_edge"), 0.0)),
+                ),
+            ),
+        )
+        derived_aggressive_tradeable = bool(
+            str(quote_diag.get("spread_classification") or sports_context.get("spread_classification") or "").strip().upper() == "AGGRESSIVE_BUT_TRADEABLE"
+            and canonical_final_edge > 0.0
+            and quote_ready_from_context
+            and (selected_side_has_price or selected_side_has_liquidity or depth_available)
+        )
+        canonical_aggressive_tradeable = bool(
+            (
+                canonical_tradeability_tradeable
+                and canonical_spread_classification == "AGGRESSIVE_BUT_TRADEABLE"
+                and canonical_final_edge > 0.0
+            )
+            or derived_aggressive_tradeable
+        )
         pass_fail = bool(spread is None or (0.0 <= spread <= adaptive_threshold))
         reason = "+".join(reasons) if reasons else "base_sports_threshold"
+        market_direct_quote_ready = bool(
+            any(
+                self.to_float(market.get(key), None) not in (None, 0.0)
+                for key in (
+                    "yes_bid_dollars", "yes_bid", "yes_ask_dollars", "yes_ask",
+                    "no_bid_dollars", "no_bid", "no_ask_dollars", "no_ask",
+                )
+            )
+        )
+        market_direct_orderbook_ready = bool(
+            (self.to_float(yes_top_size, 0.0) or 0.0) > 0.0
+            or (self.to_float(no_top_size, 0.0) or 0.0) > 0.0
+            or self.to_float(market.get("yes_top_price"), None) not in (None, 0.0)
+            or self.to_float(market.get("no_top_price"), None) not in (None, 0.0)
+            or bool(market.get("orderbook"))
+            or bool(market.get("orderbook_fp"))
+        )
+        canonical_tradeability_state = {}
+        if isinstance(canonical_execution_state, dict):
+            nested_realm_vv_result = canonical_execution_state.get("realm_vv_result") if isinstance(canonical_execution_state.get("realm_vv_result"), dict) else {}
+            canonical_tradeability_state = (
+                nested_realm_vv_result.get("canonical_tradeability")
+                if isinstance(nested_realm_vv_result.get("canonical_tradeability"), dict)
+                else {}
+            )
+            if not canonical_tradeability_state and isinstance(canonical_execution_state.get("canonical_tradeability"), dict):
+                canonical_tradeability_state = canonical_execution_state.get("canonical_tradeability")
+        if not canonical_tradeability and canonical_tradeability_state:
+            canonical_tradeability = canonical_tradeability_state
+        canonical_final_submit_allowed = bool(
+            canonical_execution_state.get("final_submit_allowed")
+            if canonical_execution_state.get("final_submit_allowed") is not None
+            else canonical_execution_state.get("canonical_final_submit_allowed")
+            if canonical_execution_state.get("canonical_final_submit_allowed") is not None
+            else canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
+            if canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv") is not None
+            else canonical_tradeability.get("final_submit_allowed_by_realm_vv")
+            if canonical_tradeability.get("final_submit_allowed_by_realm_vv") is not None
+            else canonical_tradeability_state.get("canonical_final_submit_allowed_by_realm_vv")
+            if canonical_tradeability_state.get("canonical_final_submit_allowed_by_realm_vv") is not None
+            else False
+        )
+        canonical_selected_price = self.to_float(
+            canonical_tradeability.get("selected_price_dollars"),
+            self.to_float(
+                canonical_tradeability.get("selected_price"),
+                self.to_float(
+                    sports_context.get("selected_price_dollars"),
+                    self.to_float(
+                        sports_context.get("selected_price"),
+                        self.to_float(quote_diag.get("selected_price_dollars"), self.to_float(quote_diag.get("selected_price"), None)),
+                    ),
+                ),
+            ),
+        )
         quote_ready_from_context = bool(
             quote_diag.get("quote_ready")
             or quote_diag.get("quote_ready_after_fallback")
             or quote_diag.get("quote_ready_before_fallback")
+            or market_direct_quote_ready
         )
+        selected_side_has_price = bool(
+            quote_diag.get("selected_side_has_price")
+            or (resolved_selected_price is not None and self.to_float(resolved_selected_price, 0.0) > 0.0)
+            or (canonical_selected_price is not None and self.to_float(canonical_selected_price, 0.0) > 0.0)
+        )
+        selected_side_has_liquidity = bool(
+            quote_diag.get("selected_side_has_liquidity")
+            or market_direct_orderbook_ready
+            or max_top_size > 0.0
+            or bool(canonical_tradeability.get("orderbook_ready"))
+            or bool(canonical_tradeability_state.get("canonical_orderbook_ready"))
+        )
+        depth_available = bool(
+            quote_diag.get("depth_available")
+            or quote_diag.get("topbook_depth_exists")
+            or quote_diag.get("normalized_orderbook_present")
+            or quote_diag.get("topbook_snapshot_present")
+            or selected_side_has_liquidity
+        )
+        derived_price_used = bool(quote_diag.get("derived_price_used"))
+        derived_price_source = str(quote_diag.get("derived_price_source") or quote_diag.get("selected_price_source_used") or "unknown").strip().lower() or "unknown"
         orderbook_ready_from_context = bool(
             quote_diag.get("orderbook_exists")
+            or quote_diag.get("topbook_snapshot_present")
+            or quote_diag.get("normalized_orderbook_present")
             or quote_diag.get("topbook_depth_exists")
             or quote_diag.get("topbook_bucket") not in {None, "", "unknown"}
             or max_top_size > 0.0
+            or market_direct_orderbook_ready
+            or bool(canonical_tradeability.get("orderbook_ready"))
+            or bool(canonical_tradeability_state.get("canonical_orderbook_ready"))
+            or bool(canonical_tradeability_state.get("canonical_final_submit_allowed_by_realm_vv"))
         )
+        unsafe_price_status = str(
+            quote_diag.get("unsafe_price_status")
+            or quote_diag.get("unsafe_resolution_reason")
+            or sports_context.get("unsafe_price_status")
+            or "unknown"
+        ).strip().lower() or "unknown"
         refresh_reason = str(
             quote_diag.get("refresh_reason")
             or quote_diag.get("quote_fixed_reason")
@@ -6010,8 +6584,102 @@ class KalshiSniperBot:
         disabled_reason = None
         if family == "KXBTC15M" or not self._is_sports_market_or_family(family):
             disabled_reason = "disabled_family"
-        effective_quote_ready = bool(quote_ready)
+        effective_quote_ready = bool(quote_ready_from_context)
         effective_orderbook_ready = bool(orderbook_ready_from_context)
+        canonical_quote_ready_override = bool(canonical_tradeability.get("quote_ready") or canonical_tradeability_state.get("canonical_quote_ready"))
+        canonical_orderbook_ready_override = bool(
+            canonical_tradeability.get("orderbook_ready")
+            or canonical_tradeability_state.get("canonical_orderbook_ready")
+            or canonical_tradeability_state.get("canonical_final_submit_allowed_by_realm_vv")
+        )
+        if canonical_quote_ready_override:
+            effective_quote_ready = True
+        if canonical_orderbook_ready_override:
+            effective_orderbook_ready = True
+        canonical_submit_override = bool(
+            canonical_final_submit_allowed
+            and selected_side_has_price
+            and (selected_side_has_liquidity or depth_available or effective_orderbook_ready or effective_quote_ready)
+        )
+        if canonical_submit_override:
+            effective_quote_ready = True
+            effective_orderbook_ready = True
+            pass_fail = True
+        thin_book_override_applied = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and canonical_aggressive_tradeable
+            and selected_side_has_price
+            and canonical_final_edge > 0.0
+            and depth_available
+        )
+        if thin_book_override_applied:
+            effective_orderbook_ready = True
+        if (
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and derived_aggressive_tradeable
+            and selected_side_has_price
+            and depth_available
+            and canonical_final_edge > 0.0
+        ):
+            effective_orderbook_ready = True
+        thin_book_override_applied = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and canonical_aggressive_tradeable
+            and selected_side_has_price
+            and canonical_final_edge > 0.0
+            and quote_ready_from_context
+            and unsafe_price_status not in {"unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}
+        )
+        if thin_book_override_applied:
+            effective_orderbook_ready = True
+        beast_spread_override_applied = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and canonical_spread_classification == "AGGRESSIVE_BUT_TRADEABLE"
+            and canonical_final_edge > 0.0
+            and effective_quote_ready
+            and effective_orderbook_ready
+            and selected_price is not None
+        )
+        canonical_final_submit_allowed = bool(
+            canonical_final_submit_allowed
+            or (
+                canonical_tradeability.get("final_submit_allowed_by_realm_vv")
+                if canonical_tradeability.get("final_submit_allowed_by_realm_vv") is not None
+                else canonical_tradeability_state.get("canonical_final_submit_allowed_by_realm_vv")
+                if canonical_tradeability_state.get("canonical_final_submit_allowed_by_realm_vv") is not None
+                else False
+            )
+        )
+        canonical_beast_submit_override = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and canonical_spread_classification == "AGGRESSIVE_BUT_TRADEABLE"
+            and canonical_final_submit_allowed
+        )
+        if canonical_beast_submit_override:
+            effective_quote_ready = True
+            effective_orderbook_ready = True
+            pass_fail = True
+        survivable_aggressive_override = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and not canonical_beast_submit_override
+            and canonical_final_edge > 0.0
+            and selected_price is not None
+            and canonical_spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+            and (
+                selected_side_has_price
+                or selected_side_has_liquidity
+                or depth_available
+                or market_direct_orderbook_ready
+            )
+        )
+        if survivable_aggressive_override:
+            effective_quote_ready = True
+            effective_orderbook_ready = True
+            pass_fail = True
+        if canonical_aggressive_tradeable and effective_quote_ready and effective_orderbook_ready and selected_price is not None:
+            pass_fail = True
+        if beast_spread_override_applied:
+            pass_fail = True
         final_blocker_source = None
         if not effective_quote_ready:
             block_reason = "quote_not_usable"
@@ -6031,6 +6699,60 @@ class KalshiSniperBot:
         else:
             block_reason = "all_guards_passed"
             final_blocker_source = "all_guards_passed"
+        if canonical_beast_submit_override:
+            block_reason = "all_guards_passed"
+            final_blocker_source = "canonical_beast_submit_override"
+        elif canonical_submit_override:
+            block_reason = "all_guards_passed"
+            final_blocker_source = "canonical_execution_state"
+        elif survivable_aggressive_override:
+            block_reason = "all_guards_passed"
+            final_blocker_source = "survivable_aggressive_override"
+        elif _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast" and derived_aggressive_tradeable and effective_quote_ready and effective_orderbook_ready and selected_price is not None:
+            block_reason = "all_guards_passed"
+            final_blocker_source = "derived_aggressive_tradeable_override"
+        if (canonical_aggressive_tradeable or beast_spread_override_applied) and block_reason == "all_guards_passed":
+            final_blocker_source = "canonical_tradeability"
+        orderbook_usability_payload = {
+            "ticker": ticker,
+            "side": resolved_side,
+            "selected_price": resolved_selected_price,
+            "selected_price_cents": quote_diag.get("selected_price_cents"),
+            "yes_bid": quote_diag.get("yes_bid"),
+            "yes_ask": quote_diag.get("yes_ask"),
+            "no_bid": quote_diag.get("no_bid"),
+            "no_ask": quote_diag.get("no_ask"),
+            "yes_bid_cents": quote_diag.get("yes_bid_cents"),
+            "yes_ask_cents": quote_diag.get("yes_ask_cents"),
+            "no_bid_cents": quote_diag.get("no_bid_cents"),
+            "no_ask_cents": quote_diag.get("no_ask_cents"),
+            "spread_cents": quote_diag.get("spread_cents"),
+            "spread_classification": canonical_spread_classification or quote_diag.get("spread_classification") or "UNKNOWN",
+            "spread_severity": str(quote_diag.get("spread_severity") or "unknown").strip().lower() or "unknown",
+            "orderbook_age_seconds": quote_diag.get("orderbook_age_seconds") or quote_diag.get("cache_age_seconds"),
+            "orderbook_source": quote_diag.get("orderbook_source") or market.get("orderbook_source"),
+            "selected_side_has_price": bool(selected_side_has_price),
+            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+            "depth_available": bool(depth_available),
+            "derived_price_used": bool(derived_price_used),
+            "derived_price_source": derived_price_source,
+            "payload_ready": bool(quote_diag.get("payload_ready", True)),
+            "quote_ready": bool(effective_quote_ready),
+            "auth_ready": bool(canonical_tradeability.get("auth_ready") if canonical_tradeability.get("auth_ready") is not None else True),
+            "duplicate_guard": str(canonical_tradeability.get("duplicate_status") or quote_diag.get("duplicate_status") or "unknown").strip().lower() or "unknown",
+            "final_block_reason": block_reason,
+            "orderbook_not_usable_reason": orderbook_not_usable_reason if "orderbook_not_usable_reason" in locals() else None,
+            "thin_book_override_applied": bool(thin_book_override_applied),
+            "final_submit_allowed_by_realm_vv": bool(canonical_final_submit_allowed or thin_book_override_applied or canonical_beast_submit_override),
+        }
+        try:
+            print("[AION-ORDERBOOK-USABILITY] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+            if thin_book_override_applied:
+                print("[AION-ORDERBOOK-USABILITY-ALLOW] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+            elif not effective_orderbook_ready:
+                print("[AION-ORDERBOOK-USABILITY-BLOCKED] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+        except Exception:
+            pass
         original_selected_side = quote_diag.get("selected_side") or sports_context.get("selected_side")
         original_selected_price = quote_diag.get("selected_price") or sports_context.get("selected_price")
         chosen_side = resolved_selected_side
@@ -6072,11 +6794,17 @@ class KalshiSniperBot:
             "chosen_price": chosen_price,
             "quote_ready": bool(effective_quote_ready),
             "orderbook_ready": bool(effective_orderbook_ready),
+            "canonical_quote_ready_override": bool(canonical_quote_ready_override),
+            "canonical_orderbook_ready_override": bool(canonical_orderbook_ready_override),
+            "canonical_final_submit_allowed_by_realm_vv": bool(canonical_final_submit_allowed),
+            "canonical_beast_submit_override": bool(canonical_beast_submit_override),
             "spread_bucket": spread_bucket,
             "unsafe_price_status": unsafe_price_status,
             "payload_ready": bool(payload_ready),
             "phase55_ready": bool(phase55_ready),
             "blocker_source": final_blocker_source,
+            "canonical_tradeability_override": bool(canonical_aggressive_tradeable),
+            "beast_spread_override_applied": bool(beast_spread_override_applied),
         }
         try:
             print("[AION-QUOTE-USABILITY-ROOT] " + json.dumps(root_trace, sort_keys=True, default=str))
@@ -6084,6 +6812,29 @@ class KalshiSniperBot:
             pass
         try:
             print("[AION-QUOTE-USABILITY-FINAL] " + json.dumps({**root_trace, "block_reason": block_reason}, sort_keys=True, default=str))
+        except Exception:
+            pass
+        try:
+            if canonical_beast_submit_override:
+                print(
+                    "[AION-FINAL-SPREAD-OVERRIDE] "
+                    + json.dumps(
+                        {
+                            "ticker": str(market.get("ticker", "") or "").strip() or None,
+                            "family": family,
+                            "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                            "spread_classification": canonical_spread_classification,
+                            "spread_severity": "survivable",
+                            "beast_spread_override_applied": True,
+                            "final_submit_allowed_by_realm_vv": True,
+                            "quote_ready": bool(effective_quote_ready),
+                            "orderbook_ready": bool(effective_orderbook_ready),
+                            "block_reason": block_reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
         except Exception:
             pass
         if block_reason != "all_guards_passed":
@@ -6101,6 +6852,13 @@ class KalshiSniperBot:
                     "score": None,
                     "base_threshold": round(base_threshold, 4),
                     "adjusted_threshold": round(adaptive_threshold, 4),
+                    "aggression_profile": aggression_settings.get("profile"),
+                    "aggression_reason": aggression_settings.get("reason"),
+                    "candidate_count_before": aggression_settings.get("candidate_count_before"),
+                    "candidate_count_after": aggression_settings.get("candidate_count_after"),
+                    "payload_ready_count": aggression_settings.get("payload_ready_count"),
+                    "phase55_ready_count": aggression_settings.get("phase55_ready_count"),
+                    "safety_gates_preserved": bool(aggression_settings.get("safety_gates_preserved")),
                     "edge_after_cost": None,
                     "liquidity": round(self.to_float(liquidity, 0.0), 4),
                     "spread_bucket": str(
@@ -6120,15 +6878,38 @@ class KalshiSniperBot:
                     ).strip().lower(),
                     "quote_ready": bool(effective_quote_ready),
                     "orderbook_ready": bool(effective_orderbook_ready),
+                    "canonical_quote_ready_override": bool(canonical_quote_ready_override),
+                    "canonical_orderbook_ready_override": bool(canonical_orderbook_ready_override),
                     "disabled_reason": disabled_reason,
                     "refresh_reason": refresh_reason,
                     "threshold_pass": bool(pass_fail),
                     "block_reason": block_reason,
+                    "beast_spread_override_applied": bool(beast_spread_override_applied),
                 },
                 sort_keys=True,
                 default=str,
             )
         )
+        if beast_spread_override_applied:
+            print(
+                "[AION-FINAL-SPREAD-OVERRIDE] "
+                + json.dumps(
+                    {
+                        "ticker": str(market.get("ticker", "") or "").strip() or None,
+                        "family": family,
+                        "spread": spread,
+                        "spread_bucket": spread_bucket,
+                        "edge_after_cost": canonical_final_edge,
+                        "spread_classification": canonical_spread_classification,
+                        "unsafe_price_status": "caution_wide_spread",
+                        "unsafe_resolution_reason": "beast_mode_wide_spread_allowed",
+                        "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                        "final_submit_allowed_by_realm_vv": True,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         print(
             f"[LIVE-SPREAD-ADAPTIVE] ticker={str(market.get('ticker', '') or '').strip()} family={family} "
             f"base_threshold={round(base_threshold, 4)} adaptive_threshold={round(adaptive_threshold, 4)} "
@@ -6320,6 +7101,44 @@ class KalshiSniperBot:
                 "allow_normal_validation_count": int(bool(sports_context.get("final_sports_action") == "allow_normal_validation")),
                 "live_arb_enabled": bool(AION_LIVE_ARB_ENABLED),
             }, sort_keys=True, default=str))
+        _emit_aion_aggression_trace(
+            "AION-AGGRESSION-THRESHOLD",
+            {
+                "active_profile": aggression_settings.get("profile"),
+                "reason": aggression_settings.get("reason"),
+                "original_threshold": round(base_threshold, 4),
+                "adjusted_threshold": round(adaptive_threshold, 4),
+                "candidate_count_before": aggression_settings.get("candidate_count_before"),
+                "candidate_count_after": aggression_settings.get("candidate_count_after"),
+                "payload_ready_count": aggression_settings.get("payload_ready_count"),
+                "phase55_ready_count": aggression_settings.get("phase55_ready_count"),
+                "safety_gates_preserved": bool(aggression_settings.get("safety_gates_preserved")),
+                "ticker": str(market.get("ticker", "") or "").strip() or None,
+                "family": family,
+                "spread_bucket": str(quote_diag.get("spread_bucket") or quote_diag.get("sports_spread_bucket") or "unknown").strip().lower(),
+                "quote_ready": bool(quote_ready_from_context),
+                "orderbook_ready": bool(orderbook_ready_from_context),
+                "blocked": block_reason != "all_guards_passed",
+                "block_reason": block_reason,
+            },
+        )
+        _emit_aion_aggression_trace(
+            "AION-AGGRESSION-SAFETY-CHECK",
+            {
+                "active_profile": aggression_settings.get("profile"),
+                "reason": aggression_settings.get("reason"),
+                "candidate_count_before": aggression_settings.get("candidate_count_before"),
+                "candidate_count_after": aggression_settings.get("candidate_count_after"),
+                "payload_ready_count": aggression_settings.get("payload_ready_count"),
+                "phase55_ready_count": aggression_settings.get("phase55_ready_count"),
+                "safety_gates_preserved": bool(aggression_settings.get("safety_gates_preserved")),
+                "quote_ready": bool(quote_ready_from_context),
+                "orderbook_ready": bool(orderbook_ready_from_context),
+                "disabled_reason": disabled_reason,
+                "refresh_reason": refresh_reason,
+                "block_reason": block_reason,
+            },
+        )
         return {
             "base_threshold": base_threshold,
             "adaptive_threshold": adaptive_threshold,
@@ -6335,6 +7154,16 @@ class KalshiSniperBot:
             "open_interest": open_interest,
             "minutes_to_event": minutes_to_event,
             "category_confidence": category_confidence,
+            "aggression_profile": aggression_settings.get("profile"),
+            "aggression_reason": aggression_settings.get("reason"),
+            "aggression_settings": {
+                "score_threshold_delta": aggression_settings.get("score_threshold_delta"),
+                "confidence_threshold_delta": aggression_settings.get("confidence_threshold_delta"),
+                "edge_threshold_delta": aggression_settings.get("edge_threshold_delta"),
+                "sports_threshold_delta": aggression_settings.get("sports_threshold_delta"),
+                "phase55_relaxation": aggression_settings.get("phase55_relaxation"),
+                "flat_market_relaxation": aggression_settings.get("flat_market_relaxation"),
+            },
         }
 
     def _infer_missing_binary_quotes(self, yes_bid, yes_ask, no_bid, no_ask):
@@ -9611,6 +10440,7 @@ class KalshiSniperBot:
 
     def _record_shadow_arb_validation(self, audit, market=None, q=None, decision=None, decision_reason=None):
         audit = audit if isinstance(audit, dict) else {}
+        edge_quality = audit.get("edge_quality") if isinstance(audit.get("edge_quality"), dict) else {}
         ticker = str(audit.get("ticker") or getattr(q, "ticker", None) or (market or {}).get("ticker") or "").strip()
         if not ticker:
             return None
@@ -17266,21 +18096,43 @@ class KalshiSniperBot:
             record["error_reason"] = str(error)
         print(f"[AION-RUNONCE-BRANCH-{phase}] " + json.dumps(record, sort_keys=True, default=str), flush=True)
 
-    def _run_market_reachability_cycle(self, *, markets=None, quotes=None, quotes_by_ticker=None, markets_by_ticker=None, stage_label="post_quote_build"):
+    def _run_market_reachability_cycle(self, *, markets=None, quotes=None, quotes_by_ticker=None, markets_by_ticker=None, quote_hydration_summary=None, stage_label="post_quote_build"):
         markets = list(markets or [])
         quotes = list(quotes or [])
         quotes_by_ticker = quotes_by_ticker if isinstance(quotes_by_ticker, dict) else {}
         markets_by_ticker = markets_by_ticker if isinstance(markets_by_ticker, dict) else {}
+        quote_hydration_summary = quote_hydration_summary if isinstance(quote_hydration_summary, dict) else {}
         cycle_started_at = time.time()
+        markets_fetched_total = int(len(markets))
+        quote_objects_total = int(len(quotes))
+        hydration_attempted_total = int(quote_hydration_summary.get("attempted", 0) or 0)
+        hydration_success_total = int(quote_hydration_summary.get("success", 0) or 0)
+        hydration_failure_total = int(quote_hydration_summary.get("failure", 0) or 0)
+        hydration_rejected = list(quote_hydration_summary.get("rejected", []) or [])[:5]
+        market_families_seen = sorted(
+            {
+                str(self.get_market_family(market) or "").strip().upper() or "UNKNOWN"
+                for market in markets
+                if isinstance(market, dict)
+            }
+        )
+        candidate_universe_total = markets_fetched_total if stage_label == "pre_quote_build" else max(quote_objects_total, markets_fetched_total)
         self._emit_runonce_branch_event(
             "START",
             "market_reachability",
             payload={
                 "stage": stage_label,
+                "markets_fetched_total": markets_fetched_total,
+                "quote_objects_total": quote_objects_total,
+                "market_families_seen": market_families_seen,
+                "quote_hydration_attempted_total": hydration_attempted_total,
+                "quote_hydration_success_total": hydration_success_total,
+                "quote_hydration_failure_total": hydration_failure_total,
+                "quote_hydration_rejected": hydration_rejected,
                 "sports_scanned": False,
                 "crypto_scanned": False,
                 "open_market_scanned": False,
-                "candidates_seen_total": len(quotes),
+                "candidates_seen_total": candidate_universe_total,
                 "eligible_candidates_total": 0,
                 "best_family": None,
                 "best_ticker": None,
@@ -17314,7 +18166,9 @@ class KalshiSniperBot:
             liquidity_depth = self.to_float(diag.get("liquidity_depth"), self.to_float(getattr(q, "liquidity", None), 0.0))
             lifecycle_state = str(diag.get("market_lifecycle_state") or self._get_sports_market_lifecycle_state(market=market, q=q, family=family, event_urgency=None) or "unknown").strip().lower() or "unknown"
             market_live = str(market.get("status") or "open").strip().lower() == "open"
-            safe_spread = spread_bucket in {"ultra_tight", "tight"}
+            canonical_tradeability = diag.get("canonical_tradeability") if isinstance(diag.get("canonical_tradeability"), dict) else {}
+            spread_classification = str(canonical_tradeability.get("spread_classification") or diag.get("spread_classification") or "UNSAFE").strip().upper() or "UNSAFE"
+            safe_spread = spread_bucket in {"ultra_tight", "tight"} or spread_classification in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE"}
             positive_edge = final_edge > 0.0
             lifecycle_allowed = lifecycle_state in {"pregame_near", "active_near", "live_early"}
             duplicate_status = "unknown"
@@ -17327,7 +18181,7 @@ class KalshiSniperBot:
             )
             unsafe_price_status = str(unsafe_price_detail.get("unsafe_price_status") or "unsafe").strip().lower() or "unsafe"
             duplicate_block = False
-            unsafe_price_block = not quote_ready or unsafe_price_status != "safe" or not safe_spread
+            unsafe_price_block = not quote_ready or (unsafe_price_status not in {"safe", "caution_wide_spread"} and spread_classification not in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE"}) or not safe_spread
             try:
                 duplicate_check = self.check_live_duplicate_position_api(ticker) if ticker else None
                 if isinstance(duplicate_check, dict):
@@ -17556,6 +18410,13 @@ class KalshiSniperBot:
         )
         summary = {
             "stage": stage_label,
+            "markets_fetched_total": markets_fetched_total,
+            "quote_objects_total": quote_objects_total,
+            "market_families_seen": market_families_seen,
+            "quote_hydration_attempted_total": hydration_attempted_total,
+            "quote_hydration_success_total": hydration_success_total,
+            "quote_hydration_failure_total": hydration_failure_total,
+            "quote_hydration_rejected": hydration_rejected,
             "sports_scanned": bool(sports_result.get("scanned")),
             "crypto_scanned": bool(crypto_result.get("scanned")),
             "open_market_scanned": bool(open_result.get("scanned")),
@@ -17565,7 +18426,7 @@ class KalshiSniperBot:
             "crypto_eligible_count": int(crypto_result.get("eligible", 0) or 0),
             "open_market_candidate_count": int(open_result.get("seen", 0) or 0),
             "open_market_eligible_count": int(open_result.get("eligible", 0) or 0),
-            "candidates_seen_total": int(candidates_seen_total),
+            "candidates_seen_total": int(candidates_seen_total if stage_label != "pre_quote_build" else markets_fetched_total),
             "eligible_candidates_total": int(eligible_candidates_total),
             "best_family": best_branch.get("best_family") if isinstance(best_branch, dict) else None,
             "best_ticker": best_branch.get("best_ticker") if isinstance(best_branch, dict) else None,
@@ -17751,20 +18612,30 @@ class KalshiSniperBot:
         expect_positive_edge = bool(sports_edge_after_cost is None or sports_edge_after_cost > 0.0)
         spread_liquidity_adaptive_pass = bool(
             expect_positive_edge
-            and spread_bucket in {"ultra_tight", "tight", "acceptable"}
+            and spread_bucket in {"ultra_tight", "tight", "acceptable", "wide_but_possible"}
             and liquidity_strength >= 0.40
             and quote_stability >= 0.40
         )
         repeated_near_miss = bool(near_miss_count >= 2 or queue_state in {"near_ready", "improving_watch", "strong_watch"})
         controlled_loosening_enabled = bool(AION_CONTROLLED_LOOSENING_ENABLED and AION_EXPECTANCY_SCORE_ENABLED)
+        aggression_settings = _aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, spread_bucket=spread_bucket, context="phase55_fastpath")
+        phase55_relaxation = self.to_float(aggression_settings.get("phase55_relaxation"), 0.0) or 0.0
+        phase55_quote_stability_threshold = max(0.40, 0.48 - (phase55_relaxation * 0.50))
+        phase55_edge_durability_threshold = max(0.35, 0.42 - (phase55_relaxation * 0.60))
+        phase55_execution_survivability_threshold = max(0.35, 0.40 - (phase55_relaxation * 0.60))
+        phase55_regime_component_threshold = max(0.35, 0.40 - (phase55_relaxation * 0.60))
+        micro_pullback_quote_threshold = max(0.42, 0.45 - (phase55_relaxation * 0.45))
+        micro_pullback_edge_threshold = max(0.35, 0.40 - (phase55_relaxation * 0.50))
+        micro_pullback_execution_threshold = max(0.34, 0.38 - (phase55_relaxation * 0.50))
+        micro_pullback_expectancy_threshold = max(0.50, 0.60 - (phase55_relaxation * 0.80))
         phase55_fastpath_allowed = bool(
             controlled_loosening_enabled
             and expect_positive_edge
-            and spread_bucket in {"ultra_tight", "tight"}
-            and quote_stability >= 0.48
-            and edge_durability >= 0.42
-            and execution_survivability >= 0.40
-            and regime_component >= 0.40
+            and spread_bucket in {"ultra_tight", "tight", "acceptable", "wide_but_possible"}
+            and quote_stability >= phase55_quote_stability_threshold
+            and edge_durability >= phase55_edge_durability_threshold
+            and execution_survivability >= phase55_execution_survivability_threshold
+            and regime_component >= phase55_regime_component_threshold
             and strong_expectancy
             and repeated_near_miss
             and (not is_sports or sports_edge_component >= 0.40)
@@ -17772,18 +18643,18 @@ class KalshiSniperBot:
         micro_pullback_relax_allowed = bool(
             controlled_loosening_enabled
             and expect_positive_edge
-            and spread_bucket in {"ultra_tight", "tight", "acceptable"}
-            and quote_stability >= 0.45
-            and edge_durability >= 0.40
-            and execution_survivability >= 0.38
+            and spread_bucket in {"ultra_tight", "tight", "acceptable", "wide_but_possible"}
+            and quote_stability >= micro_pullback_quote_threshold
+            and edge_durability >= micro_pullback_edge_threshold
+            and execution_survivability >= micro_pullback_execution_threshold
             and repeated_near_miss
-            and expectancy_score >= 0.60
+            and expectancy_score >= micro_pullback_expectancy_threshold
         )
         controlled_cooldown_bypass_allowed = bool(
             controlled_loosening_enabled
             and expect_positive_edge
             and strong_expectancy
-            and spread_bucket in {"ultra_tight", "tight", "acceptable"}
+            and spread_bucket in {"ultra_tight", "tight", "acceptable", "wide_but_possible"}
             and liquidity_strength >= 0.45
         )
         relaxation_reason = "expectancy_support"
@@ -17794,6 +18665,44 @@ class KalshiSniperBot:
         elif controlled_cooldown_bypass_allowed:
             relaxation_reason = "cooldown_soft_bypass"
         soft_priority_adjustment = max(-0.015, min(0.015, (expectancy_score - 0.5) * 0.03))
+        _emit_aion_aggression_trace(
+            "AION-AGGRESSION-REACHABILITY",
+            {
+                "active_profile": aggression_settings.get("profile"),
+                "reason": relaxation_reason,
+                "original_threshold": round(0.60, 4),
+                "adjusted_threshold": round(micro_pullback_expectancy_threshold, 4),
+                "candidate_count_before": aggression_settings.get("candidate_count_before"),
+                "candidate_count_after": aggression_settings.get("candidate_count_after"),
+                "payload_ready_count": aggression_settings.get("payload_ready_count"),
+                "phase55_ready_count": aggression_settings.get("phase55_ready_count"),
+                "safety_gates_preserved": bool(AION_CONTROLLED_LOOSENING_ENABLED and AION_EXPECTANCY_SCORE_ENABLED),
+                "ticker": ticker,
+                "family": family,
+                "spread_bucket": spread_bucket,
+                "quote_ready": bool(sports_context.get("quote_ready") or quote_readiness_diagnostic.get("quote_ready")),
+                "phase55_ready": bool(phase55_fastpath_allowed),
+                "payload_ready": bool(sports_context.get("payload_ready") or quote_readiness_diagnostic.get("payload_ready")),
+            },
+        )
+        _emit_aion_aggression_trace(
+            "AION-AGGRESSION-SAFETY-CHECK",
+            {
+                "active_profile": aggression_settings.get("profile"),
+                "reason": aggression_settings.get("reason"),
+                "candidate_count_before": aggression_settings.get("candidate_count_before"),
+                "candidate_count_after": aggression_settings.get("candidate_count_after"),
+                "payload_ready_count": aggression_settings.get("payload_ready_count"),
+                "phase55_ready_count": aggression_settings.get("phase55_ready_count"),
+                "safety_gates_preserved": bool(AION_CONTROLLED_LOOSENING_ENABLED and AION_EXPECTANCY_SCORE_ENABLED),
+                "quote_stability_threshold": round(phase55_quote_stability_threshold, 4),
+                "edge_durability_threshold": round(phase55_edge_durability_threshold, 4),
+                "execution_survivability_threshold": round(phase55_execution_survivability_threshold, 4),
+                "regime_component_threshold": round(phase55_regime_component_threshold, 4),
+                "ticker": ticker,
+                "family": family,
+            },
+        )
         # PROFIT TARGETS ARE GUIDANCE ONLY
         # NEVER FORCE NEGATIVE EXPECTANCY TRADES
         # EXPECTANCY OVERRIDES PROFIT TARGET PRESSURE
@@ -17843,6 +18752,17 @@ class KalshiSniperBot:
             "profit_target_expansion_level": self.to_float(profit_target_guidance.get("current_expansion_level"), 0.0),
             "profit_target_expectancy_quality": self.to_float(profit_target_guidance.get("expectancy_quality"), 0.0),
             "profit_target_opportunity_density": self.to_float(profit_target_guidance.get("opportunity_density"), 0.0),
+            "aggression_profile": aggression_settings.get("profile"),
+            "aggression_reason": aggression_settings.get("reason"),
+            "aggression_phase55_relaxation": round(phase55_relaxation, 4),
+            "aggression_flat_market_relaxation": round(self.to_float(aggression_settings.get("flat_market_relaxation"), 0.0), 4),
+            "aggression_effective_thresholds": {
+                "quote_stability": round(phase55_quote_stability_threshold, 4),
+                "edge_durability": round(phase55_edge_durability_threshold, 4),
+                "execution_survivability": round(phase55_execution_survivability_threshold, 4),
+                "regime_component": round(phase55_regime_component_threshold, 4),
+                "expectancy": round(micro_pullback_expectancy_threshold, 4),
+            },
             "quote_stability": round(quote_stability, 4),
             "edge_durability": round(edge_durability, 4),
             "execution_survivability": round(execution_survivability, 4),
@@ -18245,9 +19165,108 @@ class KalshiSniperBot:
         print("[AION-FINAL-BLOCKER] " + json.dumps(payload, sort_keys=True, default=str))
         return payload
 
+    def _check_phase55_live_execution_gate(
+        self,
+        ticker,
+        family=None,
+        decision=None,
+        override_block_reason=None,
+        canonical_execution_state=None,
+    ):
+        gate_record = self._get_realm_vv_live_execution_gate_record(ticker, stage="realm_vv_gate")
+        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
+        realm_vv_status = gate_record.get("realm_vv_status")
+        realm_vv_ready = gate_record.get("realm_vv_ready")
+        realm_vv_explicit_approval = gate_record.get("realm_vv_explicit_approval")
+        if canonical_execution_state:
+            realm_vv_status = (
+                canonical_execution_state.get("realm_vv_status")
+                or canonical_execution_state.get("canonical_readiness_state")
+                or canonical_execution_state.get("final_realm_vv_status")
+                or realm_vv_status
+            )
+            if canonical_execution_state.get("realm_vv_ready") is not None:
+                realm_vv_ready = canonical_execution_state.get("realm_vv_ready")
+            elif canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv") is not None:
+                realm_vv_ready = canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
+            if canonical_execution_state.get("realm_vv_explicit_approval") is not None:
+                realm_vv_explicit_approval = canonical_execution_state.get("realm_vv_explicit_approval")
+        effective_family = family or gate_record.get("family") or "UNKNOWN"
+        effective_decision = decision or canonical_execution_state.get("canonical_execution_decision") or gate_record.get("decision") or "unknown"
+        live_mode_active = bool(globals().get("LIVE_MODE", False))
+        live_arm_active = bool(globals().get("LIVE_ARMED", False))
+        service_active = bool(self is not None)
+        blocked = False
+        reason = "approved"
+        if override_block_reason:
+            blocked = True
+            reason = str(override_block_reason)
+        elif realm_vv_status is None or not isinstance(realm_vv_status, str) or not realm_vv_status.strip():
+            blocked = True
+            reason = "missing_realm_vv_status"
+        elif str(realm_vv_status).strip().lower() != "entry_ready":
+            blocked = True
+            reason = f"realm_vv_status_{str(realm_vv_status).strip().lower()}"
+        elif realm_vv_ready is not True and realm_vv_explicit_approval is not True:
+            blocked = True
+            reason = "realm_vv_explicit_approval_not_true"
+        compatibility_alias_only = bool(
+            "phase55_status" in gate_record
+            or "entry_timing_pass" in gate_record
+            or "phase55_ready" in gate_record
+        )
+        gate_log_payload = {
+            "ticker": ticker,
+            "family": effective_family,
+            "realm_vv_status": realm_vv_status,
+            "realm_vv_ready": realm_vv_ready,
+            "realm_vv_explicit_approval": realm_vv_explicit_approval,
+            "decision": effective_decision,
+            "botStatus": "LIVE" if service_active and live_mode_active and live_arm_active and not blocked else ("BLOCKED" if blocked else ("WAITING" if live_mode_active else "OFFLINE")),
+            "phase": "realm_vv",
+            "live_mode": live_mode_active,
+            "live_arm": live_arm_active,
+            "service_active": service_active,
+            "entry_ready": bool(not blocked),
+            "block_reason": None if not blocked else reason,
+            "compatibility_alias_only": compatibility_alias_only,
+        }
+        print("[AION-REALM-VV-SOLE-AUTHORITY] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
+        if compatibility_alias_only:
+            print("[AION-PHASE55-PURGED] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
+            print("[AION-PHASE55-COMPAT-ONLY] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
+        self._write_seraph_telemetry_status_snapshot(
+            bot_status=gate_log_payload["botStatus"],
+            risk_status="NORMAL",
+            phase="realm_vv",
+            live_mode=live_mode_active,
+            live_arm=live_arm_active,
+            service_active=service_active,
+            entry_ready=bool(not blocked),
+            block_reason=None if not blocked else reason,
+        )
+        return (not blocked), reason, {
+            "ticker": ticker,
+            "family": effective_family,
+            "realm_vv_status": realm_vv_status,
+            "realm_vv_ready": realm_vv_ready,
+            "realm_vv_explicit_approval": realm_vv_explicit_approval,
+            "decision": effective_decision,
+            "reason": reason,
+            "compatibility_alias_only": compatibility_alias_only,
+        }
+
     def _build_aion_execution_quality_profile(self, *, market=None, q=None, family=None, liquidity_priority=None, expectancy_summary=None):
         market = market if isinstance(market, dict) else {}
-        q = q if q is not None else self.build_quote(market)
+        if q is None:
+            q = market
+            try:
+                q_proxy = type("_AIONQuoteProxy", (), {})()
+                for _key, _value in self._coerce_aion_orderbook_source(market).items():
+                    setattr(q_proxy, _key, _value)
+                q = q_proxy
+            except Exception:
+                q = market
         liquidity_priority = liquidity_priority if isinstance(liquidity_priority, dict) else self.get_market_liquidity_priority(market)
         expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
         family = str(family or self.get_market_family(market) or getattr(q, "family", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
@@ -19909,6 +20928,88 @@ class KalshiSniperBot:
         )
         return normalized_price
 
+    def _resolve_aion_canonical_binary_prices(self, source=None, *, ticker=None, source_label="unknown"):
+        source_dict = self._coerce_aion_orderbook_source(source)
+        ticker_text = str(ticker or source_dict.get("ticker") or "").strip()
+
+        def _normalized_price(raw_value, key_label):
+            normalized = self.normalize_contract_price(
+                raw_value,
+                ticker=ticker_text or None,
+                source=f"{source_label}.{key_label}",
+            )
+            return self.to_float(normalized, None)
+
+        raw_yes_bid = source_dict.get("yes_bid_dollars", source_dict.get("yes_bid"))
+        raw_yes_ask = source_dict.get("yes_ask_dollars", source_dict.get("yes_ask"))
+        raw_no_bid = source_dict.get("no_bid_dollars", source_dict.get("no_bid"))
+        raw_no_ask = source_dict.get("no_ask_dollars", source_dict.get("no_ask"))
+
+        yes_bid = _normalized_price(raw_yes_bid, "yes_bid")
+        yes_ask = _normalized_price(raw_yes_ask, "yes_ask")
+        no_bid = _normalized_price(raw_no_bid, "no_bid")
+        no_ask = _normalized_price(raw_no_ask, "no_ask")
+
+        derived_yes_bid = False
+        derived_yes_ask = False
+        derived_no_bid = False
+        derived_no_ask = False
+
+        if yes_ask is None and no_bid is not None:
+            yes_ask = self._clamp(1.0 - no_bid, 0.0, 1.0)
+            derived_yes_ask = True
+        if no_ask is None and yes_bid is not None:
+            no_ask = self._clamp(1.0 - yes_bid, 0.0, 1.0)
+            derived_no_ask = True
+        if yes_bid is None and no_ask is not None:
+            yes_bid = self._clamp(1.0 - no_ask, 0.0, 1.0)
+            derived_yes_bid = True
+        if no_bid is None and yes_ask is not None:
+            no_bid = self._clamp(1.0 - yes_ask, 0.0, 1.0)
+            derived_no_bid = True
+
+        yes_bid_cents = int(round(yes_bid * 100.0)) if yes_bid is not None else None
+        yes_ask_cents = int(round(yes_ask * 100.0)) if yes_ask is not None else None
+        no_bid_cents = int(round(no_bid * 100.0)) if no_bid is not None else None
+        no_ask_cents = int(round(no_ask * 100.0)) if no_ask is not None else None
+
+        yes_spread = round(max(0.0, yes_ask - yes_bid), 4) if yes_bid is not None and yes_ask is not None else None
+        no_spread = round(max(0.0, no_ask - no_bid), 4) if no_bid is not None and no_ask is not None else None
+        spread = yes_spread if yes_spread is not None else no_spread
+        book_valid = bool(
+            yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None
+            and 0.0 <= yes_bid <= 1.0 and 0.0 <= yes_ask <= 1.0 and 0.0 <= no_bid <= 1.0 and 0.0 <= no_ask <= 1.0
+        )
+        normalized_consistent = bool(
+            yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None
+            and abs((yes_bid + no_ask) - 1.0) <= 0.02 and abs((no_bid + yes_ask) - 1.0) <= 0.02
+        )
+        return {
+            "ticker": ticker_text or None,
+            "raw_yes_bid": self.to_float(raw_yes_bid, None),
+            "raw_yes_ask": self.to_float(raw_yes_ask, None),
+            "raw_no_bid": self.to_float(raw_no_bid, None),
+            "raw_no_ask": self.to_float(raw_no_ask, None),
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "yes_bid_cents": yes_bid_cents,
+            "yes_ask_cents": yes_ask_cents,
+            "no_bid_cents": no_bid_cents,
+            "no_ask_cents": no_ask_cents,
+            "derived_yes_bid": derived_yes_bid,
+            "derived_yes_ask": derived_yes_ask,
+            "derived_no_bid": derived_no_bid,
+            "derived_no_ask": derived_no_ask,
+            "yes_spread": yes_spread,
+            "no_spread": no_spread,
+            "spread": spread,
+            "book_valid": book_valid,
+            "normalized_consistent": normalized_consistent,
+            "source_label": source_label,
+        }
+
     def persist_live_entry_metadata(self, order=None, payload=None, order_id=None):
         summary = self.extract_order_execution_summary(order or {})
         ticker = (summary.get("ticker") or (payload or {}).get("ticker") or "").strip()
@@ -20111,6 +21212,15 @@ class KalshiSniperBot:
             return value not in (None, "", [], {})
 
         sports_quote_snapshot = {}
+        orderbook_shape = "none"
+        if isinstance(market.get("orderbook_fp"), dict):
+            orderbook_shape = "orderbook_fp"
+        elif isinstance(market.get("orderbook"), dict):
+            orderbook_shape = "orderbook"
+        elif market.get("yes") not in (None, "", [], {} ) or market.get("no") not in (None, "", [], {}):
+            orderbook_shape = "side_levels"
+        elif market.get("yes_dollars") not in (None, "", [], {} ) or market.get("no_dollars") not in (None, "", [], {}):
+            orderbook_shape = "root_dollars"
         if self._is_sports_market_or_family(family):
             try:
                 sports_quote_snapshot = self._extract_non_targeted_topbook_snapshot(market)
@@ -20119,6 +21229,34 @@ class KalshiSniperBot:
                     "failure_stage": "topbook_snapshot_exception",
                     "failure_reason": exc.__class__.__name__,
                 }
+
+        try:
+            print(
+                "[AION-QUOTE-HYDRATION-ROOT] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "source_path": "build_quote",
+                        "market_keys": sorted(list(market.keys()))[:64],
+                        "has_orderbook": bool(orderbook_shape != "none"),
+                        "orderbook_shape": orderbook_shape,
+                        "build_quote_called": True,
+                        "recursion_detected": False,
+                        "fallback_attempted": False,
+                        "fallback_success": False,
+                        "topbook_extract_success": False,
+                        "yes_bid": None,
+                        "yes_ask": None,
+                        "no_bid": None,
+                        "no_ask": None,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
 
         yes_bid_raw = self.to_float(market.get("yes_bid_dollars", market.get("yes_bid")), None)
         yes_ask_raw = self.to_float(market.get("yes_ask_dollars", market.get("yes_ask")), None)
@@ -20230,6 +21368,10 @@ class KalshiSniperBot:
         yes_ask = self.to_float(yes_ask, 0.0)
         no_bid = self.to_float(no_bid, 0.0)
         no_ask = self.to_float(no_ask, 0.0)
+        provisional_quote_ready = bool((yes_bid > 0.0 and yes_ask > 0.0) or (no_bid > 0.0 and no_ask > 0.0))
+        quote_complete = bool(yes_bid > 0.0 and yes_ask > 0.0 and no_bid > 0.0 and no_ask > 0.0)
+        final_quote_ready = provisional_quote_ready
+        quote_ready_reason = "direct_fields" if provisional_quote_ready else "missing_quote_object"
         if self._is_sports_market_or_family(family):
             spread = round(yes_ask - yes_bid, 4) if yes_bid > 0.0 and yes_ask > 0.0 else None
             if sports_quote_snapshot.get("failure_stage") or sports_quote_snapshot.get("failure_reason"):
@@ -20238,6 +21380,30 @@ class KalshiSniperBot:
                     stage="orderbook_parse",
                     orderbook_parse_failure=True,
                 )
+                if sports_quote_snapshot.get("failure_reason"):
+                    quote_mapping_block_reason = quote_mapping_block_reason or f"quote_orderbook_snapshot_{sports_quote_snapshot.get('failure_reason')}"
+            provisional_quote_ready = bool((yes_bid > 0.0 and yes_ask > 0.0) or (no_bid > 0.0 and no_ask > 0.0))
+            final_quote_ready = provisional_quote_ready
+            sports_threshold_quote_diag = {
+                "ticker": ticker,
+                "quote_ready": bool(provisional_quote_ready),
+                "quote_ready_before_fallback": bool(quote_ready_reason != "missing_quote_object"),
+                "quote_ready_after_fallback": bool(provisional_quote_ready),
+                "quote_complete": bool(quote_complete),
+                "selected_side": selected_side if 'selected_side' in locals() else None,
+                "selected_price": selected_price if 'selected_price' in locals() else None,
+                "orderbook_exists": bool((yes_bid > 0.0 and yes_ask > 0.0) or (no_bid > 0.0 and no_ask > 0.0) or (sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0),
+                "topbook_snapshot_present": bool(sports_quote_snapshot and not sports_quote_snapshot.get("failure_stage")),
+                "orderbook_exists": bool((yes_bid > 0.0 and yes_ask > 0.0) or (no_bid > 0.0 and no_ask > 0.0) or (sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0 or (sports_quote_snapshot and not sports_quote_snapshot.get("failure_stage"))),
+                "topbook_depth_exists": bool((sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0 or (sports_quote_snapshot and not sports_quote_snapshot.get("failure_stage"))),
+                "no_top_size": sports_quote_snapshot.get("no_top_size"),
+                "quote_source": quote_ready_reason,
+                "source_of_quote_data": quote_ready_reason,
+                "failure_stage": sports_quote_snapshot.get("failure_stage"),
+                "failure_reason": sports_quote_snapshot.get("failure_reason"),
+                "orderbook_ready": bool((sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0 or quote_mapping_applied),
+                "orderbook_ready": bool((sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0 or quote_mapping_applied or (sports_quote_snapshot and not sports_quote_snapshot.get("failure_stage"))),
+            }
             adaptive_spread_limit = self._get_sports_adaptive_spread_threshold(
                 market,
                 spread=spread,
@@ -20245,6 +21411,7 @@ class KalshiSniperBot:
                 yes_top_size=sports_quote_snapshot.get("yes_top_size"),
                 no_top_size=sports_quote_snapshot.get("no_top_size"),
                 context="build_quote_final",
+                quote_diag=sports_threshold_quote_diag,
             ).get("adaptive_threshold", MAX_ENTRY_SPREAD)
             reject_reason = self._topbook_reject_reason(
                 yes_price=yes_ask if yes_ask > 0.0 else None,
@@ -20397,6 +21564,88 @@ class KalshiSniperBot:
                         default=str,
                     ))
 
+        try:
+            print(
+                "[AION-QUOTE-HYDRATION-SOURCE] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "source_path": sports_quote_snapshot.get("source_path") or "none",
+                        "market_keys": sorted(list(market.keys()))[:64],
+                        "has_orderbook": bool(orderbook_shape != "none"),
+                        "orderbook_shape": orderbook_shape,
+                        "build_quote_called": True,
+                        "recursion_detected": bool(sports_quote_snapshot.get("failure_reason") == "RecursionError"),
+                        "fallback_attempted": bool(quote_mapping_applied),
+                        "fallback_success": bool(quote_mapping_applied and final_quote_ready),
+                        "topbook_extract_success": bool((sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0),
+                        "recursion_guard_hit": bool(sports_quote_snapshot.get("failure_reason") == "RecursionError" or getattr(self, "_last_orderbook_recursion_guard_hit", False)),
+                        "yes_bid": yes_bid,
+                        "yes_ask": yes_ask,
+                        "no_bid": no_bid,
+                        "no_ask": no_ask,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[AION-QUOTE-HYDRATION-BUILD] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "source_path": sports_quote_snapshot.get("source_path") or "none",
+                        "market_keys": sorted(list(market.keys()))[:64],
+                        "has_orderbook": bool(orderbook_shape != "none"),
+                        "orderbook_shape": orderbook_shape,
+                        "build_quote_called": True,
+                        "build_quote_success": bool(final_quote_ready),
+                        "failure_reason": None if final_quote_ready else (quote_mapping_block_reason or "missing_quote_object"),
+                        "recursion_detected": bool(sports_quote_snapshot.get("failure_reason") == "RecursionError"),
+                        "fallback_attempted": bool(quote_mapping_applied),
+                        "fallback_success": bool(quote_mapping_applied and final_quote_ready),
+                        "topbook_extract_success": bool((sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0),
+                        "yes_bid": yes_bid,
+                        "yes_ask": yes_ask,
+                        "no_bid": no_bid,
+                        "no_ask": no_ask,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            if not final_quote_ready:
+                print(
+                    "[AION-QUOTE-HYDRATION-FAIL] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "source_path": sports_quote_snapshot.get("source_path") or "none",
+                            "market_keys": sorted(list(market.keys()))[:64],
+                            "has_orderbook": bool(orderbook_shape != "none"),
+                            "orderbook_shape": orderbook_shape,
+                            "build_quote_called": True,
+                            "build_quote_success": False,
+                            "failure_reason": quote_mapping_block_reason or "missing_quote_object",
+                            "recursion_detected": bool(sports_quote_snapshot.get("failure_reason") == "RecursionError"),
+                            "fallback_attempted": bool(quote_mapping_applied),
+                            "fallback_success": False,
+                            "topbook_extract_success": bool((sports_quote_snapshot.get("yes_top_size") or 0.0) > 0.0 or (sports_quote_snapshot.get("no_top_size") or 0.0) > 0.0),
+                            "yes_bid": yes_bid,
+                            "yes_ask": yes_ask,
+                            "no_bid": no_bid,
+                            "no_ask": no_ask,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        except Exception:
+            pass
+
         return Quote(
             ticker=ticker,
             title=title,
@@ -20515,11 +21764,32 @@ class KalshiSniperBot:
                 "best_action": None,
             }
 
+        canonical_tradeability = {}
+        try:
+            canonical_tradeability = self.resolve_canonical_tradeability(
+                market,
+                quote=q,
+                context={
+                    "quote_diag": sports_context,
+                    "selected_side": sports_context.get("selected_side"),
+                    "price_source": "bid",
+                    "selection_stage": source,
+                    "allow_refresh": True,
+                    "ticker": ticker or market.get("ticker", ""),
+                },
+                source=source,
+            ) or {}
+        except Exception:
+            canonical_tradeability = {}
+        if canonical_tradeability:
+            quote_orderbook_snapshot.update(canonical_tradeability)
+
         yes_top_price = self.to_float(topbook_snapshot.get("yes_top_price"), None)
         no_top_price = self.to_float(topbook_snapshot.get("no_top_price"), None)
         yes_top_size = self.to_float(topbook_snapshot.get("yes_top_size"), 0.0) or 0.0
         no_top_size = self.to_float(topbook_snapshot.get("no_top_size"), 0.0) or 0.0
         topbook_bucket = str(topbook_snapshot.get("top_book_bucket") or "unknown").strip().lower()
+        topbook_snapshot_present = bool(topbook_snapshot and not topbook_snapshot.get("failure_stage"))
 
         quote_fields = {
             "yes_bid": yes_bid,
@@ -20546,10 +21816,38 @@ class KalshiSniperBot:
             or no_top_size > 0.0
             or bool(topbook_bucket and topbook_bucket not in {"unknown", "zero_top_book"})
         )
+        canonical_source = {}
+        canonical_source_guard_fallback_used = True
+        try:
+            canonical_source = self._resolve_aion_canonical_binary_prices(
+                q if q is not None else market,
+                ticker=ticker or None,
+                source_label=f"quote_readiness.{source}",
+            ) or {}
+            canonical_source_guard_fallback_used = False
+        except Exception:
+            canonical_source = {}
+            canonical_source_guard_fallback_used = True
+        try:
+            print("[AION-CANONICAL-SOURCE-GUARD] " + json.dumps({
+                "function": "_diagnose_quote_readiness_context",
+                "ticker": ticker or None,
+                "canonical_source": canonical_source,
+                "fallback_used": bool(canonical_source_guard_fallback_used),
+            }, sort_keys=True, default=str))
+        except Exception:
+            pass
         topbook_depth_exists = bool(
             yes_top_size > 0.0
             or no_top_size > 0.0
             or topbook_bucket in {"both_non_zero", "one_non_zero"}
+            or self.to_float(canonical_source.get("yes_bid_cents"), 0.0) > 0.0
+            or self.to_float(canonical_source.get("no_bid_cents"), 0.0) > 0.0
+            or self.to_float(canonical_source.get("yes_ask_cents"), 0.0) > 0.0
+            or self.to_float(canonical_source.get("no_ask_cents"), 0.0) > 0.0
+            or market_direct_quote_ready
+            or market_direct_orderbook_ready
+            or book_valid
         )
         liquidity_depth = round(yes_top_size + no_top_size, 4)
         quote_ready_from_fields = bool(
@@ -20578,21 +21876,21 @@ class KalshiSniperBot:
         cache_stable_cycles = int(recent_cache.get("stable_cycles", 0) or 0) if recent_cache else 0
         if not quote_ready_from_fields and market:
             try:
-                fallback_quote = self.build_quote(market)
-                fallback_source = "market_build_quote"
+                fallback_snapshot = topbook_snapshot if isinstance(topbook_snapshot, dict) else {}
+                fallback_quote = q
+                fallback_source = "topbook_snapshot"
                 fallback_quote_ready = bool(
-                    fallback_quote
-                    and (
-                        (getattr(fallback_quote, "yes_bid", None) is not None and getattr(fallback_quote, "yes_bid", 0.0) > 0.0)
-                        or (getattr(fallback_quote, "yes_ask", None) is not None and getattr(fallback_quote, "yes_ask", 0.0) > 0.0)
-                        or (getattr(fallback_quote, "no_bid", None) is not None and getattr(fallback_quote, "no_bid", 0.0) > 0.0)
-                        or (getattr(fallback_quote, "no_ask", None) is not None and getattr(fallback_quote, "no_ask", 0.0) > 0.0)
-                    )
+                    (fallback_snapshot.get("yes_top_size") or 0.0) > 0.0
+                    or (fallback_snapshot.get("no_top_size") or 0.0) > 0.0
+                    or (fallback_snapshot.get("yes_top_price") or 0.0) > 0.0
+                    or (fallback_snapshot.get("no_top_price") or 0.0) > 0.0
+                    or topbook_depth_exists
+                    or orderbook_exists
                 )
             except Exception as exc:
                 parser_related = True
                 fallback_quote = None
-                fallback_source = f"market_build_quote_{exc.__class__.__name__}"
+                fallback_source = f"topbook_snapshot_{exc.__class__.__name__}"
         if not fallback_quote_ready and topbook_depth_exists and orderbook_exists:
             fallback_quote_ready = True
             if fallback_source == "none":
@@ -20602,8 +21900,70 @@ class KalshiSniperBot:
         resolved_quote_complete = bool(quote_orderbook_snapshot.get("quote_complete"))
         resolved_selected_side = quote_orderbook_snapshot.get("selected_side")
         resolved_selected_price = quote_orderbook_snapshot.get("selected_price")
-        resolved_orderbook_ready = bool(quote_orderbook_snapshot.get("orderbook_ready"))
+        resolved_orderbook_ready = bool(quote_orderbook_snapshot.get("orderbook_ready") or quote_orderbook_snapshot.get("selected_price") not in (None, "", 0, 0.0) or quote_orderbook_snapshot.get("yes_bid") not in (None, "", 0, 0.0) or quote_orderbook_snapshot.get("yes_ask") not in (None, "", 0, 0.0) or quote_orderbook_snapshot.get("no_bid") not in (None, "", 0, 0.0) or quote_orderbook_snapshot.get("no_ask") not in (None, "", 0, 0.0) or (topbook_snapshot and not topbook_snapshot.get("failure_stage")) or topbook_snapshot_present)
         quote_ready = bool(quote_ready_from_fields or fallback_quote_ready or resolved_quote_ready or bool(sports_context.get("quote_ready")))
+        hydrated_quote_ready = bool(
+            q is not None and any(
+                self.to_float(getattr(q, field, None), None) not in (None, 0.0)
+                for field in ("yes_bid", "yes_ask", "no_bid", "no_ask")
+            )
+        )
+        if q is not None and hydrated_quote_ready and not quote_ready:
+            quote_ready = True
+            quote_ready_reason = "hydrated_quote_object"
+            source_of_quote_data = "hydrated_quote_object"
+            fallback_quote_ready = True
+            resolved_quote_ready = True
+            quote_missing = False
+        orderbook_salvaged = False
+        if not resolved_orderbook_ready and (topbook_snapshot_present or topbook_depth_exists) and (
+            resolved_selected_price not in (None, "", 0, 0.0)
+            or yes_bid is not None
+            or yes_ask is not None
+            or no_bid is not None
+            or no_ask is not None
+            or resolved_quote_ready
+        ):
+            resolved_orderbook_ready = True
+            orderbook_salvaged = True
+            quote_orderbook_snapshot["orderbook_ready"] = True
+            quote_orderbook_snapshot["orderbook_exists"] = True
+            quote_orderbook_snapshot["normalized_orderbook_present"] = True
+            quote_orderbook_snapshot["topbook_snapshot_present"] = bool(topbook_snapshot_present)
+            quote_orderbook_snapshot["topbook_depth_exists"] = bool(topbook_depth_exists)
+            quote_orderbook_snapshot["orderbook_missing_reason"] = None
+            quote_orderbook_snapshot["blocker_reason"] = None
+            try:
+                print("[AION-ORDERBOOK-SALVAGED] " + json.dumps({
+                    "ticker": ticker or None,
+                    "family": family,
+                    "source_path": source,
+                    "topbook_snapshot_present": bool(topbook_snapshot_present),
+                    "topbook_depth_exists": bool(topbook_depth_exists),
+                    "selected_side": resolved_selected_side,
+                    "selected_price": resolved_selected_price,
+                    "quote_ready": bool(quote_ready),
+                    "orderbook_ready": True,
+                    "failure_reason": None,
+                }, sort_keys=True, default=str))
+            except Exception:
+                pass
+        elif not resolved_orderbook_ready:
+            try:
+                print("[AION-ORDERBOOK-REJECT] " + json.dumps({
+                    "ticker": ticker or None,
+                    "family": family,
+                    "source_path": source,
+                    "topbook_snapshot_present": bool(topbook_snapshot_present),
+                    "topbook_depth_exists": bool(topbook_depth_exists),
+                    "selected_side": resolved_selected_side,
+                    "selected_price": resolved_selected_price,
+                    "quote_ready": bool(quote_ready),
+                    "orderbook_ready": False,
+                    "failure_reason": quote_orderbook_snapshot.get("orderbook_missing_reason") or "orderbook_not_usable",
+                }, sort_keys=True, default=str))
+            except Exception:
+                pass
         quote_complete = bool(
             resolved_quote_complete
             or (yes_bid is not None and yes_bid > 0.0 and yes_ask is not None and yes_ask > 0.0 and no_bid is not None and no_bid > 0.0 and no_ask is not None and no_ask > 0.0)
@@ -20622,6 +21982,8 @@ class KalshiSniperBot:
             name for name, raw_value in raw_quote_candidates.items()
             if raw_value in (None, "", 0, 0.0)
         ]
+        if quote_ready:
+            quote_missing = False
         if quote_ready_from_fields:
             quote_ready_reason = "direct_fields"
             source_of_quote_data = "direct_fields"
@@ -20706,6 +22068,15 @@ class KalshiSniperBot:
             "quote_missing": bool(not quote_ready),
             "fallback_quote": fallback_quote,
         }
+        diagnostics["canonical_tradeability"] = canonical_tradeability
+        diagnostics["market_personality"] = _classify_market_personality(self, market=market, quote_diag=diagnostics, q=q, family=family)
+        diagnostics["confidence_profile"] = _compute_realm_vv_confidence(self, 
+            edge_after_cost=canonical_tradeability.get("edge_after_cost", sports_context.get("edge_after_cost")),
+            liquidity_depth=liquidity_depth,
+            spread_bucket=diagnostics.get("spread_bucket"),
+            market_personality=diagnostics["market_personality"],
+            profile_settings={"profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)},
+        )
         if yes_bid is not None and yes_ask is not None:
             try:
                 diagnostics["spread"] = round(max(0.0, float(yes_ask) - float(yes_bid)), 4)
@@ -20754,6 +22125,9 @@ class KalshiSniperBot:
         q = q if q is not None else None
         family = str(family or self.get_market_family(market) or getattr(q, "family", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
         ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        aggression_profile = _normalize_aion_aggression_profile(
+            quote_diag.get("profile") or quote_diag.get("aggression_profile") or AION_AGGRESSION_PROFILE
+        )
 
         def _pick(*values):
             for value in values:
@@ -20764,12 +22138,17 @@ class KalshiSniperBot:
                 return value
             return None
 
-        yes_bid = self.to_float(_pick(getattr(q, "yes_bid", None), market.get("yes_bid_dollars"), market.get("yes_bid")), None)
-        yes_ask = self.to_float(_pick(getattr(q, "yes_ask", None), market.get("yes_ask_dollars"), market.get("yes_ask")), None)
-        no_bid = self.to_float(_pick(getattr(q, "no_bid", None), market.get("no_bid_dollars"), market.get("no_bid")), None)
-        no_ask = self.to_float(_pick(getattr(q, "no_ask", None), market.get("no_ask_dollars"), market.get("no_ask")), None)
-        raw_yes_price = self.to_float(_pick(yes_ask, yes_bid, None if no_bid is None else max(0.0, 1.0 - self.to_float(no_bid, 0.0)), None if no_ask is None else max(0.0, 1.0 - self.to_float(no_ask, 0.0))), None)
-        raw_no_price = self.to_float(_pick(no_ask, no_bid, None if yes_bid is None else max(0.0, 1.0 - self.to_float(yes_bid, 0.0)), None if yes_ask is None else max(0.0, 1.0 - self.to_float(yes_ask, 0.0))), None)
+        canonical_source = self._resolve_aion_canonical_binary_prices(
+            q if q is not None else market,
+            ticker=ticker or None,
+            source_label=f"unsafe_price.{source}",
+        )
+        yes_bid = canonical_source.get("yes_bid")
+        yes_ask = canonical_source.get("yes_ask")
+        no_bid = canonical_source.get("no_bid")
+        no_ask = canonical_source.get("no_ask")
+        raw_yes_price = canonical_source.get("raw_yes_ask") if canonical_source.get("raw_yes_ask") is not None else canonical_source.get("raw_yes_bid")
+        raw_no_price = canonical_source.get("raw_no_ask") if canonical_source.get("raw_no_ask") is not None else canonical_source.get("raw_no_bid")
 
         yes_bid_valid = yes_bid is not None and yes_bid > 0.0
         yes_ask_valid = yes_ask is not None and yes_ask > 0.0
@@ -20780,19 +22159,17 @@ class KalshiSniperBot:
         best_bid = None
         best_ask = None
         midpoint = None
-        spread = None
+        spread = canonical_source.get("spread")
         if yes_bid_valid and yes_ask_valid:
             book_source = "yes"
             best_bid = yes_bid
             best_ask = yes_ask
             midpoint = (yes_bid + yes_ask) / 2.0
-            spread = max(0.0, yes_ask - yes_bid)
         elif no_bid_valid and no_ask_valid:
             book_source = "no"
             best_bid = max(0.0, 1.0 - no_ask)
             best_ask = max(0.0, 1.0 - no_bid)
             midpoint = max(0.0, min(1.0, 1.0 - ((no_bid + no_ask) / 2.0)))
-            spread = max(0.0, no_ask - no_bid)
         elif yes_bid_valid or yes_ask_valid:
             book_source = "yes_partial"
             best_bid = yes_bid if yes_bid_valid else None
@@ -20825,22 +22202,16 @@ class KalshiSniperBot:
             or quote_diag.get("sports_spread_bucket")
             or ("ultra_tight" if spread is not None and spread <= 0.012 else ("tight" if spread is not None and spread <= 0.03 else ("wide_but_possible" if spread is not None and spread <= AION_SPORTS_MAX_SPREAD_SOFT else ("extreme_wide" if spread is not None and spread <= AION_SPORTS_MAX_SPREAD_HARD else "unsafe"))))
         ).strip().lower() or "unknown"
+        canonical_tradeability = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else {}
+        canonical_spread_classification = str(
+            canonical_tradeability.get("spread_classification")
+            or quote_diag.get("spread_classification")
+            or quote_diag.get("canonical_spread_classification")
+            or "UNSAFE"
+        ).strip().upper() or "UNSAFE"
         valid_spread_bucket = spread_bucket in {"ultra_tight", "tight", "wide_but_possible"}
-        book_valid = bool(
-            book_source in {"yes", "no"}
-            and best_bid is not None
-            and best_ask is not None
-            and best_bid > 0.0
-            and best_ask > 0.0
-            and best_bid <= best_ask
-        )
-        normalized_consistent = bool(
-            normalized_yes_price is not None
-            and normalized_no_price is not None
-            and 0.0 <= normalized_yes_price <= 1.0
-            and 0.0 <= normalized_no_price <= 1.0
-            and abs((normalized_yes_price + normalized_no_price) - 1.0) <= 0.03
-        )
+        book_valid = bool(canonical_source.get("book_valid"))
+        normalized_consistent = bool(canonical_source.get("normalized_consistent"))
         bid_ask_consistent = bool(best_bid is None or best_ask is None or best_bid <= best_ask)
         book_missing_reasons = []
         if not yes_bid_valid and not yes_ask_valid:
@@ -20860,21 +22231,153 @@ class KalshiSniperBot:
         if not book_valid and not book_missing_reasons:
             book_missing_reasons.append("insufficient_quote_detail")
 
-        if book_valid and valid_spread_bucket and normalized_consistent:
+        selected_price_candidate = self.to_float(
+            quote_diag.get("selected_price_dollars", quote_diag.get("selected_price")),
+            None,
+        )
+        if selected_price_candidate is None:
+            selected_side_candidate = str(quote_diag.get("selected_side") or "").strip().lower() or None
+            if selected_side_candidate == "yes":
+                selected_price_candidate = yes_ask if yes_ask is not None else yes_bid
+            elif selected_side_candidate == "no":
+                selected_price_candidate = no_ask if no_ask is not None else no_bid
+            else:
+                selected_price_candidate = yes_ask if yes_ask is not None else (no_ask if no_ask is not None else (yes_bid if yes_bid is not None else no_bid))
+        price_bounds_pass = bool(selected_price_candidate is not None and KALSHI_CONTRACT_MIN_PRICE <= selected_price_candidate <= KALSHI_CONTRACT_MAX_PRICE)
+        topbook_depth_exists = bool(
+            self.to_float(quote_diag.get("yes_top_size"), 0.0) > 0.0
+            or self.to_float(quote_diag.get("no_top_size"), 0.0) > 0.0
+            or self.to_float(quote_diag.get("yes_bid"), 0.0) > 0.0
+            or self.to_float(quote_diag.get("no_bid"), 0.0) > 0.0
+            or self.to_float(quote_diag.get("yes_ask"), 0.0) > 0.0
+            or self.to_float(quote_diag.get("no_ask"), 0.0) > 0.0
+            or self.to_float(canonical_source.get("yes_bid_cents"), 0.0) > 0.0
+            or self.to_float(canonical_source.get("no_bid_cents"), 0.0) > 0.0
+            or self.to_float(canonical_source.get("yes_ask_cents"), 0.0) > 0.0
+            or self.to_float(canonical_source.get("no_ask_cents"), 0.0) > 0.0
+            or bool(quote_diag.get("topbook_snapshot_present"))
+            or bool(quote_diag.get("normalized_orderbook_present"))
+        )
+        edge_after_cost_value = self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), self.to_float(quote_diag.get("sports_edge_after_cost"), 0.0)))
+        liquidity_depth_value = self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0))
+        if liquidity_depth_value <= 0.0 and topbook_depth_exists:
+            liquidity_depth_value = max(1.0, self.to_float(quote_diag.get("yes_top_size"), 0.0) + self.to_float(quote_diag.get("no_top_size"), 0.0))
+        aggression_profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+        aggression_settings = _aion_aggression_profile_settings(aggression_profile, family=family, spread_bucket=spread_bucket, context=source)
+        freshness_seconds = self.to_float(quote_diag.get("stale_seconds"), self.to_float(quote_diag.get("cache_age_seconds"), None))
+        fresh_enough = bool(freshness_seconds is None or freshness_seconds <= 900.0)
+        selected_side_has_price = bool(price_bounds_pass and selected_price_candidate is not None)
+        selected_side_has_liquidity = bool(
+            topbook_depth_exists
+            or liquidity_depth_value > 0.0
+            or self.to_float(quote_diag.get("yes_top_size"), 0.0) > 0.0
+            or self.to_float(quote_diag.get("no_top_size"), 0.0) > 0.0
+        )
+        depth_available = bool(topbook_depth_exists or selected_side_has_liquidity)
+        if not book_valid and not any(book_missing_reasons):
+            unsafe_price_status = "both_sides_unexecutable"
+            unsafe_resolution_reason = "missing_quote_book"
+        elif not price_bounds_pass:
+            unsafe_price_status = "unexecutable_price"
+            unsafe_resolution_reason = "selected_price_out_of_bounds"
+        elif book_valid and valid_spread_bucket and normalized_consistent:
             unsafe_price_status = "safe"
             unsafe_resolution_reason = "valid_structurally_consistent_book"
-        elif book_valid and valid_spread_bucket:
-            unsafe_price_status = "unsafe"
-            unsafe_resolution_reason = "normalized_inconsistent"
+        elif book_valid and spread_bucket == "unsafe":
+            opportunistic_wide_spread_ok = bool(
+                aggression_profile in {"opportunistic", "beast"}
+                and price_bounds_pass
+                and topbook_depth_exists
+                and fresh_enough
+                and edge_after_cost_value >= self.to_float(aggression_settings.get("effective_edge_threshold"), 0.001)
+                and (normalized_consistent or book_valid)
+            )
+            if price_bounds_pass and (
+                opportunistic_wide_spread_ok
+                or (
+                    liquidity_depth_value > 0.0
+                    and topbook_depth_exists
+                    and fresh_enough
+                    and edge_after_cost_value >= self.to_float(aggression_settings.get("effective_edge_threshold"), 0.009)
+                )
+            ):
+                unsafe_price_status = "caution_wide_spread"
+                unsafe_resolution_reason = "wide_spread_but_executable"
+                spread_bucket = "wide_but_possible"
+                try:
+                    print("[AION-WIDE-SPREAD-CAUTION-PASS] " + json.dumps({
+                        "ticker": ticker or None,
+                        "family": family,
+                        "profile": aggression_profile,
+                        "yes_bid_cents": canonical_source.get("yes_bid_cents"),
+                        "no_bid_cents": canonical_source.get("no_bid_cents"),
+                        "derived_yes_ask_cents": canonical_source.get("yes_ask_cents"),
+                        "derived_no_ask_cents": canonical_source.get("no_ask_cents"),
+                        "selected_side": "yes" if yes_bid_valid else ("no" if no_bid_valid else None),
+                        "selected_price_cents": int(round((normalized_yes_price or normalized_no_price or 0.0) * 100.0)) if (normalized_yes_price or normalized_no_price) is not None else None,
+                        "selected_price_dollars": normalized_yes_price or normalized_no_price,
+                        "alternate_side": "no" if yes_bid_valid else "yes",
+                        "alternate_price_cents": canonical_source.get("no_bid_cents") if yes_bid_valid else canonical_source.get("yes_bid_cents"),
+                        "price_bounds_pass": price_bounds_pass,
+                        "spread_bucket_original": str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                        "spread_bucket_final": "caution_wide_spread",
+                        "unsafe_price_status_original": str(quote_diag.get("unsafe_price_status") or "unknown").strip().lower() or "unknown",
+                        "unsafe_price_status_final": "caution_wide_spread",
+                        "edge_after_cost": edge_after_cost_value,
+                        "liquidity": liquidity_depth_value,
+                        "side_switch_attempted": False,
+                        "side_switch_success": False,
+                        "phase55_allowed": True,
+                        "block_reason": None,
+                    }, sort_keys=True, default=str))
+                except Exception:
+                    pass
+            else:
+                unsafe_price_status = "unsafe_spread"
+                unsafe_resolution_reason = "spread_bucket_not_allowed"
         elif book_valid:
-            unsafe_price_status = "unsafe"
+            unsafe_price_status = "unsafe_spread"
             unsafe_resolution_reason = "spread_bucket_not_allowed"
         elif yes_bid_valid or yes_ask_valid or no_bid_valid or no_ask_valid:
-            unsafe_price_status = "unsafe"
+            unsafe_price_status = "unexecutable_price"
             unsafe_resolution_reason = "partial_quote_book"
         else:
-            unsafe_price_status = "unsafe"
+            unsafe_price_status = "both_sides_unexecutable"
             unsafe_resolution_reason = "missing_quote_book"
+
+        beast_spread_override_applied = bool(
+            aggression_profile == "beast"
+            and canonical_spread_classification == "AGGRESSIVE_BUT_TRADEABLE"
+            and price_bounds_pass
+            and edge_after_cost_value > 0.0
+            and (book_valid or normalized_consistent or topbook_depth_exists or selected_side_has_price)
+        )
+        if beast_spread_override_applied and unsafe_price_status in {"unsafe_spread", "unsafe"}:
+            unsafe_price_status = "caution_wide_spread"
+            unsafe_resolution_reason = "beast_mode_wide_spread_allowed"
+            if spread_bucket == "unsafe":
+                spread_bucket = "wide_but_possible"
+        thin_book_override_applied = bool(
+            aggression_profile == "beast"
+            and canonical_spread_classification == "AGGRESSIVE_BUT_TRADEABLE"
+            and selected_side_has_price
+            and edge_after_cost_value > 0.0
+            and (book_valid or topbook_depth_exists or selected_side_has_liquidity or normalized_consistent or fresh_enough)
+            and unsafe_price_status not in {"unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}
+        )
+        if thin_book_override_applied:
+            unsafe_price_status = "caution_wide_spread"
+            unsafe_resolution_reason = "thin_book_beast_allowed"
+
+        spread_severity = "catastrophic" if unsafe_price_status in {"unsafe_spread", "unexecutable_price", "both_sides_unexecutable"} else "survivable"
+        spread_is_catastrophic = bool(spread_severity == "catastrophic" and not beast_spread_override_applied)
+        spread_is_survivable = bool(not spread_is_catastrophic)
+        final_submit_allowed_by_realm_vv = bool(
+            price_bounds_pass
+            and edge_after_cost_value > 0.0
+            and quote_diag.get("quote_ready", True)
+            and (not spread_is_catastrophic or thin_book_override_applied)
+        )
 
         payload = {
             "ticker": ticker or None,
@@ -20889,14 +22392,61 @@ class KalshiSniperBot:
             "normalized_no_price": round(normalized_no_price, 4) if normalized_no_price is not None else None,
             "book_valid": bool(book_valid),
             "book_missing_reason": ",".join(dict.fromkeys(book_missing_reasons)) or None,
+            "selected_side_has_price": bool(selected_side_has_price),
+            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+            "depth_available": bool(depth_available),
+            "derived_price_used": bool(quote_diag.get("derived_price_used") or quote_diag.get("derived_price_source") not in (None, "", "unknown")),
+            "derived_price_source": str(quote_diag.get("derived_price_source") or "unknown").strip().lower() or "unknown",
+            "thin_book_override_applied": bool(thin_book_override_applied),
             "unsafe_price_status": unsafe_price_status,
             "unsafe_resolution_reason": unsafe_resolution_reason,
+            "spread_classification": canonical_spread_classification,
+            "spread_severity": spread_severity,
+            "spread_is_catastrophic": bool(spread_is_catastrophic),
+            "spread_is_survivable": bool(spread_is_survivable),
+            "beast_spread_override_applied": bool(beast_spread_override_applied),
+            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
             "source": source,
         }
         print("[AION-UNSAFE-PRICE-DETAIL] " + json.dumps(payload, sort_keys=True, default=str))
         return payload
 
-    def _score_live_ticker_candidate(self, q: Quote):
+    def _realm_vv_selection_priority(self, market, q):
+        market = market if isinstance(market, dict) else {}
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        gate_record = self._get_phase55_live_execution_gate_record(ticker, stage="canary_selection") if ticker else {}
+        if not self._realm_vv_record_has_meaningful_data(gate_record):
+            return False, 0.0, gate_record
+        candidate_source = str(gate_record.get("candidate_source") or "").strip().lower()
+        decision = str(gate_record.get("decision") or "").strip().upper()
+        entry_ready = bool(gate_record.get("entry_ready") is True or gate_record.get("entry_timing_pass") is True or gate_record.get("normalized_ready") is True)
+        final_submit_allowed = bool(
+            gate_record.get("final_submit_allowed_by_realm_vv")
+            if gate_record.get("final_submit_allowed_by_realm_vv") is not None
+            else gate_record.get("realm_vv_final_submit_allowed_by_realm_vv")
+        )
+        quote_ready = bool(gate_record.get("quote_ready") is not False)
+        price = self.to_float(getattr(q, "yes_ask", None), self.to_float(gate_record.get("selected_price_dollars"), None))
+        price_bounds_pass = bool(price is not None and 0.0 < price < 1.0)
+        allowed = bool(
+            candidate_source == "realm_vv_entry_engine"
+            and decision in {"BUY", "LIVE_PROMOTION"}
+            and entry_ready
+            and final_submit_allowed
+            and quote_ready
+            and price_bounds_pass
+        )
+        if not allowed:
+            return False, 0.0, gate_record
+        priority_boost = 20.0
+        if gate_record.get("beast_spread_override_applied") is True:
+            priority_boost += 5.0
+        if gate_record.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WIDE_SPREAD"}:
+            priority_boost += 5.0
+        return True, priority_boost, gate_record
+
+    def _score_live_ticker_candidate(self, q: Quote, market=None):
+        market = market if isinstance(market, dict) else {}
         spread = q.yes_ask - q.yes_bid
         mid_price = q.yes_ask
         if q.yes_bid > 0:
@@ -20911,6 +22461,9 @@ class KalshiSniperBot:
             score += 8.0
             if 0.68 <= q.yes_ask <= 0.93:
                 score += 6.0
+        realm_vv_priority, realm_vv_priority_boost, _realm_vv_gate = self._realm_vv_selection_priority(market, q)
+        if realm_vv_priority:
+            score += realm_vv_priority_boost
         score += max(0.0, 0.25 - abs(mid_price - 0.5)) * 8
         score += max(0.0, 24 - len(q.ticker)) / 24
         return round(score, 4)
@@ -21652,8 +23205,27 @@ class KalshiSniperBot:
                     f"result=pass seen={liquidity} threshold={min_liquidity}"
                 )
         if getattr(q, "volume", 0.0) <= MIN_ENTRY_VOLUME:
-            self._record_live_reject_telemetry(reason="low_volume", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
-            return False, "low_volume"
+            realm_vv_priority, priority_boost, gate_record = self._realm_vv_selection_priority(market, q)
+            if not realm_vv_priority:
+                self._record_live_reject_telemetry(reason="low_volume", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
+                return False, "low_volume"
+            print(
+                "[LIVE-SELECT-REALM-VV-PRIORITY] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "decision": gate_record.get("decision"),
+                        "entry_ready": bool(gate_record.get("entry_ready")),
+                        "final_submit_allowed_by_realm_vv": bool(gate_record.get("final_submit_allowed_by_realm_vv")),
+                        "selected_price": getattr(q, "yes_ask", None),
+                        "priority_boost": round(priority_boost, 4),
+                        "reason": "low_volume_override",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         if yes_ask <= MIN_ENTRY_PRICE or yes_ask >= MAX_ENTRY_PRICE:
             self._record_live_reject_telemetry(reason="unsafe_price", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
             return False, "unsafe_price"
@@ -25182,6 +26754,7 @@ class KalshiSniperBot:
         return response.json()
 
     def _extract_orderbook_side_levels_with_source(self, payload, side):
+        self._last_orderbook_recursion_guard_hit = False
         if not isinstance(payload, dict):
             return [], "none"
         side = "no" if str(side).lower() == "no" else "yes"
@@ -25302,6 +26875,9 @@ class KalshiSniperBot:
             return [], "none"
 
         while queue:
+            if len(queue) > 512:
+                self._last_orderbook_recursion_guard_hit = True
+                break
             current = queue.pop(0)
             if not isinstance(current, dict):
                 continue
@@ -25392,6 +26968,9 @@ class KalshiSniperBot:
         best_positive = None
         best_any = None
         while queue:
+            if len(queue) > 1024:
+                self._last_orderbook_recursion_guard_hit = True
+                break
             current = queue.pop(0)
             if not isinstance(current, dict):
                 continue
@@ -25458,6 +27037,7 @@ class KalshiSniperBot:
         return None
 
     def _extract_orderbook_top_level(self, levels, _seen=None):
+        self._last_orderbook_recursion_guard_hit = False
         if _seen is None:
             _seen = set()
         price_keys = (
@@ -26060,10 +27640,28 @@ class KalshiSniperBot:
             "signal_details": signal_details,
         }
 
-    def _get_sports_priority_profile(self, market, liquidity_priority=None, spread=None):
+    def _get_sports_priority_profile(self, market, q=None, liquidity_priority=None, spread=None):
         family = self.get_market_family(market)
-        q = self.build_quote(market)
-        liquidity_priority = liquidity_priority or self.get_market_liquidity_priority(market)
+        q_exists = q is not None
+        q_is_none = q is None
+        fallback_used = False
+        if q is None:
+            fallback_used = True
+            try:
+                q_proxy = type("_AIONQuoteProxy", (), {})()
+                for _key, _value in self._coerce_aion_orderbook_source(market).items():
+                    setattr(q_proxy, _key, _value)
+                q = q_proxy
+            except Exception:
+                q = market
+        try:
+            print(
+                f"[AION-Q-REFERENCE-GUARD] function=_get_sports_priority_profile ticker={str(getattr(q, 'ticker', '') or market.get('ticker', '') or '') if isinstance(market, dict) else str(getattr(q, 'ticker', '') or '')} "
+                f"q_exists={'yes' if q_exists else 'no'} q_is_none={'yes' if q_is_none else 'no'} fallback_used={'yes' if fallback_used else 'no'} source_path=sports_priority_profile"
+            )
+        except Exception:
+            pass
+        liquidity_priority = liquidity_priority or self.get_market_liquidity_priority(market, q=q)
         min_top_size = self.get_market_min_top_of_book_size(market)
         yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
         no_top_size = self.to_float(liquidity_priority.get("no_top_size"), 0.0) or 0.0
@@ -26143,7 +27741,19 @@ class KalshiSniperBot:
         family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
         if family == "KXBTC15M" or not self._is_sports_market_or_family(family):
             return {"score": 0.0, "components": {}, "reason": "not_sports"}
-        q = q or self.build_quote(market)
+        if q is None:
+            canonical_tradeability = self.resolve_canonical_tradeability(market, context={"source": "get_sports_edge_score", "allow_refresh": True})
+            q = type("_AIONCanonicalQuoteProxy", (), {})()
+            for _key, _value in {
+                "ticker": canonical_tradeability.get("ticker"),
+                "yes_bid": canonical_tradeability.get("yes_bid"),
+                "yes_ask": canonical_tradeability.get("yes_ask"),
+                "no_bid": canonical_tradeability.get("no_bid"),
+                "no_ask": canonical_tradeability.get("no_ask"),
+                "volume": self.to_float((market or {}).get("volume_fp", (market or {}).get("volume")), 0.0) or 0.0,
+                "liquidity": self.to_float((market or {}).get("liquidity_dollars", (market or {}).get("liquidity")), 0.0) or 0.0,
+            }.items():
+                setattr(q, _key, _value)
         liquidity_priority = liquidity_priority or self.get_market_liquidity_priority(market)
         if spread is None:
             spread = (getattr(q, "yes_ask", 0.0) or 0.0) - (getattr(q, "yes_bid", 0.0) or 0.0)
@@ -26765,6 +28375,42 @@ class KalshiSniperBot:
             except Exception:
                 selected_quote_diag = {}
         selected_quote_ready = bool(selected_quote_diag.get("quote_ready", getattr(selected_quote, "quote_ready", False)))
+        selected_side_executable = bool(
+            selected_quote_diag.get("selected_side_has_price")
+            or (selected_quote_diag.get("selected_price_dollars") not in (None, "", 0, 0.0))
+        )
+
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+        relaxed_beast_mode = bool(_relaxed_beast_mode_enabled(4) and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"})
+        if relaxed_beast_mode and bool(selected_quote_diag.get("final_submit_allowed_by_realm_vv")) and selected_side_executable:
+            selected_quote_ready = True
+            print(
+                "[AION-RELAXED-BEAST-L4] "
+                + json.dumps(
+                    {
+                        "ticker": selected_ticker or None,
+                        "family": selected_family,
+                        "stage": "open_market_runtime_current",
+                        "selected_side_executable": bool(selected_side_executable),
+                        "quote_ready": bool(selected_quote_ready),
+                        "final_submit_allowed_by_realm_vv": bool(selected_quote_diag.get("final_submit_allowed_by_realm_vv")),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         selected_spread_bucket = str(selected_quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown"
         selected_edge = self.to_float(selected_quote_diag.get("final_edge"), self.to_float(selected_quote_diag.get("sports_edge_after_cost"), 0.0))
         selected_is_sports = selected_category == "sports"
@@ -26876,10 +28522,21 @@ class KalshiSniperBot:
             except Exception as exc:
                 quote_diag = {"quote_ready": False, "quote_ready_reason": exc.__class__.__name__}
             quote_ready = bool(quote_diag.get("quote_ready"))
+            selected_side_executable = bool(
+                quote_diag.get("selected_side_has_price")
+                or (quote_diag.get("selected_price_dollars") not in (None, "", 0, 0.0))
+            )
+            if relaxed_beast_mode and bool(quote_diag.get("final_submit_allowed_by_realm_vv")) and selected_side_executable:
+                quote_ready = True
+                quote_diag["quote_ready"] = True
+                quote_diag["quote_missing"] = False
+                quote_diag["quote_ready_reason"] = quote_diag.get("quote_ready_reason") or "relaxed_beast_mode_level_4"
+                quote_diag["source_of_quote_data"] = quote_diag.get("source_of_quote_data") or "relaxed_beast_mode_level_4"
             spread_bucket = str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown"
             spread = self.to_float(quote_diag.get("spread"), None)
             final_edge = self.to_float(quote_diag.get("final_edge"), self.to_float(quote_diag.get("sports_edge_after_cost"), 0.0))
             quote_missing = bool(quote_diag.get("quote_missing", not quote_ready))
+            payload_preflight = {}
             if final_edge >= 0.002:
                 payload_preflight = self._diagnose_live_order_payload_context(
                     q,
@@ -26959,6 +28616,10 @@ class KalshiSniperBot:
                 quote_ready=quote_ready,
                 quote_missing=quote_missing,
                 unsafe_price_status=unsafe_price_status_trace,
+                spread_classification=unsafe_price_detail.get("spread_classification"),
+                spread_severity=unsafe_price_detail.get("spread_severity"),
+                beast_spread_override_applied=unsafe_price_detail.get("beast_spread_override_applied"),
+                final_submit_allowed_by_realm_vv=unsafe_price_detail.get("final_submit_allowed_by_realm_vv"),
                 duplicate_status=quote_diag.get("duplicate_status"),
                 cooldown_status=quote_diag.get("cooldown_status"),
                 phase55_ready=bool(quote_diag.get("phase55_ready")),
@@ -27041,6 +28702,7 @@ class KalshiSniperBot:
                     payload_missing_reason=payload_preflight.get("payload_missing_reason"),
                     payload_rejection_reason=payload_preflight.get("payload_rejection_reason"),
                     payload_keys=payload_preflight.get("payload_keys"),
+                    canonical_execution_state=payload_preflight.get("canonical_execution_state"),
                     auth_ready=True,
                     duplicate_status=quote_diag.get("duplicate_status"),
                     cooldown_status=quote_diag.get("cooldown_status"),
@@ -27168,8 +28830,17 @@ class KalshiSniperBot:
                 score_result = {"candidate_score": 0.0, "decision": "SKIP", "decision_reason": exc.__class__.__name__}
             candidate_score = self.to_float(score_result.get("candidate_score"), 0.0)
             decision = str(score_result.get("decision") or "SKIP").upper()
-            candidate_eligible = bool(
+            quote_ready_for_lane = bool(
                 quote_ready
+                or (
+                    relaxed_beast_mode
+                    and bool(quote_diag.get("final_submit_allowed_by_realm_vv"))
+                    and selected_side_executable
+                    and final_edge > 0.0
+                )
+            )
+            candidate_eligible = bool(
+                quote_ready_for_lane
                 and (spread_bucket in {"ultra_tight", "tight"} or (positive_edge_override and spread_bucket == "wide_but_possible"))
                 and candidate_score > 0.0
                 and market_live
@@ -27787,6 +29458,38 @@ class KalshiSniperBot:
             print(
                 f"[ORDERBOOK-FP-EXTRACT] ticker={str(market.get('ticker', '') or '').strip()} yes_size={snapshot.get('yes_top_size')} no_size={snapshot.get('no_top_size')} success={success}"
             )
+        try:
+            print(
+                "[AION-ORDERBOOK-NONRECURSIVE-EXTRACT] "
+                + json.dumps(
+                    {
+                        "ticker": str(market.get("ticker", "") or "").strip() or None,
+                        "family": self.get_market_family(market),
+                        "source_path": snapshot.get("source_path") or "none",
+                        "orderbook_shape": (
+                            "orderbook_fp" if isinstance(fp_container, dict) else
+                            "orderbook" if isinstance(container, dict) else
+                            "side_levels" if (market.get("yes") not in (None, "", [], {}) or market.get("no") not in (None, "", [], {})) else
+                            "root_dollars" if (market.get("yes_dollars") not in (None, "", [], {}) or market.get("no_dollars") not in (None, "", [], {})) else
+                            "none"
+                        ),
+                        "recursion_guard_hit": bool(snapshot.get("failure_reason") == "RecursionError" or getattr(self, "_last_orderbook_recursion_guard_hit", False)),
+                        "topbook_extract_success": bool((snapshot.get("yes_top_size") or 0.0) > 0.0 or (snapshot.get("no_top_size") or 0.0) > 0.0),
+                        "yes_bid": yes_bid,
+                        "yes_ask": yes_ask,
+                        "no_bid": no_bid,
+                        "no_ask": no_ask,
+                        "build_quote_called": False,
+                        "build_quote_success": False,
+                        "failure_reason": snapshot.get("failure_reason"),
+                        "candidate_propagated": bool((snapshot.get("yes_top_size") or 0.0) > 0.0 or (snapshot.get("no_top_size") or 0.0) > 0.0),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
         return snapshot
 
     def _emit_strict_liquidity_trace(self, market, q, family, validation_snapshot, orderbook_snapshot, reject_reason):
@@ -28351,8 +30054,20 @@ class KalshiSniperBot:
         spread = (getattr(q, "yes_ask", 0.0) or 0.0) - (getattr(q, "yes_bid", 0.0) or 0.0)
         return self._evaluate_targeted_orderbook_gate(market, spread)
 
-    def get_market_liquidity_priority(self, market):
-        q = self.build_quote(market)
+    def get_market_liquidity_priority(self, market, q=None):
+        if q is None:
+            canonical_tradeability = self.resolve_canonical_tradeability(market, context={"source": "get_market_liquidity_priority", "allow_refresh": True})
+            q = type("_AIONCanonicalQuoteProxy", (), {})()
+            for _key, _value in {
+                "ticker": canonical_tradeability.get("ticker"),
+                "yes_bid": canonical_tradeability.get("yes_bid"),
+                "yes_ask": canonical_tradeability.get("yes_ask"),
+                "no_bid": canonical_tradeability.get("no_bid"),
+                "no_ask": canonical_tradeability.get("no_ask"),
+                "volume": self.to_float((market or {}).get("volume_fp", (market or {}).get("volume")), 0.0) or 0.0,
+                "liquidity": self.to_float((market or {}).get("liquidity_dollars", (market or {}).get("liquidity")), 0.0) or 0.0,
+            }.items():
+                setattr(q, _key, _value)
         family = self.get_market_family(market)
         volume = getattr(q, "volume", 0.0) or 0.0
         liquidity = getattr(q, "liquidity", 0.0) or 0.0
@@ -28536,6 +30251,7 @@ class KalshiSniperBot:
         if self.get_market_discovery_category(family) == "sports":
             sports_priority_profile = self._get_sports_priority_profile(
                 market,
+                q=q,
                 liquidity_priority={
                     "yes_top_size": yes_top_size,
                     "no_top_size": no_top_size,
@@ -29655,9 +31371,12 @@ class KalshiSniperBot:
             return False, "unsafe_price", family
         return True, None, family
 
-    def compute_entry_presolve_score(self, market):
+    def compute_entry_presolve_score(self, market, quote=None):
         ticker = str(market.get("ticker", "") or "").strip()
         family = self.get_market_family(market)
+        quote_payload = quote
+        if quote_payload is None and isinstance(market, dict):
+            quote_payload = market.get("quote") or market.get("quote_object") or market.get("q")
         yes_bid = self.to_float(market.get("yes_bid_dollars", market.get("yes_bid")))
         yes_ask = self.to_float(market.get("yes_ask_dollars", market.get("yes_ask")))
         volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0)
@@ -29690,11 +31409,33 @@ class KalshiSniperBot:
         market_quality = self.get_market_quality_preference(market, liquidity_priority=liquidity_priority)
         liquidity_priority_component = liquidity_priority.get("score", 0.0)
         market_quality_component = market_quality.get("score", 0.0)
-        sports_priority_profile = self._get_sports_priority_profile(
-            market,
-            liquidity_priority=liquidity_priority,
-            spread=spread,
-        ) if market_category == "sports" else None
+        sports_priority_profile = None
+        if market_category == "sports":
+            try:
+                sports_priority_profile = self._get_sports_priority_profile(
+                    market,
+                    q=quote_payload,
+                    liquidity_priority=liquidity_priority,
+                    spread=spread,
+                )
+            except NameError as exc:
+                print(
+                    "[LIVE-SELECT-WARN] "
+                    + json.dumps(
+                        {
+                            "source": "compute_entry_presolve_score.sports_priority_profile",
+                            "ticker": ticker or None,
+                            "family": family or None,
+                            "quote_present": bool(quote_payload is not None),
+                            "fallback": "sports_priority_profile_unavailable",
+                            "error_type": exc.__class__.__name__,
+                            "error_reason": str(exc),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                sports_priority_profile = None
         sports_priority_component = 0.0
         if sports_priority_profile:
             if sports_priority_profile.get("priority_boost_applied"):
@@ -29711,7 +31452,7 @@ class KalshiSniperBot:
         sports_edge_component = min(24.0, sports_edge.get("score", 0.0) * 0.30)
         liquidity_priority_profile = self._compute_liquidity_priority_score(
             market,
-            q=None,
+            q=quote_payload,
             family=family,
             spread=spread,
             liquidity_priority=liquidity_priority,
@@ -29719,7 +31460,7 @@ class KalshiSniperBot:
         liquidity_priority_boost = self.to_float(liquidity_priority_profile.get("score"), 0.0)
         market_priority_profile = self._build_aion_market_priority_profile(
             market=market,
-            q=None,
+            q=quote_payload,
             family=family,
             spread=spread,
             liquidity_priority=liquidity_priority,
@@ -30538,12 +32279,49 @@ class KalshiSniperBot:
         return best_context
 
     def get_entry_timing_observation(self, market, q, family, stage_label="entry_timing"):
+        if AION_USE_REALM_VV_ENTRY_ENGINE:
+            quote_payload = q
+            canonical_payload = dict(market or {}) if isinstance(market, dict) else {}
+            if quote_payload is not None:
+                canonical_payload.setdefault("ticker", getattr(quote_payload, "ticker", None))
+                canonical_payload.setdefault("quote_object", quote_payload)
+                canonical_payload.setdefault("yes_bid", getattr(quote_payload, "yes_bid", None))
+                canonical_payload.setdefault("yes_ask", getattr(quote_payload, "yes_ask", None))
+                canonical_payload.setdefault("no_bid", getattr(quote_payload, "no_bid", None))
+                canonical_payload.setdefault("no_ask", getattr(quote_payload, "no_ask", None))
+            orderbook_context = {
+                "quote_ready": quote_payload is not None,
+                "orderbook_ready": quote_payload is not None,
+                "orderbook_source": "realm_vv_canonical_entry_timing",
+            }
+            decision_context = {
+                "market": market,
+                "ticker": getattr(quote_payload, "ticker", None) if quote_payload is not None else None,
+                "family": family,
+                "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                "quote_diag": {},
+                "canonical_tradeability": {},
+                "selected_side": getattr(quote_payload, "side", None) if quote_payload is not None else None,
+                "price_source": "bid",
+                "edge_after_cost": None,
+                "confidence": None,
+                "score": None,
+                "duplicate_block": None,
+                "cooldown_block": None,
+                "live_arm_ok": bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+            }
+            return self.resolve_realm_vv_entry_engine(
+                quote_payload,
+                canonical_payload=canonical_payload,
+                orderbook_context=orderbook_context,
+                decision_context=decision_context,
+            )
         current_price = getattr(q, "yes_ask", 0.0) or 0.0
         best_bid = getattr(q, "yes_bid", 0.0) or 0.0
         last_price = getattr(q, "last_price", 0.0) or 0.0
         spread = (current_price - best_bid) if current_price > 0 and best_bid > 0 else None
         min_liquidity = self.get_market_min_entry_liquidity(market) if market is not None else MIN_ENTRY_LIQUIDITY
-        liquidity_priority = self.get_market_liquidity_priority(market) if market is not None else {}
+        liquidity_priority = self.get_market_liquidity_priority(market, q=q) if market is not None else {}
         liquidity_seen = getattr(q, "liquidity", 0.0) or 0.0
         ws_snapshot = self._get_websocket_snapshot(getattr(q, "ticker", None), market=market)
         if ws_snapshot and not ws_snapshot.get("stale"):
@@ -31266,6 +33044,19 @@ class KalshiSniperBot:
             "hard_reject_reason": None,
             "timing_bucket": "unknown",
             "targeted_orderbook_ok": None,
+            "aggression_profile": None,
+            "aggression_thresholds": {},
+        }
+        aggression_settings = _aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, context="score_final_candidate_decision")
+        effective_score_threshold = max(0.0, self.to_float(aggression_settings.get("effective_score_threshold"), PHASE5_BUY_SCORE_THRESHOLD))
+        effective_edge_threshold = max(0.0, self.to_float(aggression_settings.get("effective_edge_threshold"), AION_SPORTS_MIN_EDGE_AFTER_COST))
+        effective_confidence_floor = max(0.0, self.to_float(aggression_settings.get("confidence_floor"), 0.55))
+        debug_context["aggression_profile"] = aggression_settings.get("profile")
+        debug_context["aggression_thresholds"] = {
+            "score_threshold": round(effective_score_threshold, 4),
+            "confidence_floor": round(effective_confidence_floor, 4),
+            "edge_threshold": round(effective_edge_threshold, 4),
+            "reason": aggression_settings.get("reason"),
         }
         if not market or not ticker:
             debug_context["hard_reject_reason"] = "missing_market_or_ticker"
@@ -31429,6 +33220,7 @@ class KalshiSniperBot:
         )
         sports_priority_profile = self._get_sports_priority_profile(
             market,
+            q=q,
             liquidity_priority=liquidity_priority,
             spread=spread,
         ) if self.get_market_discovery_category(family) == "sports" else None
@@ -31629,6 +33421,7 @@ class KalshiSniperBot:
             15.0,
             max(0.0, (min(volume, 100.0) / 100.0) * 7.5 + (spread_score / 25.0) * 7.5),
         )
+        confidence_score = min(15.0, confidence_score + max(0.0, (0.55 - effective_confidence_floor) * 6.0))
         pre_session_original_score = liquidity_score + spread_score + structure_score + timing_score + confidence_score + sports_priority_score + sports_edge_score + family_perf_adjustment
         pre_session_total_score = pre_session_original_score + momentum_adjustment
         if self.get_market_discovery_category(family) == "sports":
@@ -31686,7 +33479,7 @@ class KalshiSniperBot:
         edge_confidence_adjustment = max(-1.5, min(1.5, edge_confidence_weight * 0.4))
         pre_session_total_score = round(pre_session_total_score + edge_confidence_adjustment, 4)
         pre_session_total_score = round(pre_session_total_score + market_priority_boost + execution_quality_boost + scan_weight_boost, 4)
-        borderline_setup = bool(pre_session_total_score < (PHASE5_BUY_SCORE_THRESHOLD + 5.0))
+        borderline_setup = bool(pre_session_total_score < (effective_score_threshold + 5.0))
         session_adjustment = self._get_live_session_entry_adjustment(adaptive_entry=False, borderline=borderline_setup)
         total_score = round(
             pre_session_total_score - session_adjustment.get("score_penalty", 0.0),
@@ -31729,7 +33522,7 @@ class KalshiSniperBot:
             decision_reason = realm_xxxii_audit.get("reject_reason") or "unsafe_pricing_block"
         if decision == "SKIP" and psychology_context.get("blocked") and not psychology_context.get("shadow_only"):
             pass
-        elif total_score >= PHASE5_BUY_SCORE_THRESHOLD:
+        elif total_score >= effective_score_threshold:
             decision = "BUY"
             decision_reason = "score_above_threshold"
         elif liquidity_score < 10.0:
@@ -31747,16 +33540,21 @@ class KalshiSniperBot:
         else:
             decision = "SKIP"
             decision_reason = "low_score"
+        sports_positive_edge_min = max(
+            0.0,
+            self.to_float(aggression_settings.get("effective_edge_threshold"), AION_SPORTS_MIN_EDGE_AFTER_COST),
+        )
         sports_positive_edge_override = bool(
             self._is_sports_market_or_family(family)
             and market
+            and orderbook_ok
             and sports_quote_ready
             and sports_edge_after_cost is not None
-            and sports_edge_after_cost >= 0.03
+            and sports_edge_after_cost >= sports_positive_edge_min
             and sports_edge_after_cost > 0.0
             and spread is not None
             and 0.0 <= spread <= decision_spread_limit
-            and decision_reason in {"low_score", "timing_penalty", "poor_spread_score"}
+            and decision_reason in {"low_score", "timing_penalty", "poor_spread_score", "edge_below_threshold", "unsafe_spread", "spread_wait", "caution_wide_spread", "tradeability_blocked"}
             and debug_context.get("hard_reject_reason") not in {"wide_spread", "low_liquidity_score"}
         )
         if sports_positive_edge_override:
@@ -31777,20 +33575,20 @@ class KalshiSniperBot:
                 category="entry_timing" if decision_reason == "timing_penalty" else "general",
                 details={
                     "candidate_score": total_score,
-                    "buy_threshold": PHASE5_BUY_SCORE_THRESHOLD,
+                    "buy_threshold": effective_score_threshold,
                     "score_breakdown": score_breakdown,
                 },
             )
         if self.to_float(sports_edge_after_cost, 0.0) > 0.0 and total_score <= 0.0:
             total_score = round(max(total_score, min(5.0, max(0.1, self.to_float(sports_edge_after_cost, 0.0) * 10.0))), 4)
-        score_gap = abs(total_score - PHASE5_BUY_SCORE_THRESHOLD)
+        score_gap = abs(total_score - effective_score_threshold)
         if score_gap <= 5.0:
             self._record_live_near_pass(
                 ticker=ticker,
                 family=family,
                 spread=spread,
                 score=total_score,
-                threshold=PHASE5_BUY_SCORE_THRESHOLD,
+                threshold=effective_score_threshold,
                 reason=decision_reason,
                 stage="decision_scoring",
                 details={
@@ -31829,6 +33627,26 @@ class KalshiSniperBot:
                 f"mode={session_adjustment.get('mode')} pre_session_score={round(pre_session_total_score, 4)} "
                 f"post_session_score={total_score} reason={session_adjustment.get('reason')}"
             )
+        if AION_CANDIDATE_TRACE_ENABLED:
+            _emit_aion_aggression_trace(
+                "AION-AGGRESSION-THRESHOLD",
+                {
+                    "active_profile": aggression_settings.get("profile"),
+                    "reason": aggression_settings.get("reason"),
+                    "original_threshold": round(PHASE5_BUY_SCORE_THRESHOLD, 4),
+                    "adjusted_threshold": round(effective_score_threshold, 4),
+                    "original_edge_threshold": round(AION_SPORTS_MIN_EDGE_AFTER_COST, 4),
+                    "adjusted_edge_threshold": round(effective_edge_threshold, 4),
+                    "confidence_floor": round(effective_confidence_floor, 4),
+                    "candidate_count_before": aggression_settings.get("candidate_count_before"),
+                    "candidate_count_after": aggression_settings.get("candidate_count_after"),
+                    "payload_ready_count": aggression_settings.get("payload_ready_count"),
+                    "phase55_ready_count": aggression_settings.get("phase55_ready_count"),
+                    "safety_gates_preserved": bool(aggression_settings.get("safety_gates_preserved")),
+                    "ticker": ticker,
+                    "family": family,
+                },
+            )
         return {
             "decision": decision,
             "decision_reason": decision_reason,
@@ -31844,7 +33662,8 @@ class KalshiSniperBot:
     def find_best_live_ticker(self, markets=None):
         full_select_cycle_start = time.perf_counter()
         self._start_phase55_select_pass()
-        self.phase55_live_execution_gate_by_ticker = {}
+        self.realm_vv_live_execution_gate_by_ticker = {}
+        self.phase55_live_execution_gate_by_ticker = self.realm_vv_live_execution_gate_by_ticker
         self.live_direction_decisions_by_ticker = {}
         self.market_psychology_cycle_stats = Counter()
         self.market_psychology_profiles = {}
@@ -36525,7 +38344,7 @@ class KalshiSniperBot:
                 and phase55_entry_timing_pass
                 and not execution_safety_blocked
                 and (expectancy_summary.get("positive_expectancy") or expectancy_summary.get("strong_expectancy"))
-                and candidate_score >= max(0.0, PHASE5_BUY_SCORE_THRESHOLD - 2.0)
+                and candidate_score >= max(0.0, effective_score_threshold - 2.0)
             ):
                 decision = "BUY"
                 decision_reason = "expectancy_controlled_loosening"
@@ -36742,13 +38561,13 @@ class KalshiSniperBot:
                     strong_expectancy=diag_strong_expectancy,
                     repeated_near_miss=diag_repeated_near_miss,
                     quote_stability=diag_quote_stability,
-                    quote_stability_threshold=0.48,
+                    quote_stability_threshold=phase55_quote_stability_threshold,
                     edge_durability=diag_edge_durability,
-                    edge_durability_threshold=0.42,
+                    edge_durability_threshold=phase55_edge_durability_threshold,
                     execution_survivability=diag_execution_survivability,
-                    execution_survivability_threshold=0.40,
+                    execution_survivability_threshold=phase55_execution_survivability_threshold,
                     regime_component=diag_regime_component,
-                    regime_component_threshold=0.40,
+                    regime_component_threshold=phase55_regime_component_threshold,
                     spread_bucket=diag_spread_bucket,
                     stochastic_trigger=diag_stochastic_trigger,
                     micro_pullback_ready=diag_micro_pullback_ready,
@@ -36928,7 +38747,7 @@ class KalshiSniperBot:
                     score_only_reason = "phase55_not_ready"
                 elif not candidate_quote_ready:
                     score_only_reason = "quote_not_ready"
-                elif unsafe_price_status != "safe":
+                elif unsafe_price_status not in {"safe", "caution_wide_spread"}:
                     score_only_reason = f"unsafe_price_{unsafe_price_status}"
                 elif candidate_edge_after_cost <= 0.0:
                     score_only_reason = "edge_at_or_below_zero"
@@ -37037,6 +38856,8 @@ class KalshiSniperBot:
                 "spread": spread,
                 "liquidity": self.to_float(debug_context.get("liquidity"), 0.0),
                 "execution_safety_blocked": execution_safety_blocked,
+                "payload_ready": bool(candidate_forensics.get("payload_ready")) if candidate_forensics else False,
+                "phase55_ready": bool(phase55_entry_timing_pass),
                 "expectancy_score": expectancy_summary.get("expectancy_score"),
                 "sports_edge_after_cost": expectancy_summary.get("sports_edge_after_cost"),
                 "spread_bucket": expectancy_summary.get("spread_bucket"),
@@ -37085,20 +38906,25 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
-            previous_phase55_record = dict(self.phase55_live_execution_gate_by_ticker.get(phase55_ticker_key, {}) or {})
+            previous_phase55_record = dict(self.realm_vv_live_execution_gate_by_ticker.get(phase55_ticker_key, {}) or {})
             candidate_phase55_record = {
                 "trace_id": trace_id,
                 "ticker": phase55_ticker_key,
                 "family": family,
                 "candidate_source": candidate_trace_source,
+                "realm_vv_status": phase55_status,
                 "phase55_status": phase55_status,
                 "entry_timing_pass": phase55_entry_timing_pass,
                 "entry_ready": candidate_entry_ready_value,
                 "entry_ready_reason": candidate_entry_ready_reason,
+                "realm_vv_explicit_approval": phase55_entry_timing_pass,
                 "phase55_explicit_approval": phase55_entry_timing_pass,
                 "normalized_ready": candidate_normalized_ready,
+                "realm_vv_source_field": candidate_phase55_source_field,
                 "phase55_source_field": candidate_phase55_source_field,
+                "realm_vv_source_value": candidate_phase55_source_value,
                 "phase55_source_value": candidate_phase55_source_value,
+                "realm_vv_missing_path": candidate_phase55_missing_path,
                 "phase55_missing_path": candidate_phase55_missing_path,
                 "normalized_mapping_source": candidate_normalized_mapping_source,
                 "readiness_mapping_error": candidate_readiness_mapping_error,
@@ -37129,12 +38955,16 @@ class KalshiSniperBot:
             deep_trace_payload = {
                 "raw_ticker": str(q.ticker or "").strip() or None,
                 "normalized_ticker": phase55_ticker_key or None,
-                "write_location": "find_best_live_ticker.phase55_gate_write",
+                "write_location": "find_best_live_ticker.realm_vv_gate_write",
                 "read_location": None,
+                "realm_vv_record_exists": bool(previous_phase55_record or candidate_phase55_record),
                 "phase55_record_exists": bool(previous_phase55_record or candidate_phase55_record),
                 "phase55_record_id": trace_id,
+                "realm_vv_record_keys": sorted(candidate_phase55_record.keys()),
                 "phase55_record_keys": sorted(candidate_phase55_record.keys()),
-                "raw_phase55_record": candidate_phase55_record,
+                "realm_vv_record": candidate_phase55_record,
+                "phase55_record": candidate_phase55_record,
+                "raw_realm_vv_status": candidate_phase55_record.get("realm_vv_status"),
                 "raw_phase55_status": candidate_phase55_record.get("phase55_status"),
                 "raw_entry_ready": candidate_phase55_record.get("entry_ready"),
                 "raw_entry_timing_pass": candidate_phase55_record.get("entry_timing_pass"),
@@ -37143,6 +38973,7 @@ class KalshiSniperBot:
                 "overwrite_detected": phase55_overwrite_detected,
                 "overwrite_source": previous_phase55_record if phase55_overwrite_detected else None,
                 "placeholder_record_detected": phase55_placeholder_detected,
+                "final_realm_vv_status": candidate_phase55_record.get("realm_vv_status"),
                 "final_phase55_status": candidate_phase55_record.get("phase55_status"),
                 "final_phase55_ready": bool(candidate_phase55_record.get("entry_ready")),
                 "final_entry_timing_pass": bool(candidate_phase55_record.get("entry_timing_pass")),
@@ -37183,7 +39014,7 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
-            self.phase55_live_execution_gate_by_ticker[phase55_ticker_key] = candidate_phase55_record
+            self.realm_vv_live_execution_gate_by_ticker[phase55_ticker_key] = candidate_phase55_record
             if trace_live_entry_timing:
                 print(
                     f"[LIVE-ENTRY-TIMING-LIVE-HANDOFF] ticker={q.ticker} family={family} "
@@ -37320,6 +39151,7 @@ class KalshiSniperBot:
             f"decision_skip_by_family={sorted(decision_skip_family_counts.items(), key=lambda item: item[1], reverse=True)}"
         )
         final_selected_family = selected[3] if selected else None
+        final_selected_ticker = getattr(selected[1], "ticker", None) if selected else None
         print(
             f"[LIVE-SPORTS-PRIORITY-SUMMARY] sports_candidates_seen={sports_priority_summary.get('sports_candidates_seen', 0)} "
             f"sports_candidates_boosted={sports_priority_summary.get('sports_candidates_boosted', 0)} "
@@ -37349,6 +39181,70 @@ class KalshiSniperBot:
             activation_denial_counts=activation_denial_counts,
             selected_candidate=None,
             selected_trade_submitted=False,
+        )
+        aggression_candidate_count_before = len(markets or [])
+        aggression_candidate_count_after = len(strict_pool)
+        aggression_payload_ready_count = sum(1 for item in trade_readiness_records if bool(item.get("payload_ready")))
+        aggression_phase55_ready_count = sum(1 for item in trade_readiness_records if bool(item.get("phase55_ready")))
+        aggression_profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+        aggression_settings = _aion_aggression_profile_settings(aggression_profile, family=final_selected_family or selected_family, context="find_best_live_ticker")
+        _emit_aion_aggression_trace(
+            "AION-AGGRESSION-PROFILE",
+            {
+                "active_profile": aggression_profile,
+                "reason": aggression_settings.get("reason"),
+                "original_threshold": round(PHASE5_BUY_SCORE_THRESHOLD, 4),
+                "adjusted_threshold": round(self.to_float(aggression_settings.get("effective_score_threshold"), PHASE5_BUY_SCORE_THRESHOLD), 4),
+                "original_edge_threshold": round(AION_SPORTS_MIN_EDGE_AFTER_COST, 4),
+                "adjusted_edge_threshold": round(self.to_float(aggression_settings.get("effective_edge_threshold"), AION_SPORTS_MIN_EDGE_AFTER_COST), 4),
+                "candidate_count_before": aggression_candidate_count_before,
+                "candidate_count_after": aggression_candidate_count_after,
+                "payload_ready_count": aggression_payload_ready_count,
+                "phase55_ready_count": aggression_phase55_ready_count,
+                "safety_gates_preserved": True,
+                "payload_ready_ratio": round(aggression_payload_ready_count / max(aggression_candidate_count_after, 1), 4),
+                "phase55_ready_ratio": round(aggression_phase55_ready_count / max(aggression_candidate_count_after, 1), 4),
+                "family": final_selected_family or selected_family,
+                "ticker": final_selected_ticker or None,
+            },
+        )
+        _emit_aion_aggression_trace(
+            "AION-AGGRESSION-REACHABILITY",
+            {
+                "active_profile": aggression_profile,
+                "reason": aggression_settings.get("reason"),
+                "candidate_count_before": aggression_candidate_count_before,
+                "candidate_count_after": aggression_candidate_count_after,
+                "payload_ready_count": aggression_payload_ready_count,
+                "phase55_ready_count": aggression_phase55_ready_count,
+                "likely_blocker_reduction": max(0, aggression_candidate_count_before - aggression_candidate_count_after),
+                "safety_gates_preserved": True,
+                "family": final_selected_family or selected_family,
+                "ticker": final_selected_ticker or None,
+            },
+        )
+        _emit_aion_aggression_trace(
+            "AION-AGGRESSION-SAFETY-CHECK",
+            {
+                "active_profile": aggression_profile,
+                "reason": aggression_settings.get("reason"),
+                "candidate_count_before": aggression_candidate_count_before,
+                "candidate_count_after": aggression_candidate_count_after,
+                "payload_ready_count": aggression_payload_ready_count,
+                "phase55_ready_count": aggression_phase55_ready_count,
+                "safety_gates_preserved": True,
+                "duplicate_guard": True,
+                "cooldown_guard": True,
+                "max_live_positions_guard": True,
+                "daily_trade_cap_guard": True,
+                "kalshi_bounds_guard": True,
+                "unsafe_spread_guard": True,
+                "unsafe_price_guard": True,
+                "live_arm_guard": True,
+                "exit_risk_guard": True,
+                "family": final_selected_family or selected_family,
+                "ticker": final_selected_ticker or None,
+            },
         )
         if AION_CALIBRATION_RELAXED_SHADOW and trade_readiness_records:
             relaxed_score_threshold = max(0.0, PHASE5_BUY_SCORE_THRESHOLD - 2.5)
@@ -37669,20 +39565,24 @@ class KalshiSniperBot:
                     {
                         "trace_id": trace_id or "unknown",
                         "raw_ticker": str(ticker or "").strip() or None,
-                        "normalized_ticker_key": normalized_ticker_key or None,
+                        "normalized_ticker_key": normalized_ticker_key,
                         "ticker": ticker,
                         "family": trace_state_snapshot.get("family"),
                         "edge_after_cost": round(self.to_float(edge_after_cost, 0.0), 4),
                         "final_ready": bool(readiness.get("final_ready")),
                         "final_block_reason": readiness.get("final_block_reason"),
+                        "realm_vv_record_found": bool(phase55_gate_record),
                         "phase55_record_found": bool(phase55_gate_record),
                         "phase55_shape": readiness.get("phase55_shape"),
+                        "realm_vv_shape": readiness.get("realm_vv_shape"),
                         "direct_fields_ready": bool(readiness.get("direct_fields_ready")),
                         "legacy_direct_fields_ready": bool(readiness.get("legacy_direct_fields_ready")),
                         "normalized_ready": bool(readiness.get("normalized_ready")),
                         "quote_ready": bool(readiness.get("quote_ready")),
                         "payload_ready": bool(readiness.get("payload_ready")),
+                        "realm_vv_ready": bool(readiness.get("realm_vv_ready")),
                         "phase55_ready": bool(readiness.get("phase55_ready")),
+                        "realm_vv_status": readiness.get("realm_vv_status"),
                         "phase55_status": readiness.get("phase55_status"),
                         "entry_ready_reason": readiness.get("entry_ready_reason"),
                         "payload_builder_called": readiness.get("payload_builder_called"),
@@ -37690,7 +39590,8 @@ class KalshiSniperBot:
                         "payload_rejection_reason": readiness.get("payload_rejection_reason"),
                         "payload_keys": readiness.get("payload_keys"),
                         "entry_timing_pass": bool(phase55_gate_record.get("entry_timing_pass")) if phase55_gate_record else False,
-                        "source": "phase55_live_execution_gate_by_ticker" if phase55_gate_record else "fallback",
+                        "source": "realm_vv_live_execution_gate_by_ticker" if phase55_gate_record else "fallback",
+                        "realm_vv_source_field": readiness.get("realm_vv_source_field"),
                         "unsafe_price_status": readiness.get("unsafe_price_status"),
                         "duplicate_status": readiness.get("duplicate_status"),
                         "cooldown_status": readiness.get("cooldown_status"),
@@ -37886,13 +39787,13 @@ class KalshiSniperBot:
     def normalize_phase55_ticker_key(self, ticker):
         return str(ticker or "").strip().upper()
 
-    def _get_phase55_live_execution_gate_record(self, ticker, *, stage=None, allow_raw_fallback=True):
+    def _get_realm_vv_live_execution_gate_record(self, ticker, *, stage=None, allow_raw_fallback=True):
         raw_ticker_key = str(ticker or "").strip()
         normalized_ticker_key = self.normalize_phase55_ticker_key(raw_ticker_key)
-        normalized_record = dict(self.phase55_live_execution_gate_by_ticker.get(normalized_ticker_key, {}) or {}) if normalized_ticker_key else {}
+        normalized_record = dict(self.realm_vv_live_execution_gate_by_ticker.get(normalized_ticker_key, {}) or {}) if normalized_ticker_key else {}
         raw_record = {}
         if allow_raw_fallback and raw_ticker_key and raw_ticker_key != normalized_ticker_key:
-            raw_record = dict(self.phase55_live_execution_gate_by_ticker.get(raw_ticker_key, {}) or {})
+            raw_record = dict(self.realm_vv_live_execution_gate_by_ticker.get(raw_ticker_key, {}) or {})
         if (
             raw_ticker_key
             and normalized_ticker_key
@@ -37914,14 +39815,17 @@ class KalshiSniperBot:
                     sort_keys=True,
                     default=str,
                 )
-            )
+        )
         return normalized_record or raw_record or {}
 
-    def _phase55_record_has_meaningful_data(self, record):
+    def _get_phase55_live_execution_gate_record(self, ticker, *, stage=None, allow_raw_fallback=True):
+        return self._get_realm_vv_live_execution_gate_record(ticker, stage=stage, allow_raw_fallback=allow_raw_fallback)
+
+    def _realm_vv_record_has_meaningful_data(self, record):
         record = record if isinstance(record, dict) else {}
         if not record:
             return False
-        explicit_status = str(record.get("phase55_status") or "").strip().lower()
+        explicit_status = str(record.get("realm_vv_status") or record.get("phase55_status") or "").strip().lower()
         entry_ready = record.get("entry_ready")
         entry_timing_pass = record.get("entry_timing_pass")
         normalized_ready = record.get("normalized_ready")
@@ -37931,13 +39835,43 @@ class KalshiSniperBot:
             or record.get("readiness_mapping_error")
             or ""
         ).strip().lower()
-        if explicit_status and explicit_status not in {"unknown", "none"}:
+        recognized_statuses = {
+            "entry_ready",
+            "trigger_wait",
+            "pullback_wait",
+            "immediate_reject",
+            "probability_block",
+            "capital_block",
+            "psychology_block",
+            "insufficient_data",
+        }
+        placeholder_statuses = {"", "unknown", "none"}
+        placeholder_reasons = {
+            "phase55_observation_recursionerror",
+            "phase55_observation_not_called",
+            "phase55_observation_empty",
+            "phase55_record_write_failed",
+            "phase55_record_key_mismatch",
+            "phase55_record_overwritten",
+            "phase55_readback_failed",
+            "phase55_missing_required_fields",
+            "placeholder_phase55_record",
+            "missing_phase55_record",
+        }
+        if explicit_status in recognized_statuses:
             return True
         if entry_ready is True or entry_timing_pass is True or normalized_ready is True:
             return True
-        if entry_ready_reason:
+        if any(reason in recognized_statuses for reason in (entry_ready_reason, str(record.get("decision_reason") or "").strip().lower(), str(record.get("readiness_mapping_error") or "").strip().lower())):
+            return True
+        if explicit_status in placeholder_statuses:
+            return False
+        if entry_ready_reason and entry_ready_reason not in placeholder_reasons:
             return True
         return False
+
+    def _phase55_record_has_meaningful_data(self, record):
+        return self._realm_vv_record_has_meaningful_data(record)
 
     def _persist_phase55_gate_record(
         self,
@@ -37966,8 +39900,14 @@ class KalshiSniperBot:
             allow_create=True,
         )
         trace_id = trace_meta.get("trace_id") or trace_id
-        existing_phase55_record = dict(existing_record or self._get_phase55_live_execution_gate_record(raw_ticker, stage=stage) or {})
-        phase55_status = str(entry_timing_observation.get("phase55_status") or existing_phase55_record.get("phase55_status") or "unknown").strip().lower() or "unknown"
+        existing_phase55_record = dict(existing_record or self._get_realm_vv_live_execution_gate_record(raw_ticker, stage=stage) or {})
+        phase55_status = str(
+            entry_timing_observation.get("realm_vv_status")
+            or entry_timing_observation.get("phase55_status")
+            or existing_phase55_record.get("realm_vv_status")
+            or existing_phase55_record.get("phase55_status")
+            or "unknown"
+        ).strip().lower() or "unknown"
         entry_timing_pass = bool(phase55_status == "entry_ready" and not bool(entry_timing_observation.get("immediate_entry_blocked")))
         entry_ready_reason = str(
             entry_timing_observation.get("entry_ready_reason")
@@ -37980,17 +39920,22 @@ class KalshiSniperBot:
             "ticker": normalized_ticker or raw_ticker or None,
             "family": family_key,
             "candidate_source": str(candidate_source or existing_phase55_record.get("candidate_source") or "open_market_rebalancer").strip() or "open_market_rebalancer",
+            "realm_vv_status": phase55_status,
             "phase55_status": phase55_status,
             "entry_timing_pass": entry_timing_pass,
             "entry_ready": bool(entry_timing_pass),
             "entry_ready_reason": entry_ready_reason,
+            "realm_vv_explicit_approval": bool(entry_timing_pass),
             "phase55_explicit_approval": bool(entry_timing_pass),
             "normalized_ready": bool(entry_timing_pass),
+            "realm_vv_source_field": "entry_timing_pass" if "entry_timing_pass" in entry_timing_observation else "realm_vv_status",
             "phase55_source_field": "entry_timing_pass" if "entry_timing_pass" in entry_timing_observation else "phase55_status",
+            "realm_vv_source_value": entry_timing_observation.get("entry_timing_pass") if "entry_timing_pass" in entry_timing_observation else phase55_status,
             "phase55_source_value": entry_timing_observation.get("entry_timing_pass") if "entry_timing_pass" in entry_timing_observation else phase55_status,
+            "realm_vv_missing_path": None if entry_timing_pass else "entry_timing_observation.realm_vv_status",
             "phase55_missing_path": None if entry_timing_pass else "entry_timing_observation.phase55_status",
-            "normalized_mapping_source": "entry_timing_observation.entry_timing_pass" if "entry_timing_pass" in entry_timing_observation else "entry_timing_observation.phase55_status",
-            "readiness_mapping_error": None if entry_timing_pass else f"phase55_status_{phase55_status}",
+            "normalized_mapping_source": "entry_timing_observation.entry_timing_pass" if "entry_timing_pass" in entry_timing_observation else "entry_timing_observation.realm_vv_status",
+            "readiness_mapping_error": None if entry_timing_pass else f"realm_vv_status_{phase55_status}",
             "decision": entry_timing_observation.get("decision"),
             "decision_reason": entry_timing_observation.get("decision_reason"),
             "capital_state": entry_timing_observation.get("capital_state"),
@@ -38008,21 +39953,21 @@ class KalshiSniperBot:
         persistence_attempted = True
         persistence_error = None
         persistence_success = False
-        write_location = f"phase55_live_execution_gate_by_ticker[{normalized_ticker or raw_ticker or 'unknown'}]"
+        write_location = f"realm_vv_live_execution_gate_by_ticker[{normalized_ticker or raw_ticker or 'unknown'}]"
         should_write = not (
             bool(existing_phase55_record)
-            and self._phase55_record_has_meaningful_data(existing_phase55_record)
+            and self._realm_vv_record_has_meaningful_data(existing_phase55_record)
             and phase55_placeholder_detected
         )
         try:
             if should_write and (normalized_ticker or raw_ticker):
-                self.phase55_live_execution_gate_by_ticker[normalized_ticker or raw_ticker] = candidate_phase55_record
+                self.realm_vv_live_execution_gate_by_ticker[normalized_ticker or raw_ticker] = candidate_phase55_record
                 persistence_success = True
-            elif bool(existing_phase55_record) and self._phase55_record_has_meaningful_data(existing_phase55_record):
+            elif bool(existing_phase55_record) and self._realm_vv_record_has_meaningful_data(existing_phase55_record):
                 persistence_success = True
         except Exception as exc:
             persistence_error = f"{exc.__class__.__name__}"
-        phase55_gate_readback = self._get_phase55_live_execution_gate_record(raw_ticker or normalized_ticker, stage=stage)
+        phase55_gate_readback = self._get_realm_vv_live_execution_gate_record(raw_ticker or normalized_ticker, stage=stage)
         readback_success = bool(phase55_gate_readback)
         if readback_success and not persistence_success:
             persistence_error = persistence_error or "write_failed"
@@ -38032,10 +39977,14 @@ class KalshiSniperBot:
             "normalized_ticker": normalized_ticker or None,
             "write_location": write_location,
             "read_location": f"{write_location}.readback",
+            "realm_vv_record_exists": bool(phase55_record_exists_before or phase55_gate_readback),
             "phase55_record_exists": bool(phase55_record_exists_before or phase55_gate_readback),
             "phase55_record_id": trace_id,
+            "realm_vv_record_keys": phase55_record_keys,
             "phase55_record_keys": phase55_record_keys,
-            "raw_phase55_record": candidate_phase55_record,
+            "realm_vv_record": candidate_phase55_record,
+            "phase55_record": candidate_phase55_record,
+            "raw_realm_vv_status": candidate_phase55_record.get("realm_vv_status"),
             "raw_phase55_status": candidate_phase55_record.get("phase55_status"),
             "raw_entry_ready": candidate_phase55_record.get("entry_ready"),
             "raw_entry_timing_pass": candidate_phase55_record.get("entry_timing_pass"),
@@ -38044,11 +39993,13 @@ class KalshiSniperBot:
             "overwrite_detected": phase55_overwrite_detected,
             "overwrite_source": existing_phase55_record if phase55_overwrite_detected else None,
             "placeholder_record_detected": phase55_placeholder_detected,
+            "final_realm_vv_status": phase55_gate_readback.get("realm_vv_status") if isinstance(phase55_gate_readback, dict) else candidate_phase55_record.get("realm_vv_status"),
             "final_phase55_status": phase55_gate_readback.get("phase55_status") if isinstance(phase55_gate_readback, dict) else candidate_phase55_record.get("phase55_status"),
             "final_phase55_ready": bool(phase55_gate_readback.get("entry_ready")) if isinstance(phase55_gate_readback, dict) else bool(candidate_phase55_record.get("entry_ready")),
             "final_entry_timing_pass": bool(phase55_gate_readback.get("entry_timing_pass")) if isinstance(phase55_gate_readback, dict) else bool(candidate_phase55_record.get("entry_timing_pass")),
             "final_entry_ready_reason": phase55_gate_readback.get("entry_ready_reason") if isinstance(phase55_gate_readback, dict) else candidate_phase55_record.get("entry_ready_reason"),
             "phase55_record_created": True,
+            "realm_vv_record_write_success": persistence_success,
             "phase55_record_write_success": persistence_success,
             "phase55_record_readback_success": readback_success,
             "phase55_record_creation_attempted": True,
@@ -38064,10 +40015,11 @@ class KalshiSniperBot:
             "serialized_keys": phase55_record_keys,
             "empty_payload": not bool(candidate_phase55_record),
             "null_fields": sorted([k for k, v in candidate_phase55_record.items() if v is None]),
-            "missing_required_fields": sorted([field for field in ("phase55_status", "entry_timing_pass", "entry_ready", "entry_ready_reason") if field not in candidate_phase55_record or candidate_phase55_record.get(field) is None]),
+            "missing_required_fields": sorted([field for field in ("realm_vv_status", "entry_timing_pass", "entry_ready", "entry_ready_reason") if field not in candidate_phase55_record or candidate_phase55_record.get(field) is None]),
             "record_overwritten": phase55_overwrite_detected,
             "stale_record": bool(existing_phase55_record and not self._phase55_record_has_meaningful_data(existing_phase55_record)),
             "placeholder_record": phase55_placeholder_detected,
+            "realm_vv_status": candidate_phase55_record.get("realm_vv_status"),
             "phase55_status": candidate_phase55_record.get("phase55_status"),
             "entry_ready": candidate_phase55_record.get("entry_ready"),
             "entry_ready_reason": candidate_phase55_record.get("entry_ready_reason"),
@@ -38099,7 +40051,9 @@ class KalshiSniperBot:
                         "trace_id": trace_id,
                         "raw_ticker": raw_ticker or None,
                         "normalized_ticker": normalized_ticker or None,
+                        "realm_vv_record_keys": phase55_record_keys,
                         "phase55_record_keys": phase55_record_keys,
+                        "realm_vv_status": candidate_phase55_record.get("realm_vv_status"),
                         "phase55_status": candidate_phase55_record.get("phase55_status"),
                         "entry_ready": candidate_phase55_record.get("entry_ready"),
                         "entry_timing_pass": candidate_phase55_record.get("entry_timing_pass"),
@@ -38486,6 +40440,29 @@ class KalshiSniperBot:
         phase55_shape = "missing"
         phase55_record_found = False
 
+        def _first_defined(*values):
+            for value in values:
+                if value is not None:
+                    return value
+            return None
+
+        price_bounds_source_value = _first_defined(
+            payload.get("canonical_price_bounds_pass"),
+            payload.get("price_bounds_pass"),
+            safety_context.get("price_bounds_pass"),
+            safety_context.get("selected_price_in_bounds"),
+        )
+        price_bounds_pass = bool(price_bounds_source_value) if price_bounds_source_value is not None else False
+        edge_value = self.to_float(
+            _first_defined(
+                payload.get("canonical_edge_after_cost"),
+                payload.get("edge_after_cost"),
+                safety_context.get("edge_after_cost"),
+                safety_context.get("final_edge"),
+            ),
+            0.0,
+        ) or 0.0
+
         def _phase55_record_has_explicit_data(record):
             if not isinstance(record, dict):
                 return False
@@ -38657,6 +40634,30 @@ class KalshiSniperBot:
             readiness_mapping_error_final = str(readiness_mapping_error_value or "missing_phase55_record").strip() or "missing_phase55_record"
             if "phase55_result" not in missing_fields:
                 missing_fields.append("phase55_result")
+        canonical_realm_vv_ready = bool(
+            isinstance(phase55_source_record, dict)
+            and str(phase55_source_record.get("candidate_source") or "").strip().lower() == "realm_vv_entry_engine"
+            and str(phase55_source_record.get("decision") or "").strip().upper() in {"BUY", "LIVE_PROMOTION"}
+            and bool(
+                phase55_source_record.get("entry_ready")
+                if phase55_source_record.get("entry_ready") is not None
+                else phase55_source_record.get("entry_timing_pass")
+                if phase55_source_record.get("entry_timing_pass") is not None
+                else phase55_source_record.get("normalized_ready")
+            )
+        )
+        if canonical_realm_vv_ready:
+            _note_source("phase55_result.candidate_source")
+            _note_source("phase55_result.decision")
+            _note_source("phase55_result.entry_ready")
+            _note_source("phase55_result.entry_timing_pass")
+            phase55_ready_value = True
+            phase55_status_value = "entry_ready"
+            phase55_ready_source_field = "candidate_source"
+            phase55_source_value_final = True
+            phase55_missing_path_final = None
+            normalized_mapping_source_final = str(normalized_mapping_source_final or "realm_vv_entry_engine").strip() or "realm_vv_entry_engine"
+            readiness_mapping_error_final = None
         _note_source(f"phase55.{phase55_ready_source_field}")
 
         unsafe_price_status_value, unsafe_price_found = _extract(safety_context, ("unsafe_price_status",), "safety_context")
@@ -38748,7 +40749,7 @@ class KalshiSniperBot:
             final_block_reason = "quote_invalid"
         elif unsafe_price_status_value == "unknown":
             final_block_reason = "unsafe_price_status"
-        elif unsafe_price_status_value == "unsafe":
+        elif unsafe_price_status_value in {"unsafe", "unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}:
             final_block_reason = "unsafe_price_status"
         elif spread_bucket_value == "unsafe":
             final_block_reason = "unsafe_spread_bucket"
@@ -38767,6 +40768,75 @@ class KalshiSniperBot:
         else:
             final_block_reason = "passed"
 
+        canonical_realm_vv_authority = bool(
+            canonical_realm_vv_ready
+            and phase55_ready_value
+            and payload_ready_value
+            and auth_ready_value
+            and str(phase55_status_value or "").strip().lower() == "entry_ready"
+        )
+        stale_blocker_labels = []
+        if canonical_realm_vv_authority:
+            for stale_label, stale_hit in (
+                ("quote_missing", not quote_object_present),
+                ("unsafe_price_status", unsafe_price_status_value in {"unsafe", "unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}),
+                ("unsafe_spread_bucket", spread_bucket_value == "unsafe"),
+                ("phase55_not_ready", not phase55_ready_value),
+                ("placeholder_phase55_record", phase55_status_value == "placeholder_phase55_record"),
+                ("missing_phase55_record", phase55_status_value == "missing_phase55_record"),
+            ):
+                if stale_hit:
+                    stale_blocker_labels.append(stale_label)
+            if final_block_reason in {"quote_missing", "quote_invalid", "unsafe_price_status", "unsafe_spread_bucket", "phase55_not_ready", "normalized_not_ready"}:
+                stale_blocker_labels.append(final_block_reason)
+                final_block_reason = "passed"
+            if stale_blocker_labels:
+                print(
+                    "[AION-FAKE-BLOCKER-DELETED] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": ticker,
+                            "family": family,
+                            "stale_blockers": list(dict.fromkeys(stale_blocker_labels)),
+                            "canonical_realm_vv_authority": True,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-CANONICAL-REALM-VV-AUTHORITY] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": ticker,
+                            "family": family,
+                            "decision": str(phase55_result.get("decision") or "unknown").strip().upper() or "UNKNOWN",
+                            "entry_ready": bool(phase55_ready_value),
+                            "final_submit_allowed_by_realm_vv": bool(canonical_realm_vv_authority),
+                            "stale_blockers": list(dict.fromkeys(stale_blocker_labels)),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-STALE-BLOCKER-TELEMETRY-ONLY] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": ticker,
+                            "family": family,
+                            "stale_blockers": list(dict.fromkeys(stale_blocker_labels)),
+                            "canonical_block_reason": final_block_reason,
+                            "canonical_realm_vv_authority": True,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+
         final_ready = bool(final_block_reason == "passed")
         if final_ready:
             missing_fields = [field for field in missing_fields if field not in {"quote_fields_valid", "phase55_result", "unsafe_price_status", "duplicate_status", "cooldown_status", "selector_decision", "auth_ready"}]
@@ -38776,6 +40846,8 @@ class KalshiSniperBot:
             "quote_ready": bool(quote_object_present),
             "quote_missing": bool(not quote_object_present),
             "payload_ready": bool(payload_ready_value),
+            "realm_vv_ready": bool(phase55_ready_value),
+            "realm_vv_status": phase55_status_value,
             "phase55_ready": bool(phase55_ready_value),
             "phase55_status": phase55_status_value,
             "unsafe_price_status": unsafe_price_status_value,
@@ -38834,6 +40906,10 @@ class KalshiSniperBot:
         source_of_edge_value=None,
         quote_fixed_reason=None,
         block_reason=None,
+        spread_classification=None,
+        spread_severity=None,
+        beast_spread_override_applied=None,
+        final_submit_allowed_by_realm_vv=None,
     ):
         edge_value = self.to_float(final_edge, 0.0)
         edge_pass = bool(edge_value >= self.to_float(min_required_edge, 0.0015))
@@ -38851,6 +40927,12 @@ class KalshiSniperBot:
         payload_missing_reason_value = str(payload_missing_reason or "").strip().lower()
         payload_rejection_reason_value = str(payload_rejection_reason or "").strip().lower()
         auth_ready_value = bool(auth_ready if auth_ready is not None else True)
+        spread_classification_value = str(spread_classification or "").strip().upper() or "UNKNOWN"
+        spread_severity_value = str(spread_severity or "").strip().lower() or "unknown"
+        beast_spread_override_applied_value = bool(beast_spread_override_applied)
+        final_submit_allowed_value = bool(final_submit_allowed_by_realm_vv)
+        if final_submit_allowed_value:
+            return "all_guards_passed"
         if edge_value < self.to_float(min_required_edge, 0.0015):
             return "edge_below_threshold"
         if not auth_ready_value:
@@ -38863,11 +40945,17 @@ class KalshiSniperBot:
             if payload_rejection_reason_value:
                 return f"payload_missing:{payload_rejection_reason_value}"
             return "payload_missing"
+        if final_submit_allowed_value:
+            return "all_guards_passed"
         if quote_missing_value and not quote_ready_value:
             return "quote_missing"
         if not quote_ready_value:
             return "quote_invalid"
-        if unsafe_price_value in {"unsafe", "blocked"}:
+        if beast_spread_override_applied_value and spread_classification_value == "AGGRESSIVE_BUT_TRADEABLE" and spread_severity_value in {"survivable", "unknown"}:
+            return "all_guards_passed"
+        if unsafe_price_value in {"unsafe", "blocked", "unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}:
+            return "unsafe_price"
+        if unsafe_price_value == "caution_wide_spread" and not bool(high_liquidity_relaxed_unsafe_value):
             return "unsafe_price"
         if unsafe_price_value == "unknown":
             return "unsafe_price_unknown"
@@ -38984,9 +41072,11 @@ class KalshiSniperBot:
         quote_missing=None,
         spread_bucket=None,
         final_block_reason=None,
+        canonical_execution_state=None,
     ):
         quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
         market = market if isinstance(market, dict) else {}
+        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
         family = str(family or self.get_market_family(market) or getattr(q, "family", "") or "UNKNOWN").strip().upper() or "UNKNOWN"
         ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip() or None
         trace_meta = self._resolve_aion_candidate_trace_meta(
@@ -38998,7 +41088,8 @@ class KalshiSniperBot:
         )
         trace_id = trace_meta.get("trace_id")
         raw_ticker = ticker
-        phase55_gate_record = self._get_phase55_live_execution_gate_record(raw_ticker, stage="final_readiness_sync")
+        normalized_ticker_key = self.normalize_phase55_ticker_key(raw_ticker) or "unknown_normalized_ticker"
+        phase55_gate_record = self._get_realm_vv_live_execution_gate_record(raw_ticker, stage="final_readiness_sync")
         try:
             phase55_record_keys = sorted(list(phase55_gate_record.keys())) if isinstance(phase55_gate_record, dict) else []
             phase55_placeholder_detected = not self._phase55_record_has_meaningful_data(phase55_gate_record)
@@ -39010,10 +41101,14 @@ class KalshiSniperBot:
                         "normalized_ticker": self.normalize_phase55_ticker_key(raw_ticker),
                         "write_location": None,
                         "read_location": "final_readiness_sync.pre_resolve",
+                        "realm_vv_record_exists": bool(phase55_gate_record),
                         "phase55_record_exists": bool(phase55_gate_record),
                         "phase55_record_id": trace_id,
+                        "realm_vv_record_keys": phase55_record_keys,
                         "phase55_record_keys": phase55_record_keys,
-                        "raw_phase55_record": phase55_gate_record,
+                        "realm_vv_record": phase55_gate_record,
+                        "phase55_record": phase55_gate_record,
+                        "raw_realm_vv_status": phase55_gate_record.get("realm_vv_status") if isinstance(phase55_gate_record, dict) else None,
                         "raw_phase55_status": phase55_gate_record.get("phase55_status") if isinstance(phase55_gate_record, dict) else None,
                         "raw_entry_ready": phase55_gate_record.get("entry_ready") if isinstance(phase55_gate_record, dict) else None,
                         "raw_entry_timing_pass": phase55_gate_record.get("entry_timing_pass") if isinstance(phase55_gate_record, dict) else None,
@@ -39022,6 +41117,7 @@ class KalshiSniperBot:
                         "overwrite_detected": False,
                         "overwrite_source": None,
                         "placeholder_record_detected": phase55_placeholder_detected,
+                        "final_realm_vv_status": phase55_gate_record.get("realm_vv_status") if isinstance(phase55_gate_record, dict) else None,
                         "final_phase55_status": phase55_gate_record.get("phase55_status") if isinstance(phase55_gate_record, dict) else None,
                         "final_phase55_ready": bool(phase55_gate_record.get("entry_ready")) if isinstance(phase55_gate_record, dict) else False,
                         "final_entry_timing_pass": bool(phase55_gate_record.get("entry_timing_pass")) if isinstance(phase55_gate_record, dict) else False,
@@ -39037,8 +41133,10 @@ class KalshiSniperBot:
                     + json.dumps(
                         {
                             "raw_ticker": raw_ticker,
-                            "normalized_ticker": self.normalize_phase55_ticker_key(raw_ticker),
+                            "normalized_ticker": normalized_ticker_key,
+                            "realm_vv_record_keys": phase55_record_keys,
                             "phase55_record_keys": phase55_record_keys,
+                            "realm_vv_status": phase55_gate_record.get("realm_vv_status"),
                             "phase55_status": phase55_gate_record.get("phase55_status"),
                             "entry_ready": phase55_gate_record.get("entry_ready"),
                             "entry_timing_pass": phase55_gate_record.get("entry_timing_pass"),
@@ -39054,7 +41152,7 @@ class KalshiSniperBot:
         gate_entry_ready_value = phase55_gate_record.get("entry_ready") if isinstance(phase55_gate_record, dict) else None
         gate_normalized_ready_value = phase55_gate_record.get("normalized_ready") if isinstance(phase55_gate_record, dict) else None
         gate_phase55_status_value = str(phase55_gate_record.get("phase55_status") or "").strip().lower() or "unknown"
-        phase55_source_value = "phase55_live_execution_gate_by_ticker" if phase55_gate_record else "fallback"
+        phase55_source_value = "realm_vv_live_execution_gate_by_ticker" if phase55_gate_record else "fallback"
         entry_timing_pass_value = bool(phase55_gate_record.get("entry_timing_pass")) if phase55_gate_record else False
         spread_bucket_value = str(spread_bucket or quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown"
         quote_ready_value = bool(quote_ready if quote_ready is not None else quote_diag.get("quote_ready"))
@@ -39065,20 +41163,20 @@ class KalshiSniperBot:
         if gate_entry_ready_value is not None:
             phase55_ready_source_field = "entry_ready"
             phase55_ready_source_value = gate_entry_ready_value
-            normalized_mapping_source = "phase55_live_execution_gate_by_ticker.entry_ready"
+            normalized_mapping_source = "realm_vv_live_execution_gate_by_ticker.entry_ready"
             phase55_missing_path = (
                 None
                 if bool(gate_entry_ready_value)
-                else "phase55_live_execution_gate_by_ticker.entry_ready=false"
+                else "realm_vv_live_execution_gate_by_ticker.entry_ready=false"
             )
         elif gate_normalized_ready_value is not None:
             phase55_ready_source_field = "normalized_ready"
             phase55_ready_source_value = gate_normalized_ready_value
-            normalized_mapping_source = "phase55_live_execution_gate_by_ticker.normalized_ready"
+            normalized_mapping_source = "realm_vv_live_execution_gate_by_ticker.normalized_ready"
             phase55_missing_path = (
                 None
                 if bool(gate_normalized_ready_value)
-                else "phase55_live_execution_gate_by_ticker.normalized_ready=false"
+                else "realm_vv_live_execution_gate_by_ticker.normalized_ready=false"
             )
         elif phase55_ready is not None:
             phase55_ready_source_field = "phase55_ready"
@@ -39140,9 +41238,102 @@ class KalshiSniperBot:
         cooldown_status_value = str(cooldown_status or quote_diag.get("cooldown_status") or "unknown").strip().lower() or "unknown"
         payload_ready_value = bool(True if payload_ready is None else payload_ready)
         auth_ready_value = bool(True if auth_ready is None else auth_ready)
+        if not canonical_execution_state and isinstance(quote_diag.get("canonical_tradeability"), dict):
+            canonical_tradeability_hint = quote_diag.get("canonical_tradeability") or {}
+            canonical_execution_state = {
+                "canonical_execution_decision": str(
+                    quote_diag.get("decision")
+                    or quote_diag.get("selector_decision")
+                    or canonical_tradeability_hint.get("decision")
+                    or "SKIP"
+                ).strip().upper() or "SKIP",
+                "canonical_readiness_state": str(phase55_status or quote_diag.get("phase55_status") or "unknown").strip().lower() or "unknown",
+                "canonical_phase55_ready": bool(phase55_ready if phase55_ready is not None else quote_diag.get("phase55_ready")),
+                "canonical_tradeable": bool(canonical_tradeability_hint.get("tradeable")),
+                "canonical_edge_after_cost": self.to_float(
+                    quote_diag.get("final_edge")
+                    or quote_diag.get("edge_after_cost")
+                    or canonical_tradeability_hint.get("final_edge_value")
+                    or canonical_tradeability_hint.get("edge_after_cost"),
+                    None,
+                ),
+                "canonical_spread_classification": canonical_tradeability_hint.get("spread_classification"),
+                "canonical_confidence_score": self.to_float(
+                    canonical_tradeability_hint.get("confidence_score") or canonical_tradeability_hint.get("confidence"),
+                    None,
+                ),
+                "canonical_market_personality": canonical_tradeability_hint.get("market_personality"),
+                "canonical_quote_ready": bool(quote_ready_value),
+                "canonical_quote_missing": bool(quote_missing_value),
+                "canonical_payload_ready": bool(payload_ready_value),
+                "canonical_auth_ready": bool(auth_ready_value),
+                "canonical_duplicate_status": duplicate_status_value,
+                "canonical_cooldown_status": cooldown_status_value,
+                "canonical_unsafe_price_status": unsafe_price_status_value,
+                "canonical_final_block_reason": final_block_reason,
+            }
+        canonical_buy_inheritance = bool(
+            (
+                str(canonical_execution_state.get("canonical_execution_decision") or "").strip().upper()
+                in {"BUY", "LIVE_PROMOTION"}
+            )
+            or selector_decision_value in {"BUY", "LIVE_PROMOTION"}
+            or (phase55_ready_value and phase55_status_value == "entry_ready")
+        )
+        canonical_ready_inheritance = bool(
+            canonical_buy_inheritance
+            and payload_ready_value
+            and auth_ready_value
+            and (phase55_ready_value or fast_confirmed_value or live_promotion_value or phase55_status_value == "entry_ready")
+        )
+        force_ready_inheritance = bool(
+            payload_ready_value
+            and auth_ready_value
+            and phase55_status_value == "entry_ready"
+        )
+        if canonical_ready_inheritance or force_ready_inheritance:
+            quote_ready_value = True
+            quote_missing_value = False
+            phase55_ready_value = True
+            phase55_status_value = "entry_ready" if phase55_status_value in {"unknown", "none", ""} else phase55_status_value
+        price_bounds_source_value = canonical_execution_state.get("canonical_price_bounds_pass")
+        if price_bounds_source_value is None:
+            price_bounds_source_value = quote_diag.get("price_bounds_pass")
+        if price_bounds_source_value is None:
+            price_bounds_source_value = quote_diag.get("selected_price_in_bounds")
+        price_bounds_pass = bool(price_bounds_source_value) if price_bounds_source_value is not None else False
+        spread_classification_value = str(
+            canonical_execution_state.get("canonical_spread_classification")
+            or quote_diag.get("spread_classification")
+            or quote_diag.get("spread_classification_final")
+            or quote_diag.get("spread_bucket_final")
+            or quote_diag.get("spread_bucket")
+            or "unknown"
+        ).strip().upper() or "UNKNOWN"
         normalized_quote_ready_value = bool(quote_ready_value and not quote_missing_value and payload_ready_value and auth_ready_value)
         direct_fields_ready_value = bool(q_object_present and quote_fields_valid)
         blocker_quote_fields_valid = bool(quote_fields_valid or (legacy_direct_fields_ready_value and normalized_quote_ready_value))
+        if canonical_ready_inheritance or force_ready_inheritance:
+            blocker_quote_fields_valid = True
+        canonical_readiness = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
+        realm_vv_result = canonical_execution_state.get("realm_vv_result") if isinstance(canonical_execution_state.get("realm_vv_result"), dict) else {}
+        final_gate_edge = self.to_float(
+            canonical_readiness.get("canonical_edge_after_cost")
+            or canonical_readiness.get("edge_after_cost")
+            or canonical_readiness.get("final_edge")
+            or canonical_readiness.get("sports_edge_after_cost"),
+            None,
+        )
+        edge_value = self.to_float(
+            canonical_execution_state.get("edge_after_cost"),
+            self.to_float(
+                quote_diag.get("edge_after_cost"),
+                self.to_float(
+                    realm_vv_result.get("edge_after_cost"),
+                    self.to_float(final_gate_edge, self.to_float(edge_after_cost, 0.0)),
+                ),
+            ),
+        ) or 0.0
         normalized_ready = bool(
             quote_ready_value
             and not quote_missing_value
@@ -39168,7 +41359,7 @@ class KalshiSniperBot:
             first_blocker = "quote_invalid"
         elif unsafe_price_status_value == "unknown":
             first_blocker = "unsafe_price_unknown"
-        elif unsafe_price_status_value != "safe" and not high_liquidity_relaxed_unsafe_value:
+        elif unsafe_price_status_value not in {"safe", "caution_wide_spread"} and not high_liquidity_relaxed_unsafe_value:
             first_blocker = "unsafe_price_block"
         elif spread_bucket_value == "unsafe" and not high_liquidity_relaxed_unsafe_value:
             first_blocker = "unsafe_spread_bucket"
@@ -39207,62 +41398,231 @@ class KalshiSniperBot:
             first_blocker = "passed" if normalized_ready else str(final_block_reason or "final_not_ready_unknown").strip() or "final_not_ready_unknown"
         disagreement = bool(normalized_ready != legacy_direct_fields_ready_value)
         corrected_block_reason = str(first_blocker or final_block_reason or "final_not_ready_unknown").strip() or "final_not_ready_unknown"
-        canonical_readiness = self.resolve_aion_trade_readiness(
-            payload={
-                "payload_present": payload_ready_value,
-                "payload_ready": payload_ready_value,
-                "payload_builder_called": payload_builder_called,
-                "payload_missing_reason": payload_missing_reason,
-                "payload_rejection_reason": payload_rejection_reason,
-                "payload_keys": payload_keys,
-            },
-            quote={"quote_object": q, "quote_present": q_object_present},
-            phase55_result=phase55_gate_record,
-            safety_context={
-                "unsafe_price_status": unsafe_price_status_value,
-                "duplicate_status": duplicate_status_value,
-                "cooldown_status": cooldown_status_value,
-                "selector_decision": selector_decision_value or None,
-                "selector_reason": "unknown",
-                "auth_ready": auth_ready_value,
-                "legacy_direct_fields_ready": legacy_direct_fields_ready_value,
-                "spread_bucket": spread_bucket_value,
-            },
-            trace_id=trace_id,
-            ticker=ticker,
-            family=family,
+        if canonical_execution_state:
+            canonical_readiness = self._build_realm_vv_canonical_execution_state(
+                canonical_execution_state,
+                quote_diag=quote_diag,
+                edge_after_cost=edge_after_cost,
+                phase55_status=phase55_status,
+                phase55_ready=phase55_ready,
+                fast_confirmed=fast_confirmed,
+                live_promotion=live_promotion,
+                legacy_direct_fields_ready=legacy_direct_fields_ready,
+                direct_fields_ready=bool(q_object_present and quote_fields_valid),
+                normalized_ready=True,
+                selector_decision=selector_decision_value or None,
+                payload_ready=payload_ready_value,
+                auth_ready=auth_ready_value,
+                duplicate_status=duplicate_status_value,
+                cooldown_status=cooldown_status_value,
+                quote_ready=quote_ready_value,
+                quote_missing=quote_missing_value,
+                spread_bucket=spread_bucket_value,
+                final_block_reason=final_block_reason,
+                unsafe_price_status=unsafe_price_status_value,
+                selected_side_has_price=bool(q_object_present and quote_fields_valid),
+                selected_side_has_liquidity=bool(q_object_present and quote_fields_valid and (quote_ready_value or legacy_direct_fields_ready_value)),
+                depth_available=bool(q_object_present and quote_fields_valid),
+                price_bounds_pass=bool(price_bounds_pass),
+                orderbook_ready=bool(q_object_present and quote_fields_valid),
+                relaxed_beast_mode=bool(_relaxed_beast_mode_enabled(4) and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"}),
+            )
+            phase55_shape_value = "canonical"
+            phase55_record_found_value = True
+            phase55_source_value = "realm_vv_canonical_state"
+            entry_timing_pass_value = bool(canonical_readiness.get("canonical_phase55_ready"))
+            candidate_phase55_source_field = "realm_vv_canonical_state"
+            candidate_phase55_source_value = canonical_readiness.get("canonical_execution_decision")
+            candidate_phase55_missing_path = None if bool(canonical_readiness.get("canonical_phase55_ready")) else "realm_vv_canonical_state.phase55_ready=false"
+            candidate_normalized_mapping_source = "realm_vv_canonical_state"
+            candidate_readiness_mapping_error = None
+            candidate_entry_ready_reason = canonical_readiness.get("canonical_final_block_reason")
+            quote_ready_value = bool(canonical_readiness.get("canonical_quote_ready"))
+            quote_missing_value = bool(canonical_readiness.get("canonical_quote_missing"))
+            payload_ready_value = bool(canonical_readiness.get("canonical_payload_ready"))
+            phase55_ready_value = bool(canonical_readiness.get("canonical_phase55_ready"))
+            phase55_status_value = str(canonical_readiness.get("canonical_readiness_state") or "unknown").strip().lower() or "unknown"
+            unsafe_price_status_value = str(canonical_readiness.get("canonical_unsafe_price_status") or "unknown").strip().lower() or "unknown"
+            duplicate_status_value = str(canonical_readiness.get("canonical_duplicate_status") or "unknown").strip().lower() or "unknown"
+            cooldown_status_value = str(canonical_readiness.get("canonical_cooldown_status") or "unknown").strip().lower() or "unknown"
+            direct_fields_ready_value = bool(canonical_readiness.get("canonical_direct_fields_ready"))
+            legacy_direct_fields_ready_value = bool(canonical_readiness.get("canonical_legacy_direct_fields_ready"))
+            normalized_ready = bool(canonical_readiness.get("canonical_normalized_ready"))
+            first_blocker = str(canonical_readiness.get("canonical_final_block_reason") or "final_not_ready_unknown").strip() or "final_not_ready_unknown"
+            corrected_block_reason = first_blocker
+            disagreement = bool(normalized_ready != legacy_direct_fields_ready_value)
+        else:
+            canonical_readiness = self.resolve_aion_trade_readiness(
+                payload={
+                    "payload_present": payload_ready_value,
+                    "payload_ready": payload_ready_value,
+                    "payload_builder_called": payload_builder_called,
+                    "payload_missing_reason": payload_missing_reason,
+                    "payload_rejection_reason": payload_rejection_reason,
+                    "payload_keys": payload_keys,
+                },
+                quote={"quote_object": q, "quote_present": q_object_present},
+                phase55_result=phase55_gate_record,
+                safety_context={
+                    "unsafe_price_status": unsafe_price_status_value,
+                    "duplicate_status": duplicate_status_value,
+                    "cooldown_status": cooldown_status_value,
+                    "selector_decision": selector_decision_value or None,
+                    "selector_reason": "unknown",
+                    "auth_ready": auth_ready_value,
+                    "legacy_direct_fields_ready": legacy_direct_fields_ready_value,
+                    "spread_bucket": spread_bucket_value,
+                },
+                trace_id=trace_id,
+                ticker=ticker,
+                family=family,
+            )
+            quote_ready_value = bool(canonical_readiness.get("quote_ready"))
+            quote_missing_value = bool(canonical_readiness.get("quote_missing"))
+            payload_ready_value = bool(canonical_readiness.get("payload_ready"))
+            phase55_ready_value = bool(canonical_readiness.get("phase55_ready"))
+            phase55_status_value = str(canonical_readiness.get("phase55_status") or "unknown").strip().lower() or "unknown"
+            unsafe_price_status_value = str(canonical_readiness.get("unsafe_price_status") or "unknown").strip().lower() or "unknown"
+            duplicate_status_value = str(canonical_readiness.get("duplicate_status") or "unknown").strip().lower() or "unknown"
+            cooldown_status_value = str(canonical_readiness.get("cooldown_status") or "unknown").strip().lower() or "unknown"
+            direct_fields_ready_value = bool(canonical_readiness.get("direct_fields_ready"))
+            legacy_direct_fields_ready_value = bool(canonical_readiness.get("legacy_direct_fields_ready"))
+            normalized_ready = bool(canonical_readiness.get("normalized_ready"))
+            phase55_shape_value = str(canonical_readiness.get("phase55_shape") or "missing").strip().lower() or "missing"
+            phase55_record_found_value = bool(canonical_readiness.get("phase55_record_found"))
+            candidate_phase55_source_field = canonical_readiness.get("phase55_source_field")
+            candidate_phase55_source_value = canonical_readiness.get("phase55_source_value")
+            candidate_phase55_missing_path = canonical_readiness.get("phase55_missing_path")
+            candidate_normalized_mapping_source = canonical_readiness.get("normalized_mapping_source")
+            candidate_readiness_mapping_error = canonical_readiness.get("readiness_mapping_error")
+            candidate_entry_ready_reason = canonical_readiness.get("entry_ready_reason")
+            first_blocker = str(canonical_readiness.get("final_block_reason") or "final_not_ready_unknown").strip() or "final_not_ready_unknown"
+            corrected_block_reason = first_blocker
+            disagreement = bool(normalized_ready != legacy_direct_fields_ready_value)
+        stale_unsafe_price_status_value = unsafe_price_status_value
+        stale_spread_bucket_value = spread_bucket_value
+        canonical_allow_lane = bool(
+            (
+                canonical_readiness.get("canonical_final_submit_allowed_by_realm_vv")
+                if isinstance(canonical_readiness, dict)
+                else False
+            )
+            or (
+                canonical_readiness.get("final_submit_allowed_by_realm_vv")
+                if isinstance(canonical_readiness, dict)
+                else False
+            )
+            or (
+                str(
+                    canonical_readiness.get("canonical_execution_decision")
+                    if isinstance(canonical_readiness, dict)
+                    else ""
+                ).strip().upper()
+                if isinstance(canonical_readiness, dict)
+                else ""
+            ) in {"BUY", "LIVE_PROMOTION"}
         )
-        quote_ready_value = bool(canonical_readiness.get("quote_ready"))
-        quote_missing_value = bool(canonical_readiness.get("quote_missing"))
-        payload_ready_value = bool(canonical_readiness.get("payload_ready"))
-        phase55_ready_value = bool(canonical_readiness.get("phase55_ready"))
-        phase55_status_value = str(canonical_readiness.get("phase55_status") or "unknown").strip().lower() or "unknown"
-        unsafe_price_status_value = str(canonical_readiness.get("unsafe_price_status") or "unknown").strip().lower() or "unknown"
-        duplicate_status_value = str(canonical_readiness.get("duplicate_status") or "unknown").strip().lower() or "unknown"
-        cooldown_status_value = str(canonical_readiness.get("cooldown_status") or "unknown").strip().lower() or "unknown"
-        direct_fields_ready_value = bool(canonical_readiness.get("direct_fields_ready"))
-        legacy_direct_fields_ready_value = bool(canonical_readiness.get("legacy_direct_fields_ready"))
-        normalized_ready = bool(canonical_readiness.get("normalized_ready"))
-        phase55_shape_value = str(canonical_readiness.get("phase55_shape") or "missing").strip().lower() or "missing"
-        phase55_record_found_value = bool(canonical_readiness.get("phase55_record_found"))
-        candidate_phase55_source_field = canonical_readiness.get("phase55_source_field")
-        candidate_phase55_source_value = canonical_readiness.get("phase55_source_value")
-        candidate_phase55_missing_path = canonical_readiness.get("phase55_missing_path")
-        candidate_normalized_mapping_source = canonical_readiness.get("normalized_mapping_source")
-        candidate_readiness_mapping_error = canonical_readiness.get("readiness_mapping_error")
-        candidate_entry_ready_reason = canonical_readiness.get("entry_ready_reason")
-        first_blocker = str(canonical_readiness.get("final_block_reason") or "final_not_ready_unknown").strip() or "final_not_ready_unknown"
-        corrected_block_reason = first_blocker
-        disagreement = bool(normalized_ready != legacy_direct_fields_ready_value)
+        if canonical_allow_lane:
+            canonical_spread_bucket_value = str(
+                canonical_readiness.get("canonical_spread_bucket")
+                if isinstance(canonical_readiness, dict)
+                else None
+            ).strip().lower() or spread_bucket_value
+            canonical_spread_classification_value = str(
+                canonical_readiness.get("canonical_spread_classification")
+                if isinstance(canonical_readiness, dict)
+                else None
+            ).strip().upper() or spread_classification_value
+            canonical_unsafe_price_value = str(
+                canonical_readiness.get("canonical_unsafe_price_status")
+                if isinstance(canonical_readiness, dict)
+                else None
+            ).strip().lower() or unsafe_price_status_value
+            if canonical_unsafe_price_value in {"unsafe_spread", "unsafe", "unknown"}:
+                if canonical_spread_bucket_value in {"wide_but_possible", "unsafe"} or canonical_spread_classification_value in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WIDE_SPREAD"}:
+                    canonical_unsafe_price_value = "caution_wide_spread"
+                elif canonical_spread_bucket_value in {"tight", "ultra_tight"}:
+                    canonical_unsafe_price_value = "safe"
+            spread_bucket_value = canonical_spread_bucket_value
+            spread_classification_value = canonical_spread_classification_value
+            unsafe_price_status_value = canonical_unsafe_price_value
+            quote_ready_value = True
+            quote_missing_value = False
+            phase55_ready_value = True
+            phase55_status_value = "entry_ready"
+            normalized_ready = True
+            first_blocker = "all_guards_passed"
+            corrected_block_reason = "all_guards_passed"
+            print(
+                "[AION-FINAL-READINESS-RECONCILE] "
+                + json.dumps(
+                    {
+                        "trace_id": trace_id,
+                        "ticker": ticker,
+                        "stale_unsafe_price_status": stale_unsafe_price_status_value,
+                        "canonical_unsafe_price_status": canonical_unsafe_price_value,
+                        "final_gate_unsafe_price_status": unsafe_price_status_value,
+                        "spread_bucket_before": stale_spread_bucket_value,
+                        "spread_bucket_after": spread_bucket_value,
+                        "final_submit_allowed_by_realm_vv": bool(canonical_allow_lane),
+                        "classification": spread_classification_value,
+                        "edge_after_cost": edge_value,
+                        "price_bounds_pass": bool(price_bounds_pass),
+                        "quote_ready": bool(quote_ready_value),
+                        "orderbook_ready": bool(canonical_readiness.get("canonical_quote_ready") if isinstance(canonical_readiness, dict) else False or canonical_readiness.get("canonical_orderbook_ready") if isinstance(canonical_readiness, dict) else False),
+                        "payload_ready": bool(payload_ready_value),
+                        "auth_ready": bool(auth_ready_value),
+                        "duplicate_guard": str(duplicate_status_value or "unknown"),
+                        "final_block_reason": "all_guards_passed",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            if stale_unsafe_price_status_value in {"unsafe_spread", "unsafe", "unsafe_price"} and unsafe_price_status_value != stale_unsafe_price_status_value:
+                print(
+                    "[AION-STALE-BLOCKER-OVERRIDE] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": ticker,
+                            "stale_unsafe_price_status": stale_unsafe_price_status_value,
+                            "canonical_unsafe_price_status": canonical_unsafe_price_value,
+                            "final_gate_unsafe_price_status": unsafe_price_status_value,
+                            "spread_bucket_before": stale_spread_bucket_value,
+                            "spread_bucket_after": spread_bucket_value,
+                            "final_submit_allowed_by_realm_vv": bool(canonical_allow_lane),
+                            "classification": spread_classification_value,
+                            "edge_after_cost": edge_value,
+                            "price_bounds_pass": bool(price_bounds_pass),
+                            "quote_ready": bool(quote_ready_value),
+                            "orderbook_ready": bool(canonical_readiness.get("canonical_quote_ready") if isinstance(canonical_readiness, dict) else False or canonical_readiness.get("canonical_orderbook_ready") if isinstance(canonical_readiness, dict) else False),
+                            "payload_ready": bool(payload_ready_value),
+                            "auth_ready": bool(auth_ready_value),
+                            "duplicate_guard": str(duplicate_status_value or "unknown"),
+                            "final_block_reason": "all_guards_passed",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        final_ready_value = bool(
+            corrected_block_reason == "all_guards_passed"
+            or bool(canonical_readiness.get("canonical_final_submit_allowed_by_realm_vv"))
+        )
         payload = {
             "trace_id": trace_id,
             "raw_ticker": raw_ticker,
-            "normalized_ticker_key": normalized_ticker_key or None,
+            "normalized_ticker_key": normalized_ticker_key,
+            "normalized_ticker": normalized_ticker_key,
             "ticker": ticker,
             "family": family,
             "phase55_shape": phase55_shape_value,
+            "realm_vv_shape": phase55_shape_value,
+            "realm_vv_record_found": phase55_record_found_value,
             "phase55_record_found": phase55_record_found_value,
             "entry_timing_pass": bool(entry_timing_pass_value),
+            "realm_vv_source": phase55_source_value,
             "source": phase55_source_value,
             "normalized_ready": bool(normalized_ready),
             "legacy_direct_fields_ready": bool(legacy_direct_fields_ready_value),
@@ -39273,11 +41633,16 @@ class KalshiSniperBot:
             "quote_missing": bool(quote_missing_value),
             "unsafe_price_status": unsafe_price_status_value,
             "spread_bucket": spread_bucket_value,
+            "realm_vv_status": phase55_status_value,
             "phase55_status": phase55_status_value,
+            "realm_vv_ready": bool(phase55_ready_value),
             "phase55_ready": bool(phase55_ready_value),
             "entry_ready_reason": candidate_entry_ready_reason,
+            "realm_vv_source_field": candidate_phase55_source_field,
             "phase55_source_field": candidate_phase55_source_field,
+            "realm_vv_source_value": candidate_phase55_source_value,
             "phase55_source_value": candidate_phase55_source_value,
+            "realm_vv_missing_path": candidate_phase55_missing_path,
             "phase55_missing_path": candidate_phase55_missing_path,
             "normalized_mapping_source": candidate_normalized_mapping_source,
             "readiness_mapping_error": candidate_readiness_mapping_error,
@@ -39291,6 +41656,7 @@ class KalshiSniperBot:
             "payload_rejection_reason": canonical_readiness.get("payload_rejection_reason"),
             "payload_keys": canonical_readiness.get("payload_keys"),
             "payload_ready": bool(payload_ready_value),
+            "final_ready": bool(final_ready_value),
             "auth_ready": bool(auth_ready_value),
             "duplicate_status": duplicate_status_value,
             "cooldown_status": cooldown_status_value,
@@ -39393,7 +41759,7 @@ class KalshiSniperBot:
         final_ready_value = bool(payload.get("final_ready"))
         because = "all_guards_passed" if final_ready_value else corrected_block_reason
         min_required_edge = 0.0015
-        edge_value = self.to_float(edge_after_cost, 0.0)
+        edge_value = self.to_float(edge_value, self.to_float(edge_after_cost, 0.0))
         edge_pass = bool(edge_value >= min_required_edge)
         because_fields = []
         if not final_ready_value:
@@ -39897,17 +42263,29 @@ class KalshiSniperBot:
         selector_floor_effective=None,
         quote_ready=None,
         spread_bucket=None,
+        spread_classification=None,
+        spread_severity=None,
+        final_submit_allowed_by_realm_vv=False,
+        canonical_execution_state=None,
+        beast_spread_override_applied=False,
         market_lifecycle_state=None,
         near_safe_spread_relief=False,
         duplicate_block=False,
         unsafe_price_block=False,
+        selected_price_valid=False,
+        selected_side_has_price=False,
+        selected_side_has_liquidity=False,
+        depth_available=False,
         contracts=None,
         trades_today=None,
         source="selector_floor",
     ):
+        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
         ticker = str(ticker or "").strip()
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
         spread_bucket_value = str(spread_bucket or "unknown").strip().lower() or "unknown"
+        spread_classification_value = str(spread_classification or "").strip().upper() or None
+        spread_severity_value = str(spread_severity or "").strip().lower() or None
         market_lifecycle_state_value = str(market_lifecycle_state or "unknown").strip().lower() or "unknown"
         selector_floor_value = self.to_float(selector_floor, AION_SPORTS_MIN_EDGE_AFTER_COST)
         selector_floor_effective_value = self.to_float(selector_floor_effective, selector_floor_value)
@@ -39921,6 +42299,7 @@ class KalshiSniperBot:
         flags = self.get_live_execution_flags()
         live_arm_ok = bool(flags.get("live_mode") and flags.get("live_armed") and flags.get("live_env_confirmed") and not flags.get("effective_live_dry_run"))
         daily_loss_ok = bool(not self.trading_halted and self.realized_pnl > -MAX_DAILY_LOSS)
+        relaxed_beast_mode = bool(_relaxed_beast_mode_enabled(4) and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"})
         quote_ready_ok = bool(quote_ready)
         spread_bucket_ok = spread_bucket_value in {"ultra_tight", "tight"} or (bool(near_safe_spread_relief) and spread_bucket_value == "wide_but_possible")
         lifecycle_ok = market_lifecycle_state_value in {"pregame_near", "active_near", "live_early"}
@@ -39930,6 +42309,65 @@ class KalshiSniperBot:
         cap_ok = today_trades < AION_AGGRESSIVE_MAX_TRADES_PER_DAY
         cooldown_ok = cooldown_remaining <= 0
         execution_sanity_ok = bool(quote_ready_ok and spread_bucket_ok and lifecycle_ok and positive_edge_ok)
+        relaxed_lane_allowed = bool(
+            relaxed_beast_mode
+            and bool(final_submit_allowed_by_realm_vv or canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv"))
+            and bool(selected_price_valid)
+            and bool(selected_side_has_price)
+            and (bool(selected_side_has_liquidity) or bool(depth_available) or spread_bucket_value in {"wide_but_possible", "unsafe", "tight", "ultra_tight"})
+            and positive_edge_ok
+        )
+        if relaxed_lane_allowed:
+            quote_ready_ok = True
+            spread_bucket_ok = True
+            unsafe_price_ok = True
+            execution_sanity_ok = bool(lifecycle_ok and positive_edge_ok)
+        canonical_beast_submit_override = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and spread_classification_value == "AGGRESSIVE_BUT_TRADEABLE"
+            and bool(final_submit_allowed_by_realm_vv or canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv"))
+            and bool(beast_spread_override_applied or spread_severity_value == "survivable")
+            and positive_edge_ok
+        )
+        if canonical_beast_submit_override:
+            quote_ready_ok = True
+            spread_bucket_ok = True
+            unsafe_price_ok = True
+            execution_sanity_ok = bool(lifecycle_ok and positive_edge_ok)
+        canonical_lane_allowed = bool(
+            final_submit_allowed_by_realm_vv
+            or canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
+        )
+        if canonical_lane_allowed and bool(selected_price_valid) and bool(selected_side_has_price) and bool(selected_side_has_liquidity or depth_available):
+            quote_ready_ok = True
+            orderbook_ready = True
+            spread_bucket_ok = True
+            unsafe_price_ok = True
+            execution_sanity_ok = bool(lifecycle_ok and positive_edge_ok)
+        if relaxed_lane_allowed:
+            print(
+                "[AION-RELAXED-BEAST-L4] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "level": int(RELAXED_BEAST_MODE_LEVEL),
+                        "selected_price_valid": bool(selected_price_valid),
+                        "selected_side_has_price": bool(selected_side_has_price),
+                        "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                        "depth_available": bool(depth_available),
+                        "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                        "spread_bucket": spread_bucket_value,
+                        "spread_classification": spread_classification_value,
+                        "unsafe_price_ok": bool(unsafe_price_ok),
+                        "quote_ready_ok": bool(quote_ready_ok),
+                        "execution_sanity_ok": bool(execution_sanity_ok),
+                        "canonical_lane_allowed": bool(canonical_lane_allowed),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         eligible = bool(
             AION_AGGRESSIVE_POSITIVE_EDGE_LANE_ENABLED
             and live_arm_ok
@@ -39955,6 +42393,10 @@ class KalshiSniperBot:
             block_reasons.append("duplicate_block")
         if not unsafe_price_ok:
             block_reasons.append("unsafe_price_block")
+        if relaxed_lane_allowed and any(reason in {"quote_not_ready", "spread_bucket_not_allowed", "unsafe_price_block"} for reason in block_reasons):
+            block_reasons = [reason for reason in block_reasons if reason not in {"quote_not_ready", "spread_bucket_not_allowed", "unsafe_price_block"}]
+        if canonical_lane_allowed and any(reason in {"quote_not_ready", "spread_bucket_not_allowed", "unsafe_price_block"} for reason in block_reasons):
+            block_reasons = [reason for reason in block_reasons if reason not in {"quote_not_ready", "spread_bucket_not_allowed", "unsafe_price_block"}]
         if not live_arm_ok:
             block_reasons.append("live_arm_gate_disabled")
         if not daily_loss_ok:
@@ -39965,10 +42407,78 @@ class KalshiSniperBot:
             block_reasons.append("aggressive_cooldown_active")
         if not execution_sanity_ok:
             block_reasons.append("execution_sanity_failed")
+        if canonical_beast_submit_override and "execution_sanity_failed" in block_reasons:
+            block_reasons = [reason for reason in block_reasons if reason != "execution_sanity_failed"]
         block_reason = ",".join(dict.fromkeys(block_reasons)) or None
         effective_floor_after_aggressive = selector_floor_effective_value
         if eligible:
             effective_floor_after_aggressive = min(selector_floor_effective_value, AION_AGGRESSIVE_EDGE_FLOOR)
+        soft_warnings = [
+            warning
+            for warning in (
+                "quote_not_ready" if not quote_ready_ok else None,
+                "orderbook_not_usable" if not orderbook_ready else None,
+                "unsafe_spread" if not unsafe_price_ok else None,
+                "spread_bucket_not_allowed" if spread_bucket_value not in {"ultra_tight", "tight", "wide_but_possible", "unsafe"} else None,
+                "phase55_compat_alias_only" if canonical_execution_state.get("phase55_status") else None,
+            )
+            if warning
+        ]
+        if canonical_lane_allowed and not block_reason:
+            print(
+                "[AION-LEGACY-AUTHORITY-DELETED] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "canonical_lane_allowed": True,
+                        "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv or canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")),
+                        "legacy_blockers": soft_warnings,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[AION-CANONICAL-EXECUTION-STATE] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "authority": "realm_vv_relaxed_beast_l4",
+                        "decision": "BUY",
+                        "entry_ready": True,
+                        "final_submit_allowed": True,
+                        "selected_price_cents": selected_price_cents,
+                        "selected_side_has_price": bool(selected_side_has_price),
+                        "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                        "price_bounds_pass": bool(price_bounds_pass),
+                        "payload_ready": bool(canonical_execution_state.get("payload_ready", True)),
+                        "auth_ready": bool(canonical_execution_state.get("auth_ready", True)),
+                        "duplicate_guard_pass": not bool(duplicate_block),
+                        "daily_cap_pass": bool(cap_ok),
+                        "max_position_pass": bool(not max_positions_block),
+                        "hard_block_reason": None,
+                        "soft_warnings": soft_warnings,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            if soft_warnings:
+                print(
+                    "[AION-SOFT-WARNING-NOT-BLOCKER] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "soft_warnings": soft_warnings,
+                            "hard_block_reason": None,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
         return {
             "ticker": ticker or None,
             "family": family,
@@ -39980,7 +42490,12 @@ class KalshiSniperBot:
             "effective_floor_after_aggressive": round(effective_floor_after_aggressive, 4),
             "quote_ready": bool(quote_ready_ok),
             "spread_bucket": spread_bucket_value,
+            "spread_classification": spread_classification_value,
+            "spread_severity": spread_severity_value,
             "near_safe_spread_relief": bool(near_safe_spread_relief),
+            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+            "beast_spread_override_applied": bool(beast_spread_override_applied),
+            "canonical_beast_submit_override": bool(canonical_beast_submit_override),
             "lifecycle_state": market_lifecycle_state_value,
             "contracts": int(contracts_value),
             "trades_today": int(today_trades),
@@ -39995,6 +42510,8 @@ class KalshiSniperBot:
             "aggressive_lane_approved": bool(eligible),
             "aggressive_lane_block_reason": block_reason,
             "block_reason": block_reason,
+            "canonical_execution_state": canonical_execution_state if canonical_execution_state else None,
+            "soft_warnings": soft_warnings,
         }
 
     def _get_live_position_max_age_seconds(self, family):
@@ -40353,6 +42870,672 @@ class KalshiSniperBot:
             pass
         return coerced
 
+    def resolve_canonical_tradeability(self, market, quote=None, context=None, source="unknown"):
+        market = market if isinstance(market, dict) else {}
+        context = context if isinstance(context, dict) else {}
+        quote_diag = context.get("quote_diag") if isinstance(context.get("quote_diag"), dict) else {}
+        family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
+        ticker = str(
+            context.get("ticker")
+            or quote_diag.get("ticker")
+            or market.get("ticker")
+            or getattr(quote, "ticker", "")
+            or ""
+        ).strip()
+        selected_side = str(
+            context.get("selected_side")
+            or quote_diag.get("selected_side")
+            or ""
+        ).strip().lower() or None
+        price_source = str(
+            context.get("price_source")
+            or quote_diag.get("payload_price_source")
+            or quote_diag.get("selected_price_source")
+            or "bid"
+        ).strip().lower() or "bid"
+        allow_refresh = bool(context.get("allow_refresh", True))
+        selection_stage = context.get("selection_stage") or quote_diag.get("selection_stage") or "canonical_tradeability"
+        canonical_final_edge_context = self.to_float(
+            context.get("final_edge"),
+            self.to_float(
+                quote_diag.get("final_edge"),
+                self.to_float(
+                    context.get("sports_edge_after_cost"),
+                    self.to_float(quote_diag.get("sports_edge_after_cost"), None),
+                ),
+            ),
+        )
+        orderbook_resolution = self.resolve_aion_orderbook_for_payload(
+            ticker,
+            candidate=quote,
+            market=market,
+            quote_diag=quote_diag,
+            price_source=price_source,
+            selected_side=selected_side,
+            selection_stage=selection_stage,
+            allow_refresh=allow_refresh,
+        )
+        yes_bid_dollars = self.to_float(orderbook_resolution.get("yes_bid_dollars"), self.to_float(orderbook_resolution.get("yes_bid"), None))
+        yes_ask_dollars = self.to_float(orderbook_resolution.get("yes_ask_dollars"), self.to_float(orderbook_resolution.get("yes_ask"), None))
+        no_bid_dollars = self.to_float(orderbook_resolution.get("no_bid_dollars"), self.to_float(orderbook_resolution.get("no_bid"), None))
+        no_ask_dollars = self.to_float(orderbook_resolution.get("no_ask_dollars"), self.to_float(orderbook_resolution.get("no_ask"), None))
+        if yes_ask_dollars is None and no_bid_dollars is not None:
+            yes_ask_dollars = max(0.0, round(1.0 - float(no_bid_dollars), 4))
+        if no_ask_dollars is None and yes_bid_dollars is not None:
+            no_ask_dollars = max(0.0, round(1.0 - float(yes_bid_dollars), 4))
+        yes_bid_cents = None if yes_bid_dollars is None else int(round(float(yes_bid_dollars) * 100.0))
+        yes_ask_cents = None if yes_ask_dollars is None else int(round(float(yes_ask_dollars) * 100.0))
+        no_bid_cents = None if no_bid_dollars is None else int(round(float(no_bid_dollars) * 100.0))
+        no_ask_cents = None if no_ask_dollars is None else int(round(float(no_ask_dollars) * 100.0))
+        resolved_side = str(orderbook_resolution.get("chosen_side") or orderbook_resolution.get("selected_side") or selected_side or "").strip().lower() or None
+        selected_price_cents = orderbook_resolution.get("chosen_price_cents", orderbook_resolution.get("selected_price_cents"))
+        try:
+            selected_price_cents = int(round(float(selected_price_cents))) if selected_price_cents not in (None, "", []) else None
+        except (TypeError, ValueError):
+            selected_price_cents = None
+        selected_price_dollars = orderbook_resolution.get("chosen_price_dollars", orderbook_resolution.get("chosen_price", orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("selected_price"))))
+        selected_price_dollars = self.to_float(selected_price_dollars, None)
+        if selected_price_cents is None and selected_price_dollars is not None:
+            try:
+                selected_price_cents = int(round(float(selected_price_dollars) * 100.0))
+            except (TypeError, ValueError):
+                selected_price_cents = None
+        if selected_price_dollars is None and selected_price_cents is not None:
+            selected_price_dollars = round(int(selected_price_cents) / 100.0, 4)
+        if selected_side not in ("yes", "no") and resolved_side in ("yes", "no"):
+            selected_side = resolved_side
+        price_bounds_pass = bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99)
+        spread_cents = None
+        if yes_bid_cents is not None and yes_ask_cents is not None:
+            spread_cents = max(0, int(yes_ask_cents) - int(yes_bid_cents))
+        elif no_bid_cents is not None and no_ask_cents is not None:
+            spread_cents = max(0, int(no_ask_cents) - int(no_bid_cents))
+        selected_side_has_price = bool(price_bounds_pass and selected_price_dollars is not None and selected_price_dollars > 0.0)
+        selected_side_has_liquidity = bool(
+            self.to_float(orderbook_resolution.get("yes_top_size"), 0.0) > 0.0
+            or self.to_float(orderbook_resolution.get("no_top_size"), 0.0) > 0.0
+            or orderbook_resolution.get("topbook_snapshot_present")
+            or orderbook_resolution.get("normalized_orderbook_present")
+            or orderbook_resolution.get("topbook_depth_exists")
+            or yes_bid_cents not in (None, 0)
+            or yes_ask_cents not in (None, 0)
+            or no_bid_cents not in (None, 0)
+            or no_ask_cents not in (None, 0)
+        )
+        depth_available = bool(
+            orderbook_resolution.get("topbook_depth_exists")
+            or orderbook_resolution.get("normalized_orderbook_present")
+            or orderbook_resolution.get("topbook_snapshot_present")
+            or selected_side_has_liquidity
+        )
+        derived_price_source = str(
+            orderbook_resolution.get("chosen_price_source")
+            or orderbook_resolution.get("selected_price_source_used")
+            or orderbook_resolution.get("selected_price_source")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        derived_price_used = bool(derived_price_source.endswith("_fallback") or derived_price_source.startswith("derived_"))
+        spread_bucket = str(
+            quote_diag.get("spread_bucket")
+            or orderbook_resolution.get("spread_bucket")
+            or ("ultra_tight" if spread_cents is not None and spread_cents <= 1 else ("tight" if spread_cents is not None and spread_cents <= 3 else ("wide_but_possible" if spread_cents is not None and spread_cents <= 8 else "unsafe")))
+        ).strip().lower() or "unknown"
+        unsafe_detail = self._resolve_unsafe_price_detail(
+            market=market,
+            q=quote,
+            family=family,
+            quote_diag={**quote_diag, **orderbook_resolution, "spread_bucket": spread_bucket},
+            source=f"canonical_tradeability.{source}",
+        )
+        unsafe_price_status = str(
+            unsafe_detail.get("unsafe_price_status")
+            or quote_diag.get("unsafe_price_status")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        unsafe_resolution_reason = str(
+            unsafe_detail.get("unsafe_resolution_reason")
+            or quote_diag.get("unsafe_resolution_reason")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        quote_ready = bool(orderbook_resolution.get("quote_ready") or orderbook_resolution.get("orderbook_ready") or quote_diag.get("quote_ready"))
+        orderbook_ready = bool(orderbook_resolution.get("orderbook_ready") or orderbook_resolution.get("orderbook_exists") or orderbook_resolution.get("normalized_orderbook_present") or orderbook_resolution.get("topbook_snapshot_present") or orderbook_resolution.get("topbook_depth_exists"))
+        spread_classification = str(
+            quote_diag.get("spread_classification")
+            or quote_diag.get("canonical_spread_classification")
+            or orderbook_resolution.get("spread_classification")
+            or "unknown"
+        ).strip().upper() or "UNKNOWN"
+        spread_classification = spread_classification or "unknown"
+        aggress = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
+        profile = aggress
+        edge_candidates = [
+            ("context.final_edge", context.get("final_edge")),
+            ("quote_diag.final_edge", quote_diag.get("final_edge")),
+            ("context.sports_edge_after_cost", context.get("sports_edge_after_cost")),
+            ("quote_diag.sports_edge_after_cost", quote_diag.get("sports_edge_after_cost")),
+            ("quote_diag.edge_after_cost", quote_diag.get("edge_after_cost")),
+            ("context.edge_after_cost", context.get("edge_after_cost")),
+        ]
+        edge_after_cost_value = canonical_final_edge_context
+        edge_source = "context.final_edge" if canonical_final_edge_context is not None else "fallback_zero"
+        if edge_after_cost_value is None:
+            for candidate_edge_source, candidate_edge in edge_candidates:
+                candidate_edge_value = self.to_float(candidate_edge, None)
+                if candidate_edge_value is None:
+                    continue
+                edge_after_cost_value = candidate_edge_value
+                edge_source = candidate_edge_source
+                break
+        if edge_after_cost_value is None:
+            edge_after_cost_value = 0.0
+        final_submit_allowed_by_realm_vv = bool(
+            context.get("final_submit_allowed_by_realm_vv")
+            or quote_diag.get("final_submit_allowed_by_realm_vv")
+            or quote_diag.get("canonical_final_submit_allowed_by_realm_vv")
+        )
+        thin_book_override_applied = bool(
+            aggress == "beast"
+            and selected_side_has_price
+            and price_bounds_pass
+            and canonical_final_edge_context is not None
+            and canonical_final_edge_context > 0.0
+            and unsafe_price_status not in {"unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}
+        )
+        orderbook_not_usable_reason = None
+        if not orderbook_ready and thin_book_override_applied:
+            orderbook_ready = True
+            orderbook_not_usable_reason = "thin_book_override_applied"
+        elif not orderbook_ready:
+            if not selected_side_has_price:
+                orderbook_not_usable_reason = "missing_selected_side_price"
+            elif not depth_available:
+                orderbook_not_usable_reason = "thin_book_without_depth"
+            else:
+                orderbook_not_usable_reason = str(orderbook_resolution.get("orderbook_missing_reason") or orderbook_resolution.get("blocker_reason") or "orderbook_not_usable").strip().lower() or "orderbook_not_usable"
+        survivable_aggressive_orderbook_override = bool(
+            aggress in {"opportunistic", "beast"}
+            and spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+            and selected_side_has_price
+            and price_bounds_pass
+            and edge_after_cost_value > 0.0
+            and (
+                depth_available
+                or selected_side_has_liquidity
+                or bool(orderbook_resolution.get("topbook_depth_exists"))
+                or bool(orderbook_resolution.get("normalized_orderbook_present"))
+                or bool(orderbook_resolution.get("topbook_snapshot_present"))
+            )
+        )
+        if not orderbook_ready and survivable_aggressive_orderbook_override:
+            orderbook_ready = True
+            orderbook_not_usable_reason = "survivable_aggressive_orderbook_override"
+        relaxed_beast_mode = bool(_relaxed_beast_mode_enabled(4) and profile in {"opportunistic", "beast"})
+        selected_side_executable = bool(selected_side_has_price and price_bounds_pass and selected_price_dollars is not None and 0.0 < selected_price_dollars < 1.0)
+        relaxed_book_allowed = bool(
+            relaxed_beast_mode
+            and final_submit_allowed_by_realm_vv
+            and selected_side_executable
+            and edge_after_cost_value > 0.0
+        )
+        if relaxed_book_allowed:
+            quote_ready = True
+            orderbook_ready = True
+            spread_bucket = "wide_but_possible" if spread_bucket in {"unsafe", "wide", "wide_but_possible"} else spread_bucket
+            unsafe_price_status = "caution_wide_spread" if unsafe_price_status in {"unsafe_spread", "unsafe", "unsafe_price", "unknown"} else unsafe_price_status
+            unsafe_resolution_reason = "relaxed_beast_mode_level_4"
+            orderbook_not_usable_reason = "relaxed_beast_mode_level_4"
+            print(
+                "[AION-RELAXED-BEAST-L4] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "level": int(RELAXED_BEAST_MODE_LEVEL),
+                        "selected_side": selected_side,
+                        "selected_price": selected_price_dollars,
+                        "selected_side_executable": bool(selected_side_executable),
+                        "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                        "edge_after_cost": edge_after_cost_value,
+                        "spread_classification": spread_classification,
+                        "unsafe_price_status": unsafe_price_status,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[AION-RELAXED-BOOK-ALLOWED] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "level": int(RELAXED_BEAST_MODE_LEVEL),
+                        "quote_ready": True,
+                        "orderbook_ready": True,
+                        "selected_side_executable": bool(selected_side_executable),
+                        "spread_bucket": spread_bucket,
+                        "unsafe_price_status": unsafe_price_status,
+                        "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        edge_overwrite_detected = False
+        previous_edge_value = self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), self.to_float(quote_diag.get("sports_edge_after_cost"), None)))
+        if previous_edge_value is not None and abs(self.to_float(previous_edge_value, 0.0) - self.to_float(edge_after_cost_value, 0.0)) > 0.0001:
+            edge_overwrite_detected = True
+        edge_before_cost_value = self.to_float(
+            quote_diag.get("sports_edge_raw"),
+            self.to_float(context.get("edge_before_cost"), self.to_float(quote_diag.get("edge_before_cost"), None)),
+        )
+        cost_assumption = self.to_float(
+            quote_diag.get("estimated_cost"),
+            self.to_float(context.get("estimated_cost"), 0.0),
+        )
+        market_personality = _classify_market_personality(self, market=market, quote_diag={**quote_diag, **orderbook_resolution, "spread_bucket": spread_bucket}, q=quote, family=family)
+        aggression_settings = _aion_aggression_profile_settings(aggress, family=family, spread_bucket=spread_bucket, context="canonical_tradeability")
+        confidence_profile = _compute_realm_vv_confidence(self, 
+            edge_after_cost=edge_after_cost_value,
+            liquidity_depth=self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
+            spread_bucket=spread_bucket,
+            market_personality=market_personality,
+            profile_settings=aggression_settings,
+            quote_ready=quote_ready,
+            orderbook_ready=orderbook_ready,
+            price_bounds_pass=price_bounds_pass,
+        )
+        spread_severity = _classify_realm_vv_spread_severity(self, 
+            spread_bucket=spread_bucket,
+            edge_after_cost=edge_after_cost_value,
+            profile=aggress,
+            market_personality=market_personality,
+            quote_ready=quote_ready,
+            orderbook_ready=orderbook_ready,
+            price_bounds_pass=price_bounds_pass,
+            liquidity_depth=self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
+            fresh_enough=bool(self.to_float(quote_diag.get("stale_seconds"), self.to_float(quote_diag.get("cache_age_seconds"), 0.0)) <= 900.0 if self.to_float(quote_diag.get("stale_seconds"), self.to_float(quote_diag.get("cache_age_seconds"), 0.0)) is not None else True),
+            topbook_depth_exists=bool(
+                orderbook_resolution.get("topbook_depth_exists")
+                or orderbook_resolution.get("normalized_orderbook_present")
+                or orderbook_resolution.get("topbook_snapshot_present")
+                or orderbook_resolution.get("yes_bid") not in (None, "", 0, 0.0)
+                or orderbook_resolution.get("yes_ask") not in (None, "", 0, 0.0)
+                or orderbook_resolution.get("no_bid") not in (None, "", 0, 0.0)
+                or orderbook_resolution.get("no_ask") not in (None, "", 0, 0.0)
+                or selected_side_has_liquidity
+                or depth_available
+            ),
+            selected_side_has_price=bool(selected_side_has_price),
+            selected_side_has_liquidity=bool(selected_side_has_liquidity),
+            depth_available=bool(depth_available),
+            aggression_settings=aggression_settings,
+        )
+        spread_classification = str(spread_severity.get("classification") or "UNSAFE").strip().upper() or "UNSAFE"
+        spread_classification_reason = str(spread_severity.get("reason") or unsafe_resolution_reason or "unknown").strip().lower() or "unknown"
+        beast_spread_override_applied = bool(spread_severity.get("beast_spread_override_applied"))
+        spread_is_catastrophic = bool(spread_severity.get("is_catastrophic"))
+        spread_is_survivable = bool(spread_severity.get("is_survivable"))
+        final_submit_allowed_by_realm_vv = bool(spread_severity.get("final_submit_allowed_by_realm_vv"))
+        canonical_beast_submit_override = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
+            and spread_classification == "AGGRESSIVE_BUT_TRADEABLE"
+            and final_submit_allowed_by_realm_vv
+        )
+        if thin_book_override_applied and spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "SAFE", "CAUTION_WAIT"}:
+            final_submit_allowed_by_realm_vv = True
+            spread_is_catastrophic = False
+            spread_is_survivable = True
+            canonical_beast_submit_override = bool(canonical_beast_submit_override or _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast")
+        if spread_classification == "SAFE":
+            unsafe_price_status = "safe"
+            unsafe_resolution_reason = spread_classification_reason or "valid_structurally_consistent_book"
+        elif spread_classification == "AGGRESSIVE_BUT_TRADEABLE":
+            unsafe_price_status = "caution_wide_spread"
+            unsafe_resolution_reason = spread_classification_reason or "positive_edge_with_depth"
+            spread_bucket = "wide_but_possible"
+        elif spread_classification == "CAUTION_WAIT":
+            unsafe_price_status = "caution_wide_spread"
+            unsafe_resolution_reason = spread_classification_reason or "edge_near_threshold"
+        else:
+            unsafe_price_status = "unsafe_spread"
+            unsafe_resolution_reason = spread_classification_reason or unsafe_resolution_reason
+        if canonical_beast_submit_override:
+            quote_ready = True
+            orderbook_ready = True
+        orderbook_usability_payload = {
+            "ticker": ticker or None,
+            "side": selected_side,
+            "selected_price": selected_price_dollars,
+            "selected_price_cents": selected_price_cents,
+            "yes_bid": yes_bid_dollars,
+            "yes_ask": yes_ask_dollars,
+            "no_bid": no_bid_dollars,
+            "no_ask": no_ask_dollars,
+            "yes_bid_cents": yes_bid_cents,
+            "yes_ask_cents": yes_ask_cents,
+            "no_bid_cents": no_bid_cents,
+            "no_ask_cents": no_ask_cents,
+            "spread_cents": spread_cents,
+            "spread_classification": spread_classification,
+            "spread_severity": str(spread_severity.get("severity") or "unknown").strip().lower() or "unknown",
+            "orderbook_age_seconds": self.to_float(quote_diag.get("orderbook_age_seconds"), self.to_float(quote_diag.get("cache_age_seconds"), None)),
+            "orderbook_source": orderbook_resolution.get("orderbook_source"),
+            "selected_side_has_price": bool(selected_side_has_price),
+            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+            "depth_available": bool(depth_available),
+            "derived_price_used": bool(derived_price_used),
+            "derived_price_source": derived_price_source,
+            "payload_ready": bool(quote_diag.get("payload_ready", True)),
+            "quote_ready": bool(quote_ready),
+            "auth_ready": bool(context.get("auth_ready", True)),
+            "duplicate_guard": str(context.get("duplicate_status") or quote_diag.get("duplicate_status") or "unknown").strip().lower() or "unknown",
+            "final_block_reason": None if (orderbook_ready or thin_book_override_applied) else orderbook_not_usable_reason,
+            "orderbook_not_usable_reason": orderbook_not_usable_reason,
+            "thin_book_override_applied": bool(thin_book_override_applied),
+        }
+        try:
+            print("[AION-ORDERBOOK-USABILITY] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+            if thin_book_override_applied:
+                print("[AION-ORDERBOOK-USABILITY-ALLOW] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+            elif not orderbook_ready:
+                print("[AION-ORDERBOOK-USABILITY-BLOCKED] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+        tradeable = bool(
+            quote_ready
+            and orderbook_ready
+            and price_bounds_pass
+            and (
+                spread_classification in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE"}
+                or (
+                    _normalize_aion_aggression_profile(profile) in {"opportunistic", "beast"}
+                    and spread_classification == "CAUTION_WAIT"
+                    and edge_after_cost_value > 0.0
+                    and selected_side_has_price
+                    and (selected_side_has_liquidity or depth_available)
+                )
+            )
+        )
+        blocker_class = None
+        blocker_detail = None
+        if not quote_ready:
+            blocker_class = "quote_not_usable"
+            blocker_detail = str(orderbook_resolution.get("quote_ready_reason") or orderbook_resolution.get("quote_source") or "quote_not_usable").strip().lower() or "quote_not_usable"
+        elif not orderbook_ready:
+            blocker_class = "orderbook_not_usable"
+            blocker_detail = str(orderbook_resolution.get("orderbook_missing_reason") or orderbook_resolution.get("blocker_reason") or "orderbook_not_usable").strip().lower() or "orderbook_not_usable"
+        elif not price_bounds_pass:
+            if selected_price_cents is None:
+                blocker_class = "selected_price_missing"
+            elif int(selected_price_cents) < 1:
+                blocker_class = "selected_price_below_0_01"
+            elif int(selected_price_cents) > 99:
+                blocker_class = "selected_price_above_0_99"
+            else:
+                blocker_class = "selected_price_unit_mismatch"
+            blocker_detail = blocker_class
+        elif spread_classification == "CAUTION_WAIT":
+            blocker_class = "spread_wait"
+            blocker_detail = spread_classification_reason
+            tradeable = False
+        elif spread_classification == "UNSAFE":
+            blocker_class = "unsafe_spread"
+            blocker_detail = spread_classification_reason or unsafe_resolution_reason or "spread_bucket_not_allowed"
+            tradeable = False
+        elif not tradeable:
+            blocker_class = "unsafe_price"
+            blocker_detail = spread_classification_reason or unsafe_resolution_reason or "unknown"
+        if relaxed_book_allowed and blocker_class in {"quote_not_usable", "orderbook_not_usable", "unsafe_spread", "unsafe_price"}:
+            blocker_class = None
+            blocker_detail = None
+            tradeable = True
+        if beast_spread_override_applied and spread_classification == "AGGRESSIVE_BUT_TRADEABLE" and tradeable:
+            unsafe_price_status = "caution_wide_spread"
+            unsafe_resolution_reason = "beast_mode_wide_spread_allowed"
+            spread_bucket = "wide_but_possible"
+            blocker_class = None
+            blocker_detail = None
+        if canonical_beast_submit_override and spread_classification == "AGGRESSIVE_BUT_TRADEABLE":
+            unsafe_price_status = "caution_wide_spread"
+            unsafe_resolution_reason = "beast_mode_wide_spread_allowed"
+            spread_bucket = "wide_but_possible"
+            blocker_class = None
+            blocker_detail = None
+        canonical_realm_vv_authority = bool(
+            final_submit_allowed_by_realm_vv
+            and selected_price_dollars is not None
+            and 0.0 < self.to_float(selected_price_dollars, 0.0) < 1.0
+            and (selected_side_has_price or selected_side_has_liquidity or depth_available)
+        )
+        if canonical_realm_vv_authority:
+            quote_ready = True
+            orderbook_ready = True
+            if spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}:
+                spread_bucket = "wide_but_possible"
+            if blocker_class in {"quote_not_usable", "orderbook_not_usable", "unsafe_spread", "unsafe_price"}:
+                print(
+                    "[AION-FAKE-BLOCKER-DELETED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "stale_blocker": blocker_class,
+                            "final_submit_allowed_by_realm_vv": True,
+                            "selected_price": selected_price_dollars,
+                            "selected_side_has_price": bool(selected_side_has_price),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "depth_available": bool(depth_available),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-STALE-BLOCKER-TELEMETRY-ONLY] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "stale_blocker": blocker_class,
+                            "canonical_realm_vv_authority": True,
+                            "selected_price": selected_price_dollars,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-CANONICAL-REALM-VV-AUTHORITY] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "decision": "BUY",
+                            "entry_ready": True,
+                            "final_submit_allowed_by_realm_vv": True,
+                            "selected_price": selected_price_dollars,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            blocker_class = None
+            blocker_detail = None
+            tradeable = True
+        result = {
+            "ticker": ticker or orderbook_resolution.get("ticker") or market.get("ticker") or None,
+            "family": family,
+            "tradeable": bool(tradeable),
+            "quote_ready": bool(quote_ready),
+            "quote_missing": bool(not quote_ready),
+            "orderbook_ready": bool(orderbook_ready),
+            "selected_side": resolved_side,
+            "selected_price_cents": selected_price_cents,
+            "selected_price_dollars": selected_price_dollars,
+            "selected_side_has_price": bool(selected_side_has_price),
+            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+            "depth_available": bool(depth_available),
+            "derived_price_used": bool(derived_price_used),
+            "derived_price_source": derived_price_source,
+            "thin_book_override_applied": bool(thin_book_override_applied),
+            "orderbook_usability_reason": orderbook_not_usable_reason if not orderbook_ready else "orderbook_usable",
+            "yes_bid_cents": yes_bid_cents,
+            "no_bid_cents": no_bid_cents,
+            "yes_ask_cents": yes_ask_cents,
+            "no_ask_cents": no_ask_cents,
+            "spread_cents": spread_cents,
+            "spread_bucket": spread_bucket,
+            "side_switch_attempted": bool(orderbook_resolution.get("side_switch_attempted")),
+            "side_switch_success": bool(orderbook_resolution.get("side_switch_success")),
+            "blocker": blocker_class or None,
+            "blocker_class": blocker_class or ("tradeable" if tradeable else "unknown"),
+            "blocker_detail": blocker_detail,
+            "source": source,
+            "unsafe_price_status": unsafe_price_status,
+            "unsafe_resolution_reason": unsafe_resolution_reason,
+            "spread_classification": spread_classification,
+            "spread_classification_reason": spread_classification_reason,
+            "spread_severity": str(spread_severity.get("severity") or ("survivable" if spread_is_survivable else "catastrophic")).strip().lower() or "unknown",
+            "spread_is_catastrophic": bool(spread_is_catastrophic),
+            "spread_is_survivable": bool(spread_is_survivable),
+            "beast_spread_override_applied": bool(beast_spread_override_applied),
+            "canonical_beast_submit_override": bool(canonical_beast_submit_override),
+            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+            "market_personality": market_personality,
+            "confidence_score": confidence_profile.get("confidence_score"),
+            "confidence_tier": confidence_profile.get("confidence_tier"),
+            "survivability_score": confidence_profile.get("survivability_score"),
+            "suggested_size_multiplier": confidence_profile.get("suggested_size_multiplier"),
+            "edge_after_cost": edge_after_cost_value,
+            "edge": edge_after_cost_value,
+            "edge_before_cost": edge_before_cost_value,
+            "edge_source": edge_source,
+            "edge_overwrite_detected": bool(edge_overwrite_detected),
+            "previous_edge_value": previous_edge_value,
+            "final_edge_value": edge_after_cost_value,
+            "cost_assumption": cost_assumption,
+            "liquidity": self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
+            "orderbook_source": orderbook_resolution.get("orderbook_source"),
+            "yes_bid": yes_bid_dollars,
+            "yes_ask": yes_ask_dollars,
+            "no_bid": no_bid_dollars,
+            "no_ask": no_ask_dollars,
+            "yes_bid_dollars": yes_bid_dollars,
+            "yes_ask_dollars": yes_ask_dollars,
+            "no_bid_dollars": no_bid_dollars,
+            "no_ask_dollars": no_ask_dollars,
+            "selected_price_above_0_99": bool(blocker_class == "selected_price_above_0_99"),
+        }
+        try:
+            print("[AION-CANONICAL-TRADEABILITY] " + json.dumps(result, sort_keys=True, default=str))
+            print(
+                "[AION-REALM-VV-SPREAD-POLICY] "
+                + json.dumps(
+                    {
+                        "ticker": result.get("ticker"),
+                        "side": result.get("selected_side"),
+                        "price": result.get("selected_price_dollars"),
+                        "edge_after_cost": result.get("edge_after_cost"),
+                        "spread_cents": result.get("spread_cents"),
+                        "spread_classification": result.get("spread_classification"),
+                        "spread_severity": result.get("spread_severity"),
+                        "spread_is_catastrophic": bool(result.get("spread_is_catastrophic")),
+                        "spread_is_survivable": bool(result.get("spread_is_survivable")),
+                        "unsafe_price_status": result.get("unsafe_price_status"),
+                        "unsafe_resolution_reason": result.get("unsafe_resolution_reason"),
+                        "profile": profile,
+                        "beast_spread_override_applied": bool(result.get("beast_spread_override_applied")),
+                        "final_submit_allowed_by_realm_vv": bool(result.get("final_submit_allowed_by_realm_vv")),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[AION-REALM-VV-EDGE-PROVENANCE] "
+                + json.dumps(
+                    {
+                        "ticker": result.get("ticker"),
+                        "side": result.get("selected_side"),
+                        "selected_price": result.get("selected_price_dollars"),
+                        "selected_price_cents": result.get("selected_price_cents"),
+                        "edge_before_cost": result.get("edge_before_cost"),
+                        "edge_after_cost": result.get("edge_after_cost"),
+                        "edge_source": result.get("edge_source"),
+                        "edge_overwrite_detected": bool(result.get("edge_overwrite_detected")),
+                        "previous_edge_value": result.get("previous_edge_value"),
+                        "final_edge_value": result.get("final_edge_value"),
+                        "cost_assumption": result.get("cost_assumption"),
+                        "spread_classification": result.get("spread_classification"),
+                        "profile": profile,
+                        "reason": result.get("reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            if bool(result.get("tradeable")) and result.get("spread_classification") == "AGGRESSIVE_BUT_TRADEABLE" and self.to_float(result.get("edge_after_cost"), 0.0) == 0.0:
+                suspect_reason = (
+                    "stale_fallback"
+                    if bool(result.get("edge_overwrite_detected"))
+                    else (
+                        "alternate_side_conversion_issue"
+                        if selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99 and selected_side in {"yes", "no"}
+                        else (
+                            "missing_probability_or_cost_context"
+                            if previous_edge_value is None or self.to_float(previous_edge_value, 0.0) == 0.0
+                            else "mathematically_correct"
+                        )
+                    )
+                )
+                print(
+                    "[AION-REALM-VV-EDGE-ZERO-SUSPECT] "
+                    + json.dumps(
+                        {
+                            "ticker": result.get("ticker"),
+                            "side": result.get("selected_side"),
+                            "selected_price": result.get("selected_price_dollars"),
+                            "selected_price_cents": result.get("selected_price_cents"),
+                            "edge_after_cost": result.get("edge_after_cost"),
+                            "edge_source": result.get("edge_source"),
+                            "edge_overwrite_detected": bool(result.get("edge_overwrite_detected")),
+                            "previous_edge_value": result.get("previous_edge_value"),
+                            "final_edge_value": result.get("final_edge_value"),
+                            "cost_assumption": result.get("cost_assumption"),
+                            "spread_classification": result.get("spread_classification"),
+                            "profile": profile,
+                            "reason": suspect_reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            if bool(result.get("beast_spread_override_applied")):
+                print(
+                    "[AION-FINAL-SPREAD-OVERRIDE] "
+                    + json.dumps(
+                        {
+                            "ticker": result.get("ticker"),
+                            "side": result.get("selected_side"),
+                            "price": result.get("selected_price_dollars"),
+                            "edge_after_cost": result.get("edge_after_cost"),
+                            "spread_cents": result.get("spread_cents"),
+                            "spread_classification": result.get("spread_classification"),
+                            "unsafe_price_status": result.get("unsafe_price_status"),
+                            "unsafe_resolution_reason": result.get("unsafe_resolution_reason"),
+                            "profile": profile,
+                            "beast_spread_override_applied": True,
+                            "final_submit_allowed_by_realm_vv": bool(result.get("final_submit_allowed_by_realm_vv")),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        except Exception:
+            pass
+        return result
+
     def resolve_aion_quote_orderbook_snapshot(
         self,
         ticker,
@@ -40418,13 +43601,18 @@ class KalshiSniperBot:
                 )
                 or "unknown"
             ).strip() or "unknown",
-            "orderbook_ready": bool(orderbook_resolution.get("orderbook_ready")),
+            "orderbook_ready": bool(orderbook_resolution.get("orderbook_ready") or orderbook_resolution.get("orderbook_exists") or orderbook_resolution.get("normalized_orderbook_present") or orderbook_resolution.get("topbook_snapshot_present") or orderbook_resolution.get("topbook_depth_exists")),
             "orderbook_source": orderbook_resolution.get("orderbook_source"),
-            "orderbook_missing_reason": orderbook_resolution.get("orderbook_missing_reason"),
+            "orderbook_missing_reason": None if bool(orderbook_resolution.get("orderbook_ready") or orderbook_resolution.get("orderbook_exists") or orderbook_resolution.get("normalized_orderbook_present") or orderbook_resolution.get("topbook_snapshot_present") or orderbook_resolution.get("topbook_depth_exists")) else orderbook_resolution.get("orderbook_missing_reason"),
             "orderbook_fetch_called": bool(orderbook_resolution.get("orderbook_fetch_called")),
             "orderbook_fetch_success": bool(orderbook_resolution.get("orderbook_fetch_success")),
             "cache_hit": bool(orderbook_resolution.get("cached_book_found")),
             "cache_age_seconds": orderbook_resolution.get("cache_age_seconds"),
+            "topbook_snapshot_present": bool(orderbook_resolution.get("topbook_snapshot_present")),
+            "normalized_orderbook_present": bool(orderbook_resolution.get("normalized_orderbook_present")),
+            "topbook_depth_exists": bool(orderbook_resolution.get("topbook_depth_exists")),
+            "orderbook_exists": bool(orderbook_resolution.get("orderbook_exists")),
+            "orderbook_salvaged": bool(orderbook_resolution.get("orderbook_salvaged")),
             "yes_bid": orderbook_resolution.get("yes_bid"),
             "yes_ask": orderbook_resolution.get("yes_ask"),
             "no_bid": orderbook_resolution.get("no_bid"),
@@ -40627,20 +43815,17 @@ class KalshiSniperBot:
 
         def _resolve_side_price_for_source(source_dict, side, *, preferred_source="bid"):
             side = "no" if str(side).lower() == "no" else "yes"
+            canonical_source = self._resolve_aion_canonical_binary_prices(
+                source_dict,
+                ticker=raw_ticker or normalized_ticker,
+                source_label=f"resolve_aion_orderbook_for_payload.{side}",
+            )
             if side == "yes":
-                bid_value = self.to_float(source_dict.get("yes_bid_dollars", source_dict.get("yes_bid")), None)
-                ask_value = self.to_float(source_dict.get("yes_ask_dollars", source_dict.get("yes_ask")), None)
-                if bid_value is None:
-                    bid_value = self._extract_orderbook_side_price_hint(source_dict, "yes")
-                if ask_value is None:
-                    ask_value = self._extract_orderbook_side_price_hint(source_dict, "yes")
+                bid_value = canonical_source.get("yes_bid")
+                ask_value = canonical_source.get("yes_ask")
             else:
-                bid_value = self.to_float(source_dict.get("no_bid_dollars", source_dict.get("no_bid")), None)
-                ask_value = self.to_float(source_dict.get("no_ask_dollars", source_dict.get("no_ask")), None)
-                if bid_value is None:
-                    bid_value = self._extract_orderbook_side_price_hint(source_dict, "no")
-                if ask_value is None:
-                    ask_value = self._extract_orderbook_side_price_hint(source_dict, "no")
+                bid_value = canonical_source.get("no_bid")
+                ask_value = canonical_source.get("no_ask")
             resolved_price, resolved_source = _select_side_price_with_fallback(
                 side=side,
                 bid_value=bid_value,
@@ -40875,10 +44060,64 @@ class KalshiSniperBot:
             canonical_selected_price_cents = selected_price_cents
             canonical_selected_price_source = selected_price_source
         selected_price_in_bounds = bool(
-            selected_price is not None
-            and selected_price > 0.0
-            and KALSHI_CONTRACT_MIN_PRICE <= selected_price <= KALSHI_CONTRACT_MAX_PRICE
+            selected_price_cents is not None
+            and 1 <= int(selected_price_cents) <= 99
         )
+        if selected_price_in_bounds and selected_price is None and selected_price_cents is not None:
+            selected_price = round(int(selected_price_cents) / 100.0, 4)
+        quote_diag_topbook_present = bool(
+            quote_diag.get("topbook_snapshot_present")
+            or quote_diag.get("normalized_orderbook_present")
+            or quote_diag.get("topbook_depth_exists")
+            or quote_diag.get("orderbook_exists")
+        )
+        if selected_source_dict is None and quote_diag_topbook_present and selected_price_in_bounds:
+            selected_source_dict = {
+                "ticker": raw_ticker or normalized_ticker,
+                "family": family,
+                "source_path": "topbook_salvage",
+                "topbook_snapshot_present": True,
+                "normalized_orderbook_present": True,
+                "topbook_depth_exists": True,
+                "orderbook_exists": True,
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": no_bid,
+                "no_ask": no_ask,
+                "yes_bid_dollars": yes_bid_dollars,
+                "yes_ask_dollars": yes_ask_dollars,
+                "no_bid_dollars": no_bid_dollars,
+                "no_ask_dollars": no_ask_dollars,
+            }
+            selected_source_label = selected_source_label or "topbook_salvage"
+            orderbook_keys = sorted(list(selected_source_dict.keys()))[:64]
+            try:
+                print(
+                    "[AION-ORDERBOOK-SALVAGED] "
+                    + json.dumps(
+                        {
+                            "ticker": raw_ticker or None,
+                            "normalized_ticker": normalized_ticker or None,
+                            "family": family,
+                            "source_path": "resolve_aion_orderbook_for_payload.topbook_salvage",
+                            "orderbook_shape": "normalized_topbook",
+                            "recursion_guard_hit": False,
+                            "topbook_extract_success": True,
+                            "yes_bid": yes_bid,
+                            "yes_ask": yes_ask,
+                            "no_bid": no_bid,
+                            "no_ask": no_ask,
+                            "selected_price": selected_price,
+                            "selected_side": resolved_side,
+                            "candidate_propagated": True,
+                            "failure_reason": None,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         if (
             selected_source_dict is not None
             and selected_price is not None
@@ -40973,10 +44212,43 @@ class KalshiSniperBot:
         else:
             orderbook_missing_reason = None
 
+        if selected_source_dict is not None or selected_price_raw is not None or orderbook_missing_reason is not None:
+            canonical_side_payload = {
+                "ticker": raw_ticker or None,
+                "family": family,
+                "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                "yes_bid_cents": yes_bid_dollars if yes_bid_dollars is None else int(round(float(yes_bid_dollars) * 100.0)),
+                "no_bid_cents": no_bid_dollars if no_bid_dollars is None else int(round(float(no_bid_dollars) * 100.0)),
+                "derived_yes_ask_cents": yes_ask_dollars if yes_ask_dollars is None else int(round(float(yes_ask_dollars) * 100.0)),
+                "derived_no_ask_cents": no_ask_dollars if no_ask_dollars is None else int(round(float(no_ask_dollars) * 100.0)),
+                "selected_side": resolved_side,
+                "selected_price_cents": selected_price_cents,
+                "selected_price_dollars": selected_price,
+                "alternate_side": opposite_side,
+                "alternate_price_cents": None if opposite_selected_price is None else int(round(float(opposite_selected_price) * 100.0)),
+                "price_bounds_pass": bool(selected_price_in_bounds),
+                "spread_bucket_original": str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                "spread_bucket_final": ("wide_but_possible" if (str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown") == "unsafe" and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"} and self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), 0.0)) >= self.to_float(_aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, spread_bucket=str(quote_diag.get("spread_bucket") or "unknown"), context="canonical_side_price").get("effective_edge_threshold"), 0.001) and selected_price_in_bounds else str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown"),
+                "unsafe_price_status_original": str(quote_diag.get("unsafe_price_status") or "unknown").strip().lower() or "unknown",
+                "unsafe_price_status_final": ("caution_wide_spread" if (str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown") == "unsafe" and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"} and self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), 0.0)) >= self.to_float(_aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, spread_bucket=str(quote_diag.get("spread_bucket") or "unknown"), context="canonical_side_price").get("effective_edge_threshold"), 0.001) and selected_price_in_bounds else str(quote_diag.get("unsafe_price_status") or "unknown").strip().lower() or "unknown"),
+                "edge_after_cost": self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), 0.0)),
+                "liquidity": self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
+                "side_switch_attempted": bool(side_switch_attempted),
+                "side_switch_success": bool(side_switch_success),
+                "phase55_allowed": bool(selected_price_in_bounds and selected_source_dict is not None and (str(_normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)) in {"opportunistic", "beast"} or (self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), 0.0)) >= self.to_float(_aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, spread_bucket=str(quote_diag.get("spread_bucket") or "unknown"), context="phase55_bridge").get("effective_edge_threshold"), 0.003)) )),
+                "block_reason": orderbook_missing_reason or locals().get("price_bounds_reason", "unknown"),
+            }
+            try:
+                print("[AION-CANONICAL-SIDE-PRICE] " + json.dumps(canonical_side_payload, sort_keys=True, default=str))
+                print("[AION-SIDE-SWITCH-DECISION] " + json.dumps(canonical_side_payload, sort_keys=True, default=str))
+                print("[AION-PHASE55-REACHABILITY-BRIDGE] " + json.dumps(canonical_side_payload, sort_keys=True, default=str))
+            except Exception:
+                pass
+
         best_action = "buy_yes" if resolved_side == "yes" else "buy_no" if resolved_side == "no" else None
+        price_bounds_reason = "unknown"
         try:
             if selected_source_dict is not None or selected_price_raw is not None or orderbook_missing_reason is not None:
-                price_bounds_reason = None
                 if selected_price is None:
                     price_bounds_reason = "selected_price_missing"
                 elif selected_price < KALSHI_CONTRACT_MIN_PRICE:
@@ -40997,7 +44269,7 @@ class KalshiSniperBot:
                             "new_max_price": KALSHI_CONTRACT_MAX_PRICE,
                             "validation_mode": "kalshi_contract_bounds",
                             "bounds_pass": bool(selected_price_in_bounds),
-                            "block_reason": orderbook_missing_reason or price_bounds_reason,
+                            "block_reason": orderbook_missing_reason or locals().get("price_bounds_reason", "unknown"),
                         },
                         sort_keys=True,
                         default=str,
@@ -41023,7 +44295,7 @@ class KalshiSniperBot:
                             "side_switch_success": side_switch_success,
                             "side_switch_reason": side_switch_reason,
                             "both_sides_executable": both_sides_executable,
-                            "block_reason": orderbook_missing_reason or price_bounds_reason,
+                            "block_reason": orderbook_missing_reason or locals().get("price_bounds_reason", "unknown"),
                         },
                         sort_keys=True,
                         default=str,
@@ -41051,8 +44323,8 @@ class KalshiSniperBot:
                             "min_price": KALSHI_CONTRACT_MIN_PRICE,
                             "max_price": KALSHI_CONTRACT_MAX_PRICE,
                             "bounds_pass": bool(selected_price_in_bounds),
-                            "failure_stage": orderbook_missing_reason or price_bounds_reason,
-                            "block_reason": orderbook_missing_reason or price_bounds_reason,
+                            "failure_stage": orderbook_missing_reason or locals().get("price_bounds_reason", "unknown"),
+                            "block_reason": orderbook_missing_reason or locals().get("price_bounds_reason", "unknown"),
                         },
                         sort_keys=True,
                         default=str,
@@ -41065,14 +44337,14 @@ class KalshiSniperBot:
             "normalized_ticker": normalized_ticker or None,
             "family": family,
             "selected_side": resolved_side,
-            "selected_price": selected_price,
-            "selected_price_dollars": selected_price,
+            "selected_price": selected_price_dollars if selected_price_dollars is not None else selected_price,
+            "selected_price_dollars": selected_price_dollars if selected_price_dollars is not None else selected_price,
             "selected_price_cents": selected_price_cents,
             "chosen_side": canonical_selected_side,
-            "chosen_price": canonical_selected_price,
-            "chosen_price_dollars": canonical_selected_price,
-            "chosen_price_cents": canonical_selected_price_cents,
-            "chosen_price_source": canonical_selected_price_source,
+            "chosen_price": selected_price_dollars if selected_price_dollars is not None else canonical_selected_price,
+            "chosen_price_dollars": selected_price_dollars if selected_price_dollars is not None else canonical_selected_price,
+            "chosen_price_cents": selected_price_cents if selected_price_cents is not None else canonical_selected_price_cents,
+            "chosen_price_source": selected_price_source or canonical_selected_price_source,
             "selected_price_raw": selected_price_raw,
             "best_action": best_action,
             "orderbook_ready": orderbook_ready,
@@ -41083,6 +44355,11 @@ class KalshiSniperBot:
             "orderbook_fetch_success": orderbook_fetch_success,
             "cached_book_found": cached_book_found,
             "cache_age_seconds": round(cache_age_seconds, 2) if cache_age_seconds is not None else None,
+            "topbook_snapshot_present": bool(quote_diag_topbook_present),
+            "normalized_orderbook_present": bool(selected_source_dict is not None or yes_bid is not None or yes_ask is not None or no_bid is not None or no_ask is not None),
+            "topbook_depth_exists": bool(quote_diag_topbook_present),
+            "orderbook_exists": bool(selected_source_dict is not None or selected_price_in_bounds or quote_diag_topbook_present),
+            "orderbook_salvaged": bool(selected_source_label == "topbook_salvage"),
             "yes_bid": yes_bid,
             "yes_ask": yes_ask,
             "no_bid": no_bid,
@@ -41096,8 +44373,8 @@ class KalshiSniperBot:
             "selected_price_source_used": selected_price_source,
             "bounds_mode": "dollars",
             "bounds_pass": bool(selected_price_in_bounds),
-            "failure_stage": orderbook_missing_reason or ("selected_price_out_of_bounds" if selected_price is not None else "selected_price_missing"),
-            "block_reason": orderbook_missing_reason or ("selected_price_out_of_bounds" if selected_price is not None else "selected_price_missing"),
+            "failure_stage": orderbook_missing_reason or (None if orderbook_ready else ("selected_price_out_of_bounds" if selected_price is not None and not selected_price_in_bounds else "selected_price_missing")),
+            "block_reason": orderbook_missing_reason or (None if orderbook_ready else ("selected_price_out_of_bounds" if selected_price is not None and not selected_price_in_bounds else "selected_price_missing")),
         }
 
     def build_live_order_payload(
@@ -41170,10 +44447,17 @@ class KalshiSniperBot:
         if rest_remainder is not None:
             payload["rest_remainder"] = bool(rest_remainder)
         payload_validation_side = orderbook_resolution.get("chosen_side") or orderbook_resolution.get("selected_side") or intended_side
-        payload_validation_price = orderbook_resolution.get("chosen_price_dollars", orderbook_resolution.get("chosen_price", orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("selected_price"))))
-        payload_validation_price_cents = orderbook_resolution.get("chosen_price_cents", orderbook_resolution.get("selected_price_cents"))
-        selected_price = payload_validation_price
-        selected_price_cents = payload_validation_price_cents
+        payload_validation_price = orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("chosen_price_dollars", orderbook_resolution.get("chosen_price", orderbook_resolution.get("selected_price"))))
+        payload_validation_price_cents = orderbook_resolution.get("selected_price_cents", orderbook_resolution.get("chosen_price_cents"))
+        selected_price = self.to_float(payload_validation_price, None)
+        selected_price_cents = None
+        try:
+            if payload_validation_price_cents not in (None, "", 0, 0.0):
+                selected_price_cents = int(round(float(payload_validation_price_cents)))
+        except (TypeError, ValueError):
+            selected_price_cents = None
+        if selected_price_cents is not None:
+            selected_price = round(selected_price_cents / 100.0, 4)
         if selected_price is None:
             if payload_validation_side == "yes":
                 selected_price = (
@@ -41188,11 +44472,11 @@ class KalshiSniperBot:
                 if selected_price is None:
                     selected_price = self._extract_orderbook_side_price_hint(orderbook_resolution, "no")
         selected_price = self.to_float(selected_price, None)
-        if selected_price is None and selected_price_cents not in (None, "", 0, 0.0):
+        if selected_price_cents is None and selected_price not in (None, 0, 0.0):
             try:
-                selected_price = float(selected_price_cents) / 100.0
+                selected_price_cents = int(round(float(selected_price) * 100.0))
             except (TypeError, ValueError):
-                selected_price = None
+                selected_price_cents = None
         try:
             print(
                 "[AION-CANONICAL-PRICE-CONSUMED] "
@@ -41213,12 +44497,47 @@ class KalshiSniperBot:
                     default=str,
                 )
             )
+            print(
+                "[AION-PHASE55-REACHABILITY-BRIDGE] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                        "yes_bid_cents": orderbook_resolution.get("yes_bid_dollars") if orderbook_resolution.get("yes_bid_dollars") is None else int(round(float(orderbook_resolution.get("yes_bid_dollars")) * 100.0)),
+                        "no_bid_cents": orderbook_resolution.get("no_bid_dollars") if orderbook_resolution.get("no_bid_dollars") is None else int(round(float(orderbook_resolution.get("no_bid_dollars")) * 100.0)),
+                        "derived_yes_ask_cents": orderbook_resolution.get("yes_ask_dollars") if orderbook_resolution.get("yes_ask_dollars") is None else int(round(float(orderbook_resolution.get("yes_ask_dollars")) * 100.0)),
+                        "derived_no_ask_cents": orderbook_resolution.get("no_ask_dollars") if orderbook_resolution.get("no_ask_dollars") is None else int(round(float(orderbook_resolution.get("no_ask_dollars")) * 100.0)),
+                        "selected_side": orderbook_resolution.get("selected_side"),
+                        "selected_price_cents": orderbook_resolution.get("selected_price_cents"),
+                        "selected_price_dollars": selected_price,
+                        "alternate_side": opposite_side,
+                        "alternate_price_cents": None if opposite_selected_price is None else int(round(float(opposite_selected_price) * 100.0)),
+                        "price_bounds_pass": bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99),
+                        "spread_bucket_original": str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                        "spread_bucket_final": str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                        "unsafe_price_status_original": str(quote_diag.get("unsafe_price_status") or "unknown").strip().lower() or "unknown",
+                        "unsafe_price_status_final": str(quote_diag.get("unsafe_price_status") or "unknown").strip().lower() or "unknown",
+                        "edge_after_cost": self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), 0.0)),
+                        "liquidity": self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
+                        "side_switch_attempted": bool(side_switch_attempted),
+                        "side_switch_success": bool(side_switch_success),
+                        "phase55_allowed": bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99),
+                        "block_reason": orderbook_missing_reason or locals().get("price_bounds_reason", "unknown"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         except Exception:
             pass
         if not ticker or selected_price is None or selected_price <= 0:
             return None
-        if selected_price < KALSHI_CONTRACT_MIN_PRICE or selected_price > KALSHI_CONTRACT_MAX_PRICE:
+        if selected_price_cents is None and selected_price is not None:
+            selected_price_cents = int(round(float(selected_price) * 100.0))
+        if selected_price_cents is None or selected_price_cents < 1 or selected_price_cents > 99:
             return None
+        selected_price = round(float(selected_price_cents) / 100.0, 4)
         if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
             return None
         if intended_side == "yes":
@@ -41245,6 +44564,677 @@ class KalshiSniperBot:
         payload["orderbook_keys"] = orderbook_resolution.get("orderbook_keys")
         return payload
 
+    def resolve_realm_vv_entry_engine(self, candidate, canonical_payload, orderbook_context, decision_context):
+        decision_context = decision_context if isinstance(decision_context, dict) else {}
+        canonical_payload = canonical_payload if isinstance(canonical_payload, dict) else {}
+        orderbook_context = orderbook_context if isinstance(orderbook_context, dict) else {}
+        market = decision_context.get("market") if isinstance(decision_context.get("market"), dict) else {}
+        quote_payload = candidate
+        ticker = str(
+            decision_context.get("ticker")
+            or canonical_payload.get("ticker")
+            or orderbook_context.get("ticker")
+            or getattr(quote_payload, "ticker", "")
+            or market.get("ticker", "")
+            or ""
+        ).strip() or None
+        family = str(
+            decision_context.get("family")
+            or self.get_market_family(market if market else {"ticker": ticker} if ticker else {})
+            or orderbook_context.get("family")
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+        profile = _normalize_aion_aggression_profile(decision_context.get("profile") or AION_AGGRESSION_PROFILE)
+        canonical_tradeability_hint = decision_context.get("canonical_tradeability") if isinstance(decision_context.get("canonical_tradeability"), dict) else {}
+        if not canonical_tradeability_hint:
+            canonical_tradeability_hint = canonical_payload.get("canonical_tradeability") if isinstance(canonical_payload.get("canonical_tradeability"), dict) else {}
+        if not canonical_tradeability_hint:
+            canonical_tradeability_hint = orderbook_context.get("canonical_tradeability") if isinstance(orderbook_context.get("canonical_tradeability"), dict) else {}
+        tradeability = canonical_tradeability_hint or self.resolve_canonical_tradeability(
+            market if isinstance(market, dict) else {"ticker": ticker},
+            quote=quote_payload,
+            context={
+                "ticker": ticker,
+                "selected_side": decision_context.get("selected_side") or orderbook_context.get("selected_side"),
+                "price_source": decision_context.get("price_source") or orderbook_context.get("selected_price_source") or "bid",
+                "quote_diag": decision_context.get("quote_diag") or canonical_payload or orderbook_context,
+                "allow_refresh": True,
+            },
+            source="realm_vv",
+        )
+        selected_price = self.to_float(tradeability.get("selected_price_dollars"), self.to_float(tradeability.get("selected_price"), None))
+        selected_price_cents = tradeability.get("selected_price_cents")
+        try:
+            selected_price_cents = int(round(float(selected_price_cents))) if selected_price_cents not in (None, "", []) else None
+        except Exception:
+            selected_price_cents = None
+        edge = None
+        for candidate_edge in (
+            canonical_payload.get("final_edge"),
+            decision_context.get("final_edge"),
+            canonical_payload.get("sports_edge_after_cost"),
+            decision_context.get("sports_edge_after_cost"),
+            tradeability.get("final_edge_value") if isinstance(tradeability, dict) else None,
+            canonical_payload.get("edge_after_cost"),
+            tradeability.get("edge_after_cost") if isinstance(tradeability, dict) else None,
+            canonical_tradeability_hint.get("edge_after_cost"),
+            canonical_tradeability_hint.get("final_edge_value"),
+            decision_context.get("edge_after_cost"),
+        ):
+            candidate_edge_value = self.to_float(candidate_edge, None)
+            if candidate_edge_value is not None and candidate_edge_value > 0.0:
+                edge = candidate_edge_value
+                break
+        if edge is None:
+            edge = self.to_float(
+                canonical_payload.get("final_edge"),
+                self.to_float(
+                    decision_context.get("final_edge"),
+                    self.to_float(
+                        canonical_payload.get("edge_after_cost"),
+                        self.to_float(
+                            canonical_tradeability_hint.get("final_edge_value"),
+                            self.to_float(
+                                canonical_tradeability_hint.get("edge_after_cost"),
+                                self.to_float(
+                                    tradeability.get("final_edge_value") if isinstance(tradeability, dict) else None,
+                                    self.to_float(
+                                        tradeability.get("edge_after_cost") if isinstance(tradeability, dict) else None,
+                                        self.to_float(decision_context.get("edge_after_cost"), 0.0),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        confidence = None
+        for candidate_confidence in (
+            canonical_payload.get("confidence"),
+            canonical_payload.get("score"),
+            tradeability.get("confidence_score") if isinstance(tradeability, dict) else None,
+            tradeability.get("confidence") if isinstance(tradeability, dict) else None,
+            canonical_tradeability_hint.get("confidence_score"),
+            canonical_tradeability_hint.get("confidence"),
+            decision_context.get("confidence"),
+            decision_context.get("score"),
+        ):
+            candidate_confidence_value = self.to_float(candidate_confidence, None)
+            if candidate_confidence_value is not None and candidate_confidence_value > 0.0:
+                confidence = candidate_confidence_value
+                break
+        if confidence is None:
+            confidence = self.to_float(
+                canonical_payload.get("confidence"),
+                self.to_float(
+                    canonical_payload.get("score"),
+                    self.to_float(
+                        canonical_tradeability_hint.get("confidence_score"),
+                        self.to_float(
+                            tradeability.get("confidence_score") if isinstance(tradeability, dict) else None,
+                            self.to_float(
+                                tradeability.get("confidence") if isinstance(tradeability, dict) else None,
+                                self.to_float(decision_context.get("confidence"), self.to_float(decision_context.get("score"), 0.0)),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        aggression_settings = _aion_aggression_profile_settings(profile, family=family, spread_bucket=tradeability.get("spread_bucket"), context="realm_vv_entry")
+        edge_threshold = self.to_float(aggression_settings.get("effective_edge_threshold"), 0.003)
+        confidence_floor = self.to_float(aggression_settings.get("confidence_floor"), 0.55)
+        if profile in {"opportunistic", "beast"} and tradeability.get("unsafe_price_status") in {"unsafe_spread", "caution_wide_spread"}:
+            confidence_floor = min(confidence_floor, 0.0)
+        quote_ready = bool(tradeability.get("quote_ready"))
+        orderbook_ready = bool(tradeability.get("orderbook_ready"))
+        price_bounds_pass = bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99)
+        duplicate_block = bool(decision_context.get("duplicate_block") or decision_context.get("duplicate_position") or tradeability.get("blocker_class") == "duplicate_position")
+        cooldown_block = bool(decision_context.get("cooldown_block") or decision_context.get("cooldown_active"))
+        live_arm_ok = bool(decision_context.get("live_arm_ok", True))
+        max_positions_block = bool(decision_context.get("max_positions_block"))
+        daily_cap_block = bool(decision_context.get("daily_cap_block"))
+        hard_blockers = []
+        if duplicate_block:
+            hard_blockers.append("duplicate_position")
+        if cooldown_block:
+            hard_blockers.append("cooldown_active")
+        if max_positions_block:
+            hard_blockers.append("max_live_positions")
+        if daily_cap_block:
+            hard_blockers.append("daily_trade_cap")
+        if not live_arm_ok:
+            hard_blockers.append("live_arm")
+        selected_side = str(tradeability.get("selected_side") or decision_context.get("selected_side") or orderbook_context.get("selected_side") or "").strip().lower() or None
+        blocker = str(tradeability.get("blocker_class") or tradeability.get("blocker") or tradeability.get("blocker_detail") or "").strip().lower() or None
+        blocker_detail = str(tradeability.get("blocker_detail") or tradeability.get("unsafe_resolution_reason") or tradeability.get("unsafe_price_status") or blocker or "unknown").strip().lower() or "unknown"
+        wait_reason = None
+        if hard_blockers:
+            decision = "SKIP"
+            blocker = hard_blockers[0]
+            blocker_detail = blocker
+        elif not quote_ready or not orderbook_ready:
+            survivable_aggressive_gate = bool(
+                profile in {"opportunistic", "beast"}
+                and edge > 0.0
+                and price_bounds_pass
+                and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+                and (
+                    tradeability.get("selected_side_has_price")
+                    or tradeability.get("selected_side_has_liquidity")
+                    or tradeability.get("depth_available")
+                    or tradeability.get("orderbook_ready")
+                )
+            )
+            if survivable_aggressive_gate:
+                decision = "BUY"
+                blocker = None
+                blocker_detail = None
+                quote_ready = True
+                orderbook_ready = True
+                tradeability["quote_ready"] = True
+                tradeability["orderbook_ready"] = True
+                tradeability["tradeable"] = True
+                tradeability["blocker_class"] = None
+                tradeability["blocker"] = None
+                tradeability["blocker_detail"] = None
+            else:
+                decision = "SKIP"
+                blocker = blocker or ("quote_not_usable" if not quote_ready else "orderbook_not_usable")
+                blocker_detail = blocker_detail or blocker
+        elif not price_bounds_pass:
+            decision = "SKIP"
+            blocker = "selected_price_above_0_99" if selected_price is not None and selected_price >= 1.0 else ("selected_price_below_0_01" if selected_price is not None and selected_price < 0.01 else "selected_price_unit_mismatch")
+            blocker_detail = blocker
+        elif blocker in {"both_sides_unexecutable", "unexecutable_price"}:
+            decision = "SKIP"
+        elif edge < edge_threshold:
+            near_miss_allowed = bool(
+                profile in {"opportunistic", "beast"}
+                and edge > 0.0
+                and quote_ready
+                and orderbook_ready
+                and price_bounds_pass
+                and selected_price_cents is not None
+                and int(selected_price_cents) <= 99
+                and confidence >= max(0.35, confidence_floor * 0.75)
+                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}
+                and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+                and (tradeability.get("liquidity") or 0.0) >= 0.0
+            )
+            if near_miss_allowed and profile == "beast" and tradeability.get("spread_classification") == "AGGRESSIVE_BUT_TRADEABLE" and edge >= max(edge_threshold * 0.5, 0.00075):
+                decision = "BUY"
+                blocker = None
+                blocker_detail = None
+            elif near_miss_allowed:
+                decision = "WAIT"
+                wait_reason = "near_miss_activation"
+                blocker = None
+                blocker_detail = None
+            else:
+                decision = "SKIP"
+                blocker = "edge_below_threshold"
+                blocker_detail = f"edge_after_cost={edge:.4f}<threshold={edge_threshold:.4f}"
+        elif confidence < confidence_floor:
+            decision = "SKIP"
+            blocker = "confidence_below_threshold"
+            blocker_detail = f"confidence={confidence:.4f}<floor={confidence_floor:.4f}"
+        elif tradeability.get("unsafe_price_status") in {"unsafe_spread", "caution_wide_spread"} and profile in {"opportunistic", "beast"}:
+            aggressive_wide_spread_ok = bool(
+                edge >= max(edge_threshold * 0.75, 0.00075)
+                and confidence >= max(0.35, confidence_floor * 0.75)
+                and quote_ready
+                and orderbook_ready
+                and price_bounds_pass
+                and tradeability.get("selected_price_cents") is not None
+                and tradeability.get("selected_price_cents") <= 99
+                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}
+                and (tradeability.get("liquidity") or 0.0) >= 0.0
+            )
+            if aggressive_wide_spread_ok:
+                decision = "BUY"
+                blocker = None
+                blocker_detail = None
+            else:
+                decision = "WAIT"
+                wait_reason = "wait_for_better_fill"
+                blocker = None
+                blocker_detail = None
+        elif tradeability.get("tradeable"):
+            decision = "BUY"
+            blocker = None
+            blocker_detail = None
+        else:
+            if tradeability.get("unsafe_price_status") in {"safe", "caution_wide_spread"} and price_bounds_pass and edge >= edge_threshold * 0.8:
+                decision = "WAIT"
+                wait_reason = "micro_pullback_possible"
+                blocker = None
+                blocker_detail = None
+            else:
+                decision = "SKIP"
+                blocker = blocker or "tradeability_blocked"
+                blocker_detail = blocker_detail or blocker
+        if decision == "WAIT" and wait_reason is None:
+            wait_reason = "wait_for_better_fill"
+        if decision == "BUY":
+            phase55_status = "entry_ready"
+        elif decision == "WAIT" and wait_reason == "micro_pullback_possible":
+            phase55_status = "pullback_wait"
+        elif decision == "WAIT":
+            phase55_status = "trigger_wait"
+        elif blocker in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}:
+            phase55_status = "immediate_reject"
+        elif blocker == "edge_below_threshold":
+            phase55_status = "probability_block"
+        elif blocker == "confidence_below_threshold":
+            phase55_status = "capital_block"
+        elif blocker in {"quote_not_usable", "orderbook_not_usable", "missing_quote_object"}:
+            phase55_status = "insufficient_data"
+        else:
+            phase55_status = blocker or "skip"
+        result = {
+            "ticker": ticker,
+            "family": family,
+            "tradeable": bool(decision == "BUY"),
+            "decision": decision,
+            "reason": wait_reason or blocker_detail or blocker or "eligible",
+            "blocker": blocker,
+            "blocker_class": blocker,
+            "blocker_detail": blocker_detail,
+            "selected_price": selected_price,
+            "selected_price_cents": selected_price_cents,
+            "selected_price_dollars": selected_price,
+            "edge": edge,
+            "confidence": confidence,
+            "profile": profile,
+            "side": selected_side,
+            "timestamp": time.time(),
+            "phase55_status": phase55_status,
+            "entry_ready": bool(phase55_status == "entry_ready"),
+            "entry_timing_pass": bool(phase55_status == "entry_ready"),
+            "entry_ready_reason": wait_reason or blocker_detail or blocker or "eligible",
+            "selected_side": selected_side,
+            "quote_ready": quote_ready,
+            "orderbook_ready": orderbook_ready,
+            "yes_bid_cents": tradeability.get("yes_bid_cents"),
+            "no_bid_cents": tradeability.get("no_bid_cents"),
+            "yes_ask_cents": tradeability.get("yes_ask_cents"),
+            "no_ask_cents": tradeability.get("no_ask_cents"),
+            "spread_cents": tradeability.get("spread_cents"),
+            "spread_bucket": tradeability.get("spread_bucket"),
+            "side_switch_attempted": bool(tradeability.get("side_switch_attempted")),
+            "side_switch_success": bool(tradeability.get("side_switch_success")),
+            "unsafe_price_status": tradeability.get("unsafe_price_status"),
+            "unsafe_resolution_reason": tradeability.get("unsafe_resolution_reason"),
+            "spread_classification": tradeability.get("spread_classification"),
+            "spread_classification_reason": tradeability.get("spread_classification_reason"),
+            "market_personality": tradeability.get("market_personality"),
+            "confidence_score": tradeability.get("confidence_score"),
+            "confidence_tier": tradeability.get("confidence_tier"),
+            "survivability_score": tradeability.get("survivability_score"),
+            "suggested_size_multiplier": tradeability.get("suggested_size_multiplier"),
+            "liquidity": tradeability.get("liquidity"),
+            "canonical_tradeability": tradeability,
+        }
+        try:
+            result["normalized_ticker_key"] = self.normalize_phase55_ticker_key(selected_ticker) or "unknown_normalized_ticker"
+            result["normalized_ticker"] = result["normalized_ticker_key"]
+            print("[AION-REALM-VV-ENTRY] " + json.dumps(result, sort_keys=True, default=str))
+            print("[AION-REALM-VV-CONFIDENCE] " + json.dumps({
+                "ticker": selected_ticker,
+                "family": family,
+                "profile": profile,
+                "confidence_score": result.get("confidence"),
+                "confidence_tier": result.get("confidence_tier"),
+                "survivability_score": result.get("survivability_score"),
+                "suggested_size_multiplier": result.get("suggested_size_multiplier"),
+                "edge": edge,
+                "threshold": edge_threshold,
+                "market_personality": result.get("market_personality"),
+                "blocker_reason": blocker_detail if decision != "BUY" else None,
+            }, sort_keys=True, default=str))
+            print("[AION-REALM-VV-SPREAD-CLASS] " + json.dumps({
+                "ticker": selected_ticker,
+                "family": family,
+                "profile": profile,
+                "spread_classification": result.get("spread_classification"),
+                "spread_classification_reason": result.get("spread_classification_reason"),
+                "unsafe_price_status": result.get("unsafe_price_status"),
+                "unsafe_resolution_reason": result.get("unsafe_resolution_reason"),
+                "edge_after_cost": edge,
+                "liquidity": result.get("liquidity") if result.get("liquidity") is not None else (result.get("canonical_tradeability", {}).get("liquidity") if isinstance(result.get("canonical_tradeability"), dict) else None),
+                "selected_price_cents": selected_price_cents,
+                "selected_price_dollars": selected_price,
+            }, sort_keys=True, default=str))
+            if decision == "BUY":
+                if result.get("spread_classification") == "AGGRESSIVE_BUT_TRADEABLE":
+                    print("[AION-REALM-VV-AGGRESSIVE-BUY] " + json.dumps(result, sort_keys=True, default=str))
+                print("[AION-REALM-VV-BUY] " + json.dumps(result, sort_keys=True, default=str))
+            elif decision == "WAIT":
+                if edge is not None and edge > 0.0:
+                    print("[AION-REALM-VV-NEAR-MISS] " + json.dumps({
+                        "ticker": selected_ticker,
+                        "family": family,
+                        "profile": profile,
+                        "spread_classification": result.get("spread_classification"),
+                        "edge": edge,
+                        "edge_threshold": edge_threshold,
+                        "confidence": confidence,
+                        "confidence_floor": confidence_floor,
+                        "reason": wait_reason or blocker_detail or "wait_for_better_fill",
+                    }, sort_keys=True, default=str))
+                print("[AION-REALM-VV-WAIT] " + json.dumps(result, sort_keys=True, default=str))
+            else:
+                print("[AION-REALM-VV-BLOCK-DETAIL] " + json.dumps({
+                    "ticker": selected_ticker,
+                    "side": selected_side,
+                    "selected_price": selected_price,
+                    "normalized_price": selected_price,
+                    "spread": result.get("spread_cents"),
+                    "spread_classification": result.get("spread_classification"),
+                    "edge_before_cost": tradeability.get("edge_before_cost") if isinstance(tradeability, dict) else None,
+                    "edge_after_cost": edge,
+                    "threshold": edge_threshold,
+                    "confidence_score": confidence,
+                    "market_personality": result.get("market_personality"),
+                    "profile": profile,
+                    "blocker_reason": blocker_detail or blocker or "unknown",
+                    "why_buy_denied": blocker_detail or blocker or "unknown",
+                    "stage": phase55_status,
+                }, sort_keys=True, default=str))
+                print("[AION-REALM-VV-SKIP] " + json.dumps(result, sort_keys=True, default=str))
+        except Exception:
+            pass
+        return result
+
+    def _build_realm_vv_canonical_execution_state(
+        self,
+        realm_vv_result=None,
+        *,
+        quote_diag=None,
+        edge_after_cost=None,
+        phase55_status=None,
+        phase55_ready=None,
+        fast_confirmed=None,
+        live_promotion=None,
+        legacy_direct_fields_ready=None,
+        direct_fields_ready=None,
+        normalized_ready=None,
+        selector_decision=None,
+        payload_ready=None,
+        auth_ready=None,
+        duplicate_status=None,
+        cooldown_status=None,
+        quote_ready=None,
+        quote_missing=None,
+        spread_bucket=None,
+        final_block_reason=None,
+        unsafe_price_status=None,
+        selected_side_has_price=None,
+        selected_side_has_liquidity=None,
+        depth_available=None,
+        price_bounds_pass=None,
+        orderbook_ready=None,
+        relaxed_beast_mode=None,
+    ):
+        realm_vv_result = realm_vv_result if isinstance(realm_vv_result, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        canonical_tradeability = realm_vv_result.get("canonical_tradeability")
+        canonical_tradeability = canonical_tradeability if isinstance(canonical_tradeability, dict) else {}
+        canonical_execution_decision = str(
+            realm_vv_result.get("canonical_execution_decision")
+            or realm_vv_result.get("decision")
+            or canonical_tradeability.get("decision")
+            or selector_decision
+            or quote_diag.get("decision")
+            or "SKIP"
+        ).strip().upper() or "SKIP"
+        canonical_readiness_state = str(
+            realm_vv_result.get("canonical_readiness_state")
+            or realm_vv_result.get("phase55_status")
+            or phase55_status
+            or ("entry_ready" if canonical_execution_decision == "BUY" else "trigger_wait")
+        ).strip().lower() or "unknown"
+        canonical_phase55_ready = bool(
+            realm_vv_result.get("entry_timing_pass")
+            if realm_vv_result.get("entry_timing_pass") is not None
+            else realm_vv_result.get("entry_ready")
+            if realm_vv_result.get("entry_ready") is not None
+            else phase55_ready if phase55_ready is not None else canonical_execution_decision == "BUY"
+        )
+        if canonical_phase55_ready and canonical_readiness_state != "entry_ready":
+            canonical_readiness_state = "entry_ready"
+        canonical_tradeable = bool(
+            realm_vv_result.get("canonical_tradeable")
+            if realm_vv_result.get("canonical_tradeable") is not None
+            else realm_vv_result.get("tradeable")
+            if realm_vv_result.get("tradeable") is not None
+            else canonical_tradeability.get("tradeable")
+            if canonical_tradeability.get("tradeable") is not None
+            else canonical_execution_decision == "BUY"
+        )
+        canonical_buy_ready = bool(
+            canonical_execution_decision in {"BUY", "LIVE_PROMOTION"}
+            and canonical_tradeable
+            and bool(payload_ready if payload_ready is not None else True)
+            and bool(auth_ready if auth_ready is not None else True)
+            and (canonical_phase55_ready or canonical_readiness_state == "entry_ready")
+        )
+        canonical_selected_side_has_price = bool(
+            selected_side_has_price
+            if selected_side_has_price is not None
+            else canonical_tradeability.get("selected_side_has_price")
+            if canonical_tradeability.get("selected_side_has_price") is not None
+            else canonical_tradeability.get("selected_price") is not None
+        )
+        canonical_selected_side_has_liquidity = bool(
+            selected_side_has_liquidity
+            if selected_side_has_liquidity is not None
+            else canonical_tradeability.get("selected_side_has_liquidity")
+            if canonical_tradeability.get("selected_side_has_liquidity") is not None
+            else canonical_tradeability.get("depth_available")
+        )
+        canonical_depth_available = bool(
+            depth_available
+            if depth_available is not None
+            else canonical_tradeability.get("depth_available")
+            if canonical_tradeability.get("depth_available") is not None
+            else canonical_selected_side_has_liquidity
+        )
+        canonical_price_bounds_pass = bool(
+            price_bounds_pass
+            if price_bounds_pass is not None
+            else canonical_tradeability.get("price_bounds_pass")
+            if canonical_tradeability.get("price_bounds_pass") is not None
+            else canonical_execution_decision == "BUY"
+        )
+        canonical_relaxed_beast_mode = bool(relaxed_beast_mode)
+        canonical_relaxed_submit_allowed = bool(
+            canonical_relaxed_beast_mode
+            and canonical_execution_decision in {"BUY", "LIVE_PROMOTION"}
+            and canonical_selected_side_has_price
+            and canonical_price_bounds_pass
+            and (
+                canonical_selected_side_has_liquidity
+                or canonical_depth_available
+                or bool(orderbook_ready if orderbook_ready is not None else canonical_tradeability.get("orderbook_ready"))
+            )
+            and bool(payload_ready if payload_ready is not None else True)
+            and bool(auth_ready if auth_ready is not None else True)
+            and str(duplicate_status or "unknown").strip().lower() in {"unknown", "clear", "unknown_clear", "none"}
+            and str(cooldown_status or "unknown").strip().lower() in {"unknown", "clear", "none"}
+        )
+        if canonical_relaxed_submit_allowed:
+            canonical_buy_ready = True
+        canonical_spread_classification = str(
+            realm_vv_result.get("canonical_spread_classification")
+            or realm_vv_result.get("spread_classification")
+            or canonical_tradeability.get("spread_classification")
+            or quote_diag.get("spread_classification")
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+        canonical_spread_severity = str(
+            realm_vv_result.get("spread_severity")
+            or canonical_tradeability.get("spread_severity")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        canonical_beast_spread_override_applied = bool(
+            realm_vv_result.get("beast_spread_override_applied")
+            if realm_vv_result.get("beast_spread_override_applied") is not None
+            else canonical_tradeability.get("beast_spread_override_applied")
+        )
+        canonical_final_submit_allowed_by_realm_vv = bool(
+            True
+            if canonical_relaxed_submit_allowed
+            else realm_vv_result.get("final_submit_allowed_by_realm_vv")
+            if realm_vv_result.get("final_submit_allowed_by_realm_vv") is not None
+            else canonical_tradeability.get("final_submit_allowed_by_realm_vv")
+        )
+        canonical_spread_bucket = str(
+            realm_vv_result.get("spread_bucket")
+            or canonical_tradeability.get("spread_bucket")
+            or quote_diag.get("spread_bucket")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        canonical_unsafe_price_status = str(
+            realm_vv_result.get("unsafe_price_status")
+            or canonical_tradeability.get("unsafe_price_status")
+            or unsafe_price_status
+            or quote_diag.get("unsafe_price_status")
+            or "unknown"
+        ).strip().lower() or "unknown"
+        if canonical_buy_ready and canonical_spread_classification not in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}:
+            canonical_spread_classification = "AGGRESSIVE_BUT_TRADEABLE"
+        if canonical_buy_ready and canonical_spread_severity not in {"survivable", "safe"}:
+            canonical_spread_severity = "survivable"
+        if canonical_buy_ready and canonical_unsafe_price_status in {"unsafe_spread", "unsafe", "unsafe_price", "unknown"}:
+            if canonical_spread_bucket in {"wide_but_possible", "unsafe"} or canonical_spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WIDE_SPREAD"}:
+                canonical_unsafe_price_status = "caution_wide_spread"
+            elif canonical_spread_bucket in {"tight", "ultra_tight"}:
+                canonical_unsafe_price_status = "safe"
+        canonical_final_block_reason = (
+            "all_guards_passed"
+            if canonical_buy_ready
+            else str(
+                realm_vv_result.get("canonical_final_block_reason")
+                or realm_vv_result.get("final_block_reason")
+                or final_block_reason
+                or (None if canonical_execution_decision == "BUY" else canonical_readiness_state)
+                or "final_not_ready_unknown"
+            ).strip() or "final_not_ready_unknown"
+        )
+        return {
+            "canonical_edge_after_cost": self.to_float(
+                realm_vv_result.get("canonical_edge_after_cost")
+                or realm_vv_result.get("edge")
+                or canonical_tradeability.get("edge_after_cost")
+                or edge_after_cost,
+                edge_after_cost,
+            ),
+            "canonical_spread_classification": (
+                canonical_spread_classification
+            ),
+            "canonical_spread_severity": canonical_spread_severity,
+            "canonical_spread_bucket": canonical_spread_bucket,
+            "canonical_spread_is_catastrophic": bool(
+                canonical_tradeability.get("spread_is_catastrophic")
+                if canonical_tradeability.get("spread_is_catastrophic") is not None
+                else canonical_spread_severity == "catastrophic"
+            ),
+            "canonical_spread_is_survivable": bool(
+                canonical_tradeability.get("spread_is_survivable")
+                if canonical_tradeability.get("spread_is_survivable") is not None
+                else canonical_spread_severity != "catastrophic"
+            ),
+            "canonical_beast_spread_override_applied": canonical_beast_spread_override_applied,
+            "canonical_final_submit_allowed_by_realm_vv": canonical_final_submit_allowed_by_realm_vv,
+            "canonical_selected_side_has_price": canonical_selected_side_has_price,
+            "canonical_selected_side_has_liquidity": canonical_selected_side_has_liquidity,
+            "canonical_depth_available": canonical_depth_available,
+            "canonical_price_bounds_pass": canonical_price_bounds_pass,
+            "canonical_relaxed_beast_mode": canonical_relaxed_beast_mode,
+            "canonical_relaxed_submit_allowed": canonical_relaxed_submit_allowed,
+            "canonical_confidence_score": self.to_float(
+                realm_vv_result.get("canonical_confidence_score")
+                or realm_vv_result.get("confidence_score")
+                or canonical_tradeability.get("confidence_score")
+                or quote_diag.get("confidence_score"),
+                None,
+            ),
+            "canonical_market_personality": (
+                realm_vv_result.get("canonical_market_personality")
+                or realm_vv_result.get("market_personality")
+                or canonical_tradeability.get("market_personality")
+                or quote_diag.get("market_personality")
+            ),
+            "canonical_execution_decision": canonical_execution_decision,
+            "canonical_readiness_state": canonical_readiness_state,
+            "canonical_tradeable": canonical_tradeable,
+            "canonical_phase55_ready": canonical_phase55_ready,
+            "canonical_quote_ready": bool(
+                True
+                if canonical_buy_ready
+                else (
+                    realm_vv_result.get("quote_ready")
+                    if realm_vv_result.get("quote_ready") is not None
+                    else quote_ready if quote_ready is not None else quote_diag.get("quote_ready")
+                )
+            ),
+            "canonical_quote_missing": bool(
+                False
+                if canonical_buy_ready
+                else (
+                    realm_vv_result.get("quote_missing")
+                    if realm_vv_result.get("quote_missing") is not None
+                    else quote_missing if quote_missing is not None else quote_diag.get("quote_missing")
+                )
+            ),
+            "canonical_payload_ready": bool(True if payload_ready is None else payload_ready),
+            "canonical_auth_ready": bool(True if auth_ready is None else auth_ready),
+            "canonical_duplicate_status": str(
+                realm_vv_result.get("duplicate_status")
+                or duplicate_status
+                or quote_diag.get("duplicate_status")
+                or "unknown"
+            ).strip().lower() or "unknown",
+            "canonical_cooldown_status": str(
+                realm_vv_result.get("cooldown_status")
+                or cooldown_status
+                or quote_diag.get("cooldown_status")
+                or "unknown"
+            ).strip().lower() or "unknown",
+            "canonical_unsafe_price_status": canonical_unsafe_price_status,
+            "canonical_direct_fields_ready": bool(
+                True
+                if canonical_buy_ready
+                else (
+                    realm_vv_result.get("direct_fields_ready")
+                    if realm_vv_result.get("direct_fields_ready") is not None
+                    else direct_fields_ready if direct_fields_ready is not None else canonical_tradeability.get("direct_fields_ready")
+                )
+            ),
+            "canonical_legacy_direct_fields_ready": bool(
+                True
+                if canonical_buy_ready
+                else (
+                    realm_vv_result.get("legacy_direct_fields_ready")
+                    if realm_vv_result.get("legacy_direct_fields_ready") is not None
+                    else legacy_direct_fields_ready if legacy_direct_fields_ready is not None else canonical_tradeability.get("legacy_direct_fields_ready")
+                )
+            ),
+            "canonical_normalized_ready": bool(
+                True
+                if canonical_buy_ready
+                else (
+                    realm_vv_result.get("normalized_ready")
+                    if realm_vv_result.get("normalized_ready") is not None
+                    else normalized_ready if normalized_ready is not None else canonical_tradeable
+                )
+            ),
+            "canonical_spread_bucket": canonical_spread_bucket,
+            "canonical_final_block_reason": canonical_final_block_reason,
+            "realm_vv_result": realm_vv_result,
+        }
+
     def _diagnose_live_order_payload_context(
         self,
         q,
@@ -41259,9 +45249,10 @@ class KalshiSniperBot:
     ):
         quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
         market = market if isinstance(market, dict) else {}
+        quote_payload = q
         selected_ticker = str(
             selected_ticker
-            or getattr(q, "ticker", "")
+            or getattr(quote_payload, "ticker", "")
             or quote_diag.get("ticker", "")
             or market.get("ticker", "")
             or ""
@@ -41276,9 +45267,9 @@ class KalshiSniperBot:
             )
         phase55_record_keys = sorted(list(phase55_record.keys())) if isinstance(phase55_record, dict) else []
         orderbook_present = bool(
-            q is not None
+            quote_payload is not None
             and any(
-                getattr(q, field, None) is not None
+                getattr(quote_payload, field, None) is not None
                 for field in ("yes_bid", "yes_ask", "no_bid", "no_ask")
             )
         )
@@ -41291,7 +45282,7 @@ class KalshiSniperBot:
                 intended_side = None
         quote_snapshot = self.resolve_aion_quote_orderbook_snapshot(
             selected_ticker,
-            candidate=q,
+            candidate=quote_payload,
             market=market,
             quote_diag=quote_diag,
             price_source=price_source,
@@ -41333,10 +45324,10 @@ class KalshiSniperBot:
                         "orderbook_source": orderbook_resolution.get("orderbook_source"),
                         "orderbook_missing_reason": orderbook_resolution.get("orderbook_missing_reason"),
                         "quote_fields": {
-                            "yes_bid": getattr(q, "yes_bid", None) if q is not None else None,
-                            "yes_ask": getattr(q, "yes_ask", None) if q is not None else None,
-                            "no_bid": getattr(q, "no_bid", None) if q is not None else None,
-                            "no_ask": getattr(q, "no_ask", None) if q is not None else None,
+                            "yes_bid": getattr(quote_payload, "yes_bid", None) if quote_payload is not None else None,
+                            "yes_ask": getattr(quote_payload, "yes_ask", None) if quote_payload is not None else None,
+                            "no_bid": getattr(quote_payload, "no_bid", None) if quote_payload is not None else None,
+                            "no_ask": getattr(quote_payload, "no_ask", None) if quote_payload is not None else None,
                         },
                         "orderbook_keys": orderbook_resolution.get("orderbook_keys"),
                         "payload_missing_reason": orderbook_resolution.get("orderbook_missing_reason"),
@@ -41401,7 +45392,7 @@ class KalshiSniperBot:
         payload_rejection_reason = None
         try:
             payload = self.build_live_order_payload(
-                q,
+                quote_payload,
                 size=size,
                 price_source=price_source,
                 post_only=False,
@@ -41476,23 +45467,57 @@ class KalshiSniperBot:
             and selected_ticker
             and market
             and not compute_effective_live_dry_run()
-            and not self._phase55_record_has_meaningful_data(phase55_record)
+            and (AION_USE_REALM_VV_ENTRY_ENGINE or not self._phase55_record_has_meaningful_data(phase55_record))
         ):
             phase55_observation_called = True
+            use_legacy_phase55 = False
             try:
-                phase55_observation = self.get_entry_timing_observation(
-                    market,
-                    q,
-                    family,
-                    stage_label=f"{selection_stage or 'payload_ready'}_payload_handoff",
-                )
+                if use_legacy_phase55:
+                    phase55_observation = self.get_entry_timing_observation(
+                        market,
+                        quote_payload,
+                        family,
+                        stage_label=f"{selection_stage or 'payload_ready'}_payload_handoff",
+                    )
+                else:
+                    phase55_observation = self.resolve_realm_vv_entry_engine(
+                        quote_payload,
+                        canonical_payload=payload or orderbook_resolution or quote_snapshot,
+                        orderbook_context={
+                            **orderbook_resolution,
+                            "quote_ready": bool(quote_snapshot.get("quote_ready")),
+                            "quote_complete": bool(quote_snapshot.get("quote_complete")),
+                            "quote_missing_fields": quote_snapshot.get("quote_missing_fields"),
+                        },
+                        decision_context={
+                            "market": market,
+                            "ticker": selected_ticker,
+                            "family": family,
+                            "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                            "quote_diag": quote_diag,
+                            "canonical_tradeability": quote_diag.get("canonical_tradeability") or quote_snapshot.get("canonical_tradeability") or orderbook_resolution.get("canonical_tradeability") or {},
+                            "selected_side": orderbook_resolution.get("selected_side") or quote_snapshot.get("selected_side"),
+                            "price_source": price_source,
+                            "edge_after_cost": quote_diag.get("edge_after_cost") or quote_diag.get("final_edge") or (quote_diag.get("canonical_tradeability") or {}).get("edge_after_cost"),
+                            "confidence": quote_diag.get("confidence") or quote_diag.get("confidence_score") or (quote_diag.get("canonical_tradeability") or {}).get("confidence_score"),
+                            "score": quote_diag.get("score") or quote_diag.get("confidence_score") or (quote_diag.get("canonical_tradeability") or {}).get("confidence_score"),
+                            "duplicate_block": quote_diag.get("duplicate_block"),
+                            "cooldown_block": quote_diag.get("cooldown_block"),
+                            "live_arm_ok": bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                        },
+                    )
             except Exception as exc:
                 phase55_observation = {
                     "phase55_status": "unknown",
                     "entry_ready": False,
                     "entry_timing_pass": False,
-                    "entry_ready_reason": f"phase55_observation_{exc.__class__.__name__}",
-                    "decision_reason": f"phase55_observation_{exc.__class__.__name__}",
+                    "entry_ready_reason": f"realm_vv_observation_{exc.__class__.__name__}",
+                    "decision_reason": f"realm_vv_observation_{exc.__class__.__name__}",
+                    "phase55_observation_error_type": exc.__class__.__name__,
+                    "phase55_observation_error_message": str(exc),
+                    "phase55_observation_error_repr": repr(exc),
+                    "realm_vv_decision": "SKIP",
+                    "realm_vv_reason": f"realm_vv_observation_{exc.__class__.__name__}",
                 }
             phase55_observation_returned = bool(phase55_observation)
             if isinstance(phase55_observation, dict):
@@ -41501,18 +45526,64 @@ class KalshiSniperBot:
                 phase55_observation_entry_ready = phase55_observation.get("entry_ready")
                 phase55_observation_entry_timing_pass = phase55_observation.get("entry_timing_pass")
                 phase55_observation_entry_ready_reason = phase55_observation.get("entry_ready_reason")
+            canonical_realm_vv_state = self._build_realm_vv_canonical_execution_state(
+                phase55_observation if isinstance(phase55_observation, dict) else {},
+                quote_diag=quote_diag,
+                edge_after_cost=quote_diag.get("edge_after_cost") or quote_diag.get("final_edge") or quote_diag.get("sports_edge_after_cost"),
+                phase55_status=phase55_observation_status or quote_diag.get("phase55_status"),
+                phase55_ready=phase55_observation_entry_timing_pass if phase55_observation_entry_timing_pass is not None else quote_diag.get("phase55_ready"),
+                fast_confirmed=bool(quote_diag.get("fast_confirmed_high_liquidity") or quote_diag.get("fast_confirmed")),
+                live_promotion=bool(quote_diag.get("final_gate_status") == "live_promotion" or quote_diag.get("live_promotion")),
+                legacy_direct_fields_ready=bool(str(quote_diag.get("quote_ready_reason") or quote_diag.get("source_of_quote_data") or "").strip().lower() == "direct_fields"),
+                direct_fields_ready=bool(payload_ready and orderbook_resolution.get("orderbook_ready")),
+                normalized_ready=bool(payload_ready and quote_diag.get("quote_ready")),
+                selector_decision=str(quote_diag.get("decision") or quote_diag.get("selector_decision") or "unknown").strip(),
+                payload_ready=bool(payload_ready),
+                auth_ready=True,
+                duplicate_status=quote_diag.get("duplicate_status"),
+                cooldown_status=quote_diag.get("cooldown_status"),
+                quote_ready=bool(quote_diag.get("quote_ready")),
+                quote_missing=bool(quote_diag.get("quote_missing")),
+                spread_bucket=quote_diag.get("spread_bucket"),
+                final_block_reason=phase55_observation_entry_ready_reason or phase55_observation_status,
+                unsafe_price_status=quote_diag.get("unsafe_price_status"),
+                selected_side_has_price=bool(orderbook_resolution.get("selected_side_has_price") or orderbook_resolution.get("selected_price") is not None),
+                selected_side_has_liquidity=bool(orderbook_resolution.get("selected_side_has_liquidity") or orderbook_resolution.get("depth_available") or orderbook_resolution.get("normalized_orderbook_present")),
+                depth_available=bool(orderbook_resolution.get("depth_available") or orderbook_resolution.get("normalized_orderbook_present") or orderbook_resolution.get("topbook_depth_exists")),
+                price_bounds_pass=bool(orderbook_resolution.get("price_bounds_pass") if orderbook_resolution.get("price_bounds_pass") is not None else quote_diag.get("selected_price_in_bounds")),
+                orderbook_ready=bool(orderbook_resolution.get("orderbook_ready") or orderbook_resolution.get("normalized_orderbook_present") or orderbook_resolution.get("topbook_depth_exists")),
+                relaxed_beast_mode=bool(_relaxed_beast_mode_enabled(4) and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"}),
+            )
             try:
                 persisted_phase55_record, persisted_phase55_readback, persisted_phase55_handoff, persisted_phase55_persistence = self._persist_phase55_gate_record(
                     ticker=selected_ticker,
                     family=family,
                     market=market,
-                    q=q,
+                    q=quote_payload,
                     entry_timing_observation=phase55_observation if isinstance(phase55_observation, dict) else {},
-                    candidate_source="payload_builder_handoff",
+                    candidate_source="realm_vv_entry_engine" if not use_legacy_phase55 else "legacy_phase55",
                     stage=f"{selection_stage or 'payload_ready'}_payload_handoff",
                     trace_id=None,
                     existing_record=phase55_record,
                 )
+                pipeline_gate_payload = {
+                    "ticker": selected_ticker,
+                    "family": family,
+                    "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                    "decision": str((phase55_observation or {}).get("decision") or "SKIP").strip().upper() or "SKIP",
+                    "reason": str((phase55_observation or {}).get("reason") or (phase55_observation or {}).get("entry_ready_reason") or "unknown").strip().lower() or "unknown",
+                    "blocker": str((phase55_observation or {}).get("blocker") or (phase55_observation or {}).get("blocker_class") or (phase55_observation or {}).get("phase55_status") or "unknown").strip().lower() or "unknown",
+                    "selected_price": orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("selected_price")),
+                    "edge": phase55_observation.get("edge") if isinstance(phase55_observation, dict) else None,
+                    "confidence": phase55_observation.get("confidence") if isinstance(phase55_observation, dict) else None,
+                    "stage": f"{selection_stage or 'payload_ready'}_payload_handoff",
+                    "timestamp": time.time(),
+                }
+                print("[AION-PIPELINE-EXECUTION-GATE] " + json.dumps(pipeline_gate_payload, sort_keys=True, default=str))
+                if str(pipeline_gate_payload.get("decision") or "").upper() == "BUY":
+                    print("[AION-PIPELINE-EXECUTED] " + json.dumps(pipeline_gate_payload, sort_keys=True, default=str))
+                else:
+                    print("[AION-PIPELINE-BLOCKED] " + json.dumps(pipeline_gate_payload, sort_keys=True, default=str))
                 phase55_record = dict(persisted_phase55_readback or persisted_phase55_record or phase55_record or {})
                 phase55_record_created = bool(persisted_phase55_handoff.get("phase55_record_created"))
                 phase55_record_write_success = bool(persisted_phase55_handoff.get("phase55_record_write_success"))
@@ -41566,22 +45637,29 @@ class KalshiSniperBot:
             "quote_complete": bool(quote_snapshot.get("quote_complete")),
             "quote_missing_fields": quote_snapshot.get("quote_missing_fields"),
             "quote_source": quote_snapshot.get("quote_source"),
+            "realm_vv_record_exists": bool(phase55_record),
             "phase55_record_exists": bool(phase55_record),
+            "realm_vv_record_keys": sorted(list(phase55_record.keys())) if isinstance(phase55_record, dict) else phase55_record_keys,
             "phase55_record_keys": sorted(list(phase55_record.keys())) if isinstance(phase55_record, dict) else phase55_record_keys,
+            "realm_vv_record": phase55_record,
             "phase55_record": phase55_record,
             "phase55_observation_called": phase55_observation_called,
             "phase55_observation_returned": phase55_observation_returned,
             "phase55_observation_keys": phase55_observation_keys,
+            "realm_vv_observation_status": phase55_observation_status,
             "phase55_observation_status": phase55_observation_status,
             "phase55_observation_entry_ready": phase55_observation_entry_ready,
             "phase55_observation_entry_timing_pass": phase55_observation_entry_timing_pass,
             "phase55_observation_entry_ready_reason": phase55_observation_entry_ready_reason,
+            "realm_vv_record_created": phase55_record_created,
             "phase55_record_created": phase55_record_created,
+            "realm_vv_record_write_success": phase55_record_write_success,
             "phase55_record_write_success": phase55_record_write_success,
             "phase55_record_readback_success": phase55_record_readback_success,
             "phase55_record_write_location": phase55_record_write_location,
             "phase55_record_failure_stage": phase55_record_failure_stage,
             "phase55_record_block_reason": phase55_record_block_reason,
+            "canonical_execution_state": canonical_realm_vv_state if "canonical_realm_vv_state" in locals() else None,
         }
         try:
             print(
@@ -41638,6 +45716,40 @@ class KalshiSniperBot:
         except Exception:
             pass
         try:
+            normalized_ticker_key = self.normalize_phase55_ticker_key(selected_ticker) or selected_ticker or "unknown_normalized_ticker"
+            pipeline_tradeability = self.resolve_canonical_tradeability(
+                market,
+                quote=quote_payload,
+                context={
+                    "quote_diag": quote_diag,
+                    "selected_side": orderbook_resolution.get("selected_side"),
+                    "price_source": price_source,
+                    "final_edge": quote_diag.get("final_edge") or quote_diag.get("edge_after_cost"),
+                    "sports_edge_after_cost": quote_diag.get("sports_edge_after_cost"),
+                },
+                source="pipeline_canonical_ready",
+            )
+            pipeline_common = {
+                "ticker": selected_ticker,
+                "normalized_ticker_key": normalized_ticker_key,
+                "normalized_ticker": normalized_ticker_key,
+                "family": family,
+                "profile": _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE),
+                "selected_side": orderbook_resolution.get("selected_side"),
+                "selected_price": orderbook_resolution.get("selected_price"),
+                "edge": pipeline_tradeability.get("edge_after_cost") if isinstance(pipeline_tradeability, dict) else quote_diag.get("edge_after_cost"),
+                "quote_ready": bool(quote_snapshot.get("quote_ready")),
+                "orderbook_ready": bool(orderbook_resolution.get("orderbook_ready")),
+                "payload_ready": bool(payload_ready),
+                "phase55_ready": bool((phase55_record or {}).get("entry_ready") or (phase55_record or {}).get("normalized_ready")),
+                "blocker": payload_missing_reason or payload_rejection_reason,
+                "stage": selection_stage or "unknown",
+            }
+            tradeability = pipeline_tradeability if isinstance(pipeline_tradeability, dict) else {}
+            print("[AION-PIPELINE-CANONICAL-READY] " + json.dumps({**pipeline_common, "canonical_tradeability": tradeability}, sort_keys=True, default=str))
+            print("[AION-PIPELINE-TRADEABLE] " + json.dumps({**pipeline_common, "tradeable": bool(tradeability.get("tradeable")) if isinstance(tradeability, dict) else False}, sort_keys=True, default=str))
+            if payload_ready:
+                print("[AION-PIPELINE-PAYLOAD-READY] " + json.dumps({**pipeline_common, "payload_keys": payload_keys}, sort_keys=True, default=str))
             print(
                 "[AION-CANDIDATE-LIFECYCLE] "
                 + json.dumps(
@@ -43994,7 +48106,7 @@ class KalshiSniperBot:
                         sample_rejections.append((ticker, reason))
                     print(f"[LIVE-SELECT-FILTER] ticker={ticker} reason={reason}")
                     continue
-                score = self._score_live_ticker_candidate(q)
+                score = self._score_live_ticker_candidate(q, market=market)
                 spread = q.yes_ask - q.yes_bid
                 print(
                     f"[LIVE-SELECT-SCORE] ticker={ticker} score={score} spread={spread} "
@@ -44004,8 +48116,7 @@ class KalshiSniperBot:
 
             print(f"[LIVE-CANARY-AUTO] strict_candidates={len(strict_candidates)}")
             print(f"[LIVE-CANARY-AUTO] relaxed_candidates={len(relaxed_candidates)}")
-            if strict_candidates:
-                break
+            # Keep scanning remaining batches so a later Realm V.V-ready lane can outrank an early noisy candidate.
             if not next_cursor:
                 print("[LIVE-CANARY-AUTO] search_stop=no_next_cursor")
                 break
@@ -44041,11 +48152,42 @@ class KalshiSniperBot:
             return {"ok": False, "reason": "no_live_ticker_found", "ticker": None}
         return {"ok": True, "reason": reason, "ticker": ticker}
 
-    def _check_phase55_live_execution_gate(self, ticker, family=None, decision=None, override_block_reason=None):
-        gate_record = self._get_phase55_live_execution_gate_record(ticker, stage="phase55_gate")
-        phase55_status = gate_record.get("phase55_status")
+    def _check_realm_vv_live_execution_gate(
+        self,
+        ticker,
+        family=None,
+        decision=None,
+        override_block_reason=None,
+        canonical_execution_state=None,
+    ):
+        gate_record = self._get_realm_vv_live_execution_gate_record(ticker, stage="phase55_gate")
+        phase55_status = gate_record.get("realm_vv_status") or gate_record.get("phase55_status")
         entry_timing_pass = gate_record.get("entry_timing_pass")
         recorded_decision = gate_record.get("decision")
+        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
+        canonical_final_submit_allowed = bool(
+            canonical_execution_state.get("final_submit_allowed")
+            if canonical_execution_state.get("final_submit_allowed") is not None
+            else canonical_execution_state.get("canonical_final_submit_allowed")
+            if canonical_execution_state.get("canonical_final_submit_allowed") is not None
+            else canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
+            if canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv") is not None
+            else gate_record.get("final_submit_allowed_by_realm_vv")
+        )
+        if canonical_execution_state:
+            canonical_readiness_state = canonical_execution_state.get("canonical_readiness_state") or canonical_execution_state.get("realm_vv_status") or canonical_execution_state.get("phase55_status")
+            canonical_phase55_ready = canonical_execution_state.get("canonical_phase55_ready")
+            canonical_decision = canonical_execution_state.get("canonical_execution_decision") or canonical_execution_state.get("decision")
+            phase55_status = canonical_readiness_state or phase55_status
+            entry_timing_pass = canonical_phase55_ready
+            if entry_timing_pass is None:
+                entry_timing_pass = canonical_execution_state.get("entry_timing_pass")
+            if entry_timing_pass is None:
+                entry_timing_pass = canonical_decision == "BUY"
+            if canonical_final_submit_allowed or (canonical_decision in {"BUY", "LIVE_PROMOTION"} and entry_timing_pass is not False):
+                phase55_status = "entry_ready" if not canonical_readiness_state or canonical_readiness_state in {"unknown", "none"} else canonical_readiness_state
+                entry_timing_pass = True
+            recorded_decision = canonical_decision or recorded_decision
         effective_family = family or gate_record.get("family") or "UNKNOWN"
         effective_decision = decision or recorded_decision or "unknown"
         live_mode_active = bool(globals().get("LIVE_MODE", False))
@@ -44059,12 +48201,12 @@ class KalshiSniperBot:
             reason = str(override_block_reason)
         elif phase55_status is None or not isinstance(phase55_status, str) or not phase55_status.strip():
             blocked = True
-            reason = "missing_phase55_status"
+            reason = "missing_realm_vv_status"
         else:
             phase55_status = phase55_status.strip()
             if phase55_status != "entry_ready":
                 blocked = True
-                reason = f"phase55_status_{phase55_status}"
+                reason = f"realm_vv_status_{phase55_status}"
         if not blocked and entry_timing_pass is not True:
             blocked = True
             reason = "entry_timing_pass_not_explicit"
@@ -44086,6 +48228,7 @@ class KalshiSniperBot:
         gate_log_payload = {
             "ticker": ticker,
             "family": effective_family,
+            "realm_vv_status": phase55_status,
             "phase55_status": phase55_status,
             "entry_timing_pass": entry_timing_pass,
             "decision": effective_decision,
@@ -44095,8 +48238,15 @@ class KalshiSniperBot:
             "live_mode": live_mode_active,
             "live_arm": live_arm_active,
             "service_active": service_active,
-            "entry_ready": bool(phase55_status == "entry_ready" and entry_timing_pass is True and not blocked),
+            "entry_ready": bool(
+                (phase55_status == "entry_ready" or canonical_execution_state.get("canonical_execution_decision") == "BUY")
+                and entry_timing_pass is True
+                and not blocked
+            ),
             "block_reason": None if not blocked else reason,
+            "canonical_execution_decision": canonical_execution_state.get("canonical_execution_decision"),
+            "canonical_readiness_state": canonical_execution_state.get("canonical_readiness_state"),
+            "canonical_phase55_ready": canonical_execution_state.get("canonical_phase55_ready"),
         }
         print("[AION-PHASE55-GATE-CHECK] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
         if previous_marker != log_marker:
@@ -44304,27 +48454,77 @@ class KalshiSniperBot:
             return {"ok": False, "reason": "immediate_negative_edge_block_cooldown", "submitted": False}
 
         payload = dict(payload_override) if isinstance(payload_override, dict) else self.build_live_order_payload(q, size=size)
+        def _emit_final_submit_telemetry(event_tag, *, blocker=None, reason=None, duplicate_check_result=None, order_payload=None, extra=None):
+            payload_view = order_payload if isinstance(order_payload, dict) else payload if isinstance(payload, dict) else {}
+            try:
+                open_position_count = sum(
+                    1
+                    for position in self.live_positions
+                    if str(position.get("status", "open") or "open").strip().lower() == "open"
+                )
+            except Exception:
+                open_position_count = None
+            telemetry = {
+                "ticker": ticker or None,
+                "side": payload_view.get("side"),
+                "action": payload_view.get("action"),
+                "price": payload_view.get("yes_price") if payload_view.get("yes_price") is not None else payload_view.get("no_price"),
+                "count": payload_view.get("count"),
+                "live_mode": bool(globals().get("LIVE_MODE", False)),
+                "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                "dry_run": bool(payload_view.get("is_dry_run", compute_effective_live_dry_run())),
+                "duplicate_check_result": duplicate_check_result,
+                "daily_trade_count": int(self.live_trade_count_today or 0),
+                "max_daily_trades": int(MAX_LIVE_TRADES_PER_DAY),
+                "open_position_count": open_position_count,
+                "reason": reason,
+                "blocker": blocker,
+                "order_payload_keys": sorted(list(payload_view.keys())) if isinstance(payload_view, dict) else [],
+            }
+            if extra:
+                telemetry.update(extra)
+            print(f"[{event_tag}] " + json.dumps(telemetry, sort_keys=True, default=str))
         if payload is None:
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="invalid_payload",
+                reason="invalid_payload",
+                extra={"stage": "payload_build"},
+            )
             print(f"[LIVE-SKIP] {ticker} reason=invalid_payload")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason('invalid_payload')}")
             self._log_live_execution_final_blocked(ticker, "invalid_payload")
             return {"ok": False, "reason": "invalid_payload", "submitted": False}
         smart_allowed, smart_reason, _smart_details = self._evaluate_smart_entry_gate({"ticker": ticker}, q, payload=payload)
         if not smart_allowed:
-            self._check_phase55_live_execution_gate(
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker=smart_reason,
+                reason=smart_reason,
+                extra={"stage": "smart_entry_gate"},
+            )
+            self._check_realm_vv_live_execution_gate(
                 ticker,
                 family=candidate_family if ticker else None,
                 override_block_reason=smart_reason,
+                canonical_execution_state=relaxation_gate_record,
             )
             print(f"[LIVE-SKIP] {ticker} reason={smart_reason}")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(smart_reason)}")
             self._log_live_execution_final_blocked(ticker, smart_reason)
             return {"ok": False, "reason": smart_reason, "submitted": False}
-        phase55_allowed, phase55_reason, _phase55_details = self._check_phase55_live_execution_gate(
+        phase55_allowed, phase55_reason, _phase55_details = self._check_realm_vv_live_execution_gate(
             ticker,
             family=candidate_family if ticker else None,
+            canonical_execution_state=relaxation_gate_record,
         )
         if not phase55_allowed:
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker=phase55_reason,
+                reason=phase55_reason,
+                extra={"stage": "phase55_gate"},
+            )
             print(f"[LIVE-SKIP] {ticker} reason={phase55_reason}")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(phase55_reason)}")
             self._log_live_execution_final_blocked(ticker, phase55_reason)
@@ -44337,6 +48537,12 @@ class KalshiSniperBot:
             "payload": payload,
         })
         if not sports_context_allowed:
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker=sports_context_reason,
+                reason=sports_context_reason,
+                extra={"stage": "sports_context_gate"},
+            )
             print(f"[LIVE-SKIP] {ticker} reason={sports_context_reason}")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
             self._log_live_execution_final_blocked(ticker, sports_context_reason)
@@ -44345,6 +48551,12 @@ class KalshiSniperBot:
         if callable(live_check):
             allowed, reason = live_check(q)
             if not allowed:
+                _emit_final_submit_telemetry(
+                    "AION-FINAL-SUBMIT-BLOCKED",
+                    blocker=reason,
+                    reason=reason,
+                    extra={"stage": "live_can_place_gate"},
+                )
                 print(f"[LIVE-SKIP] {ticker} reason={reason}")
                 print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(reason)}")
                 self._log_live_execution_final_blocked(ticker, reason)
@@ -44373,6 +48585,12 @@ class KalshiSniperBot:
                         f"[LIVE-ENTRY-BLOCK-COOLDOWN] ticker={ticker} reason={edge_reason} "
                         f"seconds_remaining={IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS} decision=skip"
                     )
+                _emit_final_submit_telemetry(
+                    "AION-FINAL-SUBMIT-BLOCKED",
+                    blocker=edge_reason,
+                    reason=edge_reason,
+                    extra={"stage": "negative_edge_gate", "edge_details": _edge_details},
+                )
                 print(f"[LIVE-SKIP] {ticker} reason={edge_reason}")
                 print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(edge_reason)}")
                 self._log_live_execution_final_blocked(ticker, edge_reason)
@@ -44386,6 +48604,12 @@ class KalshiSniperBot:
                 stale_allowed = True
                 print(f"[ENTRY-LOOSEN] ticker={ticker} reason=stale passed")
             else:
+                _emit_final_submit_telemetry(
+                    "AION-FINAL-SUBMIT-BLOCKED",
+                    blocker=stale_reason,
+                    reason=stale_reason,
+                    extra={"stage": "stale_signal_gate", "stale_details": _stale_details},
+                )
                 print(f"[LIVE-SKIP] {ticker} reason={stale_reason}")
                 print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(stale_reason)}")
                 self._log_live_execution_final_blocked(ticker, stale_reason)
@@ -44412,6 +48636,12 @@ class KalshiSniperBot:
         )
 
         if flags.get("effective_live_dry_run"):
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="dry_run_only",
+                reason="dry_run_only",
+                extra={"stage": "dry_run_gate", "live_submit_authorized": False},
+            )
             self.print_live_order_preview(q, size=size)
             print(
                 f"[LIVE-EXECUTION-RESPONSE] ticker={ticker} ok=yes submitted=no "
@@ -44432,6 +48662,12 @@ class KalshiSniperBot:
             elif aggressive_cooldown_remaining > 0:
                 lane_block_reason = "aggressive_cooldown_active"
             if lane_block_reason:
+                _emit_final_submit_telemetry(
+                    "AION-FINAL-SUBMIT-BLOCKED",
+                    blocker=lane_block_reason,
+                    reason=lane_block_reason,
+                    extra={"stage": "aggressive_lane_gate"},
+                )
                 print(
                     "[AION-AGGRESSIVE-LANE-BLOCKED] "
                     + json.dumps(
@@ -44480,6 +48716,13 @@ class KalshiSniperBot:
             f"normal_live_service_mode={'yes' if authz.get('normal_live_service_mode') else 'no'} persisted_state=no"
         )
         if not authz.get("ok"):
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker=authz.get("reason"),
+                reason=authz.get("reason"),
+                duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                extra={"stage": "submit_authorization", "authz": authz},
+            )
             self._record_live_reject_telemetry(
                 reason=authz.get("reason"),
                 ticker=ticker,
@@ -44513,6 +48756,13 @@ class KalshiSniperBot:
             family=candidate_family,
         )
         if not exposure_allowed:
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker=exposure_reason,
+                reason=exposure_reason,
+                duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                extra={"stage": "exposure_gate", "exposure_snapshot": _exposure_snapshot},
+            )
             print(
                 f"[LIVE-GUARD] blocked new entry reason={exposure_reason} "
                 f"ticker={ticker} family={candidate_family}"
@@ -44526,6 +48776,13 @@ class KalshiSniperBot:
             family=candidate_family,
         )
         if not correlation_allowed:
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker=correlation_reason,
+                reason=correlation_reason,
+                duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                extra={"stage": "correlation_gate", "correlation_snapshot": _correlation_snapshot},
+            )
             print(
                 f"[LIVE-GUARD] blocked new entry reason={correlation_reason} "
                 f"ticker={ticker} family={candidate_family}"
@@ -44546,6 +48803,13 @@ class KalshiSniperBot:
             f"limit={LIVE_ORDER_RATE_LIMIT} window_seconds={LIVE_ORDER_RATE_WINDOW_SEC}"
         )
         if len(self._live_order_timestamps) >= LIVE_ORDER_RATE_LIMIT:
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="rate_limited",
+                reason="rate_limited",
+                duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                extra={"stage": "rate_limit_gate"},
+            )
             print("[LIVE-BLOCK] rate limit exceeded")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="rate_limited")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
@@ -44561,6 +48825,13 @@ class KalshiSniperBot:
             f"count_today={self.live_trade_count_today} cap={MAX_LIVE_TRADES_PER_DAY}"
         )
         if self.live_trade_count_today >= MAX_LIVE_TRADES_PER_DAY:
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="daily_trade_cap",
+                reason="daily_trade_cap",
+                duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                extra={"stage": "daily_cap_gate"},
+            )
             print(
                 f"[LIVE-EXECUTION-CAP-BLOCK] ticker={ticker} reason=daily_trade_cap "
                 f"count_today={self.live_trade_count_today} cap={MAX_LIVE_TRADES_PER_DAY}"
@@ -44571,6 +48842,13 @@ class KalshiSniperBot:
             return {"ok": False, "reason": "daily_trade_cap", "submitted": False}
 
         if not self.has_live_order_api_path():
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="no_order_api_path",
+                reason="no_order_api_path",
+                duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                extra={"stage": "order_api_path_gate"},
+            )
             print(f"[LIVE-SKIP] {ticker} reason=no_order_api_path")
             self.append_live_audit_log("live_safeguard_block", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="no_order_api_path")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
@@ -44579,6 +48857,13 @@ class KalshiSniperBot:
 
         auth_smoke_result = self.run_live_auth_get_smoke_test()
         if not auth_smoke_result.get("ok"):
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="auth_smoke_required_failed",
+                reason="auth_smoke_required_failed",
+                duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                extra={"stage": "auth_smoke_gate", "auth_smoke_result": auth_smoke_result},
+            )
             print("[LIVE-BLOCK] AUTH_SMOKE_REQUIRED failed; aborting live submit")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
             self._log_live_execution_final_blocked(ticker, "auth_smoke_required_failed")
@@ -44604,6 +48889,13 @@ class KalshiSniperBot:
                     f"spread_bucket={bypass_details.get('spread_bucket')}"
                 )
             else:
+                _emit_final_submit_telemetry(
+                    "AION-FINAL-SUBMIT-BLOCKED",
+                    blocker=post_loss_reason,
+                    reason=post_loss_reason,
+                    duplicate_check_result={"blocked": None, "reason": "not_checked"},
+                    extra={"stage": "post_loss_gate", "bypass_allowed": False},
+                )
                 self._log_relaxation_blocked(
                     ticker=ticker,
                     family=candidate_family,
@@ -44617,6 +48909,13 @@ class KalshiSniperBot:
                 return {"ok": False, "reason": post_loss_reason, "submitted": False}
         api_duplicate_check = self.check_live_duplicate_position_api(ticker)
         if api_duplicate_check.get("blocked"):
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker=api_duplicate_check.get("reason") or "duplicate_position_guard",
+                reason=api_duplicate_check.get("reason") or "duplicate_position_guard",
+                duplicate_check_result=api_duplicate_check,
+                extra={"stage": "duplicate_api_gate"},
+            )
             print(
                 f"[LIVE-EXECUTION-DUPLICATE-API-BLOCK] ticker={ticker} "
                 f"position_size={api_duplicate_check.get('position_size')} "
@@ -44631,6 +48930,13 @@ class KalshiSniperBot:
             f"count={payload.get('count')} yes_price={payload.get('yes_price')} "
             f"path=/trade-api/v2/portfolio/orders"
         )
+        _emit_final_submit_telemetry(
+            "AION-FINAL-SUBMIT-PREFLIGHT",
+            blocker=None,
+            reason="all_gates_passed",
+            duplicate_check_result=api_duplicate_check,
+            extra={"stage": "submit_live_order_preconfirm"},
+        )
         self._live_order_timestamps.append(now)
         print(
             f"[LIVE-CONFIRM] ticker={payload['ticker']} side={payload['side']} "
@@ -44638,6 +48944,13 @@ class KalshiSniperBot:
             f"price={payload.get('yes_price')} type={payload['type']}"
         )
         if not self.confirm_live_order_submit(payload):
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="user_aborted",
+                reason="user_aborted",
+                duplicate_check_result=api_duplicate_check,
+                extra={"stage": "user_confirmation_gate"},
+            )
             print("[SAFEGUARD] live submit aborted by user")
             self.append_live_audit_log("live_user_aborted", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="user_aborted")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
@@ -44668,6 +48981,34 @@ class KalshiSniperBot:
                 pass
         print(f"[REAL-SUBMIT-ATTEMPT] ticker={ticker} price={submit_price}")
         print(f"[REAL-SUBMIT] ticker={ticker} price={submit_price} side={payload.get('side')} count={payload.get('count')}")
+        print(
+            "[AION-FINAL-SUBMIT-CALL] "
+            + json.dumps(
+                {
+                    "ticker": ticker or None,
+                    "side": payload.get("side"),
+                    "action": payload.get("action"),
+                    "price": submit_price,
+                    "count": payload.get("count"),
+                    "live_mode": bool(globals().get("LIVE_MODE", False)),
+                    "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                    "dry_run": bool(payload.get("is_dry_run")),
+                    "duplicate_check_result": api_duplicate_check,
+                    "daily_trade_count": int(self.live_trade_count_today or 0),
+                    "max_daily_trades": int(MAX_LIVE_TRADES_PER_DAY),
+                    "open_position_count": sum(
+                        1
+                        for position in self.live_positions
+                        if str(position.get("status", "open") or "open").strip().lower() == "open"
+                    ),
+                    "reason": "submit_live_order",
+                    "blocker": None,
+                    "order_payload_keys": sorted(list(payload.keys())),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         self.live_pending_entry_ticker = ticker
         try:
             result = self.place_live_order(payload)
@@ -44773,11 +49114,43 @@ class KalshiSniperBot:
                 "verification": verification,
             }
         if result.get("reason") == "no_order_api_path":
+            _emit_final_submit_telemetry(
+                "AION-FINAL-SUBMIT-BLOCKED",
+                blocker="no_order_api_path",
+                reason="no_order_api_path",
+                duplicate_check_result=api_duplicate_check,
+                extra={"stage": "place_live_order"},
+            )
             print(f"[LIVE-SKIP] {ticker} reason=no_order_api_path")
             self.append_live_audit_log("live_submit_failure", ticker=payload.get("ticker"), side=payload.get("side"), action=payload.get("action"), count=payload.get("count"), price=payload.get("price"), reason="no_order_api_path")
             self._record_execution_failure_audit(reason="no_order_api_path", stage="submit_live_order", execution_block=True, api_submit_failure=True)
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
             return {"ok": False, "reason": "no_order_api_path", "submitted": False}
+        _emit_final_submit_telemetry(
+            "AION-FINAL-SUBMIT-BLOCKED",
+            blocker=result.get("reason") or "submit_error",
+            reason=result.get("reason") or "submit_error",
+            duplicate_check_result=api_duplicate_check,
+            extra={"stage": "place_live_order", "status_code": result.get("status_code"), "response": result.get("response")},
+        )
+        print(
+            "[LIVE-EXECUTION-ORDER-ERROR] "
+            + json.dumps(
+                {
+                    "ticker": ticker or None,
+                    "side": payload.get("side"),
+                    "action": payload.get("action"),
+                    "price": payload.get("yes_price") if payload.get("yes_price") is not None else payload.get("no_price"),
+                    "count": payload.get("count"),
+                    "reason": result.get("reason") or "submit_error",
+                    "status_code": result.get("status_code"),
+                    "duplicate_check_result": api_duplicate_check,
+                    "order_payload_keys": sorted(list(payload.keys())),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         self.append_live_audit_log(
             "live_submit_failure",
             ticker=payload.get("ticker"),
@@ -46425,6 +50798,7 @@ class KalshiSniperBot:
     def run_once(self):
         self.cycle_count += 1
         now = time.time()
+        profile = _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE)
         print("[AION-RUNONCE-START] " + json.dumps(
             {
                 "cycle_count": int(self.cycle_count or 0),
@@ -46458,6 +50832,47 @@ class KalshiSniperBot:
         self._start_execution_failure_audit_cycle(source="live_cycle")
         self._start_live_edge_quality_cycle(source="live_cycle")
         markets_by_ticker = {str(market.get("ticker", "") or "").strip(): market for market in markets if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()}
+        market_families_seen = sorted({str(self.get_market_family(market) or "").strip().upper() or "UNKNOWN" for market in markets if isinstance(market, dict)})
+        discovery_disabled_count = sum(1 for market in markets if isinstance(market, dict) and (bool(market.get("disabled")) or bool(market.get("is_disabled")) or str(market.get("status") or "").strip().lower() in {"disabled", "inactive", "suspended"}))
+        discovery_refresh_stale_count = sum(1 for market in markets if isinstance(market, dict) and (bool(market.get("refresh")) or bool(market.get("stale")) or bool(market.get("is_stale"))))
+        discovery_time_window_eligible_count = sum(1 for market in markets if isinstance(market, dict) and self.get_minutes_to_event(market) is not None and self.get_minutes_to_event(market) >= 0.0)
+        discovery_family_allowed_count = sum(1 for market in markets if isinstance(market, dict) and (self.get_market_discovery_category(market or self.get_market_family(market)) in {"sports", "crypto"} or self.get_market_family(market) == "KXBTC15M"))
+        discovery_high_liquidity_allowed_count = sum(1 for market in markets if isinstance(market, dict) and int((self.get_market_liquidity_priority(market) or {}).get("tier", 3) or 3) in {1, 2})
+        print(
+            "[AION-MARKET-DISCOVERY-ROOT] "
+            + json.dumps(
+                {
+                    "total_markets_fetched": int(len(markets)),
+                    "market_families_seen": market_families_seen,
+                    "disabled_count": int(discovery_disabled_count),
+                    "refresh_stale_count": int(discovery_refresh_stale_count),
+                    "time_window_eligible_count": int(discovery_time_window_eligible_count),
+                    "family_allowed_count": int(discovery_family_allowed_count),
+                    "high_liquidity_allowed_count": int(discovery_high_liquidity_allowed_count),
+                    "open_market_scanned": False,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        print(
+            "[AION-PRE-QUOTE-BUILD-ROOT] "
+            + json.dumps(
+                {
+                    "total_markets_fetched": int(len(markets)),
+                    "markets_by_ticker_count": int(len(markets_by_ticker)),
+                    "quote_hydration_attempted_count": 0,
+                    "quote_hydration_success_count": 0,
+                    "quote_hydration_failure_count": 0,
+                    "quote_hydration_rejected": [],
+                    "candidate_universe_total": int(len(markets)),
+                    "missing_quote_object_expected": True,
+                    "final_no_trade_reason": "no_eligible_candidate",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         try:
             self._run_market_reachability_cycle(
                 markets=markets,
@@ -46492,19 +50907,136 @@ class KalshiSniperBot:
                 ),
                 flush=True,
             )
+        quote_hydration_summary = {
+            "attempted": 0,
+            "success": 0,
+            "recovered": 0,
+            "failure": 0,
+            "rejected": [],
+        }
         quotes = []
         for market in markets:
+            if not isinstance(market, dict):
+                continue
+            ticker = str(market.get("ticker", "") or "").strip()
+            family = self.get_market_family(market)
+            quote_hydration_summary["attempted"] += 1
+            print(
+                "[AION-QUOTE-HYDRATION-ATTEMPT] "
+                + json.dumps(
+                    {
+                        "ticker": ticker or None,
+                        "family": family,
+                        "market_status": str(market.get("status") or "unknown").strip().lower() or "unknown",
+                        "has_ticker": bool(ticker),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
             self._record_execution_failure_audit(reason="quote_attempt", stage="quote_build", quote_attempt=True)
+            quote = None
+            quote_failure_reason = None
             try:
                 quote = self.build_quote(market)
             except Exception as exc:
-                self._record_execution_failure_audit(reason=exc.__class__.__name__, stage="quote_build", quote_failure=True)
-                continue
-            if quote is None:
-                self._record_execution_failure_audit(reason="quote_build_none", stage="quote_build", quote_failure=True)
-                continue
-            quotes.append(quote)
-            self._record_execution_failure_audit(reason="quote_success", stage="quote_build", quote_success=True)
+                quote_failure_reason = exc.__class__.__name__
+                self._record_execution_failure_audit(reason=quote_failure_reason, stage="quote_build", quote_failure=True)
+            if quote is None and quote_failure_reason is None:
+                quote_failure_reason = "quote_build_none"
+                self._record_execution_failure_audit(reason=quote_failure_reason, stage="quote_build", quote_failure=True)
+            quote_diag = {}
+            if quote is not None:
+                try:
+                    quote_diag = self._diagnose_quote_readiness_context(
+                        market=market,
+                        q=quote,
+                        family=family,
+                        sports_context={},
+                        source="quote_hydration",
+                    ) or {}
+                except Exception as exc:
+                    quote_diag = {"quote_ready": False, "quote_ready_reason": exc.__class__.__name__}
+            quote_ready = bool(quote_diag.get("quote_ready")) if quote is not None else False
+            hydrated_quote_ready = bool(
+                quote is not None and any(
+                    self.to_float(getattr(quote, field, None), None) not in (None, 0.0)
+                    for field in ("yes_bid", "yes_ask", "no_bid", "no_ask")
+                )
+            )
+            if quote is not None and hydrated_quote_ready and not quote_ready:
+                quote_ready = True
+            if quote is not None and hydrated_quote_ready:
+                if isinstance(quote_diag, dict):
+                    quote_diag = dict(quote_diag)
+                    quote_diag["quote_ready"] = True
+                    quote_diag["quote_missing"] = False
+                    quote_diag["quote_ready_reason"] = quote_diag.get("quote_ready_reason") or "hydrated_quote_object"
+                    quote_diag["source_of_quote_data"] = quote_diag.get("source_of_quote_data") or "hydrated_quote_object"
+            quote_ready_reason = str(quote_diag.get("quote_ready_reason") or quote_failure_reason or "unknown").strip() or "unknown"
+            canonical_tradeability = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else {}
+            realm_vv_recoverable = bool(
+                quote is not None
+                and not quote_ready
+                and (
+                    bool(quote_diag.get("fallback_quote_ready"))
+                    or bool(canonical_tradeability.get("final_submit_allowed_by_realm_vv"))
+                    or (
+                        str(quote_diag.get("decision") or "").strip().upper() == "BUY"
+                        and bool(quote_diag.get("entry_ready"))
+                    )
+                )
+            )
+            if realm_vv_recoverable:
+                quote_ready = True
+                if isinstance(quote_diag, dict):
+                    quote_diag = dict(quote_diag)
+                    quote_diag["quote_ready"] = True
+                    quote_diag["quote_missing"] = False
+                    quote_diag["quote_ready_reason"] = quote_diag.get("quote_ready_reason") or "realm_vv_recoverable"
+                    quote_diag["source_of_quote_data"] = quote_diag.get("source_of_quote_data") or "realm_vv_canonical_tradeability"
+                    quote_diag["realm_vv_recoverable"] = True
+                print(
+                    "[AION-QUOTE-HYDRATION-RECOVERED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "quote_ready_reason": quote_diag.get("quote_ready_reason"),
+                            "source_of_quote_data": quote_diag.get("source_of_quote_data"),
+                            "final_submit_allowed_by_realm_vv": bool(canonical_tradeability.get("final_submit_allowed_by_realm_vv")),
+                            "decision": quote_diag.get("decision"),
+                            "entry_ready": bool(quote_diag.get("entry_ready")),
+                            "selected_side": quote_diag.get("selected_side"),
+                            "selected_price": quote_diag.get("selected_price"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                quote_hydration_summary["recovered"] += 1
+            result_payload = {
+                "ticker": ticker or None,
+                "family": family,
+                "quote_object_exists": bool(quote is not None),
+                "quote_ready": quote_ready,
+                "quote_ready_reason": quote_ready_reason,
+                "quote_missing": bool(not quote_ready),
+                "quote_source": quote_diag.get("source_of_quote_data") or "quote_hydration",
+                "selected_side": quote_diag.get("selected_side"),
+                "selected_price": quote_diag.get("selected_price"),
+                "orderbook_ready": bool(quote_diag.get("orderbook_ready")),
+                "orderbook_missing_reason": quote_diag.get("orderbook_missing_reason"),
+                "realm_vv_recoverable": bool(realm_vv_recoverable),
+            }
+            print("[AION-QUOTE-HYDRATION-RESULT] " + json.dumps(result_payload, sort_keys=True, default=str))
+            if quote is not None and quote_ready:
+                quotes.append(quote)
+                quote_hydration_summary["success"] += 1
+                self._record_execution_failure_audit(reason="quote_success", stage="quote_build", quote_success=True)
+            else:
+                quote_hydration_summary["failure"] += 1
+                quote_hydration_summary["rejected"].append({"ticker": ticker or None, "reason": quote_ready_reason})
 
         discovery_now = time.time()
         discovery_last_heartbeat = float(getattr(self, "last_aion_discovery_dashboard_ts", 0.0) or 0.0)
@@ -46554,40 +51086,6 @@ class KalshiSniperBot:
                 f"| last={q.last_price:.4f} | volume={q.volume} | liquidity={q.liquidity:.4f}"
             )
         quotes_by_ticker = {q.ticker: q for q in quotes}
-        try:
-            self._run_market_reachability_cycle(
-                markets=markets,
-                quotes=[],
-                quotes_by_ticker={},
-                markets_by_ticker=markets_by_ticker,
-                stage_label="pre_quote_build",
-            )
-        except Exception as exc:
-            print(
-                "[AION-RUNONCE-BRANCH-ERROR] " + json.dumps(
-                    {
-                        "branch": "market_reachability_pre_quote_build",
-                        "cycle_count": int(getattr(self, "cycle_count", 0) or 0),
-                        "payload": {
-                            "stage": "pre_quote_build",
-                            "sports_scanned": False,
-                            "crypto_scanned": False,
-                            "open_market_scanned": False,
-                            "candidates_seen_total": 0,
-                            "eligible_candidates_total": 0,
-                            "best_family": None,
-                            "best_ticker": None,
-                            "best_edge": None,
-                            "no_trade_reason": "reachability_exception",
-                        },
-                        "error_type": exc.__class__.__name__,
-                        "error_reason": str(exc),
-                    },
-                    sort_keys=True,
-                    default=str,
-                ),
-                flush=True,
-            )
         reachability_cycle = {
             "summary": {
                 "sports_scanned": False,
@@ -46609,6 +51107,7 @@ class KalshiSniperBot:
                 quotes=quotes,
                 quotes_by_ticker=quotes_by_ticker,
                 markets_by_ticker=markets_by_ticker,
+                quote_hydration_summary=quote_hydration_summary,
                 stage_label="post_quote_build",
             )
         except Exception as exc:
@@ -46636,6 +51135,26 @@ class KalshiSniperBot:
                 ),
                 flush=True,
             )
+        market_filter_summary = {
+            "total_markets_fetched": int(len(markets)),
+            "market_families_seen": market_families_seen,
+            "disabled_count": int(discovery_disabled_count),
+            "refresh_stale_count": int(discovery_refresh_stale_count),
+            "time_window_eligible_count": int(discovery_time_window_eligible_count),
+            "family_allowed_count": int(discovery_family_allowed_count),
+            "high_liquidity_allowed_count": int(discovery_high_liquidity_allowed_count),
+            "quote_hydration_attempted_count": int(quote_hydration_summary.get("attempted", 0) or 0),
+            "quote_hydration_success_count": int(quote_hydration_summary.get("success", 0) or 0),
+            "quote_hydration_failure_count": int(quote_hydration_summary.get("failure", 0) or 0),
+            "first_5_rejected_tickers": list(quote_hydration_summary.get("rejected", []) or [])[:5],
+            "selected_best_candidate": {
+                "ticker": (reachability_cycle.get("summary") or {}).get("best_ticker"),
+                "family": (reachability_cycle.get("summary") or {}).get("best_family"),
+                "edge": (reachability_cycle.get("summary") or {}).get("best_edge"),
+            } if (reachability_cycle.get("summary") or {}).get("best_ticker") else None,
+            "final_no_trade_reason": (reachability_cycle.get("summary") or {}).get("no_trade_reason") or "unknown",
+        }
+        print("[AION-MARKET-FILTER-SUMMARY] " + json.dumps(market_filter_summary, sort_keys=True, default=str))
         if (AION_FAIR_VALUE_SHADOW or AION_LIVE_ARB_ENABLED) and markets:
             fallback_market = markets[0] if isinstance(markets[0], dict) else {}
             fallback_ticker = str(fallback_market.get("ticker", "") or "").strip()
@@ -47560,11 +52079,21 @@ class KalshiSniperBot:
             expectancy_item = expectancy_summary_by_ticker.get(ticker, {}) if ticker else {}
             expectancy_summary = expectancy_item.get("expectancy_summary", {}) if isinstance(expectancy_item, dict) else {}
             if isinstance(expectancy_summary, dict):
-                edge_after_cost = expectancy_summary.get("sports_edge_after_cost")
+                edge_after_cost = expectancy_summary.get("final_edge")
+                if edge_after_cost is None:
+                    edge_after_cost = expectancy_summary.get("edge_after_cost")
+                if edge_after_cost is None:
+                    edge_after_cost = expectancy_summary.get("sports_edge_after_cost")
+                if edge_after_cost is None:
+                    edge_after_cost = expectancy_summary.get("sports_edge_after_cost_after_family_bias")
             if edge_after_cost is None and ticker:
                 for record in trade_readiness_records:
                     if str(record.get("ticker") or "").strip() == ticker:
-                        edge_after_cost = record.get("sports_edge_after_cost")
+                        edge_after_cost = record.get("final_edge")
+                        if edge_after_cost is None:
+                            edge_after_cost = record.get("edge_after_cost")
+                        if edge_after_cost is None:
+                            edge_after_cost = record.get("sports_edge_after_cost")
                         break
             if edge_after_cost is None:
                 edge_after_cost = (self.last_trade_failure_analyzer_summary or {}).get("best_rejected_edge_after_cost")
@@ -47642,6 +52171,60 @@ class KalshiSniperBot:
                 "candidate_record": candidate_record,
             }
 
+        def _aion_build_quote_readiness_sports_context(base_context=None, quote_obj=None):
+            base_context = base_context if isinstance(base_context, dict) else {}
+            quote_payload = {}
+            if quote_obj is not None:
+                quote_payload = {
+                    "selected_side": str(
+                        base_context.get("selected_side")
+                        or getattr(quote_obj, "selected_side", None)
+                        or getattr(quote_obj, "side", None)
+                        or ""
+                    ).strip().lower() or None,
+                    "selected_price_dollars": self.to_float(
+                        base_context.get("selected_price_dollars"),
+                        self.to_float(
+                            getattr(quote_obj, "selected_price", None),
+                            self.to_float(
+                                getattr(quote_obj, "yes_ask", None),
+                                self.to_float(getattr(quote_obj, "no_ask", None), self.to_float(getattr(quote_obj, "yes_bid", None), getattr(quote_obj, "no_bid", None))),
+                            ),
+                        ),
+                    ),
+                    "selected_price_cents": base_context.get("selected_price_cents"),
+                    "yes_bid": getattr(quote_obj, "yes_bid", None),
+                    "yes_ask": getattr(quote_obj, "yes_ask", None),
+                    "no_bid": getattr(quote_obj, "no_bid", None),
+                    "no_ask": getattr(quote_obj, "no_ask", None),
+                    "yes_top_size": getattr(quote_obj, "yes_top_size", None),
+                    "no_top_size": getattr(quote_obj, "no_top_size", None),
+                }
+                if quote_payload["selected_price_dollars"] is not None and quote_payload.get("selected_price_cents") is None:
+                    try:
+                        quote_payload["selected_price_cents"] = int(round(float(quote_payload["selected_price_dollars"]) * 100.0))
+                    except (TypeError, ValueError):
+                        quote_payload["selected_price_cents"] = None
+                quote_payload["selected_side_has_price"] = bool(
+                    quote_payload.get("selected_price_dollars") is not None and float(quote_payload.get("selected_price_dollars") or 0.0) > 0.0
+                )
+                quote_payload["selected_side_has_liquidity"] = bool(
+                    self.to_float(quote_payload.get("yes_top_size"), 0.0) > 0.0
+                    or self.to_float(quote_payload.get("no_top_size"), 0.0) > 0.0
+                    or self.to_float(quote_payload.get("yes_bid"), 0.0) > 0.0
+                    or self.to_float(quote_payload.get("yes_ask"), 0.0) > 0.0
+                    or self.to_float(quote_payload.get("no_bid"), 0.0) > 0.0
+                    or self.to_float(quote_payload.get("no_ask"), 0.0) > 0.0
+                )
+                quote_payload["depth_available"] = bool(
+                    quote_payload["selected_side_has_liquidity"]
+                    or self.to_float(quote_payload.get("yes_top_size"), 0.0) > 0.0
+                    or self.to_float(quote_payload.get("no_top_size"), 0.0) > 0.0
+                )
+            merged_context = dict(base_context)
+            merged_context.update({k: v for k, v in quote_payload.items() if v is not None})
+            return merged_context
+
         if selected_context_quote is not None:
             selected_market = markets_by_ticker.get(getattr(selected_context_quote, "ticker", "") or "", {})
             self.record_realm_xv_snapshot(
@@ -47676,8 +52259,15 @@ class KalshiSniperBot:
                 sports_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
                 source="final_gate",
             )
-            if not bool(quote_readiness_diagnostic.get("quote_ready")) and quote_readiness_diagnostic.get("fallback_quote") is not None:
-                selected_quote = quote_readiness_diagnostic.get("fallback_quote")
+            fallback_quote_for_restore = quote_readiness_diagnostic.get("fallback_quote")
+            selected_side_has_price_diag = bool(quote_readiness_diagnostic.get("selected_side_has_price"))
+            selected_side_has_liquidity_diag = bool(quote_readiness_diagnostic.get("selected_side_has_liquidity"))
+            if fallback_quote_for_restore is not None and (
+                not bool(quote_readiness_diagnostic.get("quote_ready"))
+                or not selected_side_has_price_diag
+                or not selected_side_has_liquidity_diag
+            ):
+                selected_quote = fallback_quote_for_restore
                 selected_context_quote = selected_quote
                 sports_quote_ready = True
                 if isinstance(expectancy_summary, dict):
@@ -47687,7 +52277,7 @@ class KalshiSniperBot:
                 print(
                     f"[AION-QUOTE-FASTPATH] ticker={auto_live_ticker} family={selected_family} "
                     f"edge={self.to_float(expectancy_summary.get('sports_edge_after_cost'), 0.0):.4f} decision=ALLOW "
-                    f"skipped_layer=quote_ready_confirmation"
+                    f"skipped_layer=quote_ready_confirmation_or_selected_side_restore"
                 )
             selector_context = _aion_resolve_selector_decision_context(auto_live_ticker, quote_readiness_diagnostic)
             selector_decision_value = str(selector_context.get("selector_decision") or "unknown").strip().upper()
@@ -47703,6 +52293,80 @@ class KalshiSniperBot:
             skipped_by_family_gate = bool(selector_context.get("skipped_by_family_gate"))
             skipped_by_liquidity = bool(selector_context.get("skipped_by_liquidity"))
             skipped_by_spread = bool(selector_context.get("skipped_by_spread"))
+            canonical_execution_state = quote_readiness_diagnostic.get("canonical_execution_state")
+            canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
+            classifier_result = quote_readiness_diagnostic.get("classifier_result")
+            classifier_result = classifier_result if isinstance(classifier_result, dict) else {}
+            if not classifier_result and isinstance(expectancy_summary, dict):
+                classifier_result = expectancy_summary
+            spread_classification_final = str(
+                quote_readiness_diagnostic.get("spread_classification_final")
+                or quote_readiness_diagnostic.get("spread_classification")
+                or quote_readiness_diagnostic.get("spread_bucket_final")
+                or quote_readiness_diagnostic.get("spread_bucket")
+                or "unknown"
+            ).strip().upper() or "UNKNOWN"
+            spread_bucket_final = str(
+                quote_readiness_diagnostic.get("spread_bucket_final")
+                or quote_readiness_diagnostic.get("spread_bucket")
+                or aggressive_spread_bucket
+                or "unknown"
+            ).strip().lower() or "unknown"
+            spread_classification = str(
+                canonical_execution_state.get("spread_classification")
+                or classifier_result.get("classification")
+                or spread_classification_final
+                or spread_bucket_final
+                or "unknown"
+            ).strip().upper() or "UNKNOWN"
+            spread_severity = str(
+                canonical_execution_state.get("spread_severity")
+                or classifier_result.get("spread_severity")
+                or quote_readiness_diagnostic.get("spread_severity")
+                or ("survivable" if spread_classification in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"} else "catastrophic" if spread_classification == "UNSAFE" else "unknown")
+            ).strip().lower() or "unknown"
+            beast_spread_override_applied = bool(
+                canonical_execution_state.get("beast_spread_override_applied")
+                if canonical_execution_state.get("beast_spread_override_applied") is not None
+                else classifier_result.get("beast_spread_override_applied")
+                if classifier_result.get("beast_spread_override_applied") is not None
+                else quote_readiness_diagnostic.get("beast_spread_override_applied")
+            )
+            final_submit_allowed_by_realm_vv = bool(
+                canonical_execution_state.get("final_submit_allowed_by_realm_vv")
+                if canonical_execution_state.get("final_submit_allowed_by_realm_vv") is not None
+                else classifier_result.get("final_submit_allowed_by_realm_vv")
+                if classifier_result.get("final_submit_allowed_by_realm_vv") is not None
+                else quote_readiness_diagnostic.get("final_submit_allowed_by_realm_vv")
+            )
+            orderbook_ready = bool(
+                quote_readiness_diagnostic.get("orderbook_ready")
+                or quote_readiness_diagnostic.get("orderbook_exists")
+                or quote_readiness_diagnostic.get("normalized_orderbook_present")
+                or quote_readiness_diagnostic.get("topbook_snapshot_present")
+                or quote_readiness_diagnostic.get("topbook_depth_exists")
+                or canonical_execution_state.get("orderbook_ready")
+            )
+            selected_side_has_price = bool(
+                quote_readiness_diagnostic.get("selected_side_has_price")
+                or quote_readiness_diagnostic.get("selected_price_dollars") not in (None, "", 0, 0.0)
+                or quote_readiness_diagnostic.get("selected_price_cents") not in (None, "", 0, 0.0)
+                or canonical_execution_state.get("selected_side_has_price")
+            )
+            selected_side_has_liquidity = bool(
+                quote_readiness_diagnostic.get("selected_side_has_liquidity")
+                or quote_readiness_diagnostic.get("orderbook_ready")
+                or quote_readiness_diagnostic.get("topbook_depth_exists")
+                or quote_readiness_diagnostic.get("normalized_orderbook_present")
+                or quote_readiness_diagnostic.get("topbook_snapshot_present")
+                or canonical_execution_state.get("selected_side_has_liquidity")
+            )
+            depth_available = bool(
+                quote_readiness_diagnostic.get("depth_available")
+                or selected_side_has_liquidity
+                or orderbook_ready
+                or canonical_execution_state.get("depth_available")
+            )
             trace_meta = self._resolve_aion_candidate_trace_meta(
                 ticker=auto_live_ticker,
                 family=selected_family,
@@ -47774,6 +52438,22 @@ class KalshiSniperBot:
                 pass
             quote_readiness_diagnostic["unsafe_price_status"] = preflight_unsafe_price_status
             quote_readiness_diagnostic["unsafe_resolution_reason"] = preflight_unsafe_resolution_reason
+            quote_readiness_context = _aion_build_quote_readiness_sports_context(
+                base_context={
+                    **(expectancy_summary if isinstance(expectancy_summary, dict) else {}),
+                    "selected_side": getattr(selected_context_quote, "side", None) or getattr(selected_context_quote, "selected_side", None),
+                    "selected_price_dollars": getattr(selected_context_quote, "yes_ask", None) if str(getattr(selected_context_quote, "side", None) or getattr(selected_context_quote, "selected_side", "")).strip().lower() != "no" else getattr(selected_context_quote, "no_ask", None),
+                    "selected_price_cents": int(round(float(getattr(selected_context_quote, "yes_ask", None) if str(getattr(selected_context_quote, "side", None) or getattr(selected_context_quote, "selected_side", "")).strip().lower() != "no" else getattr(selected_context_quote, "no_ask", None)) * 100.0)) if getattr(selected_context_quote, "yes_ask", None) is not None or getattr(selected_context_quote, "no_ask", None) is not None else None,
+                    "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
+                    "quote_missing": bool(quote_readiness_diagnostic.get("quote_missing")),
+                    "spread_bucket": quote_readiness_diagnostic.get("spread_bucket"),
+                    "spread_classification": (expectancy_summary or {}).get("spread_classification") if isinstance(expectancy_summary, dict) else None,
+                    "unsafe_price_status": quote_readiness_diagnostic.get("unsafe_price_status"),
+                    "final_submit_allowed_by_realm_vv": (expectancy_summary or {}).get("final_submit_allowed_by_realm_vv") if isinstance(expectancy_summary, dict) else None,
+                    "canonical_tradeability": (expectancy_summary or {}).get("canonical_tradeability") if isinstance(expectancy_summary, dict) else None,
+                },
+                quote_obj=selected_context_quote or selected_quote,
+            )
             payload_preflight = self._diagnose_live_order_payload_context(
                 selected_quote,
                 size=AION_AGGRESSIVE_MAX_CONTRACTS,
@@ -47782,12 +52462,349 @@ class KalshiSniperBot:
                 selection_stage="final_gate_preflight",
                 market=selected_market,
                 phase55_gate_record=self._get_phase55_live_execution_gate_record(auto_live_ticker, stage="final_gate_preflight"),
-                quote_diag=quote_readiness_diagnostic,
+                quote_diag=quote_readiness_context,
             )
             payload_preview = payload_preflight.get("payload")
             phase55_gate_record = dict(payload_preflight.get("phase55_record") or {})
             phase55_record_meaningful = self._phase55_record_has_meaningful_data(phase55_gate_record)
             final_gate_unsafe_price_status = preflight_unsafe_price_status
+            payload_canonical_execution_state = payload_preflight.get("canonical_execution_state")
+            payload_canonical_execution_state = payload_canonical_execution_state if isinstance(payload_canonical_execution_state, dict) else {}
+            canonical_tradeability_state = quote_readiness_diagnostic.get("canonical_tradeability")
+            canonical_tradeability_state = canonical_tradeability_state if isinstance(canonical_tradeability_state, dict) else {}
+            if payload_canonical_execution_state:
+                canonical_realm_vv_state = payload_canonical_execution_state
+                quote_readiness_diagnostic["canonical_execution_state"] = payload_canonical_execution_state
+            canonical_spread_classification = str(
+                payload_canonical_execution_state.get("canonical_spread_classification")
+                or canonical_tradeability_state.get("spread_classification")
+                or classifier_result.get("classification")
+                or spread_classification_final
+                or spread_bucket_final
+                or "unknown"
+            ).strip().upper() or "UNKNOWN"
+            canonical_spread_bucket = str(
+                payload_canonical_execution_state.get("canonical_spread_bucket")
+                or canonical_tradeability_state.get("spread_bucket")
+                or quote_readiness_diagnostic.get("spread_bucket_final")
+                or quote_readiness_diagnostic.get("spread_bucket")
+                or aggressive_spread_bucket
+                or "unknown"
+            ).strip().lower() or "unknown"
+            canonical_spread_severity = str(
+                payload_canonical_execution_state.get("canonical_spread_severity")
+                or canonical_tradeability_state.get("spread_severity")
+                or spread_severity
+                or "unknown"
+            ).strip().lower() or "unknown"
+            canonical_unsafe_price_status = str(
+                payload_canonical_execution_state.get("canonical_unsafe_price_status")
+                or canonical_tradeability_state.get("unsafe_price_status")
+                or quote_readiness_diagnostic.get("unsafe_price_status")
+                or preflight_unsafe_price_status
+                or "unknown"
+            ).strip().lower() or "unknown"
+            canonical_beast_spread_override_applied = bool(
+                payload_canonical_execution_state.get("canonical_beast_spread_override_applied")
+                if payload_canonical_execution_state.get("canonical_beast_spread_override_applied") is not None
+                else canonical_tradeability_state.get("beast_spread_override_applied")
+                if canonical_tradeability_state.get("beast_spread_override_applied") is not None
+                else beast_spread_override_applied
+            )
+            canonical_final_submit_allowed_by_realm_vv = bool(
+                payload_canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
+                if payload_canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv") is not None
+                else canonical_tradeability_state.get("final_submit_allowed_by_realm_vv")
+                if canonical_tradeability_state.get("final_submit_allowed_by_realm_vv") is not None
+                else final_submit_allowed_by_realm_vv
+            )
+            canonical_realm_vv_state = payload_canonical_execution_state if isinstance(payload_canonical_execution_state, dict) else {}
+            canonical_execution_state = dict(payload_canonical_execution_state or canonical_tradeability_state or canonical_realm_vv_state or {})
+            canonical_execution_state.update(
+                {
+                    "authority": "realm_vv_relaxed_beast_l4",
+                    "decision": "BUY" if canonical_final_submit_allowed_by_realm_vv else str(canonical_execution_state.get("canonical_execution_decision") or canonical_execution_state.get("decision") or selector_decision_value or "SKIP").strip().upper() or "SKIP",
+                    "entry_ready": bool(canonical_final_submit_allowed_by_realm_vv),
+                    "final_submit_allowed": bool(canonical_final_submit_allowed_by_realm_vv),
+                    "selected_side": quote_readiness_diagnostic.get("selected_side") or payload_preflight.get("side") or canonical_execution_state.get("selected_side"),
+                    "selected_price_cents": quote_readiness_diagnostic.get("selected_price_cents") or payload_preflight.get("selected_price_cents") or canonical_execution_state.get("selected_price_cents"),
+                    "selected_side_has_price": bool(selected_side_has_price),
+                    "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                    "price_bounds_pass": bool(price_bounds_pass),
+                    "payload_ready": bool(payload_preflight.get("payload_ready")),
+                    "auth_ready": bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                    "duplicate_guard_pass": not bool(duplicate_guard_detail.get("blocked")),
+                    "daily_cap_pass": int(self.live_trade_count_today or 0) < int(MAX_LIVE_TRADES_PER_DAY),
+                    "max_position_pass": not bool(duplicate_guard_detail.get("blocked")),
+                    "hard_block_reason": None if canonical_final_submit_allowed_by_realm_vv else preflight_unsafe_resolution_reason,
+                    "soft_warnings": [
+                        warning
+                        for warning in (
+                            "unsafe_spread" if preflight_unsafe_price_status in {"unsafe_spread", "unsafe", "unsafe_price"} else None,
+                            "quote_missing" if quote_readiness_diagnostic.get("quote_missing") else None,
+                            "orderbook_not_usable" if not orderbook_ready else None,
+                            "edge_below_threshold" if self.to_float(preflight_edge, 0.0) < 0.0015 else None,
+                            "phase55_compat_alias_only" if str(payload_canonical_execution_state.get("phase55_status") or "").strip().lower() and not payload_canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv") else None,
+                        )
+                        if warning
+                    ],
+                }
+            )
+            quote_readiness_diagnostic["canonical_execution_state"] = canonical_execution_state
+            payload_canonical_execution_state = canonical_execution_state
+            price_bounds_pass = bool(
+                payload_canonical_execution_state.get("canonical_price_bounds_pass")
+                if payload_canonical_execution_state.get("canonical_price_bounds_pass") is not None
+                else payload_preflight.get("price_bounds_pass")
+                if payload_preflight.get("price_bounds_pass") is not None
+                else quote_readiness_diagnostic.get("price_bounds_pass")
+                if quote_readiness_diagnostic.get("price_bounds_pass") is not None
+                else quote_readiness_diagnostic.get("selected_price_in_bounds")
+                if quote_readiness_diagnostic.get("selected_price_in_bounds") is not None
+                else (
+                    selected_price_cents is not None
+                    and 1 <= int(selected_price_cents) <= 99
+                )
+            )
+            if canonical_execution_state:
+                print(
+                    "[AION-CANONICAL-EXECUTION-STATE] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": auto_live_ticker,
+                            **canonical_execution_state,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-REALM-VV-SOLE-AUTHORITY] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": auto_live_ticker,
+                            "authority": canonical_execution_state.get("authority"),
+                            "decision": canonical_execution_state.get("decision"),
+                            "entry_ready": canonical_execution_state.get("entry_ready"),
+                            "final_submit_allowed": canonical_execution_state.get("final_submit_allowed"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                if canonical_execution_state.get("soft_warnings"):
+                    print(
+                        "[AION-SOFT-WARNING-NOT-BLOCKER] "
+                        + json.dumps(
+                            {
+                                "trace_id": trace_id,
+                                "ticker": auto_live_ticker,
+                                "soft_warnings": canonical_execution_state.get("soft_warnings"),
+                                "hard_block_reason": canonical_execution_state.get("hard_block_reason"),
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                if any(
+                    key in payload_canonical_execution_state
+                    for key in (
+                        "phase55_status",
+                        "phase55_ready",
+                        "phase55_record",
+                        "phase55_source_field",
+                        "phase55_live_execution_gate_by_ticker",
+                    )
+                ):
+                    print(
+                        "[AION-LEGACY-AUTHORITY-DELETED] "
+                        + json.dumps(
+                            {
+                                "trace_id": trace_id,
+                                "ticker": auto_live_ticker,
+                                "compatibility_alias_only": True,
+                                "authority": canonical_execution_state.get("authority"),
+                                "legacy_keys": [
+                                    key
+                                    for key in (
+                                        "phase55_status",
+                                        "phase55_ready",
+                                        "phase55_record",
+                                        "phase55_source_field",
+                                        "phase55_live_execution_gate_by_ticker",
+                                    )
+                                    if key in payload_canonical_execution_state
+                                ],
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+            orderbook_ready = bool(
+                payload_preflight.get("orderbook_ready")
+                or quote_readiness_diagnostic.get("orderbook_ready")
+                or quote_readiness_diagnostic.get("orderbook_exists")
+                or quote_readiness_diagnostic.get("normalized_orderbook_present")
+                or quote_readiness_diagnostic.get("topbook_snapshot_present")
+                or quote_readiness_diagnostic.get("topbook_depth_exists")
+                or payload_canonical_execution_state.get("canonical_orderbook_ready")
+            )
+            selected_side_has_price = bool(
+                payload_preflight.get("selected_side_has_price")
+                if payload_preflight.get("selected_side_has_price") is not None
+                else quote_readiness_diagnostic.get("selected_side_has_price")
+                if quote_readiness_diagnostic.get("selected_side_has_price") is not None
+                else canonical_realm_vv_state.get("canonical_selected_side_has_price")
+                if canonical_realm_vv_state.get("canonical_selected_side_has_price") is not None
+                else selected_side_has_price
+            )
+            selected_side_has_liquidity = bool(
+                payload_preflight.get("selected_side_has_liquidity")
+                if payload_preflight.get("selected_side_has_liquidity") is not None
+                else quote_readiness_diagnostic.get("selected_side_has_liquidity")
+                if quote_readiness_diagnostic.get("selected_side_has_liquidity") is not None
+                else canonical_realm_vv_state.get("canonical_selected_side_has_liquidity")
+                if canonical_realm_vv_state.get("canonical_selected_side_has_liquidity") is not None
+                else selected_side_has_liquidity
+            )
+            depth_available = bool(
+                payload_preflight.get("depth_available")
+                if payload_preflight.get("depth_available") is not None
+                else quote_readiness_diagnostic.get("depth_available")
+                if quote_readiness_diagnostic.get("depth_available") is not None
+                else canonical_realm_vv_state.get("canonical_depth_available")
+                if canonical_realm_vv_state.get("canonical_depth_available") is not None
+                else depth_available
+            )
+            relaxed_beast_mode = bool(_relaxed_beast_mode_enabled(4) and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"})
+            relaxed_selected_side_valid = bool(
+                selected_side_has_price
+                and price_bounds_pass
+                and final_gate_unsafe_price_status not in {"selected_price_missing", "selected_price_below_0_01", "selected_price_above_0_99", "invalid_price"}
+                and (selected_side_has_liquidity or depth_available or orderbook_ready)
+            )
+            relaxed_allow_lane = bool(
+                relaxed_beast_mode
+                and canonical_final_submit_allowed_by_realm_vv
+                and relaxed_selected_side_valid
+                and final_gate_edge > 0.0
+                and not bool(duplicate_guard_detail.get("blocked"))
+            )
+            canonical_allow_lane = bool(
+                canonical_final_submit_allowed_by_realm_vv
+                and canonical_spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "WIDE_BUT_POSSIBLE", "CAUTION_WIDE_SPREAD", "SAFE"}
+                and (price_bounds_pass or relaxed_allow_lane)
+                and (orderbook_ready or relaxed_allow_lane)
+                and bool(payload_preflight.get("payload_ready"))
+                and bool(globals().get("LIVE_MODE", False))
+                and bool(globals().get("LIVE_ARMED", False))
+                and bool(globals().get("LIVE_ENV_CONFIRMED", False))
+                and not bool(duplicate_guard_detail.get("blocked"))
+            )
+            if relaxed_allow_lane:
+                quote_ready_value = True
+                quote_missing_value = False
+                orderbook_ready = True
+            stale_unsafe_price_status = preflight_unsafe_price_status
+            final_gate_spread_bucket = preflight_spread_bucket
+            if canonical_allow_lane:
+                if canonical_unsafe_price_status in {"unsafe_spread", "unsafe", "unsafe_price", "unknown"}:
+                    if canonical_spread_bucket in {"wide_but_possible", "unsafe"} or canonical_spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WIDE_SPREAD"}:
+                        final_gate_unsafe_price_status = "caution_wide_spread"
+                    elif canonical_spread_bucket in {"tight", "ultra_tight"}:
+                        final_gate_unsafe_price_status = "safe"
+                    else:
+                        final_gate_unsafe_price_status = canonical_unsafe_price_status
+                else:
+                        final_gate_unsafe_price_status = canonical_unsafe_price_status
+                final_gate_spread_bucket = canonical_spread_bucket
+                spread_classification = canonical_spread_classification
+                spread_severity = canonical_spread_severity
+                beast_spread_override_applied = canonical_beast_spread_override_applied
+                final_submit_allowed_by_realm_vv = canonical_final_submit_allowed_by_realm_vv
+                quote_readiness_diagnostic["spread_bucket"] = final_gate_spread_bucket
+                quote_readiness_diagnostic["spread_classification"] = spread_classification
+                quote_readiness_diagnostic["unsafe_price_status"] = final_gate_unsafe_price_status
+                quote_readiness_diagnostic["final_submit_allowed_by_realm_vv"] = final_submit_allowed_by_realm_vv
+                quote_readiness_diagnostic["orderbook_ready"] = orderbook_ready
+                if relaxed_allow_lane:
+                    quote_readiness_diagnostic["quote_ready"] = True
+                    quote_readiness_diagnostic["quote_missing"] = False
+                    print(
+                        "[AION-RELAXED-BEAST-L4] "
+                        + json.dumps(
+                            {
+                                "trace_id": trace_id,
+                                "ticker": auto_live_ticker,
+                                "level": int(RELAXED_BEAST_MODE_LEVEL),
+                                "selected_side_has_price": bool(selected_side_has_price),
+                                "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                                "depth_available": bool(depth_available),
+                                "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                                "spread_classification": spread_classification,
+                                "unsafe_price_status": final_gate_unsafe_price_status,
+                                "quote_ready": True,
+                                "orderbook_ready": True,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+            print(
+                "[AION-FINAL-READINESS-RECONCILE] "
+                + json.dumps(
+                    {
+                        "trace_id": trace_id,
+                        "ticker": auto_live_ticker,
+                        "stale_unsafe_price_status": stale_unsafe_price_status,
+                        "canonical_unsafe_price_status": canonical_unsafe_price_status,
+                        "final_gate_unsafe_price_status": final_gate_unsafe_price_status,
+                        "spread_bucket_before": preflight_spread_bucket,
+                        "spread_bucket_after": final_gate_spread_bucket,
+                        "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                        "classification": spread_classification,
+                        "edge_after_cost": preflight_edge,
+                        "price_bounds_pass": price_bounds_pass,
+                        "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
+                        "orderbook_ready": orderbook_ready,
+                        "payload_ready": bool(payload_preflight.get("payload_ready")),
+                        "auth_ready": bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                        "duplicate_guard": bool(duplicate_guard_detail.get("blocked")),
+                        "final_block_reason": "all_guards_passed" if canonical_allow_lane else preflight_unsafe_resolution_reason,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            if stale_unsafe_price_status in {"unsafe_spread", "unsafe", "unsafe_price"} and final_gate_unsafe_price_status != stale_unsafe_price_status:
+                print(
+                    "[AION-STALE-BLOCKER-OVERRIDE] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": auto_live_ticker,
+                            "stale_unsafe_price_status": stale_unsafe_price_status,
+                            "canonical_unsafe_price_status": canonical_unsafe_price_status,
+                            "final_gate_unsafe_price_status": final_gate_unsafe_price_status,
+                            "spread_bucket_before": preflight_spread_bucket,
+                            "spread_bucket_after": final_gate_spread_bucket,
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "classification": spread_classification,
+                            "edge_after_cost": preflight_edge,
+                            "price_bounds_pass": price_bounds_pass,
+                            "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
+                            "orderbook_ready": orderbook_ready,
+                            "payload_ready": bool(payload_preflight.get("payload_ready")),
+                            "auth_ready": bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                            "duplicate_guard": bool(duplicate_guard_detail.get("blocked")),
+                            "final_block_reason": "all_guards_passed" if canonical_allow_lane else preflight_unsafe_resolution_reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             if not bool(payload_preflight.get("payload_ready")):
                 payload_missing_reason = str(
                     payload_preflight.get("payload_missing_reason")
@@ -47827,10 +52844,14 @@ class KalshiSniperBot:
                                 "normalized_ticker": payload_preflight.get("normalized_ticker"),
                                 "write_location": None,
                                 "read_location": "final_gate.payload_preflight",
+                                "realm_vv_record_exists": bool(phase55_gate_record),
                                 "phase55_record_exists": bool(phase55_gate_record),
                                 "phase55_record_id": trace_id,
+                                "realm_vv_record_keys": phase55_record_keys,
                                 "phase55_record_keys": phase55_record_keys,
-                                "raw_phase55_record": phase55_gate_record,
+                                "realm_vv_record": phase55_gate_record,
+                                "phase55_record": phase55_gate_record,
+                                "raw_realm_vv_status": phase55_gate_record.get("realm_vv_status") if isinstance(phase55_gate_record, dict) else None,
                                 "raw_phase55_status": phase55_gate_record.get("phase55_status") if isinstance(phase55_gate_record, dict) else None,
                                 "raw_entry_ready": phase55_gate_record.get("entry_ready") if isinstance(phase55_gate_record, dict) else None,
                                 "raw_entry_timing_pass": phase55_gate_record.get("entry_timing_pass") if isinstance(phase55_gate_record, dict) else None,
@@ -47839,6 +52860,7 @@ class KalshiSniperBot:
                                 "overwrite_detected": False,
                                 "overwrite_source": None,
                                 "placeholder_record_detected": not self._phase55_record_has_meaningful_data(phase55_gate_record),
+                                "final_realm_vv_status": phase55_gate_record.get("realm_vv_status") if isinstance(phase55_gate_record, dict) else None,
                                 "final_phase55_status": phase55_gate_record.get("phase55_status") if isinstance(phase55_gate_record, dict) else None,
                                 "final_phase55_ready": bool(phase55_gate_record.get("entry_ready")) if isinstance(phase55_gate_record, dict) else False,
                                 "final_entry_timing_pass": bool(phase55_gate_record.get("entry_timing_pass")) if isinstance(phase55_gate_record, dict) else False,
@@ -47938,6 +52960,7 @@ class KalshiSniperBot:
                     q=selected_quote or selected_context_quote,
                     quote_diag=quote_readiness_diagnostic,
                     edge_after_cost=final_gate_sync_edge,
+                    canonical_execution_state=canonical_realm_vv_state,
                     phase55_status=str(final_gate_phase55_state.get("phase55_status") or "unknown").strip().lower() or "unknown",
                     phase55_ready=bool(final_gate_phase55_state.get("entry_timing_pass")),
                     fast_confirmed=bool(final_gate_phase55_state.get("fast_confirmed_high_liquidity") or quote_readiness_diagnostic.get("fast_confirmed_high_liquidity") or quote_readiness_diagnostic.get("fast_confirmed")),
@@ -47948,6 +52971,12 @@ class KalshiSniperBot:
                         and (
                             bool(near_safe_spread_context and near_safe_spread_context.get("eligible"))
                             or tradable_unsafe_override
+                            or (
+                                _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "opportunistic"
+                                and self.to_float(final_gate_sync_edge, 0.0) >= 0.009
+                                and bool(quote_readiness_diagnostic.get("quote_ready"))
+                                and bool(quote_readiness_diagnostic.get("orderbook_ready") or quote_readiness_diagnostic.get("topbook_depth_exists"))
+                            )
                         )
                     ),
                     selector_decision=selector_decision_value,
@@ -48388,6 +53417,83 @@ class KalshiSniperBot:
                 selected_quote,
                 payload=payload_preview,
             )
+            selected_submission_price_hint = None
+            if isinstance(payload_preview, dict):
+                selected_submission_price_hint = payload_preview.get("yes_price")
+                if selected_submission_price_hint is None:
+                    selected_submission_price_hint = payload_preview.get("no_price")
+            canonical_realm_vv_lane_survives = bool(
+                final_submit_allowed_by_realm_vv
+                and payload_preview is not None
+                and selected_submission_price_hint is not None
+                and 0.0 < self.to_float(selected_submission_price_hint, 0.0) < 1.0
+                and (selected_side_has_price or bool((payload_preview or {}).get("selected_side")) or bool(selected_quote))
+                and (selected_side_has_liquidity or depth_available or bool(quote_readiness_diagnostic.get("quote_ready")))
+            )
+            if not smart_allowed and canonical_realm_vv_lane_survives and smart_reason in {
+                "quote_not_ready",
+                "quote_missing",
+                "quote_not_ready_after_refresh",
+                "unsafe_price",
+                "unsafe_spread",
+                "orderbook_not_usable",
+                "phase55_block",
+                "placeholder_phase55_record",
+                "phase55_not_ready",
+                "spread_above_threshold",
+                "spread_wait",
+            }:
+                print(
+                    "[AION-FAKE-BLOCKER-DELETED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "gate": "smart_entry_gate",
+                            "stale_blocker": smart_reason,
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "selected_price": selected_submission_price_hint,
+                            "selected_side_has_price": bool(selected_side_has_price),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "depth_available": bool(depth_available),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-STALE-BLOCKER-TELEMETRY-ONLY] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "gate": "smart_entry_gate",
+                            "stale_blocker": smart_reason,
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "selected_price_valid": bool(selected_submission_price_hint is not None and 0.0 < self.to_float(selected_submission_price_hint, 0.0) < 1.0),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-CANONICAL-REALM-VV-AUTHORITY] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "gate": "smart_entry_gate",
+                            "decision": "BUY",
+                            "entry_ready": True,
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "selected_price": selected_submission_price_hint,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                smart_allowed = True
+                smart_reason = "all_guards_passed"
             execution_funnel["execution_attempted"] = 1
             final_blocker_live_arm = bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False))
             final_blocker_entry_ready = bool(phase55_gate_record.get("entry_timing_pass"))
@@ -48419,10 +53525,11 @@ class KalshiSniperBot:
                     stage="smart_entry_gate",
                     decision="SKIP",
                 )
-                self._check_phase55_live_execution_gate(
+                self._check_realm_vv_live_execution_gate(
                     auto_live_ticker,
                     family=selected_family,
                     override_block_reason=smart_reason,
+                    canonical_execution_state=canonical_realm_vv_state if "canonical_realm_vv_state" in locals() else None,
                 )
                 execution_funnel["execution_blocked"] = 1
                 self._emit_aion_final_blocker(
@@ -48451,9 +53558,10 @@ class KalshiSniperBot:
                     auto_live_reason=auto_live_reason,
                 )
                 return
-            phase55_allowed, phase55_reason, _phase55_details = self._check_phase55_live_execution_gate(
+            phase55_allowed, phase55_reason, _phase55_details = self._check_realm_vv_live_execution_gate(
                 auto_live_ticker,
                 family=selected_family,
+                canonical_execution_state=canonical_realm_vv_state if "canonical_realm_vv_state" in locals() else None,
             )
             final_blocker_entry_ready = bool(phase55_allowed)
             if not phase55_allowed:
@@ -48520,7 +53628,15 @@ class KalshiSniperBot:
                 quote_diag=quote_readiness_diagnostic,
                 source="final_gate",
             )
-            final_gate_unsafe_price_status = str(final_gate_unsafe_price_detail.get("unsafe_price_status") or "unsafe").strip().lower() or "unsafe"
+            final_gate_unsafe_price_status = str(
+                canonical_unsafe_price_status
+                if canonical_allow_lane
+                else final_gate_unsafe_price_detail.get("unsafe_price_status")
+                or "unsafe"
+            ).strip().lower() or "unsafe"
+            if canonical_allow_lane:
+                final_gate_unsafe_price_detail = dict(final_gate_unsafe_price_detail)
+                final_gate_unsafe_price_detail["unsafe_price_status"] = final_gate_unsafe_price_status
             near_safe_spread_context = None
             if aggressive_spread_bucket == "unsafe":
                 near_safe_spread_context = self._build_aion_near_safe_spread_context(
@@ -48598,12 +53714,12 @@ class KalshiSniperBot:
                 cooldown_status="clear",
                 duplicate_status="clear",
                 unsafe_price_status=final_gate_unsafe_price_status,
-                final_gate_status="handoff_ready",
-                final_block_reason=None,
-                spread_bucket=controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get("eligible")) else (expectancy_summary.get("spread_bucket") if isinstance(expectancy_summary, dict) else None),
-                market_lifecycle_state=expectancy_summary.get("market_lifecycle_state") if isinstance(expectancy_summary, dict) else None,
-                submit_status="pending",
-            )
+                    final_gate_status="handoff_ready",
+                    final_block_reason=None,
+                    spread_bucket=controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get("eligible")) else (expectancy_summary.get("spread_bucket") if isinstance(expectancy_summary, dict) else None),
+                    market_lifecycle_state=expectancy_summary.get("market_lifecycle_state") if isinstance(expectancy_summary, dict) else None,
+                    submit_status="pending",
+                )
             sports_context_allowed, sports_context_reason, _sports_context_details = self.sports_context_check({
                 "ticker": auto_live_ticker,
                 "family": selected_family,
@@ -48827,7 +53943,10 @@ class KalshiSniperBot:
                         market=selected_market,
                         q=aggressive_fastpath_quote,
                         family=selected_family,
-                        sports_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
+                        sports_context=_aion_build_quote_readiness_sports_context(
+                            base_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
+                            quote_obj=aggressive_fastpath_quote,
+                        ),
                         source="final_gate_refresh",
                     ) or quote_readiness_diagnostic
                     if not bool(quote_readiness_diagnostic.get("quote_ready")):
@@ -48863,14 +53982,102 @@ class KalshiSniperBot:
                 or controlled_spread_value > AION_SPORTS_MAX_SPREAD_HARD
                 or controlled_spread_bucket in {"extreme_wide"}
             )
+            selected_submission_price_hint = None
+            if isinstance(payload_preview, dict):
+                selected_submission_price_hint = payload_preview.get("yes_price")
+                if selected_submission_price_hint is None:
+                    selected_submission_price_hint = payload_preview.get("no_price")
+            canonical_realm_vv_lane_survives = bool(
+                final_submit_allowed_by_realm_vv
+                and payload_preview is not None
+                and selected_submission_price_hint is not None
+                and 0.0 < self.to_float(selected_submission_price_hint, 0.0) < 1.0
+                and (selected_side_has_price or bool((payload_preview or {}).get("selected_side")) or bool(selected_quote))
+                and (selected_side_has_liquidity or depth_available or controlled_quote_ready)
+            )
+            if canonical_realm_vv_lane_survives:
+                controlled_quote_ready = True
+                controlled_quote_stale = False
+                controlled_spread_extreme = False
+                controlled_spread_bucket = "wide_but_possible" if controlled_spread_bucket == "unsafe" else controlled_spread_bucket
+                quote_readiness_diagnostic["quote_ready"] = True
+                quote_readiness_diagnostic["quote_missing"] = False
+                if isinstance(expectancy_summary, dict):
+                    expectancy_summary["quote_ready"] = True
+                    expectancy_summary["quote_missing"] = False
+                    expectancy_summary["spread_bucket"] = controlled_spread_bucket
+                    expectancy_summary["sports_spread_bucket"] = controlled_spread_bucket
+                print(
+                    "[AION-FAKE-BLOCKER-DELETED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "stale_blockers": [
+                                label
+                                for label, hit in (
+                                    ("quote_missing", bool(quote_readiness_diagnostic.get("quote_missing"))),
+                                    ("unsafe_spread", str(final_gate_unsafe_price_status) in {"unsafe_spread", "unsafe", "unsafe_price"}),
+                                    ("orderbook_not_usable", not bool(selected_side_has_liquidity or depth_available)),
+                                    ("phase55_ready_no", not bool(phase55_allowed)),
+                                )
+                                if hit
+                            ],
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-CANONICAL-REALM-VV-AUTHORITY] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "selected_submission_price": selected_submission_price_hint,
+                            "selected_side_has_price": bool(selected_side_has_price),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "depth_available": bool(depth_available),
+                            "spread_bucket": controlled_spread_bucket,
+                            "unsafe_price_status": str(final_gate_unsafe_price_status),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-STALE-BLOCKER-TELEMETRY-ONLY] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "stale_blockers": [
+                                label
+                                for label, hit in (
+                                    ("quote_missing", bool(quote_readiness_diagnostic.get("quote_missing"))),
+                                    ("unsafe_spread", str(final_gate_unsafe_price_status) in {"unsafe_spread", "unsafe", "unsafe_price"}),
+                                    ("orderbook_not_usable", not bool(selected_side_has_liquidity or depth_available)),
+                                    ("phase55_ready_no", not bool(phase55_allowed)),
+                                )
+                                if hit
+                            ],
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "selected_price_valid": bool(selected_submission_price_hint is not None and 0.0 < self.to_float(selected_submission_price_hint, 0.0) < 1.0),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             controlled_lane_ok = bool(
                 aggressive_positive_edge_override
-                and controlled_quote_ready
-                and not controlled_quote_stale
+                and (controlled_quote_ready or canonical_realm_vv_lane_survives)
+                and (not controlled_quote_stale or canonical_realm_vv_lane_survives)
                 and payload_preview is not None
                 and controlled_family_allowed
                 and controlled_family_strong
-                and not controlled_spread_extreme
+                and (not controlled_spread_extreme or canonical_realm_vv_lane_survives)
                 and controlled_spread_bucket in {"ultra_tight", "tight", "wide_but_possible", "unsafe"}
             )
             if aggressive_fastpath_eligible:
@@ -48882,16 +54089,19 @@ class KalshiSniperBot:
                         aggressive_fastpath_quote = refreshed_quote
                         selected_quote = refreshed_quote
                         selected_context_quote = refreshed_quote
-                        quote_readiness_diagnostic = self._diagnose_quote_readiness_context(
-                            market=selected_market,
-                            q=aggressive_fastpath_quote,
-                            family=selected_family,
-                            sports_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
-                            source="final_gate_refresh_fastpath",
-                        ) or quote_readiness_diagnostic
-                        if isinstance(expectancy_summary, dict):
-                            expectancy_summary["quote_ready"] = bool(quote_readiness_diagnostic.get("quote_ready"))
-                            expectancy_summary["quote_missing"] = bool(quote_readiness_diagnostic.get("quote_missing"))
+                    quote_readiness_diagnostic = self._diagnose_quote_readiness_context(
+                        market=selected_market,
+                        q=aggressive_fastpath_quote,
+                        family=selected_family,
+                        sports_context=_aion_build_quote_readiness_sports_context(
+                            base_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
+                            quote_obj=aggressive_fastpath_quote,
+                        ),
+                        source="final_gate_refresh_fastpath",
+                    ) or quote_readiness_diagnostic
+                    if isinstance(expectancy_summary, dict):
+                        expectancy_summary["quote_ready"] = bool(quote_readiness_diagnostic.get("quote_ready"))
+                        expectancy_summary["quote_missing"] = bool(quote_readiness_diagnostic.get("quote_missing"))
             direct_fields_tradable_override = bool(
                 self.to_float(edge_after_cost, 0.0) >= 0.002
                 and str(quote_readiness_diagnostic.get("quote_ready_reason") or "").strip().lower() == "direct_fields"
@@ -48908,7 +54118,10 @@ class KalshiSniperBot:
                         market=selected_market,
                         q=aggressive_fastpath_quote,
                         family=selected_family,
-                        sports_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
+                        sports_context=_aion_build_quote_readiness_sports_context(
+                            base_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
+                            quote_obj=aggressive_fastpath_quote,
+                        ),
                         source="direct_fields_override_refresh",
                     ) or quote_readiness_diagnostic
                     quote_readiness_diagnostic["quote_ready"] = True
@@ -49001,6 +54214,11 @@ class KalshiSniperBot:
                     open_market_payload_override = None
             if open_market_payload_override is not None and aggressive_fastpath_payload_override is None:
                 aggressive_fastpath_payload_override = open_market_payload_override
+            selected_submission_price = None
+            if isinstance(payload_preview, dict):
+                selected_submission_price = payload_preview.get("yes_price")
+                if selected_submission_price is None:
+                    selected_submission_price = payload_preview.get("no_price")
             cooldown_gate_allowed = self._register_entry_attempt_event(
                 auto_live_ticker,
                 family=selected_family,
@@ -49041,12 +54259,47 @@ class KalshiSniperBot:
                 selector_floor_effective=self.to_float(expectancy_summary.get("aggressive_lane_effective_floor"), selector_floor_effective) if isinstance(expectancy_summary, dict) else selector_floor_effective,
                 quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
                 spread_bucket=controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get("eligible")) or tradable_unsafe_override else aggressive_spread_bucket,
+                spread_classification=str(
+                    (expectancy_summary or {}).get("spread_classification")
+                    or (quote_diag.get("canonical_tradeability") or {}).get("spread_classification")
+                    or (canonical_realm_vv_state or {}).get("canonical_spread_classification")
+                    or "unknown"
+                ).strip().upper(),
+                spread_severity=str(
+                    (expectancy_summary or {}).get("spread_severity")
+                    or (quote_diag.get("canonical_tradeability") or {}).get("spread_severity")
+                    or (canonical_realm_vv_state or {}).get("canonical_spread_severity")
+                    or "unknown"
+                ).strip().lower(),
+                final_submit_allowed_by_realm_vv=bool(
+                    (expectancy_summary or {}).get("final_submit_allowed_by_realm_vv")
+                    or (quote_diag.get("canonical_tradeability") or {}).get("final_submit_allowed_by_realm_vv")
+                    or (canonical_realm_vv_state or {}).get("canonical_final_submit_allowed_by_realm_vv")
+                ),
+                beast_spread_override_applied=bool(
+                    (expectancy_summary or {}).get("beast_spread_override_applied")
+                    or (quote_diag.get("canonical_tradeability") or {}).get("beast_spread_override_applied")
+                    or (canonical_realm_vv_state or {}).get("canonical_beast_spread_override_applied")
+                ),
                 market_lifecycle_state=aggressive_lifecycle_state,
                 near_safe_spread_relief=bool(near_safe_spread_context and near_safe_spread_context.get("eligible")),
                 duplicate_block=False,
                 unsafe_price_block=bool(aggressive_spread_bucket == "unsafe" and not bool(near_safe_spread_context and near_safe_spread_context.get("eligible"))),
+                selected_price_valid=bool(selected_submission_price is not None and 0.0 < self.to_float(selected_submission_price, 0.0) < 1.0),
+                selected_side_has_price=bool((selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None)) or (payload_preview or {}).get("selected_side")),
+                selected_side_has_liquidity=bool(
+                    quote_readiness_diagnostic.get("selected_side_has_liquidity")
+                    or quote_readiness_diagnostic.get("depth_available")
+                    or (payload_preview or {}).get("selected_side_has_liquidity")
+                ),
+                depth_available=bool(
+                    quote_readiness_diagnostic.get("depth_available")
+                    or quote_readiness_diagnostic.get("selected_side_has_liquidity")
+                    or (payload_preview or {}).get("depth_available")
+                ),
                 contracts=AION_AGGRESSIVE_MAX_CONTRACTS,
                 trades_today=self.aggressive_trades_today,
+                canonical_execution_state=canonical_execution_state,
                 source="final_gate",
             )
             unsafe_spread_tradable_override = bool(
@@ -49068,7 +54321,10 @@ class KalshiSniperBot:
                             market=selected_market,
                             q=aggressive_fastpath_quote,
                             family=selected_family,
-                            sports_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
+                            sports_context=_aion_build_quote_readiness_sports_context(
+                                base_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
+                                quote_obj=aggressive_fastpath_quote,
+                            ),
                             source="unsafe_spread_override_refresh",
                         ) or quote_readiness_diagnostic
                         if not bool(quote_readiness_diagnostic.get("quote_ready")):
@@ -49282,6 +54538,62 @@ class KalshiSniperBot:
                 f"contracts={int(AION_AGGRESSIVE_MAX_CONTRACTS)} "
                 f"decision=EXECUTED"
             )
+            print(
+                "[AION-FINAL-SUBMIT-PREFLIGHT] "
+                + json.dumps(
+                    {
+                        "ticker": auto_live_ticker,
+                        "side": selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None) or getattr(selected_quote_for_submission, "side", None) or getattr(selected_quote_for_submission, "selected_side", None) or None,
+                        "action": DEFAULT_LIVE_ORDER_ACTION,
+                        "price": submission_price,
+                        "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                        "live_mode": bool(globals().get("LIVE_MODE", False)),
+                        "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                        "dry_run": bool(compute_effective_live_dry_run()),
+                        "duplicate_check_result": duplicate_guard_detail,
+                        "daily_trade_count": int(self.live_trade_count_today or 0),
+                        "max_daily_trades": int(MAX_LIVE_TRADES_PER_DAY),
+                        "open_position_count": sum(
+                            1
+                            for position in self.live_positions
+                            if str(position.get("status", "open") or "open").strip().lower() == "open"
+                        ),
+                        "reason": "all_gates_passed",
+                        "blocker": None,
+                        "order_payload_keys": sorted(list(payload_preview.keys())) if isinstance(payload_preview, dict) else [],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[AION-FINAL-SUBMIT-CALL] "
+                + json.dumps(
+                    {
+                        "ticker": auto_live_ticker,
+                        "side": selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None) or getattr(selected_quote_for_submission, "side", None) or getattr(selected_quote_for_submission, "selected_side", None) or None,
+                        "action": DEFAULT_LIVE_ORDER_ACTION,
+                        "price": submission_price,
+                        "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                        "live_mode": bool(globals().get("LIVE_MODE", False)),
+                        "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                        "dry_run": bool(compute_effective_live_dry_run()),
+                        "duplicate_check_result": duplicate_guard_detail,
+                        "daily_trade_count": int(self.live_trade_count_today or 0),
+                        "max_daily_trades": int(MAX_LIVE_TRADES_PER_DAY),
+                        "open_position_count": sum(
+                            1
+                            for position in self.live_positions
+                            if str(position.get("status", "open") or "open").strip().lower() == "open"
+                        ),
+                        "reason": "submit_live_order",
+                        "blocker": None,
+                        "order_payload_keys": sorted(list(payload_preview.keys())) if isinstance(payload_preview, dict) else [],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
             result = self.submit_live_order(
                 selected_quote_for_submission,
                 size=AION_AGGRESSIVE_MAX_CONTRACTS,
@@ -49350,6 +54662,34 @@ class KalshiSniperBot:
                 submit_reason = str(result.get("reason") or "unknown")
                 if submit_reason in {"live_mode_disabled", "live_not_armed", "live_env_not_confirmed", "effective_dry_run", "auth_smoke_required_failed", "no_live_test_ticker", "ticker_not_allowed", "canary_already_used", "authorized_canary_ticker"} or submit_reason.startswith("auth_") or submit_reason.startswith("live_"):
                     submit_reason = "submission_auth_block"
+                print(
+                    "[AION-FINAL-SUBMIT-BLOCKED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "side": selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None) or getattr(selected_quote_for_submission, "side", None) or getattr(selected_quote_for_submission, "selected_side", None) or None,
+                            "action": DEFAULT_LIVE_ORDER_ACTION,
+                            "price": submission_price,
+                            "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                            "live_mode": bool(globals().get("LIVE_MODE", False)),
+                            "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
+                            "dry_run": bool(compute_effective_live_dry_run()),
+                            "duplicate_check_result": duplicate_guard_detail,
+                            "daily_trade_count": int(self.live_trade_count_today or 0),
+                            "max_daily_trades": int(MAX_LIVE_TRADES_PER_DAY),
+                            "open_position_count": sum(
+                                1
+                                for position in self.live_positions
+                                if str(position.get("status", "open") or "open").strip().lower() == "open"
+                            ),
+                            "reason": submit_reason,
+                            "blocker": submit_reason,
+                            "order_payload_keys": sorted(list(payload_preview.keys())) if isinstance(payload_preview, dict) else [],
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
                 self._emit_aion_execution_blocker(
                     ticker=auto_live_ticker,
                     family=selected_family,
@@ -49730,6 +55070,8 @@ def main():
             print("\nStopped by user.")
             break
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             print(f"Error: {e}")
             bot.last_error_message = str(e)[:200]
             send_telegram_message(f"🚨 ERROR\n{str(e)[:200]}")

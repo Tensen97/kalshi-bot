@@ -76,7 +76,7 @@ class StateInterpreter:
             if selected_ticker:
                 summary = f"AION is live and focused on {selected_ticker}. Execution posture is {posture.lower()}."
             elif posture == "WAITING_FOR_SIGNAL":
-                summary = "AION is live and scanning. No active opportunities currently satisfy Phase 5.5 timing conditions."
+                summary = "AION is live and scanning. No active opportunities currently satisfy Realm V.V timing conditions."
             else:
                 summary = f"AION is live and scanning. Execution posture is {posture.lower()}."
         else:
@@ -105,7 +105,7 @@ class StateInterpreter:
         if posture == "WAITING_FOR_SIGNAL":
             summary = "AION is actively monitoring markets but no valid signal currently meets entry standards."
         elif posture == "ENTRY_TIMING":
-            summary = "Signal detected. Phase 5.5 timing layer is evaluating pullback structure."
+            summary = "Signal detected. Realm V.V timing layer is evaluating pullback structure."
         elif posture == "BLOCKED":
             summary = "Execution blocked due to insufficient conviction or elevated environmental risk."
         elif posture == "LIVE_READY":
@@ -286,4 +286,3 @@ class StateInterpreter:
             "warnings": warnings[:10],
             "active_blocks": active_blocks[:10],
         }
-
