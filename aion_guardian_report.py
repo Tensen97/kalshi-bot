@@ -965,8 +965,15 @@ def _runtime_snapshot(repo_dir: str = "/opt/kalshi-bot") -> Dict[str, Any]:
     out["runtime_size_bytes"] = _path_size_bytes(str(runtime_root))
     out["git_ignored_runtime"] = None
     try:
-        check = subprocess.run(["git", "-C", repo_dir, "check-ignore", "-q", "runtime/tmp", "runtime/cache", "runtime/memory"], capture_output=True, text=True, check=False)
-        out["git_ignored_runtime"] = check.returncode == 0
+        gitignore = Path(repo_dir) / ".gitignore"
+        if gitignore.exists():
+            gitignore_text = gitignore.read_text(encoding="utf-8", errors="ignore")
+            required_patterns = ("runtime/tmp/", "runtime/cache/", "runtime/memory/")
+            if all(pattern in gitignore_text for pattern in required_patterns):
+                out["git_ignored_runtime"] = True
+        if out["git_ignored_runtime"] is not True:
+            check = subprocess.run(["git", "-C", repo_dir, "check-ignore", "-q", "runtime/tmp/", "runtime/cache/", "runtime/memory/"], capture_output=True, text=True, check=False)
+            out["git_ignored_runtime"] = check.returncode == 0
     except Exception:
         pass
     return out
