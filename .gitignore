@@ -5,6 +5,11 @@
 *.key
 keys/
 .venv/
+runtime/tmp/
+runtime/cache/
+runtime/memory/
+*.tmp
+*.log
 __pycache__/
 *.pyc
 *.pyo
