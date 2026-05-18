@@ -934,6 +934,8 @@ MAX_CONSECUTIVE_LOSSES = 3
 MAX_POSITION_COST = 0.85
 MIN_ENTRY_PRICE = 0.10
 MAX_ENTRY_PRICE = 0.90
+KALSHI_CONTRACT_MIN_PRICE = 0.01
+KALSHI_CONTRACT_MAX_PRICE = 0.99
 TRADE_LOG_CSV = runtime_state_file("kalshi_trade_log.csv")
 LIVE_POSITION_STATE_FILE = runtime_state_file("live_position_state.json")
 MARKET_PERSONALITY_PROFILE_FILE = runtime_state_file("market_personality_profiles.json")
@@ -2918,12 +2920,73 @@ class KalshiSniperBot:
             legacy_direct_fields_ready_value = bool(str(quote_readiness_diagnostic.get("quote_ready_reason") or quote_readiness_diagnostic.get("source_of_quote_data") or "").strip().lower() == "direct_fields")
             normalized_ready_value = bool(bool(quote_readiness_diagnostic.get("quote_ready")) and not bool(quote_readiness_diagnostic.get("quote_missing")) and bool(q is not None))
             score_trace_raw_block_reason = str(quote_readiness_diagnostic.get("block_reason") or quote_readiness_diagnostic.get("quote_ready_reason") or quote_readiness_diagnostic.get("quote_fixed_reason") or log_payload.get("source_of_edge_value") or "unknown").strip() or "unknown"
+            unsafe_price_detail = self._resolve_unsafe_price_detail(
+                market=market,
+                q=q,
+                family=family,
+                quote_diag=quote_readiness_diagnostic,
+                source="score_trace",
+            )
+            unsafe_price_status_trace = str(
+                unsafe_price_detail.get("unsafe_price_status")
+                or quote_readiness_diagnostic.get("unsafe_price_status")
+                or "unknown"
+            ).strip().lower() or "unknown"
+            unsafe_resolution_reason_trace = str(
+                unsafe_price_detail.get("unsafe_resolution_reason")
+                or quote_readiness_diagnostic.get("unsafe_resolution_reason")
+                or "unknown"
+            ).strip() or "unknown"
+            try:
+                print(
+                    "[AION-UNSAFE-PRICE-ROOT] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "original_selected_side": payload_preflight.get("selected_side"),
+                            "original_selected_price": payload_preflight.get("selected_price"),
+                            "chosen_side": payload_preflight.get("chosen_side") or payload_preflight.get("selected_side"),
+                            "chosen_price": payload_preflight.get("chosen_price") or payload_preflight.get("selected_price"),
+                            "spread_bucket": str(quote_readiness_diagnostic.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                            "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
+                            "unsafe_price_status": unsafe_price_status_trace,
+                            "unsafe_resolution_reason": unsafe_resolution_reason_trace,
+                            "payload_ready": bool(payload_preflight.get("payload_ready")),
+                            "phase55_ready": bool(payload_preflight.get("phase55_record_exists")),
+                            "exact_blocker_source": "score_trace",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-UNSAFE-PRICE-CLASSIFICATION] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "unsafe_price_status": unsafe_price_status_trace,
+                            "unsafe_resolution_reason": unsafe_resolution_reason_trace,
+                            "book_valid": bool(unsafe_price_detail.get("book_valid")),
+                            "book_missing_reason": unsafe_price_detail.get("book_missing_reason"),
+                            "spread_bucket": str(unsafe_price_detail.get("spread_bucket") or quote_readiness_diagnostic.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                            "phase55_ready": bool(payload_preflight.get("phase55_record_exists")),
+                            "payload_ready": bool(payload_preflight.get("payload_ready")),
+                            "exact_blocker_source": "score_trace",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+            quote_readiness_diagnostic["unsafe_price_status"] = unsafe_price_status_trace
+            quote_readiness_diagnostic["unsafe_resolution_reason"] = unsafe_resolution_reason_trace
             score_trace_final_block_reason = self._aion_canonical_final_block_reason(
                 final_edge=final_edge,
                 min_required_edge=0.0015,
                 quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
                 quote_missing=bool(quote_readiness_diagnostic.get("quote_missing")),
-                unsafe_price_status=quote_readiness_diagnostic.get("unsafe_price_status"),
+                unsafe_price_status=unsafe_price_status_trace,
                 duplicate_status=quote_readiness_diagnostic.get("duplicate_status"),
                 cooldown_status=quote_readiness_diagnostic.get("cooldown_status"),
                 phase55_ready=bool(quote_readiness_diagnostic.get("phase55_ready")),
@@ -2937,9 +3000,28 @@ class KalshiSniperBot:
                 phase55_record_found=bool(payload_preflight.get("phase55_record_exists")),
                 readiness_mapping_error=quote_readiness_diagnostic.get("readiness_mapping_error"),
                 source_of_edge_value=log_payload.get("source_of_edge_value"),
-                quote_fixed_reason=quote_readiness_diagnostic.get("quote_fixed_reason"),
+                quote_fixed_reason=unsafe_resolution_reason_trace,
                 block_reason=score_trace_raw_block_reason,
             )
+            try:
+                print(
+                    "[AION-UNSAFE-PRICE-FINAL] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "unsafe_price_status": unsafe_price_status_trace,
+                            "unsafe_resolution_reason": unsafe_resolution_reason_trace,
+                            "final_block_reason": score_trace_final_block_reason,
+                            "payload_ready": bool(payload_preflight.get("payload_ready")),
+                            "phase55_ready": bool(payload_preflight.get("phase55_record_exists")),
+                            "exact_blocker_source": "score_trace",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
             if score_trace_raw_block_reason == "final_edge" and self.to_float(final_edge, 0.0) >= 0.0015:
                 print(
                     "[AION-FINAL-EDGE-CONSISTENCY-WARN] "
@@ -5928,18 +6010,87 @@ class KalshiSniperBot:
         disabled_reason = None
         if family == "KXBTC15M" or not self._is_sports_market_or_family(family):
             disabled_reason = "disabled_family"
-        if not quote_ready_from_context:
+        effective_quote_ready = bool(quote_ready)
+        effective_orderbook_ready = bool(orderbook_ready_from_context)
+        final_blocker_source = None
+        if not effective_quote_ready:
             block_reason = "quote_not_usable"
-        elif not orderbook_ready_from_context:
+            final_blocker_source = "quote_ready=false"
+        elif not effective_orderbook_ready:
             block_reason = "orderbook_not_usable"
+            final_blocker_source = "orderbook_ready=false"
         elif disabled_reason:
             block_reason = disabled_reason
+            final_blocker_source = "disabled_family"
         elif not pass_fail:
             block_reason = "spread_above_threshold"
+            final_blocker_source = "spread_above_threshold"
         elif liquidity is not None and liquidity <= 0.0:
             block_reason = "insufficient_liquidity"
+            final_blocker_source = "insufficient_liquidity"
         else:
             block_reason = "all_guards_passed"
+            final_blocker_source = "all_guards_passed"
+        original_selected_side = quote_diag.get("selected_side") or sports_context.get("selected_side")
+        original_selected_price = quote_diag.get("selected_price") or sports_context.get("selected_price")
+        chosen_side = resolved_selected_side
+        chosen_price = resolved_selected_price
+        spread_bucket = str(
+            quote_diag.get("spread_bucket")
+            or quote_diag.get("sports_spread_bucket")
+            or (
+                "ultra_tight"
+                if spread is not None and spread <= min(0.03, adaptive_threshold * 0.55)
+                else "tight"
+                if spread is not None and spread <= min(0.06, adaptive_threshold)
+                else "medium"
+                if spread is not None and spread <= min(0.12, max(adaptive_threshold + 0.015, 0.08))
+                else "wide_but_possible"
+                if spread is not None and spread <= AION_SPORTS_MAX_SPREAD_SOFT
+                else "unsafe"
+            )
+        ).strip().lower()
+        unsafe_price_status = (
+            quote_diag.get("unsafe_price_status")
+            or quote_diag.get("unsafe_resolution_reason")
+            or sports_context.get("unsafe_price_status")
+            or "unknown"
+        )
+        payload_ready = bool(
+            quote_diag.get("payload_ready")
+            or sports_context.get("payload_ready")
+        )
+        phase55_ready = bool(
+            quote_diag.get("phase55_ready")
+            or sports_context.get("phase55_ready")
+        )
+        root_trace = {
+            "ticker": str(market.get("ticker", "") or "").strip() or None,
+            "original_selected_side": original_selected_side,
+            "original_selected_price": original_selected_price,
+            "chosen_side": chosen_side,
+            "chosen_price": chosen_price,
+            "quote_ready": bool(effective_quote_ready),
+            "orderbook_ready": bool(effective_orderbook_ready),
+            "spread_bucket": spread_bucket,
+            "unsafe_price_status": unsafe_price_status,
+            "payload_ready": bool(payload_ready),
+            "phase55_ready": bool(phase55_ready),
+            "blocker_source": final_blocker_source,
+        }
+        try:
+            print("[AION-QUOTE-USABILITY-ROOT] " + json.dumps(root_trace, sort_keys=True, default=str))
+        except Exception:
+            pass
+        try:
+            print("[AION-QUOTE-USABILITY-FINAL] " + json.dumps({**root_trace, "block_reason": block_reason}, sort_keys=True, default=str))
+        except Exception:
+            pass
+        if block_reason != "all_guards_passed":
+            try:
+                print("[AION-QUOTE-USABILITY-BLOCK] " + json.dumps({**root_trace, "block_reason": block_reason}, sort_keys=True, default=str))
+            except Exception:
+                pass
         print(
             "[AION-SPORTS-THRESHOLD-TRACE] "
             + json.dumps(
@@ -5967,8 +6118,8 @@ class KalshiSniperBot:
                             else "unsafe"
                         )
                     ).strip().lower(),
-                    "quote_ready": bool(quote_ready_from_context),
-                    "orderbook_ready": bool(orderbook_ready_from_context),
+                    "quote_ready": bool(effective_quote_ready),
+                    "orderbook_ready": bool(effective_orderbook_ready),
                     "disabled_reason": disabled_reason,
                     "refresh_reason": refresh_reason,
                     "threshold_pass": bool(pass_fail),
@@ -20301,6 +20452,40 @@ class KalshiSniperBot:
                 allow_refresh=True,
             ) or {}
         except Exception as exc:
+            try:
+                import traceback as _traceback
+                print(
+                    "[AION-QUOTE-USABILITY-TRACE] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "quote_ready": False,
+                            "orderbook_ready": False,
+                            "source_of_quote_data": "diagnostic_exception",
+                            "quote_source": f"quote_orderbook_snapshot_{exc.__class__.__name__}",
+                            "topbook_snapshot_present": bool(topbook_snapshot and not topbook_snapshot.get("failure_stage")),
+                            "normalized_quote_present": False,
+                            "normalized_orderbook_present": False,
+                            "selected_side": None,
+                            "selected_price": None,
+                            "selected_price_source": "bid",
+                            "missing_fields": [],
+                            "stale_seconds": stale_seconds,
+                            "cache_hit": False,
+                            "cache_age": None,
+                            "fetch_attempted": False,
+                            "fetch_success": False,
+                            "failure_stage": f"quote_orderbook_snapshot_{exc.__class__.__name__}",
+                            "block_reason": f"quote_orderbook_snapshot_{exc.__class__.__name__}",
+                            "traceback": _traceback.format_exc(limit=18),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
             quote_orderbook_snapshot = {
                 "quote_ready": False,
                 "quote_missing": True,
@@ -25272,96 +25457,105 @@ class KalshiSniperBot:
                     queue.append(nested)
         return None
 
-    def _extract_orderbook_top_level(self, levels):
-        if isinstance(levels, dict):
-            for key in (
-                "levels", "orders", "bids", "asks", "yes", "no", "yes_orders", "no_orders",
-                "yes_dollars", "no_dollars", "orderbook", "orderbook_fp",
-            ):
-                nested = levels.get(key)
-                if isinstance(nested, (list, dict)) and nested:
-                    extracted = self._extract_orderbook_top_level(nested)
-                    if extracted.get("price") is not None or extracted.get("size", 0.0) > 0:
-                        return extracted
-            direct_price = self.to_float(
-                levels.get("price")
-                or levels.get("price_dollars")
-                or levels.get("price_fp")
-                or levels.get("yes_price")
-                or levels.get("no_price")
-                or levels.get("bid")
-                or levels.get("ask"),
-                None,
-            )
-            direct_size = self.to_float(
-                levels.get("size")
-                or levels.get("size_fp")
-                or levels.get("count")
-                or levels.get("quantity")
-                or levels.get("quantity_fp")
-                or levels.get("qty")
-                or levels.get("contracts")
-                or levels.get("contracts_fp")
-                or levels.get("contract_count")
-                or levels.get("num_contracts")
-                or levels.get("available")
-                or levels.get("remaining")
-                or levels.get("volume")
-                or levels.get("shares"),
-                0.0,
-            )
-            if direct_price is not None or direct_size > 0:
-                return {"price": direct_price, "size": direct_size}
-            first_items = list(levels.items())
-            if first_items:
-                first_key, first_value = first_items[0]
-                first_price = self.to_float(first_key, None)
-                if first_price is not None and hasattr(self, "normalize_contract_price"):
-                    first_price = self.normalize_contract_price(first_price, ticker=None, source="orderbook_fp.first_key")
-                nested_extracted = self._extract_orderbook_top_level(first_value) if isinstance(first_value, (list, dict)) else {"price": None, "size": self.to_float(first_value, 0.0)}
-                if nested_extracted.get("price") is not None and first_price is None:
-                    first_price = nested_extracted.get("price")
-                first_size = nested_extracted.get("size", 0.0)
-                return {"price": first_price, "size": self.to_float(first_size, 0.0)}
-            return {"price": None, "size": 0.0}
-        if not isinstance(levels, list) or not levels:
-            return {"price": None, "size": 0.0}
-        level = levels[0]
-        if isinstance(level, dict):
-            return {
-                "price": self.to_float(
-                    level.get("price")
-                    or level.get("price_dollars")
-                    or level.get("price_fp")
-                    or level.get("yes_price")
-                    or level.get("no_price")
-                    or level.get("bid")
-                    or level.get("ask"),
-                    None,
-                ),
-                "size": self.to_float(
-                    level.get("size")
-                    or level.get("size_fp")
-                    or level.get("count")
-                    or level.get("quantity")
-                    or level.get("quantity_fp")
-                    or level.get("qty")
-                    or level.get("contracts")
-                    or level.get("contracts_fp")
-                    or level.get("contract_count")
-                    or level.get("num_contracts")
-                    or level.get("available")
-                    or level.get("remaining")
-                    or level.get("volume")
-                    or level.get("shares"),
-                    0.0,
-                ),
-            }
-        if isinstance(level, (list, tuple)) and len(level) >= 2:
-            return {
-                "price": self.to_float(level[0], None),
-                "size": self.to_float(level[1], 0.0),
-            }
+    def _extract_orderbook_top_level(self, levels, _seen=None):
+        if _seen is None:
+            _seen = set()
+        price_keys = (
+            "price",
+            "price_dollars",
+            "price_fp",
+            "yes_price",
+            "no_price",
+            "bid",
+            "ask",
+        )
+        size_keys = (
+            "size",
+            "size_fp",
+            "count",
+            "quantity",
+            "quantity_fp",
+            "qty",
+            "contracts",
+            "contracts_fp",
+            "contract_count",
+            "num_contracts",
+            "available",
+            "remaining",
+            "volume",
+            "shares",
+        )
+        queue = [levels]
+        while queue:
+            current = queue.pop(0)
+            if isinstance(current, dict):
+                current_id = id(current)
+                if current_id in _seen:
+                    continue
+                _seen.add(current_id)
+                direct_price = None
+                for key in price_keys:
+                    direct_price = self.to_float(current.get(key), None)
+                    if direct_price is not None:
+                        break
+                direct_size = None
+                for key in size_keys:
+                    direct_size = self.to_float(current.get(key), None)
+                    if direct_size is not None:
+                        break
+                if direct_price is not None or (direct_size is not None and direct_size > 0):
+                    return {"price": direct_price, "size": self.to_float(direct_size, 0.0)}
+                for nested_key in (
+                    "levels",
+                    "orders",
+                    "bids",
+                    "asks",
+                    "yes",
+                    "no",
+                    "yes_orders",
+                    "no_orders",
+                    "yes_dollars",
+                    "no_dollars",
+                    "orderbook",
+                    "orderbook_fp",
+                ):
+                    nested = current.get(nested_key)
+                    if isinstance(nested, (list, dict)) and nested:
+                        queue.append(nested)
+                first_items = list(current.items())
+                if first_items:
+                    first_key, first_value = first_items[0]
+                    first_price = self.to_float(first_key, None)
+                    if first_price is not None and hasattr(self, "normalize_contract_price"):
+                        first_price = self.normalize_contract_price(first_price, ticker=None, source="orderbook_fp.first_key")
+                    if isinstance(first_value, (list, dict)) and first_value:
+                        queue.append(first_value)
+                    elif first_value not in (None, "", [], {}):
+                        first_size = self.to_float(first_value, 0.0)
+                        if first_price is not None or first_size > 0:
+                            return {"price": first_price, "size": first_size}
+                        queue.append(first_value)
+            elif isinstance(current, list) and current:
+                first = current[0]
+                if isinstance(first, dict):
+                    direct_price = None
+                    for key in price_keys:
+                        direct_price = self.to_float(first.get(key), None)
+                        if direct_price is not None:
+                            break
+                    direct_size = None
+                    for key in size_keys:
+                        direct_size = self.to_float(first.get(key), None)
+                        if direct_size is not None:
+                            break
+                    if direct_price is not None or (direct_size is not None and direct_size > 0):
+                        return {"price": direct_price, "size": self.to_float(direct_size, 0.0)}
+                    queue.append(first)
+                elif isinstance(first, (list, tuple)) and len(first) >= 2:
+                    return {
+                        "price": self.to_float(first[0], None),
+                        "size": self.to_float(first[1], 0.0),
+                    }
         return {"price": None, "size": 0.0}
 
     def _get_liquidity_trace_origin(self, market):
@@ -26694,60 +26888,140 @@ class KalshiSniperBot:
                     selected_ticker=ticker,
                     selection_stage="open_market_preflight",
                     market=market,
-                    phase55_gate_record=self._get_phase55_live_execution_gate_record(ticker, stage="open_market_preflight"),
-                    quote_diag=quote_diag,
+                phase55_gate_record=self._get_phase55_live_execution_gate_record(ticker, stage="open_market_preflight"),
+                quote_diag=quote_diag,
+            )
+            unsafe_price_detail = self._resolve_unsafe_price_detail(
+                market=market,
+                q=q,
+                family=family,
+                quote_diag=quote_diag,
+                source="open_market_preflight",
+            )
+            unsafe_price_status_trace = str(
+                unsafe_price_detail.get("unsafe_price_status")
+                or quote_diag.get("unsafe_price_status")
+                or "unknown"
+            ).strip().lower() or "unknown"
+            unsafe_resolution_reason_trace = str(
+                unsafe_price_detail.get("unsafe_resolution_reason")
+                or quote_diag.get("unsafe_resolution_reason")
+                or "unknown"
+            ).strip() or "unknown"
+            try:
+                print(
+                    "[AION-UNSAFE-PRICE-ROOT] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "original_selected_side": payload_preflight.get("selected_side"),
+                            "original_selected_price": payload_preflight.get("selected_price"),
+                            "chosen_side": payload_preflight.get("chosen_side") or payload_preflight.get("selected_side"),
+                            "chosen_price": payload_preflight.get("chosen_price") or payload_preflight.get("selected_price"),
+                            "spread_bucket": str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                            "quote_ready": bool(quote_ready),
+                            "unsafe_price_status": unsafe_price_status_trace,
+                            "unsafe_resolution_reason": unsafe_resolution_reason_trace,
+                            "payload_ready": bool(payload_preflight.get("payload_ready")),
+                            "phase55_ready": bool(payload_preflight.get("phase55_record_exists")),
+                            "exact_blocker_source": "open_market_preflight",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-                raw_open_market_block_reason = str(quote_diag.get("block_reason") or quote_diag.get("quote_ready_reason") or quote_fixed_reason or "").strip() or "unknown"
-                canonical_open_market_block_reason = self._aion_canonical_final_block_reason(
-                    final_edge=final_edge,
-                    min_required_edge=0.0015,
-                    quote_ready=quote_ready,
-                    quote_missing=quote_missing,
-                    unsafe_price_status=quote_diag.get("unsafe_price_status"),
-                    duplicate_status=quote_diag.get("duplicate_status"),
-                    cooldown_status=quote_diag.get("cooldown_status"),
-                    phase55_ready=bool(quote_diag.get("phase55_ready")),
-                    phase55_status=quote_diag.get("phase55_status"),
-                    normalized_ready=bool(quote_diag.get("quote_ready")) and not bool(quote_diag.get("quote_missing")) and bool(q is not None),
+                print(
+                    "[AION-UNSAFE-PRICE-CLASSIFICATION] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "unsafe_price_status": unsafe_price_status_trace,
+                            "unsafe_resolution_reason": unsafe_resolution_reason_trace,
+                            "book_valid": bool(unsafe_price_detail.get("book_valid")),
+                            "book_missing_reason": unsafe_price_detail.get("book_missing_reason"),
+                            "spread_bucket": str(unsafe_price_detail.get("spread_bucket") or quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown",
+                            "phase55_ready": bool(payload_preflight.get("phase55_record_exists")),
+                            "payload_ready": bool(payload_preflight.get("payload_ready")),
+                            "exact_blocker_source": "open_market_preflight",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+            quote_diag["unsafe_price_status"] = unsafe_price_status_trace
+            quote_diag["unsafe_resolution_reason"] = unsafe_resolution_reason_trace
+            raw_open_market_block_reason = str(quote_diag.get("block_reason") or quote_diag.get("quote_ready_reason") or quote_fixed_reason or "").strip() or "unknown"
+            canonical_open_market_block_reason = self._aion_canonical_final_block_reason(
+                final_edge=final_edge,
+                min_required_edge=0.0015,
+                quote_ready=quote_ready,
+                quote_missing=quote_missing,
+                unsafe_price_status=unsafe_price_status_trace,
+                duplicate_status=quote_diag.get("duplicate_status"),
+                cooldown_status=quote_diag.get("cooldown_status"),
+                phase55_ready=bool(quote_diag.get("phase55_ready")),
+                phase55_status=quote_diag.get("phase55_status"),
+                normalized_ready=bool(quote_diag.get("quote_ready")) and not bool(quote_diag.get("quote_missing")) and bool(q is not None),
                     payload_ready=bool(payload_preflight.get("payload_ready")),
                     payload_builder_called=payload_preflight.get("payload_builder_called"),
                     payload_missing_reason=payload_preflight.get("payload_missing_reason"),
                     payload_rejection_reason=payload_preflight.get("payload_rejection_reason"),
                     auth_ready=True,
-                    phase55_record_found=bool(payload_preflight.get("phase55_record_exists")),
-                    readiness_mapping_error=quote_diag.get("readiness_mapping_error"),
-                    source_of_edge_value=quote_diag.get("source_of_edge_value"),
-                    quote_fixed_reason=quote_diag.get("quote_fixed_reason"),
-                    block_reason=raw_open_market_block_reason,
-                )
-                if not bool(payload_preflight.get("payload_ready")):
-                    payload_missing_reason = str(
-                        payload_preflight.get("payload_missing_reason")
-                        or payload_preflight.get("payload_rejection_reason")
-                        or "payload_builder_rejected"
-                    ).strip().lower() or "payload_builder_rejected"
-                    self._emit_aion_payload_missing_trace(
-                        trace_id=trace_meta.get("trace_id") if 'trace_meta' in locals() else None,
-                        ticker=ticker,
-                        selected_ticker=payload_preflight.get("selected_ticker"),
-                        normalized_ticker=payload_preflight.get("normalized_ticker"),
-                        selection_stage=payload_preflight.get("selection_stage"),
-                        payload_builder_called=payload_preflight.get("payload_builder_called"),
-                        payload_ready=payload_preflight.get("payload_ready"),
-                        payload_keys=payload_preflight.get("payload_keys"),
-                        payload_missing_reason=payload_preflight.get("payload_missing_reason"),
-                        payload_rejection_reason=payload_preflight.get("payload_rejection_reason"),
-                        side=payload_preflight.get("side"),
-                        price=payload_preflight.get("price"),
-                        contract_id=payload_preflight.get("contract_id"),
-                        orderbook_present=payload_preflight.get("orderbook_present"),
-                        quote_ready=payload_preflight.get("quote_ready"),
-                        quote_missing=payload_preflight.get("quote_missing"),
-                        phase55_record_exists=payload_preflight.get("phase55_record_exists"),
-                        phase55_record_keys=payload_preflight.get("phase55_record_keys"),
-                        final_block_reason=f"payload_missing:{payload_missing_reason}",
-                        phase55_skipped_reason=f"payload_missing:{payload_missing_reason}",
+                phase55_record_found=bool(payload_preflight.get("phase55_record_exists")),
+                readiness_mapping_error=quote_diag.get("readiness_mapping_error"),
+                source_of_edge_value=quote_diag.get("source_of_edge_value"),
+                quote_fixed_reason=unsafe_resolution_reason_trace,
+                block_reason=raw_open_market_block_reason,
+            )
+            try:
+                print(
+                    "[AION-UNSAFE-PRICE-FINAL] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "unsafe_price_status": unsafe_price_status_trace,
+                            "unsafe_resolution_reason": unsafe_resolution_reason_trace,
+                            "final_block_reason": canonical_open_market_block_reason,
+                            "payload_ready": bool(payload_preflight.get("payload_ready")),
+                            "phase55_ready": bool(payload_preflight.get("phase55_record_exists")),
+                            "exact_blocker_source": "open_market_preflight",
+                        },
+                        sort_keys=True,
+                        default=str,
                     )
+                )
+            except Exception:
+                pass
+            if not bool(payload_preflight.get("payload_ready")):
+                payload_missing_reason = str(
+                    payload_preflight.get("payload_missing_reason")
+                    or payload_preflight.get("payload_rejection_reason")
+                    or "payload_builder_rejected"
+                ).strip().lower() or "payload_builder_rejected"
+                self._emit_aion_payload_missing_trace(
+                    trace_id=trace_meta.get("trace_id") if 'trace_meta' in locals() else None,
+                    ticker=ticker,
+                    selected_ticker=payload_preflight.get("selected_ticker"),
+                    normalized_ticker=payload_preflight.get("normalized_ticker"),
+                    selection_stage=payload_preflight.get("selection_stage"),
+                    payload_builder_called=payload_preflight.get("payload_builder_called"),
+                    payload_ready=payload_preflight.get("payload_ready"),
+                    payload_keys=payload_preflight.get("payload_keys"),
+                    payload_missing_reason=payload_preflight.get("payload_missing_reason"),
+                    payload_rejection_reason=payload_preflight.get("payload_rejection_reason"),
+                    side=payload_preflight.get("side"),
+                    price=payload_preflight.get("price"),
+                    contract_id=payload_preflight.get("contract_id"),
+                    orderbook_present=payload_preflight.get("orderbook_present"),
+                    quote_ready=payload_preflight.get("quote_ready"),
+                    quote_missing=payload_preflight.get("quote_missing"),
+                    phase55_record_exists=payload_preflight.get("phase55_record_exists"),
+                    phase55_record_keys=payload_preflight.get("phase55_record_keys"),
+                    final_block_reason=f"payload_missing:{payload_missing_reason}",
+                    phase55_skipped_reason=f"payload_missing:{payload_missing_reason}",
+                )
                 readiness_sync_payload = self._emit_aion_final_readiness_sync(
                     ticker=ticker,
                     family=family,
@@ -40340,12 +40614,40 @@ class KalshiSniperBot:
             alternate_price = ask_value if preferred_source == "bid" else bid_value
             price_source_used = preferred_source
             price = self.to_float(primary_price, None)
-            if price is not None and price > 0.0 and not (MIN_ENTRY_PRICE < price < MAX_ENTRY_PRICE):
-                alternate_numeric = self.to_float(alternate_price, None)
-                if alternate_numeric is not None and MIN_ENTRY_PRICE < alternate_numeric < MAX_ENTRY_PRICE:
+            alternate_numeric = self.to_float(alternate_price, None)
+            if price is None or price <= 0.0:
+                if alternate_numeric is not None and alternate_numeric > 0.0:
+                    price = alternate_numeric
+                    price_source_used = f"{'ask' if preferred_source == 'bid' else 'bid'}_fallback"
+            elif not (KALSHI_CONTRACT_MIN_PRICE <= price <= KALSHI_CONTRACT_MAX_PRICE):
+                if alternate_numeric is not None and KALSHI_CONTRACT_MIN_PRICE <= alternate_numeric <= KALSHI_CONTRACT_MAX_PRICE:
                     price = alternate_numeric
                     price_source_used = f"{'ask' if preferred_source == 'bid' else 'bid'}_fallback"
             return price, price_source_used
+
+        def _resolve_side_price_for_source(source_dict, side, *, preferred_source="bid"):
+            side = "no" if str(side).lower() == "no" else "yes"
+            if side == "yes":
+                bid_value = self.to_float(source_dict.get("yes_bid_dollars", source_dict.get("yes_bid")), None)
+                ask_value = self.to_float(source_dict.get("yes_ask_dollars", source_dict.get("yes_ask")), None)
+                if bid_value is None:
+                    bid_value = self._extract_orderbook_side_price_hint(source_dict, "yes")
+                if ask_value is None:
+                    ask_value = self._extract_orderbook_side_price_hint(source_dict, "yes")
+            else:
+                bid_value = self.to_float(source_dict.get("no_bid_dollars", source_dict.get("no_bid")), None)
+                ask_value = self.to_float(source_dict.get("no_ask_dollars", source_dict.get("no_ask")), None)
+                if bid_value is None:
+                    bid_value = self._extract_orderbook_side_price_hint(source_dict, "no")
+                if ask_value is None:
+                    ask_value = self._extract_orderbook_side_price_hint(source_dict, "no")
+            resolved_price, resolved_source = _select_side_price_with_fallback(
+                side=side,
+                bid_value=bid_value,
+                ask_value=ask_value,
+                preferred_source=preferred_source,
+            )
+            return self.to_float(resolved_price, None), resolved_source, bid_value, ask_value
 
         def _normalize_selected_price_snapshot(raw_price):
             raw_numeric = self.to_float(raw_price, None)
@@ -40389,17 +40691,15 @@ class KalshiSniperBot:
             no_bid = no_bid_dollars
             no_ask = no_ask_dollars
             if resolved_side == "no":
-                selected_price, selected_price_source = _select_side_price_with_fallback(
-                    side="no",
-                    bid_value=no_bid_dollars if no_bid_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "no"),
-                    ask_value=no_ask_dollars if no_ask_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "no"),
+                selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
+                    source_dict,
+                    "no",
                     preferred_source=str(price_source).strip().lower() or "bid",
                 )
             elif resolved_side == "yes":
-                selected_price, selected_price_source = _select_side_price_with_fallback(
-                    side="yes",
-                    bid_value=yes_bid_dollars if yes_bid_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "yes"),
-                    ask_value=yes_ask_dollars if yes_ask_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "yes"),
+                selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
+                    source_dict,
+                    "yes",
                     preferred_source=str(price_source).strip().lower() or "bid",
                 )
             selected_price = self.to_float(selected_price, None)
@@ -40414,17 +40714,15 @@ class KalshiSniperBot:
                 if preferred_side and preferred_side != resolved_side:
                     resolved_side = preferred_side
                     if resolved_side == "no":
-                        selected_price, selected_price_source = _select_side_price_with_fallback(
-                            side="no",
-                            bid_value=no_bid_dollars if no_bid_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "no"),
-                            ask_value=no_ask_dollars if no_ask_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "no"),
+                        selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
+                            source_dict,
+                            "no",
                             preferred_source=str(price_source).strip().lower() or "bid",
                         )
                     elif resolved_side == "yes":
-                        selected_price, selected_price_source = _select_side_price_with_fallback(
-                            side="yes",
-                            bid_value=yes_bid_dollars if yes_bid_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "yes"),
-                            ask_value=yes_ask_dollars if yes_ask_dollars is not None else self._extract_orderbook_side_price_hint(source_dict, "yes"),
+                        selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
+                            source_dict,
+                            "yes",
                             preferred_source=str(price_source).strip().lower() or "bid",
                         )
                     selected_price = self.to_float(selected_price, None)
@@ -40464,17 +40762,15 @@ class KalshiSniperBot:
                     no_bid = no_bid_dollars
                     no_ask = no_ask_dollars
                     if resolved_side == "no":
-                        selected_price, selected_price_source = _select_side_price_with_fallback(
-                            side="no",
-                            bid_value=no_bid_dollars if no_bid_dollars is not None else self._extract_orderbook_side_price_hint(fresh_source, "no"),
-                            ask_value=no_ask_dollars if no_ask_dollars is not None else self._extract_orderbook_side_price_hint(fresh_source, "no"),
+                        selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
+                            fresh_source,
+                            "no",
                             preferred_source=str(price_source).strip().lower() or "bid",
                         )
                     elif resolved_side == "yes":
-                        selected_price, selected_price_source = _select_side_price_with_fallback(
-                            side="yes",
-                            bid_value=yes_bid_dollars if yes_bid_dollars is not None else self._extract_orderbook_side_price_hint(fresh_source, "yes"),
-                            ask_value=yes_ask_dollars if yes_ask_dollars is not None else self._extract_orderbook_side_price_hint(fresh_source, "yes"),
+                        selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
+                            fresh_source,
+                            "yes",
                             preferred_source=str(price_source).strip().lower() or "bid",
                         )
                     selected_price = self.to_float(selected_price, None)
@@ -40488,10 +40784,100 @@ class KalshiSniperBot:
             else:
                 fetch_error = fetch_error or "empty_orderbook"
 
+        def _side_candidate_snapshot(side_name):
+            side_name = "no" if str(side_name).lower() == "no" else "yes"
+            candidate_price, candidate_source_used, candidate_bid, candidate_ask = _resolve_side_price_for_source(
+                selected_source_dict,
+                side_name,
+                preferred_source=str(price_source).strip().lower() or "bid",
+            )
+            candidate_price = self.to_float(candidate_price, None)
+            candidate_valid = bool(
+                candidate_price is not None
+                and KALSHI_CONTRACT_MIN_PRICE <= candidate_price <= KALSHI_CONTRACT_MAX_PRICE
+            )
+            return {
+                "side": side_name,
+                "price": candidate_price,
+                "source": candidate_source_used,
+                "bid": candidate_bid,
+                "ask": candidate_ask,
+                "valid": candidate_valid,
+            }
+
+        original_selected_side = resolved_side
+        original_selected_price = selected_price
+        original_selected_price_cents = selected_price_cents
+        side_switch_attempted = False
+        side_switch_success = False
+        side_switch_reason = None
+        both_sides_executable = False
+        opposite_side = "no" if resolved_side == "yes" else "yes" if resolved_side == "no" else None
+        opposite_selected_price = None
+        opposite_selected_price_source = None
+        original_candidate = None
+        opposite_candidate = None
+        canonical_selected_side = resolved_side
+        canonical_selected_price = selected_price
+        canonical_selected_price_cents = selected_price_cents
+        canonical_selected_price_source = selected_price_source
+        if selected_source_dict is not None and resolved_side in {"yes", "no"}:
+            yes_candidate = _side_candidate_snapshot("yes")
+            no_candidate = _side_candidate_snapshot("no")
+            both_sides_executable = bool(yes_candidate["valid"] and no_candidate["valid"])
+            original_candidate = yes_candidate if resolved_side == "yes" else no_candidate
+            opposite_candidate = no_candidate if resolved_side == "yes" else yes_candidate
+            resolved_direction_decision = self.live_direction_decisions_by_ticker.get(raw_ticker or "", {}) or self.live_direction_decisions_by_ticker.get(normalized_ticker or "", {})
+            strategy_allows_yes = bool(
+                family != "KXBTC15M"
+                or str(resolved_direction_decision.get("intended_side") or "").strip().lower() in {"", "yes"}
+            )
+            strategy_allows_no = bool(
+                family != "KXBTC15M"
+                or str(resolved_direction_decision.get("intended_side") or "").strip().lower() in {"no"}
+            )
+
+            chosen_candidate = original_candidate
+            if original_candidate is not None and not original_candidate["valid"]:
+                side_switch_attempted = True
+                if opposite_candidate is not None and opposite_candidate["valid"]:
+                    if opposite_candidate["side"] == "yes" and strategy_allows_yes:
+                        chosen_candidate = opposite_candidate
+                        side_switch_success = True
+                        side_switch_reason = "switched_to_yes_executable_price"
+                    elif opposite_candidate["side"] == "no" and strategy_allows_no:
+                        chosen_candidate = opposite_candidate
+                        side_switch_success = True
+                        side_switch_reason = "switched_to_no_executable_price"
+                    else:
+                        side_switch_reason = "strategy_incompatible_opposite_side"
+                else:
+                    side_switch_reason = "both_sides_unexecutable"
+            elif original_candidate is not None and original_candidate["valid"]:
+                chosen_candidate = original_candidate
+
+            if chosen_candidate is not None:
+                resolved_side = chosen_candidate["side"]
+                selected_price = chosen_candidate["price"]
+                selected_price_source = chosen_candidate["source"]
+                selected_price_raw = chosen_candidate["price"]
+                selected_price_dollars = chosen_candidate["price"]
+                selected_price_cents = int(round(chosen_candidate["price"] * 100.0)) if chosen_candidate["price"] is not None else None
+                selected_price = self.to_float(selected_price, None)
+                opposite_selected_price = opposite_candidate["price"] if opposite_candidate is not None else None
+                opposite_selected_price_source = opposite_candidate["source"] if opposite_candidate is not None else None
+                if side_switch_success:
+                    orderbook_fetch_success = orderbook_fetch_success or False
+            elif original_candidate is not None and not original_candidate["valid"]:
+                side_switch_reason = side_switch_reason or "both_sides_unexecutable"
+            canonical_selected_side = resolved_side
+            canonical_selected_price = selected_price
+            canonical_selected_price_cents = selected_price_cents
+            canonical_selected_price_source = selected_price_source
         selected_price_in_bounds = bool(
             selected_price is not None
             and selected_price > 0.0
-            and MIN_ENTRY_PRICE < selected_price < MAX_ENTRY_PRICE
+            and KALSHI_CONTRACT_MIN_PRICE <= selected_price <= KALSHI_CONTRACT_MAX_PRICE
         )
         if (
             selected_source_dict is not None
@@ -40542,7 +40928,7 @@ class KalshiSniperBot:
                             selected_source_dict = dict(fresh_source)
                             orderbook_keys = sorted(list(fresh_source.keys()))[:64]
                             selected_price_in_bounds = bool(
-                                MIN_ENTRY_PRICE < selected_price < MAX_ENTRY_PRICE
+                                KALSHI_CONTRACT_MIN_PRICE <= selected_price <= KALSHI_CONTRACT_MAX_PRICE
                             )
                             if selected_price_in_bounds:
                                 fetch_error = None
@@ -40568,10 +40954,10 @@ class KalshiSniperBot:
                         orderbook_missing_reason = "orderbook_fetch_not_called"
             else:
                 if selected_price is not None and selected_price > 0.0 and not selected_price_in_bounds:
-                    if selected_price is not None and selected_price <= MIN_ENTRY_PRICE:
-                        orderbook_missing_reason = "selected_price_below_min"
-                    elif selected_price is not None and selected_price >= MAX_ENTRY_PRICE:
-                        orderbook_missing_reason = "selected_price_above_max"
+                    if selected_price is not None and selected_price < KALSHI_CONTRACT_MIN_PRICE:
+                        orderbook_missing_reason = "selected_price_below_0_01"
+                    elif selected_price is not None and selected_price > KALSHI_CONTRACT_MAX_PRICE:
+                        orderbook_missing_reason = "selected_price_above_0_99"
                     else:
                         orderbook_missing_reason = "selected_price_out_of_bounds"
                 elif selected_source_label in {"market", "candidate", "quote_diag"} and selected_source_dict and any(
@@ -40580,6 +40966,8 @@ class KalshiSniperBot:
                     orderbook_missing_reason = "orderbook_shape_unrecognized"
                 elif selected_source_dict and selected_price is None:
                     orderbook_missing_reason = "missing_price"
+                elif selected_price is not None and not selected_price_in_bounds and side_switch_reason == "both_sides_unexecutable":
+                    orderbook_missing_reason = "both_sides_unexecutable"
                 else:
                     orderbook_missing_reason = "orderbook_shape_unrecognized"
         else:
@@ -40591,10 +40979,56 @@ class KalshiSniperBot:
                 price_bounds_reason = None
                 if selected_price is None:
                     price_bounds_reason = "selected_price_missing"
-                elif selected_price <= MIN_ENTRY_PRICE:
-                    price_bounds_reason = "selected_price_below_min"
-                elif selected_price >= MAX_ENTRY_PRICE:
-                    price_bounds_reason = "selected_price_above_max"
+                elif selected_price < KALSHI_CONTRACT_MIN_PRICE:
+                    price_bounds_reason = "selected_price_below_0_01"
+                elif selected_price > KALSHI_CONTRACT_MAX_PRICE:
+                    price_bounds_reason = "selected_price_above_0_99"
+                else:
+                    price_bounds_reason = None
+                print(
+                    "[AION-PRICE-VALIDATION-MODE] "
+                    + json.dumps(
+                        {
+                            "ticker": raw_ticker or None,
+                            "selected_side": resolved_side,
+                            "selected_price_dollars": selected_price,
+                            "selected_price_cents": selected_price_cents,
+                            "old_max_price": MAX_ENTRY_PRICE,
+                            "new_max_price": KALSHI_CONTRACT_MAX_PRICE,
+                            "validation_mode": "kalshi_contract_bounds",
+                            "bounds_pass": bool(selected_price_in_bounds),
+                            "block_reason": orderbook_missing_reason or price_bounds_reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-SIDE-PRICE-SELECTION-TRACE] "
+                    + json.dumps(
+                        {
+                            "ticker": raw_ticker or None,
+                            "original_selected_side": original_selected_side,
+                            "original_selected_price": original_selected_price,
+                            "alternate_side": opposite_side,
+                            "alternate_price": opposite_selected_price,
+                            "yes_bid": yes_bid_dollars,
+                            "yes_ask": yes_ask_dollars,
+                            "no_bid": no_bid_dollars,
+                            "no_ask": no_ask_dollars,
+                            "chosen_side": resolved_side,
+                            "chosen_price": selected_price,
+                            "chosen_price_cents": selected_price_cents,
+                            "side_switch_attempted": side_switch_attempted,
+                            "side_switch_success": side_switch_success,
+                            "side_switch_reason": side_switch_reason,
+                            "both_sides_executable": both_sides_executable,
+                            "block_reason": orderbook_missing_reason or price_bounds_reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
                 print(
                     "[AION-PRICE-BOUNDS-TRACE] "
                     + json.dumps(
@@ -40614,8 +41048,8 @@ class KalshiSniperBot:
                             "no_bid_dollars": no_bid_dollars,
                             "no_ask_dollars": no_ask_dollars,
                             "bounds_mode": "dollars",
-                            "min_price": MIN_ENTRY_PRICE,
-                            "max_price": MAX_ENTRY_PRICE,
+                            "min_price": KALSHI_CONTRACT_MIN_PRICE,
+                            "max_price": KALSHI_CONTRACT_MAX_PRICE,
                             "bounds_pass": bool(selected_price_in_bounds),
                             "failure_stage": orderbook_missing_reason or price_bounds_reason,
                             "block_reason": orderbook_missing_reason or price_bounds_reason,
@@ -40634,6 +41068,11 @@ class KalshiSniperBot:
             "selected_price": selected_price,
             "selected_price_dollars": selected_price,
             "selected_price_cents": selected_price_cents,
+            "chosen_side": canonical_selected_side,
+            "chosen_price": canonical_selected_price,
+            "chosen_price_dollars": canonical_selected_price,
+            "chosen_price_cents": canonical_selected_price_cents,
+            "chosen_price_source": canonical_selected_price_source,
             "selected_price_raw": selected_price_raw,
             "best_action": best_action,
             "orderbook_ready": orderbook_ready,
@@ -40730,10 +41169,13 @@ class KalshiSniperBot:
             payload["post_only"] = bool(post_only)
         if rest_remainder is not None:
             payload["rest_remainder"] = bool(rest_remainder)
-        selected_price = orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("selected_price"))
-        selected_price_cents = orderbook_resolution.get("selected_price_cents")
+        payload_validation_side = orderbook_resolution.get("chosen_side") or orderbook_resolution.get("selected_side") or intended_side
+        payload_validation_price = orderbook_resolution.get("chosen_price_dollars", orderbook_resolution.get("chosen_price", orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("selected_price"))))
+        payload_validation_price_cents = orderbook_resolution.get("chosen_price_cents", orderbook_resolution.get("selected_price_cents"))
+        selected_price = payload_validation_price
+        selected_price_cents = payload_validation_price_cents
         if selected_price is None:
-            if intended_side == "yes":
+            if payload_validation_side == "yes":
                 selected_price = (
                     orderbook_resolution.get("yes_bid") if price_source == "bid" else orderbook_resolution.get("yes_ask")
                 )
@@ -40751,9 +41193,31 @@ class KalshiSniperBot:
                 selected_price = float(selected_price_cents) / 100.0
             except (TypeError, ValueError):
                 selected_price = None
+        try:
+            print(
+                "[AION-CANONICAL-PRICE-CONSUMED] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "original_selected_side": orderbook_resolution.get("selected_side"),
+                        "original_selected_price": orderbook_resolution.get("selected_price"),
+                        "chosen_side": orderbook_resolution.get("chosen_side") or orderbook_resolution.get("selected_side"),
+                        "chosen_price": orderbook_resolution.get("chosen_price") or orderbook_resolution.get("selected_price"),
+                        "chosen_price_cents": orderbook_resolution.get("chosen_price_cents") or orderbook_resolution.get("selected_price_cents"),
+                        "side_switch_success": bool(orderbook_resolution.get("side_switch_success")),
+                        "payload_validation_price": selected_price,
+                        "payload_validation_side": payload_validation_side,
+                        "block_reason": orderbook_resolution.get("orderbook_missing_reason") or orderbook_resolution.get("blocker_reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
         if not ticker or selected_price is None or selected_price <= 0:
             return None
-        if selected_price <= MIN_ENTRY_PRICE or selected_price >= MAX_ENTRY_PRICE:
+        if selected_price < KALSHI_CONTRACT_MIN_PRICE or selected_price > KALSHI_CONTRACT_MAX_PRICE:
             return None
         if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
             return None
@@ -40981,11 +41445,11 @@ class KalshiSniperBot:
                     payload_missing_reason = "market_not_tradeable"
                 elif price_numeric is None or price_numeric <= 0:
                     payload_missing_reason = "selected_price_null" if price_source_value is None else "selected_price_non_numeric"
-                elif price_numeric <= MIN_ENTRY_PRICE or price_numeric >= MAX_ENTRY_PRICE:
-                    if price_numeric <= MIN_ENTRY_PRICE:
-                        payload_missing_reason = "selected_price_below_min"
+                elif price_numeric < KALSHI_CONTRACT_MIN_PRICE or price_numeric > KALSHI_CONTRACT_MAX_PRICE:
+                    if price_numeric < KALSHI_CONTRACT_MIN_PRICE:
+                        payload_missing_reason = "selected_price_below_0_01"
                     else:
-                        payload_missing_reason = "selected_price_above_max"
+                        payload_missing_reason = "selected_price_above_0_99"
                 elif str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
                     payload_missing_reason = "invalid_action"
                 else:
@@ -40994,6 +41458,74 @@ class KalshiSniperBot:
                 payload_rejection_reason = payload_missing_reason
         if payload_rejection_reason is None and not payload_ready:
             payload_rejection_reason = "payload_builder_rejected"
+        phase55_record_created = False
+        phase55_record_write_success = False
+        phase55_record_readback_success = False
+        phase55_record_write_location = None
+        phase55_record_failure_stage = None
+        phase55_record_block_reason = None
+        phase55_observation_called = False
+        phase55_observation_returned = None
+        phase55_observation_keys = []
+        phase55_observation_status = None
+        phase55_observation_entry_ready = None
+        phase55_observation_entry_timing_pass = None
+        phase55_observation_entry_ready_reason = None
+        if (
+            payload_ready
+            and selected_ticker
+            and market
+            and not compute_effective_live_dry_run()
+            and not self._phase55_record_has_meaningful_data(phase55_record)
+        ):
+            phase55_observation_called = True
+            try:
+                phase55_observation = self.get_entry_timing_observation(
+                    market,
+                    q,
+                    family,
+                    stage_label=f"{selection_stage or 'payload_ready'}_payload_handoff",
+                )
+            except Exception as exc:
+                phase55_observation = {
+                    "phase55_status": "unknown",
+                    "entry_ready": False,
+                    "entry_timing_pass": False,
+                    "entry_ready_reason": f"phase55_observation_{exc.__class__.__name__}",
+                    "decision_reason": f"phase55_observation_{exc.__class__.__name__}",
+                }
+            phase55_observation_returned = bool(phase55_observation)
+            if isinstance(phase55_observation, dict):
+                phase55_observation_keys = sorted(list(phase55_observation.keys()))
+                phase55_observation_status = phase55_observation.get("phase55_status")
+                phase55_observation_entry_ready = phase55_observation.get("entry_ready")
+                phase55_observation_entry_timing_pass = phase55_observation.get("entry_timing_pass")
+                phase55_observation_entry_ready_reason = phase55_observation.get("entry_ready_reason")
+            try:
+                persisted_phase55_record, persisted_phase55_readback, persisted_phase55_handoff, persisted_phase55_persistence = self._persist_phase55_gate_record(
+                    ticker=selected_ticker,
+                    family=family,
+                    market=market,
+                    q=q,
+                    entry_timing_observation=phase55_observation if isinstance(phase55_observation, dict) else {},
+                    candidate_source="payload_builder_handoff",
+                    stage=f"{selection_stage or 'payload_ready'}_payload_handoff",
+                    trace_id=None,
+                    existing_record=phase55_record,
+                )
+                phase55_record = dict(persisted_phase55_readback or persisted_phase55_record or phase55_record or {})
+                phase55_record_created = bool(persisted_phase55_handoff.get("phase55_record_created"))
+                phase55_record_write_success = bool(persisted_phase55_handoff.get("phase55_record_write_success"))
+                phase55_record_readback_success = bool(persisted_phase55_handoff.get("phase55_record_readback_success"))
+                phase55_record_write_location = persisted_phase55_handoff.get("write_location")
+                phase55_record_failure_stage = persisted_phase55_handoff.get("failure_stage")
+                phase55_record_block_reason = persisted_phase55_handoff.get("block_reason")
+            except Exception as exc:
+                phase55_record_failure_stage = "phase55_record_write_failed"
+                phase55_record_block_reason = f"phase55_record_write_failed:{exc.__class__.__name__}"
+                phase55_record_created = False
+                phase55_record_write_success = False
+                phase55_record_readback_success = False
         result = {
             "trace_id": None,
             "ticker": selected_ticker,
@@ -41035,8 +41567,21 @@ class KalshiSniperBot:
             "quote_missing_fields": quote_snapshot.get("quote_missing_fields"),
             "quote_source": quote_snapshot.get("quote_source"),
             "phase55_record_exists": bool(phase55_record),
-            "phase55_record_keys": phase55_record_keys,
+            "phase55_record_keys": sorted(list(phase55_record.keys())) if isinstance(phase55_record, dict) else phase55_record_keys,
             "phase55_record": phase55_record,
+            "phase55_observation_called": phase55_observation_called,
+            "phase55_observation_returned": phase55_observation_returned,
+            "phase55_observation_keys": phase55_observation_keys,
+            "phase55_observation_status": phase55_observation_status,
+            "phase55_observation_entry_ready": phase55_observation_entry_ready,
+            "phase55_observation_entry_timing_pass": phase55_observation_entry_timing_pass,
+            "phase55_observation_entry_ready_reason": phase55_observation_entry_ready_reason,
+            "phase55_record_created": phase55_record_created,
+            "phase55_record_write_success": phase55_record_write_success,
+            "phase55_record_readback_success": phase55_record_readback_success,
+            "phase55_record_write_location": phase55_record_write_location,
+            "phase55_record_failure_stage": phase55_record_failure_stage,
+            "phase55_record_block_reason": phase55_record_block_reason,
         }
         try:
             print(
@@ -47168,7 +47713,67 @@ class KalshiSniperBot:
             trace_id = trace_meta.get("trace_id")
             preflight_edge = self.to_float(expectancy_summary.get("final_edge"), self.to_float(expectancy_summary.get("sports_edge_after_cost"), 0.0))
             preflight_spread_bucket = str(quote_readiness_diagnostic.get("spread_bucket") or aggressive_spread_bucket or "unknown").strip().lower() or "unknown"
-            preflight_unsafe_price_status = str(quote_readiness_diagnostic.get("unsafe_price_status") or "unknown").strip().lower() or "unknown"
+            preflight_unsafe_detail = self._resolve_unsafe_price_detail(
+                market=selected_market,
+                q=selected_quote,
+                family=selected_family,
+                quote_diag=quote_readiness_diagnostic,
+                source="final_gate_preflight",
+            )
+            preflight_unsafe_price_status = str(
+                preflight_unsafe_detail.get("unsafe_price_status")
+                or quote_readiness_diagnostic.get("unsafe_price_status")
+                or "unknown"
+            ).strip().lower() or "unknown"
+            preflight_unsafe_resolution_reason = str(
+                preflight_unsafe_detail.get("unsafe_resolution_reason")
+                or quote_readiness_diagnostic.get("unsafe_resolution_reason")
+                or "unknown"
+            ).strip() or "unknown"
+            try:
+                print(
+                    "[AION-UNSAFE-PRICE-ROOT] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "original_selected_side": None,
+                            "original_selected_price": None,
+                            "chosen_side": None,
+                            "chosen_price": None,
+                            "spread_bucket": preflight_spread_bucket,
+                            "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
+                            "unsafe_price_status": preflight_unsafe_price_status,
+                            "unsafe_resolution_reason": preflight_unsafe_resolution_reason,
+                            "payload_ready": None,
+                            "phase55_ready": None,
+                            "exact_blocker_source": "final_gate_preflight",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-UNSAFE-PRICE-CLASSIFICATION] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "unsafe_price_status": preflight_unsafe_price_status,
+                            "unsafe_resolution_reason": preflight_unsafe_resolution_reason,
+                            "book_valid": bool(preflight_unsafe_detail.get("book_valid")),
+                            "book_missing_reason": preflight_unsafe_detail.get("book_missing_reason"),
+                            "spread_bucket": str(preflight_unsafe_detail.get("spread_bucket") or preflight_spread_bucket or "unknown").strip().lower() or "unknown",
+                            "phase55_ready": bool(payload_preflight.get("phase55_record_exists")) if "payload_preflight" in locals() else None,
+                            "payload_ready": bool(payload_preflight.get("payload_ready")) if "payload_preflight" in locals() else None,
+                            "exact_blocker_source": "final_gate_preflight",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+            quote_readiness_diagnostic["unsafe_price_status"] = preflight_unsafe_price_status
+            quote_readiness_diagnostic["unsafe_resolution_reason"] = preflight_unsafe_resolution_reason
             payload_preflight = self._diagnose_live_order_payload_context(
                 selected_quote,
                 size=AION_AGGRESSIVE_MAX_CONTRACTS,

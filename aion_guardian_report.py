@@ -453,6 +453,224 @@ def _summarize(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str
     }
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    return text in {"true", "1", "yes", "y", "on", "ok", "ready", "passed", "pass", "executed", "submitted"}
+
+
+def _extract_funnel_ticker(payload: Dict[str, Any]) -> Optional[str]:
+    ticker = str(
+        payload.get("ticker")
+        or payload.get("selected_ticker")
+        or payload.get("raw_ticker")
+        or payload.get("normalized_ticker")
+        or ""
+    ).strip()
+    return ticker or None
+
+
+def _execution_funnel_summary(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    stage_rank_by_ticker: Dict[str, int] = {}
+    stage_label_by_ticker: Dict[str, str] = {}
+    stage_event_by_ticker: Dict[str, Dict[str, Any]] = {}
+    blockers: Dict[str, Dict[str, Any]] = {"entry_ready": {}, "phase55_handoff": {}, "live_execution": {}}
+    counts = {
+        "quote_orderbook_ready": set(),
+        "price_valid": set(),
+        "payload_ready": set(),
+        "entry_ready": set(),
+        "phase55_handoff": set(),
+        "live_execution_attempts": set(),
+        "executed_orders": set(),
+    }
+
+    def _record_blocker(stage_key: str, entry: Dict[str, Any], ticker: str, reason: str, source: str) -> None:
+        if not reason:
+            return
+        current = blockers.get(stage_key) or {}
+        ts = entry.get("ts") or ""
+        if not current or str(ts) >= str(current.get("ts") or ""):
+            blockers[stage_key] = {
+                "ticker": ticker,
+                "reason": reason,
+                "source": source,
+                "trace": entry.get("raw") or "",
+                "ts": ts,
+            }
+
+    def _advance_stage(ticker: str, rank: int, label: str, entry: Dict[str, Any]) -> None:
+        current_rank = int(stage_rank_by_ticker.get(ticker, 0) or 0)
+        if rank < current_rank:
+            return
+        if rank > current_rank or ticker not in stage_event_by_ticker:
+            stage_rank_by_ticker[ticker] = rank
+            stage_label_by_ticker[ticker] = label
+            stage_event_by_ticker[ticker] = entry
+
+    for entry in entries:
+        prefix = str(entry.get("prefix") or "")
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        ticker = _extract_funnel_ticker(payload)
+        if not ticker:
+            continue
+        raw_line = entry.get("raw") or ""
+
+        if prefix == "AION-ORDERBOOK-PAYLOAD-TRACE":
+            quote_ready = _truthy(payload.get("quote_ready"))
+            orderbook_ready = _truthy(payload.get("orderbook_ready"))
+            if quote_ready and orderbook_ready:
+                counts["quote_orderbook_ready"].add(ticker)
+                _advance_stage(ticker, 1, "quote_orderbook_ready", entry)
+            else:
+                reason = (
+                    payload.get("orderbook_missing_reason")
+                    or payload.get("payload_missing_reason")
+                    or payload.get("payload_rejection_reason")
+                    or ("quote_not_ready" if not quote_ready else "orderbook_not_ready")
+                    or "quote_not_usable"
+                )
+                _record_blocker("entry_ready", entry, ticker, str(reason), prefix)
+            if _truthy(payload.get("bounds_pass")):
+                counts["price_valid"].add(ticker)
+                _advance_stage(ticker, 2, "price_valid", entry)
+            else:
+                price_reason = (
+                    payload.get("block_reason")
+                    or payload.get("failure_stage")
+                    or payload.get("orderbook_missing_reason")
+                    or "selected_price_out_of_bounds"
+                )
+                _record_blocker("entry_ready", entry, ticker, str(price_reason), prefix)
+            continue
+
+        if prefix == "AION-PRICE-BOUNDS-TRACE":
+            if _truthy(payload.get("bounds_pass")):
+                counts["price_valid"].add(ticker)
+                _advance_stage(ticker, 2, "price_valid", entry)
+            else:
+                reason = (
+                    payload.get("block_reason")
+                    or payload.get("failure_stage")
+                    or "selected_price_out_of_bounds"
+                )
+                _record_blocker("entry_ready", entry, ticker, str(reason), prefix)
+            continue
+
+        if prefix == "AION-PAYLOAD-USABILITY-TRACE":
+            if _truthy(payload.get("payload_ready")):
+                counts["payload_ready"].add(ticker)
+                _advance_stage(ticker, 3, "payload_ready", entry)
+            else:
+                reason = payload.get("payload_reject_reason") or payload.get("payload_missing_reason") or "payload_missing"
+                _record_blocker("entry_ready", entry, ticker, str(reason), prefix)
+            continue
+
+        if prefix == "AION-ENTRY-READINESS":
+            if _truthy(payload.get("entry_ready")):
+                counts["entry_ready"].add(ticker)
+                _advance_stage(ticker, 4, "entry_ready", entry)
+            else:
+                reason = payload.get("block_reason") or payload.get("entry_ready_reason") or "entry_not_ready"
+                _record_blocker("entry_ready", entry, ticker, str(reason), prefix)
+            continue
+
+        if prefix == "AION-ENTRY-READINESS-BLOCKED":
+            reason = payload.get("block_reason") or payload.get("entry_ready_reason") or payload.get("reason") or "entry_not_ready"
+            _record_blocker("entry_ready", entry, ticker, str(reason), prefix)
+            continue
+
+        if prefix == "AION-PHASE55-HANDOFF":
+            if _truthy(payload.get("phase55_handoff")):
+                counts["phase55_handoff"].add(ticker)
+                _advance_stage(ticker, 5, "phase55_handoff", entry)
+            else:
+                reason = payload.get("block_reason") or payload.get("reason") or "phase55_not_ready"
+                _record_blocker("phase55_handoff", entry, ticker, str(reason), prefix)
+            continue
+
+        if prefix == "AION-PHASE55-HANDOFF-BLOCKED":
+            reason = payload.get("block_reason") or payload.get("reason") or "phase55_not_ready"
+            _record_blocker("phase55_handoff", entry, ticker, str(reason), prefix)
+            continue
+
+        if prefix == "AION-LIVE-PROMOTION":
+            counts["phase55_handoff"].add(ticker)
+            _advance_stage(ticker, 5, "live_promotion", entry)
+            continue
+
+        if prefix.startswith("LIVE-EXECUTION") or prefix.startswith("AION-LIVE-EXECUTION"):
+            counts["live_execution_attempts"].add(ticker)
+            _advance_stage(ticker, 6, "live_execution_attempt", entry)
+            decision = str(payload.get("decision") or payload.get("status") or payload.get("result") or "").strip().upper()
+            order_submitted = prefix.endswith("ORDER-SUBMITTED") or _truthy(payload.get("submitted")) or decision == "EXECUTED"
+            if order_submitted:
+                counts["executed_orders"].add(ticker)
+                _advance_stage(ticker, 7, "executed", entry)
+            else:
+                reason = payload.get("reason") or payload.get("block_reason") or payload.get("final_block_reason") or decision or "live_execution_blocked"
+                _record_blocker("live_execution", entry, ticker, str(reason), prefix)
+            continue
+
+        if prefix in {"AION-FINAL-BLOCKER-TRACE", "AION-FINAL-READY-EXPLAIN", "AION-FINAL-READINESS-SYNC"}:
+            reason = (
+                payload.get("final_block_reason")
+                or payload.get("because")
+                or payload.get("final_ready")
+                or payload.get("final_blocker")
+                or ""
+            )
+            if reason and str(reason).strip().lower() not in {"true", "false", "none"}:
+                _record_blocker("live_execution", entry, ticker, str(reason), prefix)
+            continue
+
+    closest_ticker = None
+    closest_rank = -1
+    closest_event = None
+    for ticker, rank in stage_rank_by_ticker.items():
+        event = stage_event_by_ticker.get(ticker) or {}
+        event_ts = str(event.get("ts") or "")
+        closest_ts = str(closest_event.get("ts") or "") if closest_event else ""
+        if rank > closest_rank or (rank == closest_rank and event_ts >= closest_ts):
+            closest_ticker = ticker
+            closest_rank = rank
+            closest_event = event
+
+    if closest_event:
+        proof_trace = str(closest_event.get("raw") or "")
+        proof_source = str(closest_event.get("prefix") or "")
+    else:
+        proof_trace = ""
+        proof_source = ""
+
+    def _blocker_for(stage_key: str) -> Dict[str, Any]:
+        return blockers.get(stage_key) or {}
+
+    return {
+        "quote_orderbook_ready_count": len(counts["quote_orderbook_ready"]),
+        "price_valid_count": len(counts["price_valid"]),
+        "payload_ready_count": len(counts["payload_ready"]),
+        "entry_ready_count": len(counts["entry_ready"]),
+        "phase55_handoff_count": len(counts["phase55_handoff"]),
+        "live_execution_attempt_count": len(counts["live_execution_attempts"]),
+        "executed_orders_count": len(counts["executed_orders"]),
+        "last_blocker_before_entry_ready": _blocker_for("entry_ready"),
+        "last_blocker_before_phase55_handoff": _blocker_for("phase55_handoff"),
+        "last_blocker_before_live_execution": _blocker_for("live_execution"),
+        "closest_ticker": closest_ticker,
+        "closest_rank": closest_rank if closest_rank >= 0 else None,
+        "closest_source": proof_source,
+        "closest_trace": proof_trace,
+        "stage_rank_by_ticker": stage_rank_by_ticker,
+        "stage_label_by_ticker": stage_label_by_ticker,
+    }
+
+
 def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[str, Any], entries: List[Dict[str, Any]]) -> str:
     blocker_counts: Counter = summary["blocker_counts"]
     blocker_tickers: Counter = summary["blocker_tickers"]
@@ -470,6 +688,25 @@ def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[s
     blocker_total = summary["blocker_total"]
     trend = summary["trend"]
     last_hb = summary["heartbeat_ts"] or "unknown"
+    funnel = _execution_funnel_summary(entries)
+    funnel_counts = {
+        "quote_orderbook_ready": funnel["quote_orderbook_ready_count"],
+        "price_valid": funnel["price_valid_count"],
+        "payload_ready": funnel["payload_ready_count"],
+        "entry_ready": funnel["entry_ready_count"],
+        "phase55_handoff": funnel["phase55_handoff_count"],
+        "live_execution_attempts": funnel["live_execution_attempt_count"],
+        "executed_orders": funnel["executed_orders_count"],
+    }
+    closest_ticker = funnel["closest_ticker"] or "none"
+    closest_source = funnel["closest_source"] or "none"
+    closest_trace = (funnel["closest_trace"] or "none").strip()
+    entry_blocker = funnel["last_blocker_before_entry_ready"] or {}
+    phase55_blocker = funnel["last_blocker_before_phase55_handoff"] or {}
+    exec_blocker = funnel["last_blocker_before_live_execution"] or {}
+    current_final_blocker = exec_blocker or phase55_blocker or entry_blocker or {}
+    current_final_block_reason = current_final_blocker.get("reason") or "all_guards_passed"
+    current_final_block_ticker = current_final_blocker.get("ticker") or closest_ticker
 
     critical_blockers = ", ".join(top_blockers[:3]) if top_blockers else "none"
     best_sign = (
@@ -551,6 +788,21 @@ def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[s
         f"- top 5 affected tickers: {', '.join(top_tickers[:5])}",
         f"- blocker trend: {trend}",
         "",
+        "⚔️ Execution Funnel",
+        f"- Quote/Orderbook ready: {funnel_counts['quote_orderbook_ready']}",
+        f"- Price valid: {funnel_counts['price_valid']}",
+        f"- Payload ready: {funnel_counts['payload_ready']}",
+        f"- Entry ready: {funnel_counts['entry_ready']}",
+        f"- Phase 5.5 handoff: {funnel_counts['phase55_handoff']}",
+        f"- Live execution attempts: {funnel_counts['live_execution_attempts']}",
+        f"- Executed orders: {funnel_counts['executed_orders']}",
+        f"- Last blocker before entry_ready: {entry_blocker.get('reason') or 'none'} ({entry_blocker.get('ticker') or 'none'})",
+        f"- Last blocker before phase55_handoff: {phase55_blocker.get('reason') or 'none'} ({phase55_blocker.get('ticker') or 'none'})",
+        f"- Last blocker before LIVE-EXECUTION: {exec_blocker.get('reason') or 'none'} ({exec_blocker.get('ticker') or 'none'})",
+        f"- Closest ticker: {closest_ticker}",
+        f"- Current final blocker: {current_final_block_reason} ({current_final_block_ticker})",
+        f"- Proof: {closest_source} {closest_trace[:300] if len(closest_trace) > 300 else closest_trace}",
+        "",
         "🔥 Top blocker:",
         f"- {top_blockers[0]}",
         "",
@@ -594,6 +846,7 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
     system = _system_status()
     summary = _summarize(entries, state)
     report = _build_report(summary, system, state, entries)
+    funnel = _execution_funnel_summary(entries)
     report_payload = {
         "created_at": time.time(),
         "service": SERVICE_NAME,
@@ -607,6 +860,20 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
             "phase55_ready_count": summary["phase55_ready_count"],
             "live_exec_count": summary["live_exec_count"],
             "exit_count": summary["exit_count"],
+            "execution_funnel": {
+                "quote_orderbook_ready": funnel["quote_orderbook_ready_count"],
+                "price_valid": funnel["price_valid_count"],
+                "payload_ready": funnel["payload_ready_count"],
+                "entry_ready": funnel["entry_ready_count"],
+                "phase55_handoff": funnel["phase55_handoff_count"],
+                "live_execution_attempts": funnel["live_execution_attempt_count"],
+                "executed_orders": funnel["executed_orders_count"],
+                "closest_ticker": funnel["closest_ticker"] or "none",
+                "current_final_block_reason": funnel["last_blocker_before_live_execution"].get("reason")
+                or funnel["last_blocker_before_phase55_handoff"].get("reason")
+                or funnel["last_blocker_before_entry_ready"].get("reason")
+                or "all_guards_passed",
+            },
         },
         "report": report,
     }
@@ -698,7 +965,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print the report and persist state without sending Telegram.")
     parser.add_argument("--minutes", type=int, default=LOOKBACK_MINUTES, help="Lookback window in minutes.")
     args = parser.parse_args(argv)
-    LOOKBACK_MINUTES = max(5, int(args.minutes or LOOKBACK_MINUTES))
+    LOOKBACK_MINUTES = max(1, int(args.minutes or LOOKBACK_MINUTES))
     return build_and_send_report(force=bool(args.send_now), dry_run=bool(args.dry_run))
 
 
