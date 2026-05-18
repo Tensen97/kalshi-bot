@@ -19,8 +19,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 SERVICE_NAME = "kalshi-bot"
 REPORT_COOLDOWN_SECONDS = 3600
 LOOKBACK_MINUTES = 60
+DAILY_INTEGRITY_LOOKBACK_MINUTES = 24 * 60
 STATE_FILE_NAME = "aion_guardian_report_state.json"
 LAST_REPORT_FILE_NAME = "aion_guardian_report_last.json"
+DAILY_STATE_FILE_NAME = "aion_guardian_integrity_state.json"
+DAILY_LAST_REPORT_FILE_NAME = "aion_guardian_integrity_last.json"
 
 PHASE55_BLOCKERS = {
     "trigger_wait",
@@ -113,6 +116,34 @@ def _runtime_last_report_path() -> str:
         except Exception:
             continue
     return str(Path("/tmp") / LAST_REPORT_FILE_NAME)
+
+
+def _runtime_daily_state_path() -> str:
+    candidates = [
+        "/opt/kalshi-bot/runtime/state",
+        str(Path(__file__).resolve().parent / "runtime" / "state"),
+    ]
+    for base in candidates:
+        try:
+            Path(base).mkdir(parents=True, exist_ok=True)
+            return str(Path(base) / DAILY_STATE_FILE_NAME)
+        except Exception:
+            continue
+    return str(Path("/tmp") / DAILY_STATE_FILE_NAME)
+
+
+def _runtime_daily_last_report_path() -> str:
+    candidates = [
+        "/opt/kalshi-bot/runtime/state",
+        str(Path(__file__).resolve().parent / "runtime" / "state"),
+    ]
+    for base in candidates:
+        try:
+            Path(base).mkdir(parents=True, exist_ok=True)
+            return str(Path(base) / DAILY_LAST_REPORT_FILE_NAME)
+        except Exception:
+            continue
+    return str(Path("/tmp") / DAILY_LAST_REPORT_FILE_NAME)
 
 
 def _safe_atomic_json_write(path: str, payload: dict) -> bool:
@@ -336,7 +367,39 @@ def _system_status() -> Dict[str, Any]:
         cmdline = None
     live_mode = bool(cmdline and "--live" in cmdline)
     armed = bool(cmdline and "--arm-live" in cmdline)
-    return {"active": active, "mainpid": mainpid, "cmdline": cmdline, "live_mode": live_mode, "armed": armed}
+    restart_count = 0
+    try:
+        restart_count_raw = subprocess.run(
+            ["systemctl", "show", SERVICE_NAME, "-p", "NRestarts"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        restart_count = int((restart_count_raw.split("=", 1)[-1] or 0))
+    except Exception:
+        restart_count = 0
+    cpu_percent = None
+    mem_percent = None
+    rss_kb = None
+    vms_kb = None
+    try:
+        if mainpid > 0:
+            ps_out = subprocess.run(
+                ["ps", "-p", str(mainpid), "-o", "%cpu=,%mem=,rss=,vsz="],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            if ps_out:
+                parts = ps_out.split()
+                if len(parts) >= 4:
+                    cpu_percent = float(parts[0])
+                    mem_percent = float(parts[1])
+                    rss_kb = int(float(parts[2]))
+                    vms_kb = int(float(parts[3]))
+    except Exception:
+        pass
+    return {"active": active, "mainpid": mainpid, "cmdline": cmdline, "live_mode": live_mode, "armed": armed, "restart_count": restart_count, "cpu_percent": cpu_percent, "mem_percent": mem_percent, "rss_kb": rss_kb, "vms_kb": vms_kb}
 
 
 def _load_state(path: str) -> Dict[str, Any]:
@@ -825,6 +888,361 @@ def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[s
     return "\n".join(report).strip() + "\n"
 
 
+def _path_size_bytes(path: str) -> int:
+    total = 0
+    try:
+        p = Path(path)
+        if not p.exists():
+            return 0
+        if p.is_file():
+            return p.stat().st_size
+        for child in p.rglob("*"):
+            try:
+                if child.is_file():
+                    total += child.stat().st_size
+            except Exception:
+                continue
+    except Exception:
+        return 0
+    return total
+
+
+def _read_meminfo() -> Dict[str, int]:
+    info: Dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if not line or ":" not in line:
+                continue
+            key, rest = line.split(":", 1)
+            match = re.search(r"(\d+)", rest)
+            if match:
+                info[key.strip()] = int(match.group(1))
+    except Exception:
+        pass
+    return info
+
+
+def _load_avg() -> Dict[str, Any]:
+    try:
+        raw = Path("/proc/loadavg").read_text(encoding="utf-8").strip().split()
+        if len(raw) >= 3:
+            return {"1m": float(raw[0]), "5m": float(raw[1]), "15m": float(raw[2])}
+    except Exception:
+        pass
+    return {"1m": None, "5m": None, "15m": None}
+
+
+def _git_snapshot(repo_dir: str = "/opt/kalshi-bot") -> Dict[str, Any]:
+    out: Dict[str, Any] = {"status_clean": None, "status_short": [], "head": None, "push_ready": None}
+    try:
+        status = subprocess.run(["git", "-C", repo_dir, "status", "--short"], capture_output=True, text=True, check=False)
+        short = [line for line in (status.stdout or "").splitlines() if line.strip()]
+        out["status_short"] = short[:50]
+        out["status_clean"] = not bool(short)
+    except Exception:
+        out["status_clean"] = None
+    try:
+        head = subprocess.run(["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+        out["head"] = head or None
+    except Exception:
+        out["head"] = None
+    try:
+        remote = subprocess.run(["git", "-C", repo_dir, "status", "-sb"], capture_output=True, text=True, check=False).stdout.strip()
+        out["push_ready"] = bool(out.get("status_clean")) and remote.startswith("##")
+    except Exception:
+        out["push_ready"] = None
+    return out
+
+
+def _runtime_snapshot(repo_dir: str = "/opt/kalshi-bot") -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    runtime_root = Path(repo_dir) / "runtime"
+    for sub in ("tmp", "cache", "memory"):
+        path = runtime_root / sub
+        out[f"{sub}_exists"] = path.exists()
+        out[f"{sub}_size_bytes"] = _path_size_bytes(str(path))
+    out["runtime_exists"] = runtime_root.exists()
+    out["runtime_size_bytes"] = _path_size_bytes(str(runtime_root))
+    out["git_ignored_runtime"] = None
+    try:
+        check = subprocess.run(["git", "-C", repo_dir, "check-ignore", "-q", "runtime/tmp", "runtime/cache", "runtime/memory"], capture_output=True, text=True, check=False)
+        out["git_ignored_runtime"] = check.returncode == 0
+    except Exception:
+        pass
+    return out
+
+
+def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prefix_counts = Counter()
+    blocker_counts = Counter()
+    phase55_observation_called = 0
+    phase55_record_written = 0
+    phase55_record_exists = 0
+    placeholder_overwrite = 0
+    stale_records = 0
+    recursion_errors = 0
+    quote_not_usable = 0
+    selected_price_above = 0
+    unsafe_unknown = 0
+    for entry in entries:
+        prefix = str(entry.get("prefix") or "")
+        prefix_counts[prefix] += 1
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        category, reason, _ticker = _classify_blocker(entry)
+        if reason:
+            blocker_counts[reason] += 1
+        if prefix == "AION-PHASE55-HANDOFF-TRACE":
+            if _truthy(payload.get("phase55_observation_called")):
+                phase55_observation_called += 1
+            if _truthy(payload.get("phase55_record_write_success")) or _truthy(payload.get("phase55_record_created")):
+                phase55_record_written += 1
+            if _truthy(payload.get("phase55_record_exists")):
+                phase55_record_exists += 1
+            if _truthy(payload.get("placeholder_record_detected")) or _truthy(payload.get("overwrite_detected")):
+                placeholder_overwrite += 1
+        if prefix == "AION-PHASE55-PERSISTENCE-TRACE":
+            if _truthy(payload.get("placeholder_record")):
+                placeholder_overwrite += 1
+            if _truthy(payload.get("stale_record")):
+                stale_records += 1
+        if "recursionerror" in reason:
+            recursion_errors += 1
+        if reason == "quote_not_usable":
+            quote_not_usable += 1
+        if reason in {"selected_price_above_0_99", "selected_price_above_max", "selected_price_out_of_bounds"}:
+            selected_price_above += 1
+        if reason == "unsafe_price_unknown":
+            unsafe_unknown += 1
+    return {
+        "prefix_counts": prefix_counts,
+        "blocker_counts": blocker_counts,
+        "phase55_observation_called": phase55_observation_called,
+        "phase55_record_written": phase55_record_written,
+        "phase55_record_exists": phase55_record_exists,
+        "placeholder_overwrite": placeholder_overwrite,
+        "stale_records": stale_records,
+        "recursion_errors": recursion_errors,
+        "quote_not_usable": quote_not_usable,
+        "selected_price_above": selected_price_above,
+        "unsafe_unknown": unsafe_unknown,
+    }
+
+
+def _compute_health_score(system: Dict[str, Any], daily: Dict[str, Any], summary: Dict[str, Any]) -> Tuple[int, str, float, str]:
+    score = 100
+    reasons = []
+    if str(system.get("active") or "").lower() != "active":
+        score -= 35
+        reasons.append("service_inactive")
+    if not system.get("live_mode"):
+        score -= 20
+        reasons.append("live_mode_disabled")
+    if not system.get("armed"):
+        score -= 15
+        reasons.append("live_arm_off")
+    if int(system.get("restart_count") or 0) > 0:
+        score -= min(15, int(system.get("restart_count") or 0) * 5)
+        reasons.append("service_restarted")
+    if daily.get("recursion_errors", 0) > 0:
+        score -= 15
+        reasons.append("recursion_errors")
+    if daily.get("phase55_record_written", 0) == 0 and summary.get("payload_ready_count", 0) > 0:
+        score -= 15
+        reasons.append("payload_no_phase55")
+    if summary.get("payload_ready_count", 0) > 0 and summary.get("phase55_ready_count", 0) == 0:
+        score -= 15
+        reasons.append("phase55_stall")
+    if summary.get("live_exec_count", 0) == 0 and summary.get("payload_ready_count", 0) > 0:
+        score -= 10
+        reasons.append("no_executions")
+    if daily.get("quote_not_usable", 0) > 1000:
+        score -= 10
+        reasons.append("quote_pipeline_blocked")
+    if daily.get("selected_price_above", 0) > 1000:
+        score -= 10
+        reasons.append("price_validation_pressure")
+    if summary.get("blocker_total", 0) == 0 and summary.get("payload_ready_count", 0) == 0 and summary.get("phase55_ready_count", 0) == 0:
+        score -= 5
+        reasons.append("idle_window")
+    score = max(0, min(100, score))
+    if score >= 85:
+        state = "CLEAN"
+    elif score >= 60:
+        state = "WARNING"
+    else:
+        state = "CRITICAL"
+    confidence = min(0.99, max(0.35, 0.35 + min(0.55, (summary.get("blocker_total", 0) + summary.get("payload_ready_count", 0) + summary.get("phase55_ready_count", 0)) / 100000.0)))
+    silent_risk = "high" if (summary.get("payload_ready_count", 0) > 0 and summary.get("phase55_ready_count", 0) == 0) or (summary.get("payload_ready_count", 0) == 0 and summary.get("blocker_total", 0) > 5000) else "moderate" if summary.get("blocker_total", 0) > 0 else "low"
+    return score, state, confidence, ",".join(reasons) or "none"
+
+
+def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any], daily: Dict[str, Any], entries: List[Dict[str, Any]], state: Dict[str, Any]) -> str:
+    blocker_counts: Counter = summary["blocker_counts"]
+    new_blockers = summary["new_blocker_types"] or []
+    repeated_blockers = summary["repeated_blocker_types"] or []
+    funnel = _execution_funnel_summary(entries)
+    git_info = _git_snapshot()
+    runtime_info = _runtime_snapshot()
+    meminfo = _read_meminfo()
+    loadavg = _load_avg()
+    disk = {}
+    for path in ("/", "/opt", "/var"):
+        try:
+            df = subprocess.run(["df", "-P", path], capture_output=True, text=True, check=False).stdout.splitlines()
+            if len(df) >= 2:
+                parts = df[1].split()
+                if len(parts) >= 5:
+                    disk[path] = {"used_pct": parts[4], "avail": parts[3]}
+        except Exception:
+            continue
+    restart_count = int(system.get("restart_count") or 0)
+    api_auth_healthy = not any(k for k in blocker_counts if "auth" in str(k).lower() or "api" in str(k).lower())
+    telegram_configured = bool(_telegram_config()[0] and _telegram_config()[1])
+    dormant_pipeline = bool(summary.get("candidate_tickers") and summary.get("payload_ready_count", 0) == 0 and summary.get("phase55_ready_count", 0) == 0)
+    hidden_blockers = sorted(set(summary.get("top_blockers", []) or []) - set(new_blockers or []))
+    score, overall_state, confidence, score_reasons = _compute_health_score(system, daily, summary)
+    silent_risk = "high" if (summary.get("candidate_tickers") and summary.get("payload_ready_count", 0) == 0 and summary.get("phase55_ready_count", 0) == 0) or daily.get("recursion_errors", 0) > 0 else "moderate" if summary.get("blocker_total", 0) > 0 else "low"
+    closest_ticker = funnel.get("closest_ticker") or "none"
+    current_blocker = (funnel.get("last_blocker_before_live_execution") or {}).get("reason") or (funnel.get("last_blocker_before_phase55_handoff") or {}).get("reason") or (funnel.get("last_blocker_before_entry_ready") or {}).get("reason") or "all_guards_passed"
+    total_scanned = len(summary.get("candidate_tickers") or [])
+    report_lines = [
+        "🛡️ AION DAILY INTEGRITY AUDIT",
+        "",
+        f"Overall state: {overall_state}",
+        f"Health score: {score}/100",
+        f"Confidence: {confidence:.2f}",
+        f"Silent failure risk: {silent_risk}",
+        "",
+        "SYSTEM",
+        f"- service_active: {system.get('active')}",
+        f"- restart_count: {restart_count}",
+        f"- crash_loops: {'yes' if restart_count > 3 else 'no'}",
+        f"- disk: {disk}",
+        f"- ram: total={meminfo.get('MemTotal')}kB available={meminfo.get('MemAvailable')}kB swap_free={meminfo.get('SwapFree')}kB",
+        f"- cpu_load: {loadavg}",
+        "",
+        "LIVE READINESS",
+        f"- live_mode: {'enabled' if system.get('live_mode') else 'disabled'}",
+        f"- live_armed: {'yes' if system.get('armed') else 'no'}",
+        f"- dry_run: {'no' if system.get('live_mode') else 'yes'}",
+        f"- api_auth_healthy: {'yes' if api_auth_healthy else 'no'}",
+        f"- telegram_configured: {'yes' if telegram_configured else 'no'}",
+        "",
+        "MARKET PIPELINE",
+        f"- candidates_scanned_24h: {total_scanned}",
+        f"- payload_ready_count: {summary.get('payload_ready_count', 0)}",
+        f"- phase55_ready_count: {summary.get('phase55_ready_count', 0)}",
+        f"- live_execution_count: {summary.get('live_exec_count', 0)}",
+        f"- exits_count: {summary.get('exit_count', 0)}",
+        f"- closest_ticker_to_execution: {closest_ticker}",
+        f"- dormant_pipeline: {'yes' if dormant_pipeline else 'no'}",
+        "",
+        "BLOCKERS",
+        f"- top_blockers: {', '.join(summary.get('top_blockers') or ['none'])}",
+        f"- newly_appearing: {', '.join(new_blockers or ['none'])}",
+        f"- recurring_blockers: {', '.join(repeated_blockers or ['none'])}",
+        f"- trend: {summary.get('trend')}",
+        f"- hidden_blockers: {', '.join(hidden_blockers[:10]) if hidden_blockers else 'none'}",
+        f"- stale_blocker_labels: {'yes' if any(k in {'direct_fields', 'selected_price_above_max', 'selected_price_above_0_99'} for k in blocker_counts.keys()) else 'no'}",
+        f"- zero_execution_blockers: {', '.join([k for k, v in blocker_counts.items() if v > 0 and summary.get('live_exec_count', 0) == 0][:10]) or 'none'}",
+        "",
+        "QUOTE/ORDERBOOK HEALTH",
+        f"- recursion_errors: {daily.get('recursion_errors', 0)}",
+        f"- quote_not_usable: {daily.get('quote_not_usable', 0)}",
+        f"- stale_orderbooks: {blocker_counts.get('stale_orderbook', 0)}",
+        f"- malformed_books: {blocker_counts.get('orderbook_shape_unrecognized', 0)}",
+        f"- empty_books: {blocker_counts.get('empty_orderbook', 0)}",
+        f"- unsafe_price_propagation: {daily.get('unsafe_unknown', 0)}",
+        "",
+        "PHASE 5.5 HEALTH",
+        f"- persistence_working: {'yes' if daily.get('phase55_record_written', 0) > 0 else 'no'}",
+        f"- readback_working: {'yes' if summary.get('phase55_ready_count', 0) > 0 else 'no'}",
+        f"- placeholder_overwrite_detection: {'yes' if daily.get('placeholder_overwrite', 0) > 0 else 'no'}",
+        f"- trigger_wait: {blocker_counts.get('trigger_wait', 0)}",
+        f"- pullback_wait: {blocker_counts.get('pullback_wait', 0)}",
+        f"- psychology_block: {blocker_counts.get('psychology_block', 0)}",
+        f"- probability_block: {blocker_counts.get('probability_block', 0)}",
+        "",
+        "EXECUTION HEALTH",
+        f"- duplicate_guard: {blocker_counts.get('duplicate_position', 0)}",
+        f"- cooldown_lock: {blocker_counts.get('cooldown_active', 0)}",
+        f"- daily_trade_cap: {blocker_counts.get('daily_trade_cap', 0)}",
+        f"- max_live_positions: {blocker_counts.get('max_live_positions', 0)}",
+        f"- api_submission_failures: {sum(v for k, v in blocker_counts.items() if 'submission' in str(k) or 'submit' in str(k))}",
+        "",
+        "EXIT/RISK HEALTH",
+        f"- exit_monitor_alive: {'yes' if summary.get('exit_count', 0) > 0 or system.get('active') == 'active' else 'unknown'}",
+        f"- tp_sl_activity: {'yes' if any('exit' in str(k) for k in blocker_counts.keys()) else 'no'}",
+        f"- stuck_positions: {'unknown'}",
+        f"- unreadable_positions: {'unknown'}",
+        "",
+        "GIT/RUNTIME HEALTH",
+        f"- git_clean: {'yes' if git_info.get('status_clean') else 'no' if git_info.get('status_clean') is not None else 'unknown'}",
+        f"- runtime_ignored: {'yes' if runtime_info.get('git_ignored_runtime') else 'no' if runtime_info.get('git_ignored_runtime') is not None else 'unknown'}",
+        f"- runtime_growth: tmp={runtime_info.get('tmp_size_bytes')} cache={runtime_info.get('cache_size_bytes')} memory={runtime_info.get('memory_size_bytes')}",
+        f"- runtime_dirs_valid: {'yes' if runtime_info.get('runtime_exists') else 'no'}",
+        "",
+        "Recommendation:",
+        f"- next_fix: {'review raw blocker trace samples' if overall_state == 'CLEAN' else 'fix the dominant blocker path'}",
+    ]
+    report = "\n".join(report_lines).strip() + "\n"
+    print(
+        "[AION-DAILY-INTEGRITY-BUILD] "
+        + json.dumps(
+            {
+                "service": SERVICE_NAME,
+                "lookback_minutes": DAILY_INTEGRITY_LOOKBACK_MINUTES,
+                "state": overall_state,
+                "health_score": score,
+                "confidence": confidence,
+                "silent_failure_risk": silent_risk,
+                "payload_ready_count": summary.get('payload_ready_count', 0),
+                "phase55_ready_count": summary.get('phase55_ready_count', 0),
+                "live_exec_count": summary.get('live_exec_count', 0),
+                "top_blockers": summary.get('top_blockers')[:5],
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
+    return report
+
+
+def _run_daily_integrity_audit(*, dry_run: bool = False) -> int:
+    _load_env_file("/opt/kalshi-bot/.env")
+    state_path = _runtime_daily_state_path()
+    last_report_path = _runtime_daily_last_report_path()
+    state = _load_state(state_path)
+    entries = _parse_journal(minutes=DAILY_INTEGRITY_LOOKBACK_MINUTES)
+    system = _system_status()
+    summary = _summarize(entries, state)
+    daily = _integrity_daily_counts(entries)
+    report = _build_daily_integrity_report(system, summary, daily, entries, state)
+    report_payload = {
+        "created_at": time.time(),
+        "service": SERVICE_NAME,
+        "mode": "daily_integrity_audit",
+        "system": system,
+        "summary": summary,
+        "daily": daily,
+        "report": report,
+    }
+    if dry_run:
+        print(report)
+        _safe_atomic_json_write(last_report_path, report_payload)
+        return 0
+    sent = _send_telegram_message(report)
+    if sent:
+        state["last_sent_ts"] = time.time()
+        state["last_sent_reason"] = "daily_integrity_audit"
+        state["seen_blocker_types"] = sorted(set(state.get("seen_blocker_types", []) or []) | set(summary["blocker_counts"].keys()))
+        _store_state(state_path, state)
+        _safe_atomic_json_write(last_report_path, report_payload)
+        print("[AION-DAILY-INTEGRITY-SENT] " + json.dumps({"telegram_configured": bool(_telegram_config()[0] and _telegram_config()[1]), "health_score": _compute_health_score(system, daily, summary)[0]}, sort_keys=True, default=str))
+        return 0
+    print("[AION-DAILY-INTEGRITY-ERROR] " + json.dumps({"reason": "telegram_send_failed", "telegram_configured": bool(_telegram_config()[0] and _telegram_config()[1])}, sort_keys=True, default=str))
+    return 2
+
 def _can_send_now(state: Dict[str, Any], force: bool) -> Tuple[bool, str]:
     if force:
         return True, "forced"
@@ -963,8 +1381,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="AION Guardian hourly report agent")
     parser.add_argument("--send-now", action="store_true", help="Send the report immediately (ignores cooldown).")
     parser.add_argument("--dry-run", action="store_true", help="Print the report and persist state without sending Telegram.")
+    parser.add_argument("--daily-integrity-audit", action="store_true", help="Run the 24h whole-system integrity audit and send the daily Telegram report.")
     parser.add_argument("--minutes", type=int, default=LOOKBACK_MINUTES, help="Lookback window in minutes.")
     args = parser.parse_args(argv)
+    if args.daily_integrity_audit:
+        LOOKBACK_MINUTES = max(1, int(args.minutes or DAILY_INTEGRITY_LOOKBACK_MINUTES))
+        return _run_daily_integrity_audit(dry_run=bool(args.dry_run))
     LOOKBACK_MINUTES = max(1, int(args.minutes or LOOKBACK_MINUTES))
     return build_and_send_report(force=bool(args.send_now), dry_run=bool(args.dry_run))
 

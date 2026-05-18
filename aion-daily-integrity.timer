@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AION Daily Integrity Audit every 24 hours
+
+[Timer]
+OnBootSec=30m
+OnUnitActiveSec=1d
+Persistent=true
+Unit=aion-daily-integrity.service
+
+[Install]
+WantedBy=timers.target

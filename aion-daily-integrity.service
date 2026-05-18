@@ -1,0 +1,7 @@
+[Unit]
+Description=AION Daily Integrity Audit
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kalshi-bot
+ExecStart=/usr/bin/python3 /opt/kalshi-bot/aion_guardian_report.py --daily-integrity-audit
