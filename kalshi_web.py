@@ -6750,7 +6750,7 @@ class KalshiSniperBot:
             if thin_book_override_applied:
                 print("[AION-ORDERBOOK-USABILITY-ALLOW] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
             elif not effective_orderbook_ready:
-                print("[AION-ORDERBOOK-USABILITY-BLOCKED] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+                print("[AION-PRECHECK-WARN] " + json.dumps({**orderbook_usability_payload, "precheck_stage": "orderbook_usability", "recoverable": True}, sort_keys=True, default=str))
         except Exception:
             pass
         original_selected_side = quote_diag.get("selected_side") or sports_context.get("selected_side")
@@ -6839,7 +6839,7 @@ class KalshiSniperBot:
             pass
         if block_reason != "all_guards_passed":
             try:
-                print("[AION-QUOTE-USABILITY-BLOCK] " + json.dumps({**root_trace, "block_reason": block_reason}, sort_keys=True, default=str))
+                print("[AION-PRECHECK-WARN] " + json.dumps({**root_trace, "block_reason": block_reason, "precheck_stage": "quote_usability", "recoverable": True}, sort_keys=True, default=str))
             except Exception:
                 pass
         print(
@@ -18805,6 +18805,232 @@ class KalshiSniperBot:
             print("[AION-FINAL-GATE-BLOCKER] " + json.dumps(blocker_payload, sort_keys=True, default=str))
         return payload
 
+    def _resolve_aion_canonical_final_execution(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        canonical_execution_state=None,
+        quote_readiness_diagnostic=None,
+        payload_preview=None,
+        edge_after_cost=None,
+        selected_submission_price=None,
+        final_submit_allowed_by_realm_vv=None,
+        selected_side_has_price=None,
+        selected_side_has_liquidity=None,
+        depth_available=None,
+        orderbook_ready=None,
+        duplicate_guard_detail=None,
+        live_mode=None,
+        live_armed=None,
+        live_env_confirmed=None,
+        live_trade_count_today=None,
+        max_live_trades=None,
+        live_positions=None,
+        spread_bucket=None,
+        unsafe_price_status=None,
+        trace_id=None,
+    ):
+        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
+        quote_readiness_diagnostic = quote_readiness_diagnostic if isinstance(quote_readiness_diagnostic, dict) else {}
+        payload_preview = payload_preview if isinstance(payload_preview, dict) else {}
+        duplicate_guard_detail = duplicate_guard_detail if isinstance(duplicate_guard_detail, dict) else {}
+        live_positions = live_positions if isinstance(live_positions, list) else []
+
+        executable_side = str(
+            payload_preview.get('selected_side')
+            or payload_preview.get('side')
+            or quote_readiness_diagnostic.get('selected_side')
+            or canonical_execution_state.get('selected_side')
+            or ''
+        ).strip().lower() or None
+        selected_price_value = selected_submission_price
+        if selected_price_value is None:
+            selected_price_value = payload_preview.get('yes_price')
+        if selected_price_value is None:
+            selected_price_value = payload_preview.get('no_price')
+        selected_price_value = self.to_float(selected_price_value, None)
+        selected_price_valid = bool(selected_price_value is not None and 0.0 < selected_price_value < 1.0)
+        payload_ready = bool(payload_preview)
+        selected_side_has_price_value = bool(
+            selected_side_has_price
+            if selected_side_has_price is not None
+            else quote_readiness_diagnostic.get('selected_side_has_price')
+            if quote_readiness_diagnostic.get('selected_side_has_price') is not None
+            else canonical_execution_state.get('canonical_selected_side_has_price')
+        )
+        selected_side_has_liquidity_value = bool(
+            selected_side_has_liquidity
+            if selected_side_has_liquidity is not None
+            else quote_readiness_diagnostic.get('selected_side_has_liquidity')
+            if quote_readiness_diagnostic.get('selected_side_has_liquidity') is not None
+            else canonical_execution_state.get('canonical_selected_side_has_liquidity')
+        )
+        depth_available_value = bool(
+            depth_available
+            if depth_available is not None
+            else quote_readiness_diagnostic.get('depth_available')
+            if quote_readiness_diagnostic.get('depth_available') is not None
+            else canonical_execution_state.get('canonical_depth_available')
+        )
+        orderbook_ready_value = bool(
+            orderbook_ready
+            if orderbook_ready is not None
+            else quote_readiness_diagnostic.get('orderbook_ready')
+            if quote_readiness_diagnostic.get('orderbook_ready') is not None
+            else canonical_execution_state.get('canonical_orderbook_ready')
+            if canonical_execution_state.get('canonical_orderbook_ready') is not None
+            else depth_available_value
+            or selected_side_has_liquidity_value
+        )
+        live_mode_value = bool(live_mode if live_mode is not None else globals().get('LIVE_MODE', False))
+        live_armed_value = bool(live_armed if live_armed is not None else globals().get('LIVE_ARMED', False))
+        live_env_confirmed_value = bool(live_env_confirmed if live_env_confirmed is not None else globals().get('LIVE_ENV_CONFIRMED', False))
+        auth_ready = bool(live_mode_value and live_armed_value and live_env_confirmed_value)
+        duplicate_blocked = bool(duplicate_guard_detail.get('blocked'))
+        daily_cap_hit = bool(
+            live_trade_count_today is not None
+            and max_live_trades is not None
+            and int(live_trade_count_today) >= int(max_live_trades)
+        )
+        max_live_positions = int(globals().get('MAX_LIVE_POSITIONS', 0) or 0)
+        open_live_positions = sum(
+            1
+            for position in live_positions
+            if str(position.get('status', 'open') or 'open').strip().lower() == 'open'
+        )
+        max_positions_hit = bool(max_live_positions > 0 and open_live_positions >= max_live_positions)
+
+        hard_block_reason = None
+        if not auth_ready:
+            hard_block_reason = 'auth_failure'
+        elif duplicate_blocked:
+            hard_block_reason = str(duplicate_guard_detail.get('reason') or 'duplicate_live_position').strip().lower() or 'duplicate_live_position'
+        elif not payload_ready:
+            hard_block_reason = 'malformed_payload'
+        elif not selected_price_valid:
+            hard_block_reason = 'invalid_selected_price'
+        elif not selected_side_has_price_value or not executable_side:
+            hard_block_reason = 'missing_executable_selected_side_ask'
+        elif not orderbook_ready_value and not depth_available_value and not selected_side_has_liquidity_value:
+            hard_block_reason = 'dead_corrupt_orderbook'
+        elif daily_cap_hit:
+            hard_block_reason = 'daily_cap'
+        elif max_positions_hit:
+            hard_block_reason = 'max_live_positions'
+
+        final_submit_allowed = bool(
+            final_submit_allowed_by_realm_vv
+            and payload_ready
+            and selected_price_valid
+            and selected_side_has_price_value
+            and auth_ready
+            and not duplicate_blocked
+            and not daily_cap_hit
+            and not max_positions_hit
+            and (orderbook_ready_value or depth_available_value or selected_side_has_liquidity_value)
+            and hard_block_reason is None
+        )
+        edge_value = self.to_float(edge_after_cost, 0.0)
+        spread_bucket_value = str(
+            spread_bucket
+            or canonical_execution_state.get('canonical_spread_bucket')
+            or quote_readiness_diagnostic.get('spread_bucket')
+            or 'unknown'
+        ).strip().lower() or 'unknown'
+        unsafe_price_value = str(
+            unsafe_price_status
+            or canonical_execution_state.get('canonical_unsafe_price_status')
+            or quote_readiness_diagnostic.get('unsafe_price_status')
+            or 'unknown'
+        ).strip().lower() or 'unknown'
+        wide_spread = bool(
+            spread_bucket_value in {'unsafe', 'extreme_wide'}
+            or unsafe_price_value in {'unsafe_spread', 'unsafe', 'unsafe_price'}
+        )
+        adaptive_edge_floor = max(
+            self.to_float(globals().get('AION_SPORTS_MIN_EDGE_AFTER_COST', 0.0), 0.0),
+            self.to_float(globals().get('AION_AGGRESSIVE_EDGE_FLOOR', 0.0), 0.0),
+            0.0015,
+        )
+        if wide_spread:
+            adaptive_edge_floor = max(adaptive_edge_floor, 0.0025)
+        strong_edge = bool(edge_value >= adaptive_edge_floor)
+
+        if hard_block_reason:
+            canonical_state = 'HARD_BLOCK'
+            execution_policy = 'hard_block'
+            canonical_reason = hard_block_reason
+            final_action = 'SKIP'
+        elif final_submit_allowed and strong_edge:
+            canonical_state = 'EXECUTE'
+            execution_policy = 'opportunistic_bounded' if wide_spread else 'normal_limit'
+            canonical_reason = 'wide_spread_but_executable' if wide_spread else 'canonical_lane_passed'
+            final_action = 'EXECUTE'
+        else:
+            canonical_state = 'SKIP'
+            execution_policy = 'wait' if final_submit_allowed else 'skip'
+            if not final_submit_allowed:
+                canonical_reason = (
+                    'final_submit_not_allowed'
+                    if not payload_ready
+                    else 'price_bounds_pass=false'
+                    if not selected_price_valid
+                    else 'missing_executable_selected_side_ask'
+                    if not selected_side_has_price_value
+                    else 'orderbook_not_usable'
+                    if not (orderbook_ready_value or depth_available_value or selected_side_has_liquidity_value)
+                    else 'canonical_lane_blocked'
+                )
+            elif wide_spread:
+                canonical_reason = 'wide_spread_wait'
+            else:
+                canonical_reason = 'edge_below_threshold'
+            final_action = 'SKIP'
+
+        return {
+            'ticker': str(ticker or '').strip() or None,
+            'family': str(family or 'UNKNOWN').strip().upper() or 'UNKNOWN',
+            'canonical_state': canonical_state,
+            'canonical_reason': canonical_reason,
+            'final_submit_allowed': bool(final_submit_allowed),
+            'executable_price': selected_price_value,
+            'executable_side': executable_side,
+            'hard_block': bool(hard_block_reason is not None),
+            'hard_block_reason': hard_block_reason,
+            'execution_policy': execution_policy,
+            'final_action': final_action,
+            'edge_after_cost': edge_value,
+            'spread_bucket': spread_bucket_value,
+            'unsafe_price_status': unsafe_price_value,
+            'trace_id': trace_id,
+            'selected_side_has_price': bool(selected_side_has_price_value),
+            'selected_side_has_liquidity': bool(selected_side_has_liquidity_value),
+            'depth_available': bool(depth_available_value),
+            'orderbook_ready': bool(orderbook_ready_value),
+            'price_valid': bool(selected_price_valid),
+        }
+
+    def _emit_aion_canonical_final(self, *, canonical_final=None):
+        canonical_final = canonical_final if isinstance(canonical_final, dict) else {}
+        payload = {
+            'ticker': canonical_final.get('ticker'),
+            'family': canonical_final.get('family'),
+            'canonical_state': canonical_final.get('canonical_state'),
+            'canonical_reason': canonical_final.get('canonical_reason'),
+            'final_submit_allowed': bool(canonical_final.get('final_submit_allowed')),
+            'executable_price': canonical_final.get('executable_price'),
+            'hard_block': bool(canonical_final.get('hard_block')),
+            'execution_policy': canonical_final.get('execution_policy'),
+            'final_action': canonical_final.get('final_action'),
+            'edge_after_cost': canonical_final.get('edge_after_cost'),
+            'spread_bucket': canonical_final.get('spread_bucket'),
+            'unsafe_price_status': canonical_final.get('unsafe_price_status'),
+            'trace_id': canonical_final.get('trace_id'),
+        }
+        print('[AION-CANONICAL-FINAL] ' + json.dumps(payload, sort_keys=True, default=str))
+        return payload
+
     def _emit_candidate_phase55_forensics(
         self,
         *,
@@ -22209,7 +22435,7 @@ class KalshiSniperBot:
             or quote_diag.get("canonical_spread_classification")
             or "UNSAFE"
         ).strip().upper() or "UNSAFE"
-        valid_spread_bucket = spread_bucket in {"ultra_tight", "tight", "wide_but_possible"}
+        valid_spread_bucket = spread_bucket in {"ultra_tight", "tight", "wide_but_possible", "extreme_wide"}
         book_valid = bool(canonical_source.get("book_valid"))
         normalized_consistent = bool(canonical_source.get("normalized_consistent"))
         bid_ask_consistent = bool(best_bid is None or best_ask is None or best_bid <= best_ask)
@@ -22274,70 +22500,38 @@ class KalshiSniperBot:
             or self.to_float(quote_diag.get("no_top_size"), 0.0) > 0.0
         )
         depth_available = bool(topbook_depth_exists or selected_side_has_liquidity)
+        book_usable = bool(book_valid or topbook_depth_exists or selected_side_has_price or selected_side_has_liquidity)
+        opportunistic_edge_floor = max(self.to_float(aggression_settings.get("effective_edge_threshold"), 0.001), 0.0015)
+        extreme_edge_floor = max(opportunistic_edge_floor * 1.5, 0.0025)
         if not book_valid and not any(book_missing_reasons):
             unsafe_price_status = "both_sides_unexecutable"
             unsafe_resolution_reason = "missing_quote_book"
         elif not price_bounds_pass:
             unsafe_price_status = "unexecutable_price"
             unsafe_resolution_reason = "selected_price_out_of_bounds"
-        elif book_valid and valid_spread_bucket and normalized_consistent:
+        elif book_valid and spread_bucket in {"ultra_tight", "tight", "wide_but_possible"} and normalized_consistent:
             unsafe_price_status = "safe"
             unsafe_resolution_reason = "valid_structurally_consistent_book"
-        elif book_valid and spread_bucket == "unsafe":
+        elif book_usable and spread_bucket in {"unsafe", "extreme_wide"}:
+            edge_floor = extreme_edge_floor if spread_bucket == "extreme_wide" else opportunistic_edge_floor
             opportunistic_wide_spread_ok = bool(
                 aggression_profile in {"opportunistic", "beast"}
                 and price_bounds_pass
-                and topbook_depth_exists
+                and selected_side_has_price
                 and fresh_enough
-                and edge_after_cost_value >= self.to_float(aggression_settings.get("effective_edge_threshold"), 0.001)
-                and (normalized_consistent or book_valid)
+                and edge_after_cost_value >= edge_floor
+                and (normalized_consistent or book_valid or topbook_depth_exists)
             )
-            if price_bounds_pass and (
-                opportunistic_wide_spread_ok
-                or (
-                    liquidity_depth_value > 0.0
-                    and topbook_depth_exists
-                    and fresh_enough
-                    and edge_after_cost_value >= self.to_float(aggression_settings.get("effective_edge_threshold"), 0.009)
-                )
-            ):
+            if opportunistic_wide_spread_ok:
                 unsafe_price_status = "caution_wide_spread"
                 unsafe_resolution_reason = "wide_spread_but_executable"
                 spread_bucket = "wide_but_possible"
-                try:
-                    print("[AION-WIDE-SPREAD-CAUTION-PASS] " + json.dumps({
-                        "ticker": ticker or None,
-                        "family": family,
-                        "profile": aggression_profile,
-                        "yes_bid_cents": canonical_source.get("yes_bid_cents"),
-                        "no_bid_cents": canonical_source.get("no_bid_cents"),
-                        "derived_yes_ask_cents": canonical_source.get("yes_ask_cents"),
-                        "derived_no_ask_cents": canonical_source.get("no_ask_cents"),
-                        "selected_side": "yes" if yes_bid_valid else ("no" if no_bid_valid else None),
-                        "selected_price_cents": int(round((normalized_yes_price or normalized_no_price or 0.0) * 100.0)) if (normalized_yes_price or normalized_no_price) is not None else None,
-                        "selected_price_dollars": normalized_yes_price or normalized_no_price,
-                        "alternate_side": "no" if yes_bid_valid else "yes",
-                        "alternate_price_cents": canonical_source.get("no_bid_cents") if yes_bid_valid else canonical_source.get("yes_bid_cents"),
-                        "price_bounds_pass": price_bounds_pass,
-                        "spread_bucket_original": str(quote_diag.get("spread_bucket") or "unknown").strip().lower() or "unknown",
-                        "spread_bucket_final": "caution_wide_spread",
-                        "unsafe_price_status_original": str(quote_diag.get("unsafe_price_status") or "unknown").strip().lower() or "unknown",
-                        "unsafe_price_status_final": "caution_wide_spread",
-                        "edge_after_cost": edge_after_cost_value,
-                        "liquidity": liquidity_depth_value,
-                        "side_switch_attempted": False,
-                        "side_switch_success": False,
-                        "phase55_allowed": True,
-                        "block_reason": None,
-                    }, sort_keys=True, default=str))
-                except Exception:
-                    pass
             else:
                 unsafe_price_status = "unsafe_spread"
-                unsafe_resolution_reason = "spread_bucket_not_allowed"
-        elif book_valid:
-            unsafe_price_status = "unsafe_spread"
-            unsafe_resolution_reason = "spread_bucket_not_allowed"
+                unsafe_resolution_reason = "spread_bucket_not_allowed" if spread_bucket != "extreme_wide" else "extreme_wide_edge_weak"
+        elif book_usable:
+            unsafe_price_status = "caution_wide_spread" if price_bounds_pass and selected_side_has_price and edge_after_cost_value >= opportunistic_edge_floor else "unsafe_spread"
+            unsafe_resolution_reason = "partial_quote_but_executable" if unsafe_price_status == "caution_wide_spread" else "spread_bucket_not_allowed"
         elif yes_bid_valid or yes_ask_valid or no_bid_valid or no_ask_valid:
             unsafe_price_status = "unexecutable_price"
             unsafe_resolution_reason = "partial_quote_book"
@@ -22378,7 +22572,6 @@ class KalshiSniperBot:
             and quote_diag.get("quote_ready", True)
             and (not spread_is_catastrophic or thin_book_override_applied)
         )
-
         payload = {
             "ticker": ticker or None,
             "family": family,
@@ -39535,7 +39728,7 @@ class KalshiSniperBot:
             readiness = self.resolve_aion_trade_readiness(
                 payload={"payload_present": trace_state_snapshot.get("payload_ready"), "payload_ready": trace_state_snapshot.get("payload_ready")},
                 quote={"quote_present": trace_state_snapshot.get("quote_ready"), "quote_object": trace_state_snapshot.get("quote_object")},
-                phase55_result=trace_state_snapshot,
+                phase55_result=phase55_gate_record or trace_state_snapshot,
                 safety_context={
                     "unsafe_price_status": unsafe_price_status if unsafe_price_status is not None else trace_state_snapshot.get("unsafe_price_status"),
                     "duplicate_status": duplicate_status if duplicate_status is not None else trace_state_snapshot.get("duplicate_status"),
@@ -39546,6 +39739,7 @@ class KalshiSniperBot:
                     "legacy_direct_fields_ready": trace_state_snapshot.get("legacy_direct_fields_ready"),
                     "spread_bucket": spread_bucket if spread_bucket is not None else trace_state_snapshot.get("spread_bucket"),
                 },
+                canonical_execution_state=trace_state_snapshot,
                 trace_id=trace_id,
                 ticker=ticker,
                 family=trace_state_snapshot.get("family"),
@@ -40161,8 +40355,19 @@ class KalshiSniperBot:
         selector_threshold_available = bool(state.get("selector_threshold_available"))
         phase55_ready = bool(state.get("phase55_ready"))
         phase55_status = str(state.get("phase55_status") or "unknown").strip().lower() or "unknown"
+        canonical_ready = bool(
+            state.get("canonical_ready")
+            or state.get("final_ready")
+            or state.get("canonical_final_submit_allowed_by_realm_vv")
+            or state.get("final_submit_allowed")
+        )
         auth_ready = bool(state.get("auth_ready"))
         direct_fields_missing = not (direct_fields_ready or legacy_direct_fields_ready)
+        legacy_metadata_missing = bool(
+            phase55_status in {"placeholder_phase55_record", "missing_phase55_record", "unknown", "none", ""}
+            or not phase55_ready
+            or not bool(state.get("source_fields_used"))
+        )
         quote_block = not quote_ready or quote_missing
         blocker_chain = []
 
@@ -40217,10 +40422,8 @@ class KalshiSniperBot:
             first_blocker = "selector_skip"
         elif selector_decision in {"UNKNOWN", "NONE", ""}:
             first_blocker = "selector_unknown" if (selector_input_available or selector_score_available or selector_threshold_available) else "final_not_ready_unknown"
-        elif not phase55_ready and phase55_status != "entry_ready":
-            first_blocker = "phase55_not_ready"
-        elif not normalized_ready:
-            first_blocker = "normalized_not_ready"
+        elif canonical_ready:
+            first_blocker = "passed"
         else:
             first_blocker = "final_not_ready_unknown"
 
@@ -40246,6 +40449,8 @@ class KalshiSniperBot:
             "legacy_direct_fields_ready": legacy_direct_fields_ready,
             "direct_fields_ready": direct_fields_ready,
             "normalized_ready": normalized_ready,
+            "canonical_ready": canonical_ready,
+            "legacy_metadata_missing": legacy_metadata_missing,
             "unsafe_price_status": unsafe_price_status,
             "spread_bucket": spread_bucket,
             "duplicate_status": duplicate_status,
@@ -40425,7 +40630,7 @@ class KalshiSniperBot:
         print("[AION-SPORTS-THRESHOLD-TRACE] " + json.dumps(payload, sort_keys=True, default=str))
         return payload
 
-    def resolve_aion_trade_readiness(self, *, payload=None, quote=None, phase55_result=None, safety_context=None, trace_id=None, ticker=None, family=None):
+    def resolve_aion_trade_readiness(self, *, payload=None, quote=None, phase55_result=None, safety_context=None, canonical_execution_state=None, trace_id=None, ticker=None, family=None):
         # Canonical readiness resolver:
         # - quote missing blocks with quote_missing
         # - phase55 not ready blocks with phase55_not_ready
@@ -40435,6 +40640,7 @@ class KalshiSniperBot:
         quote = quote if isinstance(quote, dict) else {}
         phase55_result = phase55_result if isinstance(phase55_result, dict) else {}
         safety_context = safety_context if isinstance(safety_context, dict) else {}
+        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
         source_fields_used = []
         missing_fields = []
         phase55_shape = "missing"
@@ -40761,19 +40967,14 @@ class KalshiSniperBot:
             final_block_reason = "selector_skip"
         elif selector_decision_value in {"UNKNOWN", "NONE", ""}:
             final_block_reason = "selector_unknown"
-        elif not phase55_ready_value:
-            final_block_reason = "phase55_not_ready"
-        elif not normalized_ready_value:
-            final_block_reason = "normalized_not_ready"
         else:
             final_block_reason = "passed"
 
         canonical_realm_vv_authority = bool(
-            canonical_realm_vv_ready
-            and phase55_ready_value
-            and payload_ready_value
-            and auth_ready_value
-            and str(phase55_status_value or "").strip().lower() == "entry_ready"
+            canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
+            or canonical_execution_state.get("canonical_ready")
+            or canonical_realm_vv_ready
+            or (phase55_ready_value and payload_ready_value and auth_ready_value and str(phase55_status_value or "").strip().lower() == "entry_ready")
         )
         stale_blocker_labels = []
         if canonical_realm_vv_authority:
@@ -40840,6 +41041,27 @@ class KalshiSniperBot:
         final_ready = bool(final_block_reason == "passed")
         if final_ready:
             missing_fields = [field for field in missing_fields if field not in {"quote_fields_valid", "phase55_result", "unsafe_price_status", "duplicate_status", "cooldown_status", "selector_decision", "auth_ready"}]
+        canonical_ready = bool(canonical_allow_lane)
+        legacy_phase55_issue = bool(
+            phase55_status_value in {"placeholder_phase55_record", "missing_phase55_record", "overwritten_phase55_record", "unknown", "none", ""}
+            or not phase55_ready_value
+            or readiness_mapping_error_final in {"missing_phase55_result", "missing_phase55_record", "placeholder_phase55_record", "overwritten_phase55_record"}
+        )
+        if canonical_ready and legacy_phase55_issue:
+            print(
+                "[AION-LEGACY-PHASE55-BYPASSED] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "reason": "legacy_metadata_missing",
+                        "canonical_action": "BUY",
+                        "old_phase55_status": phase55_status_value,
+                        "trace_id": trace_id,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         result = {
             "final_ready": final_ready,
             "final_block_reason": final_block_reason,
@@ -40964,19 +41186,13 @@ class KalshiSniperBot:
         if cooldown_value not in {"unknown", "clear", "none"}:
             return "cooldown_active"
         if not phase55_ready_value:
-            if phase55_status_value in {"trigger_wait", "pullback_wait", "immediate_reject", "probability_block", "capital_block", "psychology_block", "insufficient_data", "entry_ready", "placeholder_phase55_record", "missing_phase55_record", "overwritten_phase55_record"}:
-                return phase55_status_value
+            if phase55_status_value in {"placeholder_phase55_record", "missing_phase55_record", "overwritten_phase55_record"}:
+                return "legacy_metadata_missing"
             if readiness_mapping_error in {"missing_phase55_result", "missing_phase55_record", "placeholder_phase55_record", "overwritten_phase55_record"}:
-                return str(readiness_mapping_error).strip().lower()
-            if phase55_record_found is True:
-                return "placeholder_phase55_record" if phase55_status_value in {"", "unknown", "none"} else "phase55_not_ready"
-            if phase55_record_found is False:
-                return "missing_phase55_record"
-            if not entry_timing_pass_value:
-                return "phase55_not_ready"
-            return "phase55_not_ready"
+                return "legacy_metadata_missing"
+            return "final_not_ready_unknown"
         if not normalized_ready_value:
-            return "normalized_not_ready"
+            return "final_not_ready_unknown"
         if str(block_reason or "").strip().lower() in {"final_edge", "unknown", "none", ""}:
             return "all_guards_passed"
         return str(block_reason or quote_fixed_reason or source_of_edge_value or "all_guards_passed").strip() or "all_guards_passed"
@@ -41238,6 +41454,7 @@ class KalshiSniperBot:
         cooldown_status_value = str(cooldown_status or quote_diag.get("cooldown_status") or "unknown").strip().lower() or "unknown"
         payload_ready_value = bool(True if payload_ready is None else payload_ready)
         auth_ready_value = bool(True if auth_ready is None else auth_ready)
+        canonical_ready = bool(canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv") or canonical_execution_state.get("canonical_ready"))
         if not canonical_execution_state and isinstance(quote_diag.get("canonical_tradeability"), dict):
             canonical_tradeability_hint = quote_diag.get("canonical_tradeability") or {}
             canonical_execution_state = {
@@ -41368,28 +41585,10 @@ class KalshiSniperBot:
         elif cooldown_status_value not in {"unknown", "clear", "none"}:
             first_blocker = "cooldown_unknown"
         elif not (phase55_ready_value or fast_confirmed_value or live_promotion_value):
-            if phase55_status_value in {
-                "trigger_wait",
-                "pullback_wait",
-                "immediate_reject",
-                "probability_block",
-                "capital_block",
-                "psychology_block",
-                "insufficient_data",
-                "placeholder_phase55_record",
-                "missing_phase55_record",
-                "overwritten_phase55_record",
-            }:
-                first_blocker = phase55_status_value
-            elif readiness_mapping_error_final in {
-                "missing_phase55_result",
-                "missing_phase55_record",
-                "placeholder_phase55_record",
-                "overwritten_phase55_record",
-            }:
-                first_blocker = readiness_mapping_error_final
+            if canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv"):
+                first_blocker = "passed"
             else:
-                first_blocker = "phase55_not_ready"
+                first_blocker = "final_not_ready_unknown"
         elif not selector_decision_value or selector_decision_value in {"UNKNOWN", "NONE"}:
             first_blocker = "selector_unknown"
         elif selector_decision_value and selector_decision_value not in {"BUY", "LIVE_PROMOTION"} and not live_promotion_value:
@@ -41637,6 +41836,7 @@ class KalshiSniperBot:
             "phase55_status": phase55_status_value,
             "realm_vv_ready": bool(phase55_ready_value),
             "phase55_ready": bool(phase55_ready_value),
+            "canonical_ready": bool(canonical_ready),
             "entry_ready_reason": candidate_entry_ready_reason,
             "realm_vv_source_field": candidate_phase55_source_field,
             "phase55_source_field": candidate_phase55_source_field,
@@ -41673,6 +41873,7 @@ class KalshiSniperBot:
                 legacy_direct_fields_ready=legacy_direct_fields_ready_value,
                 direct_fields_ready=direct_fields_ready_value,
                 normalized_ready=normalized_ready,
+                canonical_ready=canonical_ready,
                 spread_bucket=spread_bucket_value,
                 unsafe_price_status=unsafe_price_status_value,
                 phase55_ready=phase55_ready_value,
@@ -41686,10 +41887,30 @@ class KalshiSniperBot:
                 duplicate_status=duplicate_status_value,
                 cooldown_status=cooldown_status_value,
                 auth_ready=auth_ready_value,
+                canonical_final_submit_allowed_by_realm_vv=bool(canonical_allow_lane),
+                canonical_action="BUY" if canonical_ready else selector_decision_value or None,
                 first_blocker=corrected_block_reason,
                 final_block_reason=corrected_block_reason,
         )
         print("[AION-FINAL-READINESS-SYNC] " + json.dumps(payload, sort_keys=True, default=str))
+        print(
+            "[AION-CANONICAL-FINAL] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "canonical_state": payload.get("phase55_status") if payload.get("canonical_ready") else payload.get("final_block_reason"),
+                    "canonical_reason": payload.get("final_block_reason"),
+                    "final_submit_allowed": bool(payload.get("canonical_ready")),
+                    "executable_price": payload.get("selected_price") or self.to_float(edge_after_cost, 0.0),
+                    "hard_block": not bool(payload.get("canonical_ready")),
+                    "execution_policy": "execute" if bool(payload.get("canonical_ready")) else "skip",
+                    "final_action": "BUY" if bool(payload.get("canonical_ready")) else "SKIP",
+                    "trace_id": trace_id,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         readiness_consistency_warn = bool(
             disagreement
             or (legacy_direct_fields_ready_value and not direct_fields_ready_value)
@@ -41764,7 +41985,6 @@ class KalshiSniperBot:
         because_fields = []
         if not final_ready_value:
             if final_block_reason in {
-                "phase55_not_ready",
                 "selector_unknown",
                 "selector_skip",
                 "entry_timing_wait",
@@ -41775,13 +41995,12 @@ class KalshiSniperBot:
                 "capital_block",
                 "psychology_block",
                 "insufficient_data",
-                "placeholder_phase55_record",
-                "missing_phase55_record",
-                "overwritten_phase55_record",
             }:
                 because_fields.append(f"phase55_ready:{bool(phase55_ready_value)}")
                 because_fields.append(f"phase55_status:{phase55_status_value}")
                 because_fields.append(f"entry_timing_pass:{bool(phase55_ready_value)}")
+            if final_block_reason in {"legacy_metadata_missing", "placeholder_phase55_record", "missing_phase55_record", "overwritten_phase55_record", "phase55_not_ready"}:
+                because_fields.append("legacy_metadata_missing")
             if final_block_reason in {"unsafe_price_block", "unsafe_price_unknown", "unsafe_spread_bucket", "unsafe_price"}:
                 because_fields.append(f"unsafe_price_status:{unsafe_price_status_value}")
                 because_fields.append(f"spread_bucket:{spread_bucket_value}")
@@ -41797,7 +42016,7 @@ class KalshiSniperBot:
             if candidate_phase55_missing_path:
                 because_fields.append(f"phase55_missing_path:{candidate_phase55_missing_path}")
         if not final_ready_value and edge_pass and final_block_reason == "final_edge":
-            because_fields.append("replacement_block_reason:phase55_not_ready")
+            because_fields.append("replacement_block_reason:legacy_metadata_missing")
         print(
             "[AION-FINAL-READY-EXPLAIN] "
             + json.dumps(
@@ -43239,7 +43458,7 @@ class KalshiSniperBot:
             if thin_book_override_applied:
                 print("[AION-ORDERBOOK-USABILITY-ALLOW] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
             elif not orderbook_ready:
-                print("[AION-ORDERBOOK-USABILITY-BLOCKED] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+                print("[AION-PRECHECK-WARN] " + json.dumps({**orderbook_usability_payload, "precheck_stage": "orderbook_usability", "recoverable": True}, sort_keys=True, default=str))
         except Exception:
             pass
         tradeable = bool(
@@ -44999,7 +45218,7 @@ class KalshiSniperBot:
             if realm_vv_result.get("entry_timing_pass") is not None
             else realm_vv_result.get("entry_ready")
             if realm_vv_result.get("entry_ready") is not None
-            else phase55_ready if phase55_ready is not None else canonical_execution_decision == "BUY"
+            else phase55_ready if phase55_ready is not None else canonical_buy_ready
         )
         if canonical_phase55_ready and canonical_readiness_state != "entry_ready":
             canonical_readiness_state = "entry_ready"
@@ -45011,13 +45230,6 @@ class KalshiSniperBot:
             else canonical_tradeability.get("tradeable")
             if canonical_tradeability.get("tradeable") is not None
             else canonical_execution_decision == "BUY"
-        )
-        canonical_buy_ready = bool(
-            canonical_execution_decision in {"BUY", "LIVE_PROMOTION"}
-            and canonical_tradeable
-            and bool(payload_ready if payload_ready is not None else True)
-            and bool(auth_ready if auth_ready is not None else True)
-            and (canonical_phase55_ready or canonical_readiness_state == "entry_ready")
         )
         canonical_selected_side_has_price = bool(
             selected_side_has_price
@@ -45046,6 +45258,17 @@ class KalshiSniperBot:
             else canonical_tradeability.get("price_bounds_pass")
             if canonical_tradeability.get("price_bounds_pass") is not None
             else canonical_execution_decision == "BUY"
+        )
+        canonical_buy_ready = bool(
+            canonical_execution_decision in {"BUY", "LIVE_PROMOTION"}
+            and canonical_tradeable
+            and bool(payload_ready if payload_ready is not None else True)
+            and bool(auth_ready if auth_ready is not None else True)
+            and canonical_selected_side_has_price
+            and canonical_price_bounds_pass
+            and (canonical_selected_side_has_liquidity or canonical_depth_available or bool(orderbook_ready if orderbook_ready is not None else canonical_tradeability.get("orderbook_ready")))
+            and str(duplicate_status or "unknown").strip().lower() in {"unknown", "clear", "unknown_clear", "none"}
+            and str(cooldown_status or "unknown").strip().lower() in {"unknown", "clear", "none"}
         )
         canonical_relaxed_beast_mode = bool(relaxed_beast_mode)
         canonical_relaxed_submit_allowed = bool(
@@ -45114,11 +45337,17 @@ class KalshiSniperBot:
         canonical_final_block_reason = (
             "all_guards_passed"
             if canonical_buy_ready
+            and canonical_price_bounds_pass
+            and canonical_selected_side_has_price
+            and (canonical_selected_side_has_liquidity or canonical_depth_available or bool(orderbook_ready if orderbook_ready is not None else canonical_tradeability.get("orderbook_ready")))
             else str(
                 realm_vv_result.get("canonical_final_block_reason")
                 or realm_vv_result.get("final_block_reason")
                 or final_block_reason
                 or (None if canonical_execution_decision == "BUY" else canonical_readiness_state)
+                or ("price_bounds_pass=false" if canonical_buy_ready and not canonical_price_bounds_pass else None)
+                or ("selected_side_missing_price" if canonical_buy_ready and not canonical_selected_side_has_price else None)
+                or ("orderbook_not_usable" if canonical_buy_ready and not (canonical_selected_side_has_liquidity or canonical_depth_available or bool(orderbook_ready if orderbook_ready is not None else canonical_tradeability.get("orderbook_ready"))) else None)
                 or "final_not_ready_unknown"
             ).strip() or "final_not_ready_unknown"
         )
@@ -49001,7 +49230,7 @@ class KalshiSniperBot:
                         for position in self.live_positions
                         if str(position.get("status", "open") or "open").strip().lower() == "open"
                     ),
-                    "reason": "submit_live_order",
+                    "reason": final_decision_reason,
                     "blocker": None,
                     "order_payload_keys": sorted(list(payload.keys())),
                 },
@@ -52566,7 +52795,8 @@ class KalshiSniperBot:
                     and 1 <= int(selected_price_cents) <= 99
                 )
             )
-            if canonical_execution_state:
+            debug_live = str(os.environ.get("DEBUG_LIVE", "")).strip().lower() == "true"
+            if canonical_execution_state and debug_live:
                 print(
                     "[AION-CANONICAL-EXECUTION-STATE] "
                     + json.dumps(
@@ -52772,7 +53002,7 @@ class KalshiSniperBot:
                         "payload_ready": bool(payload_preflight.get("payload_ready")),
                         "auth_ready": bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
                         "duplicate_guard": bool(duplicate_guard_detail.get("blocked")),
-                        "final_block_reason": "all_guards_passed" if canonical_allow_lane else preflight_unsafe_resolution_reason,
+                        "final_block_reason": (("all_guards_passed" if price_bounds_pass else "price_bounds_pass=false") if canonical_allow_lane else (canonical_execution_state.get("hard_block_reason") or canonical_execution_state.get("canonical_reason") or preflight_unsafe_resolution_reason or "final_not_ready")),
                     },
                     sort_keys=True,
                     default=str,
@@ -52799,7 +53029,7 @@ class KalshiSniperBot:
                             "payload_ready": bool(payload_preflight.get("payload_ready")),
                             "auth_ready": bool(globals().get("LIVE_MODE", False) and globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
                             "duplicate_guard": bool(duplicate_guard_detail.get("blocked")),
-                            "final_block_reason": "all_guards_passed" if canonical_allow_lane else preflight_unsafe_resolution_reason,
+                            "final_block_reason": (("all_guards_passed" if price_bounds_pass else "price_bounds_pass=false") if canonical_allow_lane else (canonical_execution_state.get("hard_block_reason") or canonical_execution_state.get("canonical_reason") or preflight_unsafe_resolution_reason or "final_not_ready")),
                         },
                         sort_keys=True,
                         default=str,
@@ -54080,6 +54310,37 @@ class KalshiSniperBot:
                 and (not controlled_spread_extreme or canonical_realm_vv_lane_survives)
                 and controlled_spread_bucket in {"ultra_tight", "tight", "wide_but_possible", "unsafe"}
             )
+            canonical_final = self._resolve_aion_canonical_final_execution(
+                ticker=auto_live_ticker,
+                family=selected_family,
+                canonical_execution_state=canonical_execution_state,
+                quote_readiness_diagnostic=quote_readiness_diagnostic,
+                payload_preview=payload_preview,
+                edge_after_cost=edge_after_cost,
+                selected_submission_price=selected_submission_price_hint,
+                final_submit_allowed_by_realm_vv=bool(final_submit_allowed_by_realm_vv),
+                selected_side_has_price=selected_side_has_price,
+                selected_side_has_liquidity=selected_side_has_liquidity,
+                depth_available=depth_available,
+                orderbook_ready=orderbook_ready,
+                duplicate_guard_detail=duplicate_guard_detail,
+                live_mode=globals().get("LIVE_MODE", False),
+                live_armed=globals().get("LIVE_ARMED", False),
+                live_env_confirmed=globals().get("LIVE_ENV_CONFIRMED", False),
+                live_trade_count_today=self.live_trade_count_today,
+                max_live_trades=MAX_LIVE_TRADES_PER_DAY,
+                live_positions=self.live_positions,
+                spread_bucket=controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get("eligible")) else aggressive_spread_bucket,
+                unsafe_price_status=final_gate_unsafe_price_status,
+                trace_id=trace_id,
+            )
+            self._emit_aion_canonical_final(canonical_final=canonical_final)
+            final_decision_allowed = bool(canonical_final.get("final_action") == "EXECUTE")
+            final_decision_reason = str(canonical_final.get("canonical_reason") or "blocked").strip() or "blocked"
+            aggressive_lane_execution["aggressive_lane_approved"] = final_decision_allowed
+            aggressive_lane_execution["aggressive_lane_block_reason"] = None if final_decision_allowed else final_decision_reason
+            aggressive_lane_execution["block_reason"] = None if final_decision_allowed else final_decision_reason
+            aggressive_lane_execution["execution_sanity_pass"] = final_decision_allowed
             if aggressive_fastpath_eligible:
                 if not bool(quote_readiness_diagnostic.get("quote_ready")) and aggressive_fastpath_quote is not None:
                     refreshed_quote, aggressive_fastpath_refresh_meta = self._refresh_quote_for_aggressive_fastpath(
@@ -54306,7 +54567,7 @@ class KalshiSniperBot:
                 self.to_float(edge_after_cost, 0.0) >= 0.002
                 and aggressive_spread_bucket == "unsafe"
             )
-            if unsafe_spread_tradable_override and not bool(aggressive_lane_execution.get("aggressive_lane_approved")):
+            if unsafe_spread_tradable_override and not bool(aggressive_lane_execution.get("aggressive_lane_approved")) and final_decision_allowed:
                 quote_fixed = False
                 if bool(quote_readiness_diagnostic.get("quote_missing")) or aggressive_fastpath_quote is None:
                     refreshed_quote, aggressive_fastpath_refresh_meta = self._refresh_quote_for_aggressive_fastpath(
@@ -54363,7 +54624,7 @@ class KalshiSniperBot:
                             f"quote_fixed={'yes' if quote_fixed else 'no'} "
                             f"decision=EXECUTED"
                         )
-            if controlled_lane_ok and not aggressive_lane_execution.get("aggressive_lane_approved"):
+            if controlled_lane_ok and not aggressive_lane_execution.get("aggressive_lane_approved") and final_decision_allowed:
                 aggressive_lane_execution["aggressive_lane_approved"] = True
                 aggressive_lane_execution["aggressive_lane_block_reason"] = None
                 aggressive_lane_execution["block_reason"] = None
@@ -54388,77 +54649,72 @@ class KalshiSniperBot:
                     )
                 )
             if not aggressive_lane_execution.get("aggressive_lane_approved"):
-                edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
-                self._emit_aion_final_gate(
-                    ticker=auto_live_ticker,
-                    family=final_family or selected_family,
-                    edge_after_cost=edge_after_cost,
-                    quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
-                    reason=aggressive_lane_execution.get("block_reason") or "aggressive_lane_blocked",
-                    stage="aggressive_lane_gate",
-                    decision="SKIP",
-                )
-                execution_funnel["execution_blocked"] = 1
-                block_reason = aggressive_lane_execution.get("block_reason") or "aggressive_lane_blocked"
-                if block_reason in {"live_arm_gate_disabled", "live_trading_not_armed"}:
-                    block_reason = "live_arm_block"
-                elif block_reason in {"duplicate_block", "duplicate"}:
-                    block_reason = "duplicate_position"
-                elif block_reason in {"unsafe_price_block", "unsafe_price"}:
-                    block_reason = (
-                        near_safe_spread_context.get("rejection_reason")
-                        if bool(near_safe_spread_context) and not bool(near_safe_spread_context.get("eligible"))
-                        else "unsafe_price"
+                if bool(canonical_final.get("hard_block")):
+                    block_reason = str(canonical_final.get("hard_block_reason") or final_decision_reason or "blocked").strip().lower() or "blocked"
+                    execution_funnel["execution_blocked"] = 1
+                    self._emit_aion_execution_blocker(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        exact_blocker=block_reason,
+                        execution_path="aggressive_lane_gate",
+                        selector_state=str(aggressive_lane_execution.get("block_reason") or "unknown"),
+                        quote_state="quote_ready" if controlled_quote_ready else "quote_not_ready",
+                        cooldown_state="cooldown" if self.is_on_cooldown(auto_live_ticker) else "clear",
+                        duplicate_state=str(aggressive_lane_execution.get("duplicate_status") or "unknown"),
+                        position_state=final_blocker_position_state,
+                        auth_state="armed" if final_blocker_live_arm else "blocked",
+                        final_decision_state="SKIP",
                     )
-                elif block_reason in {"daily_loss_guard", "daily_loss_limit"}:
-                    block_reason = "daily_loss_guard"
-                elif block_reason in {"position_too_expensive", "max_exposure"}:
-                    block_reason = "position_limit"
-                elif block_reason in {"phase55_not_ready", "missing_phase55_status"}:
-                    block_reason = "phase55_block"
-                elif bool(near_safe_spread_context) and not bool(near_safe_spread_context.get("eligible")) and aggressive_spread_bucket == "unsafe":
-                    block_reason = near_safe_spread_context.get("rejection_reason") or "near_safe_relief_denied"
-                elif not controlled_quote_ready or controlled_quote_stale:
-                    block_reason = "quote_not_ready_after_refresh"
-                elif payload_preview is None:
-                    block_reason = "invalid_bid_ask"
-                elif controlled_spread_extreme or not controlled_family_allowed or not controlled_family_strong:
-                    block_reason = "spread_extreme"
-                self._emit_aion_execution_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    exact_blocker=block_reason,
-                    execution_path="aggressive_lane_gate",
-                    selector_state=str(aggressive_lane_execution.get("block_reason") or "unknown"),
-                    quote_state="quote_ready" if controlled_quote_ready else "quote_not_ready",
-                    cooldown_state="cooldown" if self.is_on_cooldown(auto_live_ticker) else "clear",
-                    duplicate_state=str(aggressive_lane_execution.get("duplicate_status") or "unknown"),
-                    position_state=final_blocker_position_state,
-                    auth_state="armed" if final_blocker_live_arm else "blocked",
-                    final_decision_state="SKIP",
-                )
-                self._emit_aion_final_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    block_reason=block_reason,
-                    decision="SKIP",
-                    live_arm=final_blocker_live_arm,
-                    entry_ready=final_blocker_entry_ready,
-                    cooldown_state=final_blocker_cooldown_state,
-                    duplicate_state="blocked" if bool(aggressive_lane_execution.get("duplicate_status") == "blocked") else final_blocker_duplicate_state,
-                    position_state=final_blocker_position_state,
-                    order_payload_ready=bool(payload_preview is not None),
-                    execution_path=final_blocker_execution_path,
-                )
+                    self._emit_aion_final_blocker(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        block_reason=block_reason,
+                        decision="SKIP",
+                        live_arm=final_blocker_live_arm,
+                        entry_ready=final_blocker_entry_ready,
+                        cooldown_state=final_blocker_cooldown_state,
+                        duplicate_state="blocked" if bool(aggressive_lane_execution.get("duplicate_status") == "blocked") else final_blocker_duplicate_state,
+                        position_state=final_blocker_position_state,
+                        order_payload_ready=bool(payload_preview is not None),
+                        execution_path=final_blocker_execution_path,
+                    )
+                    print(
+                        f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
+                        f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
+                        f"spread_bucket={canonical_final.get('spread_bucket')} quote_ready={'yes' if controlled_quote_ready else 'no'} "
+                        f"price={'none' if payload_preview is None else payload_preview.get('yes_price', payload_preview.get('no_price'))} "
+                        f"contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason={block_reason}"
+                    )
+                    print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={block_reason}")
+                    print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                    self._emit_trade_readiness_cycle_telemetry(
+                        markets=markets,
+                        quotes=quotes,
+                        candidates=candidates,
+                        selected_context_quote=selected_context_quote,
+                        selected_trade_submitted=trade_readiness_trade_submitted,
+                        auto_live_ticker=auto_live_ticker,
+                        auto_live_reason=auto_live_reason,
+                    )
+                    return
                 print(
-                    f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
-                    f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
-                    f"spread_bucket={controlled_spread_bucket} quote_ready={'yes' if controlled_quote_ready else 'no'} "
-                    f"price={'none' if payload_preview is None else payload_preview.get('yes_price', payload_preview.get('no_price'))} "
-                    f"contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason={block_reason}"
+                    "[AION-CANONICAL-FINAL-SKIP] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "trace_id": trace_id,
+                            "canonical_state": canonical_final.get("canonical_state"),
+                            "canonical_reason": final_decision_reason,
+                            "execution_policy": canonical_final.get("execution_policy"),
+                            "final_action": canonical_final.get("final_action"),
+                            "spread_bucket": canonical_final.get("spread_bucket"),
+                            "unsafe_price_status": canonical_final.get("unsafe_price_status"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={aggressive_lane_execution.get('block_reason') or 'aggressive_lane_blocked'}")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
                 self._emit_trade_readiness_cycle_telemetry(
                     markets=markets,
                     quotes=quotes,
@@ -54493,11 +54749,11 @@ class KalshiSniperBot:
                 family=final_family or selected_family,
                 edge_after_cost=edge_after_cost,
                 quote_ready=True,
-                reason="all_gates_passed",
+                reason=final_decision_reason,
                 stage="final_submit",
                 decision="BUY",
             )
-            self._log_live_execution_final_approved(auto_live_ticker, reason="all_gates_passed")
+            self._log_live_execution_final_approved(auto_live_ticker, reason=final_decision_reason)
             selected_quote_for_submission = aggressive_fastpath_quote or selected_quote
             if tradable_unsafe_override:
                 print(
@@ -54516,7 +54772,7 @@ class KalshiSniperBot:
                 unsafe_price_status=final_gate_unsafe_price_status,
                 duplicate_status=final_blocker_duplicate_state,
                 cooldown_status=final_blocker_cooldown_state,
-                final_block_reason="all_gates_passed",
+                final_block_reason=final_decision_reason,
             )
             print(
                 f"[AION-FINAL-EXECUTION-ATTEMPT] ticker={auto_live_ticker} "
@@ -54558,7 +54814,7 @@ class KalshiSniperBot:
                             for position in self.live_positions
                             if str(position.get("status", "open") or "open").strip().lower() == "open"
                         ),
-                        "reason": "all_gates_passed",
+                        "reason": final_decision_reason,
                         "blocker": None,
                         "order_payload_keys": sorted(list(payload_preview.keys())) if isinstance(payload_preview, dict) else [],
                     },
@@ -54586,7 +54842,7 @@ class KalshiSniperBot:
                             for position in self.live_positions
                             if str(position.get("status", "open") or "open").strip().lower() == "open"
                         ),
-                        "reason": "submit_live_order",
+                        "reason": final_decision_reason,
                         "blocker": None,
                         "order_payload_keys": sorted(list(payload_preview.keys())) if isinstance(payload_preview, dict) else [],
                     },
