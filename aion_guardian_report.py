@@ -16,6 +16,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from aion_patch_queue import summarize_queue as latest_patch_queue_summary
+from aion_memory_store import latest_memory_summary
+from aion_telemetry import emit_compact_event, emit_event, emit_error_event, emit_once_per_key, emit_rate_limited, emit_state_transition, emit_summary_counter, flush_cycle_summary, redact_sensitive_fields, telemetry_print as print
+from aion_canonical_execution import (
+    CandidateState,
+    ERROR_LABELS as CANONICAL_ERROR_LABELS,
+    HARD_BLOCK_LABELS as CANONICAL_HARD_BLOCK_LABELS,
+    OBSOLETE_LABELS as CANONICAL_OBSOLETE_LABELS,
+    PASS_LABELS as CANONICAL_PASS_LABELS,
+    SOFT_WARNING_LABELS as CANONICAL_SOFT_WARNING_LABELS,
+    WAIT_LABELS as CANONICAL_WAIT_LABELS,
+    classify_candidate_state,
+    classify_label_role,
+    sanitize_blocker_reason,
+)
+
 SERVICE_NAME = "kalshi-bot"
 REPORT_COOLDOWN_SECONDS = 3600
 LOOKBACK_MINUTES = 60
@@ -35,6 +51,13 @@ PHASE55_BLOCKERS = {
     "psychology_block",
     "phase55_not_ready",
 }
+
+PASS_LABELS = set(CANONICAL_PASS_LABELS)
+WAIT_LABELS = set(CANONICAL_WAIT_LABELS)
+SOFT_WARNING_LABELS = set(CANONICAL_SOFT_WARNING_LABELS)
+HARD_BLOCK_LABELS = set(CANONICAL_HARD_BLOCK_LABELS)
+OBSOLETE_LABELS = set(CANONICAL_OBSOLETE_LABELS)
+ERROR_LABELS = set(CANONICAL_ERROR_LABELS)
 
 BODY_BLOCKERS = {
     "payload_missing",
@@ -144,6 +167,120 @@ def _runtime_daily_last_report_path() -> str:
         except Exception:
             continue
     return str(Path("/tmp") / DAILY_LAST_REPORT_FILE_NAME)
+
+
+def _runtime_simulation_root_path() -> str:
+    candidates = [
+        "/opt/kalshi-bot/runtime/simulation",
+        str(Path(__file__).resolve().parent / "runtime" / "simulation"),
+    ]
+    for base in candidates:
+        try:
+            Path(base).mkdir(parents=True, exist_ok=True)
+            return str(Path(base))
+        except Exception:
+            continue
+    return str(Path("/tmp") / "kalshi-bot" / "runtime" / "simulation")
+
+
+def _runtime_simulation_latest_run_path() -> str:
+    return str(Path(_runtime_simulation_root_path()) / "latest_run.json")
+
+
+def _runtime_simulation_latest_issue_path() -> str:
+    return str(Path(_runtime_simulation_root_path()) / "issues" / "latest_issue.json")
+
+
+def _load_simulation_state() -> Dict[str, Any]:
+    for path in (_runtime_simulation_latest_run_path(), _runtime_simulation_latest_issue_path()):
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            continue
+    return {}
+
+
+def _runtime_paper30_root_path() -> str:
+    candidates = [
+        Path(_runtime_simulation_root_path()) / "paper30",
+        Path("/tmp") / "kalshi-bot" / "runtime" / "simulation" / "paper30",
+    ]
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return str(path)
+        except Exception:
+            continue
+    return str(Path("/tmp") / "kalshi-bot" / "runtime" / "simulation" / "paper30")
+
+
+def _runtime_paper30_latest_summary_path() -> str:
+    return str(Path(_runtime_paper30_root_path()) / "latest_summary.json")
+
+
+def _load_paper30_summary() -> Dict[str, Any]:
+    try:
+        raw = Path(_runtime_paper30_latest_summary_path()).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return {}
+
+
+def _runtime_profit_engine_root_path() -> str:
+    candidates = [
+        Path(_runtime_simulation_root_path()) / "profit_engine",
+        Path("/tmp") / "kalshi-bot" / "runtime" / "profit_engine",
+    ]
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return str(path)
+        except Exception:
+            continue
+    return str(Path("/tmp") / "kalshi-bot" / "runtime" / "profit_engine")
+
+
+def _runtime_profit_engine_latest_summary_path() -> str:
+    return str(Path(_runtime_profit_engine_root_path()) / "latest_summary.json")
+
+
+def _load_profit_engine_summary() -> Dict[str, Any]:
+    try:
+        raw = Path(_runtime_profit_engine_latest_summary_path()).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return {}
+
+
+def _runtime_family_heatmap_latest_path() -> str:
+    candidates = [
+        Path(_runtime_profit_engine_root_path()) / "latest_family_heatmap.json",
+        Path("/tmp") / "kalshi-bot" / "runtime" / "profit_engine" / "latest_family_heatmap.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return str(Path(_runtime_profit_engine_root_path()) / "latest_family_heatmap.json")
+
+
+def _load_family_heatmap_summary() -> Dict[str, Any]:
+    try:
+        raw = Path(_runtime_family_heatmap_latest_path()).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return {}
 
 
 def _safe_atomic_json_write(path: str, payload: dict) -> bool:
@@ -271,6 +408,13 @@ def _classify_blocker(entry: Dict[str, Any]) -> Tuple[Optional[str], Optional[st
     )
     reason = _normalize_blocker_reason(reason)
     ticker = str(payload.get("ticker") or payload.get("selected_ticker") or payload.get("raw_ticker") or "").strip() or None
+    role = classify_label_role(reason)
+    if role in {"pass", "wait", "soft_warning", "obsolete", "skip"}:
+        return role, reason or None, ticker
+    if role == "error":
+        return "error", reason or None, ticker
+    if role == "hard_block":
+        return "safety", reason or None, ticker
     if prefix.startswith("AION-AGGRESSION-"):
         return None, None, ticker
     if reason in {"complete_current_quote", "partial_quote_complete"}:
@@ -418,6 +562,15 @@ def _load_state(path: str) -> Dict[str, Any]:
     return {}
 
 
+def _load_canonical_state_snapshot() -> Dict[str, Any]:
+    path = "/opt/kalshi-bot/runtime/canonical_state/latest.json"
+    snapshot = _load_state(path)
+    if not snapshot:
+        return {"exists": False, "path": path, "checksum_ok": False, "snapshot": {}}
+    checksum_ok = bool(snapshot.get("checksum")) and bool(snapshot.get("updated_at"))
+    return {"exists": True, "path": path, "checksum_ok": checksum_ok, "snapshot": snapshot}
+
+
 def _store_state(path: str, state: Dict[str, Any]) -> None:
     try:
         _safe_atomic_json_write(path, state)
@@ -427,6 +580,11 @@ def _store_state(path: str, state: Dict[str, Any]) -> None:
 
 def _summarize(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str, Any]:
     blocker_counts = Counter()
+    pass_label_counts = Counter()
+    wait_label_counts = Counter()
+    soft_warning_counts = Counter()
+    obsolete_label_counts = Counter()
+    error_label_counts = Counter()
     blocker_tickers = Counter()
     blocker_categories = Counter()
     prefix_counts = Counter()
@@ -448,6 +606,7 @@ def _summarize(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str
     stale_phase55_dependency_count = 0
     edge_zero_suspect_count = 0
     execution_gate_count = 0
+    execution_candidate_count = 0
     orderbook_usable_count = 0
     orderbook_blocked_count = 0
     thin_book_override_count = 0
@@ -473,12 +632,43 @@ def _summarize(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str
             if any(token in prefix for token in ("CANDIDATE", "QUOTE", "PAYLOAD", "FINAL", "PHASE55", "SELECTOR")):
                 candidate_tickers.add(ticker)
         category, reason, reason_ticker = _classify_blocker(entry)
-        if reason and (category in {"mind", "body", "senses", "safety", "memory"}):
-            blockers_this_hour.add(reason)
-            blocker_counts[reason] += 1
-            blocker_categories[category] += 1
-            if reason_ticker:
-                blocker_tickers[reason_ticker] += 1
+        if reason:
+            candidate_context = dict(payload)
+            candidate_context.setdefault("blocker", reason)
+            candidate_context.setdefault("block_reason", reason)
+            candidate_context.setdefault("final_block_reason", reason)
+            candidate_context.setdefault("reason", reason)
+            candidate_state = classify_candidate_state(candidate_context, context=payload)
+            if candidate_state.final_state == "BLOCKED":
+                blockers_this_hour.add(candidate_state.canonical_reason)
+                blocker_counts[candidate_state.canonical_reason] += 1
+                blocker_categories["hard_block"] += 1
+                if reason_ticker:
+                    blocker_tickers[reason_ticker] += 1
+            else:
+                if candidate_state.pass_labels:
+                    for label in candidate_state.pass_labels:
+                        pass_label_counts[label] += 1
+                if candidate_state.wait_labels:
+                    for label in candidate_state.wait_labels:
+                        if label in SOFT_WARNING_LABELS:
+                            soft_warning_counts[label] += 1
+                        else:
+                            wait_label_counts[label] += 1
+                if candidate_state.obsolete_labels_detected:
+                    for label in candidate_state.obsolete_labels_detected:
+                        obsolete_label_counts[label] += 1
+                if candidate_state.error_labels:
+                    for label in candidate_state.error_labels:
+                        error_label_counts[label] += 1
+                if candidate_state.final_state == "BLOCKED" and any(label in PASS_LABELS for label in candidate_state.raw_labels):
+                    print("[AION-BLOCKER-SANITIZER-BUG] " + json.dumps({
+                        "ticker": ticker or reason_ticker or "none",
+                        "reason": reason,
+                        "category": category,
+                        "canonical_reason": candidate_state.canonical_reason,
+                        "final_state": candidate_state.final_state,
+                    }, sort_keys=True, default=str))
         if prefix == "AION-FINAL-BLOCKER-TRACE":
             final_candidate_tickers.add(ticker or "")
         if prefix == "AION-PIPELINE-PAYLOAD-READY":
@@ -548,6 +738,8 @@ def _summarize(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str
                 if ticker:
                     phase55_candidate_tickers.add(ticker)
         if prefix in {"AION-LIVE-EXECUTION", "LIVE-EXECUTION", "AION-OPEN-MARKET-EXECUTION", "AION-PIPELINE-EXECUTED"}:
+            execution_candidate_count += 1
+        if prefix in {"AION-FINAL-SUBMIT-PREFLIGHT", "AION-FINAL-SUBMIT-CALL", "LIVE-EXECUTION-ORDER-SUBMITTED", "LIVE-EXECUTION-ORDER-ERROR"}:
             live_exec_count += 1
         if prefix in {"LIVE-EXIT", "AION-LIVE-EXIT", "LIVE-EXIT-ATTEMPT"}:
             exit_count += 1
@@ -588,10 +780,16 @@ def _summarize(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> Dict[str
         "final_candidate_tickers": final_candidate_tickers,
         "payload_candidate_tickers": payload_candidate_tickers,
         "phase55_candidate_tickers": phase55_candidate_tickers,
+        "pass_label_counts": pass_label_counts,
+        "wait_label_counts": wait_label_counts,
+        "soft_warning_counts": soft_warning_counts,
+        "obsolete_label_counts": obsolete_label_counts,
+        "error_label_counts": error_label_counts,
         "payload_ready_count": payload_ready_count,
         "phase55_ready_count": phase55_ready_count,
         "realm_vv_ready_count": realm_vv_ready_count,
         "live_exec_count": live_exec_count,
+        "execution_candidate_count": execution_candidate_count,
         "exit_count": exit_count,
         "realm_vv_seen_count": realm_vv_seen_count,
         "realm_vv_buy_count": realm_vv_buy_count,
@@ -1025,9 +1223,10 @@ def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[s
     repeated_blocker_types = summary["repeated_blocker_types"] or ["none"]
     total_candidates = len(summary["candidate_tickers"])
     live_exec_count = summary["live_exec_count"]
+    execution_candidate_count = summary.get("execution_candidate_count", 0)
     exit_count = summary["exit_count"]
     payload_ready_count = summary["payload_ready_count"]
-    realm_vv_ready_count = summary.get("realm_vv_ready_count", summary["phase55_ready_count"])
+    realm_vv_ready_count = summary.get("realm_vv_ready_count", 0)
     phase55_ready_count = summary["phase55_ready_count"]
     blocker_total = summary["blocker_total"]
     trend = summary["trend"]
@@ -1051,18 +1250,22 @@ def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[s
     exec_blocker = funnel["last_blocker_before_live_execution"] or {}
     current_final_blocker = exec_blocker or phase55_blocker or entry_blocker or {}
     current_final_block_reason = current_final_blocker.get("reason") or "all_guards_passed"
+    if str(current_final_block_reason).strip().lower() in PASS_LABELS:
+        current_final_block_reason = "waiting"
     current_final_block_ticker = current_final_blocker.get("ticker") or closest_ticker
 
     critical_blockers = ", ".join(top_blockers[:3]) if top_blockers else "none"
     best_sign = (
-        f"payload_ready={payload_ready_count}, realm_vv_ready={realm_vv_ready_count}, live_exec={live_exec_count}"
-        if (payload_ready_count or realm_vv_ready_count or live_exec_count)
+        f"payload_ready={payload_ready_count}, realm_vv_ready={realm_vv_ready_count}, execution_candidates={execution_candidate_count}, live_exec={live_exec_count}"
+        if (payload_ready_count or realm_vv_ready_count or execution_candidate_count or live_exec_count)
         else "no positive execution signals observed"
     )
-    if top_blockers[0] == "payload_missing:missing_orderbook" or top_blockers[0] == "missing_orderbook":
+    if any(t in {"selected_price_above_0_99", "payload_missing:selected_price_above_0_99", "selected_price_above_max"} for t in top_blockers):
+        next_fix = "review raw blocker trace samples for selected-side price resolution"
+    elif top_blockers[0] == "payload_missing:missing_orderbook" or top_blockers[0] == "missing_orderbook":
         next_fix = "fix orderbook-to-payload resolution and shape normalization"
     elif any(t.startswith("phase55_") or t in PHASE55_BLOCKERS for t in top_blockers):
-        next_fix = "fix Phase 5.5 handoff and entry-timing propagation"
+        next_fix = "review archived Phase 5.5 telemetry and confirm it is not active authority"
     elif any("quote" in t or "orderbook" in t for t in top_blockers):
         next_fix = "fix quote/orderbook mapping and cache freshness"
     elif any("unsafe" in t or "duplicate" in t or "cooldown" in t for t in top_blockers):
@@ -1083,7 +1286,7 @@ def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[s
         f"- Critical blockers: {critical_blockers}",
         "",
         "🧠 Mind:",
-        f"- Phase 5.5 blockers: {', '.join([b for b in top_blockers if b.startswith('phase55') or b in PHASE55_BLOCKERS] ) or 'none'}",
+        f"- Archive Phase 5.5 blockers: {', '.join([b for b in top_blockers if b.startswith('phase55') or b in PHASE55_BLOCKERS] ) or 'none'}",
         f"- trigger_wait: {blocker_counts.get('trigger_wait', 0)}",
         f"- pullback_wait: {blocker_counts.get('pullback_wait', 0)}",
         f"- immediate_reject: {blocker_counts.get('immediate_reject', 0)}",
@@ -1151,9 +1354,9 @@ def _build_report(summary: Dict[str, Any], system: Dict[str, Any], state: Dict[s
         f"- Payload ready: {funnel_counts['payload_ready']}",
         f"- Entry ready: {funnel_counts['entry_ready']}",
         f"- Realm V.V seen: {summary.get('realm_vv_seen_count', 0)}",
-        f"- Realm V.V ready: {summary.get('realm_vv_ready_count', summary['phase55_ready_count'])}",
+        f"- Realm V.V ready: {summary.get('realm_vv_ready_count', 0)}",
         f"- Realm V.V buy: {summary.get('realm_vv_buy_count', 0)}",
-        f"- Phase 5.5 handoff: {funnel_counts['phase55_handoff']}",
+        f"- Archive Phase 5.5 handoff: {funnel_counts['phase55_handoff']}",
         f"- Live execution attempts: {funnel_counts['live_execution_attempts']}",
         f"- Executed orders: {funnel_counts['executed_orders']}",
         f"- Last blocker before entry_ready: {entry_blocker.get('reason') or 'none'} ({entry_blocker.get('ticker') or 'none'})",
@@ -1279,6 +1482,11 @@ def _runtime_snapshot(repo_dir: str = "/opt/kalshi-bot") -> Dict[str, Any]:
 def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     prefix_counts = Counter()
     blocker_counts = Counter()
+    pass_label_counts = Counter()
+    wait_label_counts = Counter()
+    soft_warning_counts = Counter()
+    obsolete_label_counts = Counter()
+    error_label_counts = Counter()
     phase55_observation_called = 0
     realm_vv_record_written = 0
     realm_vv_record_exists = 0
@@ -1297,6 +1505,12 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     selected_price_above_0_99_count = 0
     phase55_reachability_bridge_count = 0
     unsafe_unknown = 0
+    true_hard_orderbook_count = 0
+    stale_orderbook_label_count = 0
+    canonical_persistence_restored_count = 0
+    canonical_readback_restored_count = 0
+    canonical_outcome_counts = Counter()
+    active_obsolete_authority_count = 0
     for entry in entries:
         prefix = str(entry.get("prefix") or "")
         prefix_counts[prefix] += 1
@@ -1304,8 +1518,34 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         category, reason, _ticker = _classify_blocker(entry)
         canonical_blocker = str(payload.get("blocker_class") or payload.get("blocker") or "").strip().lower()
         reason_text = canonical_blocker or str(reason or "").strip().lower()
-        if reason_text:
-            blocker_counts[reason_text] += 1
+        candidate_context = dict(payload)
+        candidate_context.setdefault("blocker", reason_text)
+        candidate_context.setdefault("block_reason", reason_text)
+        candidate_context.setdefault("final_block_reason", reason_text)
+        candidate_context.setdefault("reason", reason_text)
+        candidate_state = classify_candidate_state(candidate_context, context=payload)
+        if reason_text and candidate_state.final_state == "BLOCKED":
+            blocker_counts[candidate_state.canonical_reason] += 1
+        elif reason_text:
+            for label in candidate_state.pass_labels:
+                pass_label_counts[label] += 1
+            for label in candidate_state.wait_labels:
+                if label in SOFT_WARNING_LABELS:
+                    soft_warning_counts[label] += 1
+                else:
+                    wait_label_counts[label] += 1
+            for label in candidate_state.obsolete_labels_detected:
+                obsolete_label_counts[label] += 1
+            for label in candidate_state.error_labels:
+                error_label_counts[label] += 1
+            if candidate_state.final_state == "BLOCKED" and any(label in PASS_LABELS for label in candidate_state.raw_labels):
+                print("[AION-BLOCKER-SANITIZER-BUG] " + json.dumps({
+                    "ticker": payload.get("ticker") or payload.get("selected_ticker") or payload.get("raw_ticker") or "none",
+                    "reason": reason_text,
+                    "category": category,
+                    "canonical_reason": candidate_state.canonical_reason,
+                    "final_state": candidate_state.final_state,
+                }, sort_keys=True, default=str))
         blocker_detail = str(payload.get("blocker_detail") or payload.get("block_reason") or payload.get("failure_stage") or "").strip().lower()
         realm_vv_alias = _realm_vv_compat_alias_info(payload, prefix)
         if realm_vv_alias.get("compat_alias"):
@@ -1336,10 +1576,26 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
                 stale_records += 1
         if prefix == "AION-PHASE55-REACHABILITY-BRIDGE":
             phase55_reachability_bridge_count += 1
+            if not _truthy(payload.get("final_submit_allowed_by_realm_vv")) or not _truthy(payload.get("phase55_allowed")):
+                active_obsolete_authority_count += 1
         if "recursionerror" in reason_text:
             recursion_errors += 1
         if reason_text == "quote_not_usable":
             quote_not_usable += 1
+        if reason_text in {"orderbook_not_usable", "missing_orderbook_data", "missing_price", "both_sides_unexecutable"}:
+            canonical_allow = bool(
+                payload.get("final_submit_allowed_by_realm_vv")
+                or payload.get("canonical_final_submit_allowed_by_realm_vv")
+                or (
+                    payload.get("canonical_execution_state").get("canonical_final_submit_allowed_by_realm_vv")
+                    if isinstance(payload.get("canonical_execution_state"), dict)
+                    else False
+                )
+            )
+            if canonical_allow or realm_vv_alias.get("compat_alias"):
+                stale_orderbook_label_count += 1
+            else:
+                true_hard_orderbook_count += 1
         if reason_text == "unsafe_price":
             unsafe_price_count += 1
         if reason_text == "caution_wide_spread":
@@ -1352,6 +1608,15 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
             selected_price_above_0_99_count += 1
         if reason_text == "unsafe_price_unknown":
             unsafe_unknown += 1
+        if prefix == "AION-CANONICAL-PERSISTENCE-RESTORED":
+            canonical_persistence_restored_count += 1
+        if prefix == "AION-CANONICAL-READBACK-RESTORED":
+            canonical_readback_restored_count += 1
+        if prefix == "AION-CANONICAL-OUTCOME-ASSIGNED":
+            canonical_outcome = str(payload.get("outcome") or "unknown").strip().upper() or "UNKNOWN"
+            canonical_outcome_counts[canonical_outcome] += 1
+            if canonical_outcome == "HARD_BLOCK" and (reason_text in {"phase55", "direct_fields", "spread_wait", "unknown"} or reason_text in PASS_LABELS):
+                active_obsolete_authority_count += 1
     return {
         "prefix_counts": prefix_counts,
         "blocker_counts": blocker_counts,
@@ -1362,6 +1627,8 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         "phase55_record_exists": phase55_record_exists,
         "phase55_compat_alias_count": phase55_compat_alias_count,
         "stale_phase55_dependency_count": stale_phase55_dependency_count,
+        "true_hard_orderbook_count": true_hard_orderbook_count,
+        "stale_orderbook_label_count": stale_orderbook_label_count,
         "placeholder_overwrite": placeholder_overwrite,
         "stale_records": stale_records,
         "recursion_errors": recursion_errors,
@@ -1373,6 +1640,15 @@ def _integrity_daily_counts(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
         "selected_price_above_0_99_count": selected_price_above_0_99_count,
         "phase55_reachability_bridge_count": phase55_reachability_bridge_count,
         "unsafe_unknown": unsafe_unknown,
+        "canonical_persistence_restored_count": canonical_persistence_restored_count,
+        "canonical_readback_restored_count": canonical_readback_restored_count,
+        "canonical_outcome_counts": canonical_outcome_counts,
+        "active_obsolete_authority_count": active_obsolete_authority_count,
+        "pass_label_counts": pass_label_counts,
+        "wait_label_counts": wait_label_counts,
+        "soft_warning_counts": soft_warning_counts,
+        "obsolete_label_counts": obsolete_label_counts,
+        "error_label_counts": error_label_counts,
     }
 
 
@@ -1403,6 +1679,8 @@ def _aggression_threshold_like_blocker(reason: str) -> bool:
 
 def _aggression_audit_summary(summary: Dict[str, Any], daily: Dict[str, Any], entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     blocker_counts: Counter = summary.get("blocker_counts") if isinstance(summary.get("blocker_counts"), Counter) else Counter(summary.get("blocker_counts") or {})
+    soft_warning_counts: Counter = summary.get("soft_warning_counts") if isinstance(summary.get("soft_warning_counts"), Counter) else Counter(summary.get("soft_warning_counts") or {})
+    wait_label_counts: Counter = summary.get("wait_label_counts") if isinstance(summary.get("wait_label_counts"), Counter) else Counter(summary.get("wait_label_counts") or {})
     aggression_entries = [entry for entry in entries if str(entry.get("prefix") or "").startswith("AION-AGGRESSION-")]
     latest_profile_payload = {}
     for entry in reversed(aggression_entries):
@@ -1422,6 +1700,11 @@ def _aggression_audit_summary(summary: Dict[str, Any], daily: Dict[str, Any], en
             threshold_blocker_counts[reason_text] += int(count or 0)
         if any(token in reason_text for token in ("quote_not_usable", "quote_mapping_blocked", "orderbook", "missing_orderbook", "selected_price_above", "unsafe_price_unknown", "unsafe_price", "duplicate", "cooldown", "live_arm", "auth_not_ready", "daily_trade_cap", "max_live_positions")):
             hard_blocker_counts[reason_text] += int(count or 0)
+    for source_counts in (soft_warning_counts, wait_label_counts):
+        for reason, count in source_counts.items():
+            reason_text = str(reason or "").strip().lower()
+            if _aggression_threshold_like_blocker(reason_text):
+                threshold_blocker_counts[reason_text] += int(count or 0)
     blocker_kind = "idle"
     if hard_blocker_counts:
         blocker_kind = "hard_safety"
@@ -1429,12 +1712,13 @@ def _aggression_audit_summary(summary: Dict[str, Any], daily: Dict[str, Any], en
         blocker_kind = "internal_threshold"
     candidate_tickers = summary.get("candidate_tickers") or set()
     payload_ready_count = int(summary.get("payload_ready_count", 0) or 0)
-    realm_vv_ready_count = int(summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) or 0)
+    realm_vv_ready_count = int(summary.get("realm_vv_ready_count", 0) or 0)
     live_exec_count = int(summary.get("live_exec_count", 0) or 0)
+    execution_candidate_count = int(summary.get("execution_candidate_count", 0) or 0)
     top_over_filtering_gate = threshold_blocker_counts.most_common(1)[0][0] if threshold_blocker_counts else (summary.get("top_blockers") or ["none"])[0]
     threshold_reason_list = [reason for reason, _count in threshold_blocker_counts.most_common(5)] or ["none"]
     hard_reason_list = [reason for reason, _count in hard_blocker_counts.most_common(5)] or ["none"]
-    if payload_ready_count > 0 and realm_vv_ready_count > 0 and live_exec_count > 0:
+    if payload_ready_count > 0 and realm_vv_ready_count > 0 and execution_candidate_count > 0:
         recommended_profile = "safe"
     elif payload_ready_count > 0 and realm_vv_ready_count == 0:
         recommended_profile = "balanced" if threshold_blocker_counts else "opportunistic"
@@ -1451,7 +1735,7 @@ def _aggression_audit_summary(summary: Dict[str, Any], daily: Dict[str, Any], en
         reachability_score += 35
     if realm_vv_ready_count > 0:
         reachability_score += 35
-    if live_exec_count > 0:
+    if execution_candidate_count > 0:
         reachability_score += 20
     if threshold_blocker_counts and not hard_blocker_counts:
         reachability_score += min(10, len(threshold_blocker_counts) * 2)
@@ -1482,6 +1766,7 @@ def _aggression_audit_summary(summary: Dict[str, Any], daily: Dict[str, Any], en
         "phase55_ready_count": realm_vv_ready_count,
         "realm_vv_ready_count": realm_vv_ready_count,
         "live_exec_count": live_exec_count,
+        "execution_candidate_count": execution_candidate_count,
         "candidate_count": len(candidate_tickers),
     }
 
@@ -1495,6 +1780,7 @@ def _aggression_simulation_report(summary: Dict[str, Any], daily: Dict[str, Any]
     payload_ready_count = base.get("payload_ready_count", 0)
     realm_vv_ready_count = base.get("realm_vv_ready_count", base.get("phase55_ready_count", 0))
     live_exec_count = base.get("live_exec_count", 0)
+    execution_candidate_count = base.get("execution_candidate_count", 0)
     profiles = {}
     for profile, factor in (("safe", 0.0), ("balanced", 0.18), ("opportunistic", 0.35), ("beast", 0.45)):
         candidate_est = int(round(candidate_count + threshold_total * factor))
@@ -1514,6 +1800,7 @@ def _aggression_simulation_report(summary: Dict[str, Any], daily: Dict[str, Any]
         "profiles": profiles,
         "top_blockers": list(summary.get("top_blockers") or []),
         "live_exec_count": live_exec_count,
+        "execution_candidate_count": execution_candidate_count,
         "payload_ready_count": payload_ready_count,
         "phase55_ready_count": realm_vv_ready_count,
         "realm_vv_ready_count": realm_vv_ready_count,
@@ -1546,10 +1833,11 @@ def _build_watchdog_report(system: Dict[str, Any], summary: Dict[str, Any], dail
     current = {
         "ts": time.time(),
         "payload_ready": int(summary.get("payload_ready_count", 0) or 0),
-        "realm_vv_ready": int(summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) or 0),
+        "realm_vv_ready": int(summary.get("realm_vv_ready_count", 0) or 0),
         "live_exec": int(summary.get("live_exec_count", 0) or 0),
+        "execution_candidate": int(summary.get("execution_candidate_count", 0) or 0),
         "realm_vv_seen_count": realm_vv_seen_count,
-        "realm_vv_ready_count": int(summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) or 0),
+        "realm_vv_ready_count": int(summary.get("realm_vv_ready_count", 0) or 0),
         "realm_vv_buy_count": realm_vv_buy_count,
         "realm_vv_wait_count": realm_vv_wait_count,
         "realm_vv_skip_count": realm_vv_skip_count,
@@ -1606,7 +1894,9 @@ def _build_watchdog_report(system: Dict[str, Any], summary: Dict[str, Any], dail
     raw_error_lines = [line for line in raw_lines if any(token in line for token in ("Traceback", "ERROR", "Exception", "CRITICAL"))]
     raw_error_sample = raw_error_lines[-1] if raw_error_lines else None
     top_blocker = top_blockers[0] if top_blockers else None
-    current_blocker = (funnel.get("last_blocker_before_live_execution") or {}).get("reason") or (funnel.get("last_blocker_before_phase55_handoff") or {}).get("reason") or (funnel.get("last_blocker_before_entry_ready") or {}).get("reason") or top_blocker or "all_guards_passed"
+    current_blocker = (funnel.get("last_blocker_before_live_execution") or {}).get("reason") or (funnel.get("last_blocker_before_phase55_handoff") or {}).get("reason") or (funnel.get("last_blocker_before_entry_ready") or {}).get("reason") or top_blocker or "waiting"
+    if str(current_blocker).strip().lower() in PASS_LABELS:
+        current_blocker = "waiting"
     current_blocker_ticker = (funnel.get("last_blocker_before_live_execution") or {}).get("ticker") or (funnel.get("last_blocker_before_phase55_handoff") or {}).get("ticker") or (funnel.get("last_blocker_before_entry_ready") or {}).get("ticker") or (top_tickers[0] if top_tickers else None) or "none"
     if current.get("payload_ready", 0) == 0 and current.get("markets_fetched"):
         vanish_point = "payload_ready"
@@ -1772,8 +2062,9 @@ def _run_watchdog(*, minutes: int = LOOKBACK_MINUTES, dry_run: bool = False) -> 
         f"realm_vv_edge_zero_count: {watchdog.get('realm_vv_edge_zero_count', 0)}",
         f"realm_vv_aggressive_tradeable_count: {watchdog.get('realm_vv_aggressive_tradeable_count', 0)}",
         f"realm_vv_aggressive_buy_count: {watchdog.get('realm_vv_aggressive_buy_count', 0)}",
-        f"phase55_compat_alias_count: {watchdog.get('phase55_compat_alias_count', 0)}",
-        f"stale_phase55_dependency_count: {watchdog.get('stale_phase55_dependency_count', 0)}",
+        f"archive_phase55_compat_alias_count: {watchdog.get('phase55_compat_alias_count', 0)}",
+        f"archive_stale_phase55_dependency_count: {watchdog.get('stale_phase55_dependency_count', 0)}",
+        f"active_obsolete_authority_count: {daily.get('active_obsolete_authority_count', 0)}",
         f"edge_zero_suspect_count: {watchdog.get('edge_zero_suspect_count', 0)}",
         f"orderbook_usable_count: {watchdog.get('orderbook_usable_count', 0)}",
         f"orderbook_blocked_count: {watchdog.get('orderbook_blocked_count', 0)}",
@@ -1782,7 +2073,7 @@ def _run_watchdog(*, minutes: int = LOOKBACK_MINUTES, dry_run: bool = False) -> 
         f"final_submit_call_count: {watchdog.get('final_submit_call_count', 0)}",
         f"order_submitted_count: {watchdog.get('order_submitted_count', 0)}",
         f"order_error_count: {watchdog.get('order_error_count', 0)}",
-        f"Markets fetched: {'yes' if watchdog['payload_stall'] or watchdog['phase55_stall'] or watchdog['execution_stall'] or summary.get('candidate_tickers') else 'no'}",
+        f"Markets fetched: {'yes' if watchdog['payload_stall'] or watchdog['execution_stall'] or summary.get('candidate_tickers') else 'no'}",
     ]
     report = "\n".join(report_lines).strip() + "\n"
     print("[AION-GUARDIAN-WATCHDOG-BUILD] " + json.dumps({
@@ -1796,8 +2087,10 @@ def _run_watchdog(*, minutes: int = LOOKBACK_MINUTES, dry_run: bool = False) -> 
         "realm_vv_buy_count": watchdog.get('realm_vv_buy_count', 0),
         "realm_vv_wait_count": watchdog.get('realm_vv_wait_count', 0),
         "realm_vv_skip_count": watchdog.get('realm_vv_skip_count', 0),
-        "phase55_compat_alias_count": watchdog.get('phase55_compat_alias_count', 0),
-        "stale_phase55_dependency_count": watchdog.get('stale_phase55_dependency_count', 0),
+        "canonical_outcome_counts": dict(canonical_outcome_counts),
+        "archive_phase55_compat_alias_count": watchdog.get('phase55_compat_alias_count', 0),
+        "archive_stale_phase55_dependency_count": watchdog.get('stale_phase55_dependency_count', 0),
+        "active_obsolete_authority_count": daily.get('active_obsolete_authority_count', 0),
         "realm_vv_edge_positive_count": watchdog.get('realm_vv_edge_positive_count', 0),
         "realm_vv_edge_zero_count": watchdog.get('realm_vv_edge_zero_count', 0),
         "realm_vv_aggressive_tradeable_count": watchdog.get('realm_vv_aggressive_tradeable_count', 0),
@@ -1870,19 +2163,22 @@ def _compute_health_score(system: Dict[str, Any], daily: Dict[str, Any], summary
     if daily.get("realm_vv_record_written", daily.get("phase55_record_written", 0)) == 0 and summary.get("payload_ready_count", 0) > 0:
         score -= 15
         reasons.append("payload_no_phase55")
-    if summary.get("payload_ready_count", 0) > 0 and summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) == 0:
+    if summary.get("payload_ready_count", 0) > 0 and summary.get("realm_vv_ready_count", 0) == 0:
         score -= 15
         reasons.append("realm_vv_stall")
-    if summary.get("live_exec_count", 0) == 0 and summary.get("payload_ready_count", 0) > 0:
+    if summary.get("execution_candidate_count", 0) == 0 and summary.get("payload_ready_count", 0) > 0:
         score -= 10
-        reasons.append("no_executions")
+        reasons.append("no_execution_candidates")
+    if summary.get("payload_ready_count", 0) > 0 and summary.get("final_submit_preflight_count", 0) == 0:
+        score -= 10
+        reasons.append("final_handoff_missing")
     if daily.get("quote_not_usable", 0) > 1000:
         score -= 10
         reasons.append("quote_pipeline_blocked")
     if daily.get("selected_price_above", 0) > 1000:
         score -= 10
         reasons.append("price_validation_pressure")
-    if summary.get("blocker_total", 0) == 0 and summary.get("payload_ready_count", 0) == 0 and summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) == 0:
+    if summary.get("blocker_total", 0) == 0 and summary.get("payload_ready_count", 0) == 0 and summary.get("realm_vv_ready_count", 0) == 0:
         score -= 5
         reasons.append("idle_window")
     score = max(0, min(100, score))
@@ -1892,8 +2188,8 @@ def _compute_health_score(system: Dict[str, Any], daily: Dict[str, Any], summary
         state = "WARNING"
     else:
         state = "CRITICAL"
-    confidence = min(0.99, max(0.35, 0.35 + min(0.55, (summary.get("blocker_total", 0) + summary.get("payload_ready_count", 0) + summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0))) / 100000.0)))
-    silent_risk = "high" if (summary.get("payload_ready_count", 0) > 0 and summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) == 0) or (summary.get("payload_ready_count", 0) == 0 and summary.get("blocker_total", 0) > 5000) else "moderate" if summary.get("blocker_total", 0) > 0 else "low"
+    confidence = min(0.99, max(0.35, 0.35 + min(0.55, (summary.get("blocker_total", 0) + summary.get("payload_ready_count", 0) + summary.get("realm_vv_ready_count", 0)) / 100000.0)))
+    silent_risk = "high" if (summary.get("payload_ready_count", 0) > 0 and summary.get("realm_vv_ready_count", 0) == 0) or (summary.get("payload_ready_count", 0) == 0 and summary.get("blocker_total", 0) > 5000) else "moderate" if summary.get("blocker_total", 0) > 0 else "low"
     return score, state, confidence, ",".join(reasons) or "none"
 
 
@@ -1920,12 +2216,130 @@ def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any
     restart_count = int(system.get("restart_count") or 0)
     api_auth_healthy = not any(k for k in blocker_counts if "auth" in str(k).lower() or "api" in str(k).lower())
     telegram_configured = bool(_telegram_config()[0] and _telegram_config()[1])
-    dormant_pipeline = bool(summary.get("candidate_tickers") and summary.get("payload_ready_count", 0) == 0 and summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) == 0)
+    simulation = _load_simulation_state()
+    paper30 = _load_paper30_summary()
+    profit_engine = _load_profit_engine_summary()
+    family_heatmap = _load_family_heatmap_summary()
+    canonical_state = _load_canonical_state_snapshot()
+    memory_summary = latest_memory_summary()
+    memory_record_count = int(memory_summary.get("record_count", 0) or 0) if isinstance(memory_summary, dict) else 0
+    memory_recurring_count = int(memory_summary.get("recurring_count", 0) or 0) if isinstance(memory_summary, dict) else 0
+    patch_queue_summary = latest_patch_queue_summary()
+    patch_queue_pending_count = int(patch_queue_summary.get("pending_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    patch_queue_approved_count = int(patch_queue_summary.get("approved_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    patch_queue_rejected_count = int(patch_queue_summary.get("rejected_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    patch_queue_verified_count = int(patch_queue_summary.get("verified_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    simulation_required = True
+    simulation_last_run = simulation.get("timestamp") or simulation.get("created_at") or simulation.get("updated_at") if isinstance(simulation, dict) else None
+    simulation_last_result = "PASS" if bool(simulation.get("simulation_pass")) else "FAIL" if simulation else "UNKNOWN"
+    simulation_failed_phase = simulation.get("simulation_failed_phase") if isinstance(simulation, dict) else None
+    simulation_issue_count = int(simulation.get("simulation_issue_count", 0) or 0) if isinstance(simulation, dict) else 0
+    simulation_proven_ticker = simulation.get("simulation_proven_ticker") if isinstance(simulation, dict) else None
+    simulation_final_submit_preflight = bool(simulation.get("final_submit_preflight_seen")) if isinstance(simulation, dict) else False
+    simulation_order_submitted = bool(simulation.get("order_submitted_seen")) if isinstance(simulation, dict) else False
+    simulation_position_confirmed = bool(simulation.get("position_confirmed_seen")) if isinstance(simulation, dict) else False
+    simulation_exit_handoff_ready = bool(simulation.get("exit_handoff_ready")) if isinstance(simulation, dict) else False
+    memory_summary = latest_memory_summary()
+    live_execution_proven = bool(
+        simulation
+        and simulation.get("simulation_pass")
+        and simulation.get("final_submit_preflight_seen")
+        and simulation.get("final_submit_call_seen")
+        and simulation.get("order_submitted_seen")
+        and simulation.get("position_confirmed_seen")
+        and simulation.get("exit_handoff_ready")
+    )
+    paper30_last_run = paper30.get("timestamp") if isinstance(paper30, dict) else None
+    paper30_execution_rate = paper30.get("execution_rate") if isinstance(paper30, dict) else None
+    paper30_expected_profit = paper30.get("total_simulated_expected_profit") if isinstance(paper30, dict) else None
+    paper30_hard_block_rate = paper30.get("hard_block_rate") if isinstance(paper30, dict) else None
+    paper30_recommended_policy = paper30.get("recommended_live_policy") if isinstance(paper30, dict) else None
+    profit_calibration_last_run = profit_engine.get("timestamp") if isinstance(profit_engine, dict) else None
+    best_live_candidate_tiers = profit_engine.get("best_live_candidate_tiers") if isinstance(profit_engine, dict) else None
+    profitable_loosened_rules = profit_engine.get("profitable_loosened_rules") if isinstance(profit_engine, dict) else None
+    dangerous_loosened_rules = profit_engine.get("dangerous_loosened_rules") if isinstance(profit_engine, dict) else None
+    recommended_live_policy = profit_engine.get("recommended_live_policy") if isinstance(profit_engine, dict) else None
+    profitable_families = family_heatmap.get("profitable_families") if isinstance(family_heatmap, dict) else None
+    dangerous_families = family_heatmap.get("dangerous_families") if isinstance(family_heatmap, dict) else None
+    best_aggressive_candidates = family_heatmap.get("best_families") if isinstance(family_heatmap, dict) else None
+    family_promotion_policy = family_heatmap.get("live_policy") if isinstance(family_heatmap, dict) else None
+    family_diversity_score = family_heatmap.get("family_diversity_score") if isinstance(family_heatmap, dict) else None
+    families_sampled = family_heatmap.get("families_sampled") if isinstance(family_heatmap, dict) else None
+    categories_sampled = family_heatmap.get("categories_sampled") if isinstance(family_heatmap, dict) else None
+    top_family_share = family_heatmap.get("top_family_share") if isinstance(family_heatmap, dict) else None
+    latest_family_heatmap_exists = bool(family_heatmap) if isinstance(family_heatmap, dict) else False
+    diversity_sufficient_for_live_promotion = bool(family_heatmap.get("diversity_sufficient_for_live_promotion")) if isinstance(family_heatmap, dict) else False
+    paper_only_rules = None
+    if isinstance(profit_engine, dict):
+        paper_only_rules = profit_engine.get("paper_only_rules")
+        if paper_only_rules is None and isinstance(recommended_live_policy, dict):
+            paper_only_rules = [tier for tier, value in recommended_live_policy.items() if isinstance(tier, str) and isinstance(value, str) and "paper" in value.lower()]
+    current_profitability_state = profit_engine.get("current_profitability_state") if isinstance(profit_engine, dict) else None
+    execution_vs_profit_balance = profit_engine.get("execution_vs_profit_balance") if isinstance(profit_engine, dict) else None
+    recommended_live_tier_policy = family_promotion_policy if isinstance(family_promotion_policy, dict) else recommended_live_policy
+    memory_record_count = int(memory_summary.get("record_count", 0) or 0) if isinstance(memory_summary, dict) else 0
+    memory_recurring_count = int(memory_summary.get("recurring_count", 0) or 0) if isinstance(memory_summary, dict) else 0
+    patch_queue_pending_count = int(patch_queue_summary.get("pending_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    patch_queue_approved_count = int(patch_queue_summary.get("approved_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    patch_queue_rejected_count = int(patch_queue_summary.get("rejected_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    patch_queue_verified_count = int(patch_queue_summary.get("verified_count", 0) or 0) if isinstance(patch_queue_summary, dict) else 0
+    dormant_pipeline = bool(summary.get("candidate_tickers") and summary.get("payload_ready_count", 0) == 0 and summary.get("realm_vv_ready_count", 0) == 0)
     hidden_blockers = sorted(set(summary.get("top_blockers", []) or []) - set(new_blockers or []))
     score, overall_state, confidence, score_reasons = _compute_health_score(system, daily, summary)
-    silent_risk = "high" if (summary.get("candidate_tickers") and summary.get("payload_ready_count", 0) == 0 and summary.get("realm_vv_ready_count", summary.get("phase55_ready_count", 0)) == 0) or daily.get("recursion_errors", 0) > 0 else "moderate" if summary.get("blocker_total", 0) > 0 else "low"
+    silent_risk = "high" if (summary.get("candidate_tickers") and summary.get("payload_ready_count", 0) == 0 and summary.get("realm_vv_ready_count", 0) == 0) or daily.get("recursion_errors", 0) > 0 else "moderate" if summary.get("blocker_total", 0) > 0 else "low"
+    canonical_outcome_counts = daily.get("canonical_outcome_counts", Counter()) if isinstance(daily, dict) else Counter()
+    if not isinstance(canonical_outcome_counts, Counter):
+        canonical_outcome_counts = Counter(canonical_outcome_counts or {})
+    active_obsolete_authority_count = int(daily.get("active_obsolete_authority_count", 0) or 0) if isinstance(daily, dict) else 0
     closest_ticker = funnel.get("closest_ticker") or "none"
-    current_blocker = (funnel.get("last_blocker_before_live_execution") or {}).get("reason") or (funnel.get("last_blocker_before_phase55_handoff") or {}).get("reason") or (funnel.get("last_blocker_before_entry_ready") or {}).get("reason") or "all_guards_passed"
+    current_blocker = (funnel.get("last_blocker_before_live_execution") or {}).get("reason") or (funnel.get("last_blocker_before_entry_ready") or {}).get("reason") or "waiting"
+    if str(current_blocker).strip().lower() in PASS_LABELS:
+        current_blocker = "waiting"
+    top_blockers = summary.get("top_blockers") or []
+    needs_sentinel = bool(
+        summary.get("blocker_total", 0)
+        or summary.get("final_submit_preflight_count", 0) == 0
+        or summary.get("final_submit_call_count", 0) == 0
+        or daily.get("stale_orderbook_label_count", 0)
+        or daily.get("active_obsolete_authority_count", 0)
+        or memory_recurring_count > 0
+    )
+    exact_trace = _latest_matching(entries, ("AION-QUOTE-USABILITY-BLOCK", "AION-QUOTE-USABILITY-FINAL", "AION-PAYLOAD-MISSING-TRACE", "AION-PHASE55-HANDOFF-TRACE", "AION-PHASE55-PERSISTENCE-TRACE", "AION-PRICE-VALIDATION-MODE", "AION-PRICE-BOUNDS-TRACE", "AION-SIDE-PRICE-SELECTION-TRACE", "AION-CANONICAL-PRICE-CONSUMED", "AION-ORDERBOOK-PAYLOAD-TRACE", "AION-QUOTE-HYDRATION-FAIL", "AION-QUOTE-HYDRATION-BUILD")) or {}
+    exact_source = exact_trace.get("prefix") or "none"
+    exact_raw = exact_trace.get("raw") or "none"
+    exact_function = exact_trace.get("payload", {}).get("blocker_source_function") or exact_trace.get("payload", {}).get("source_path") or "unknown"
+    exact_line = exact_trace.get("payload", {}).get("blocker_source_line") or exact_trace.get("payload", {}).get("source_line") or "unknown"
+    emit_compact_event(
+        "AION_GUARDIAN_SENTINEL_HANDOFF",
+        "Guardian integrity handoff prepared",
+        {
+            "overall_state": overall_state,
+            "score": score,
+            "memory_record_count": memory_record_count,
+            "memory_recurring_count": memory_recurring_count,
+            "dormant_pipeline": dormant_pipeline,
+            "active_obsolete_authority_count": active_obsolete_authority_count,
+        },
+        component="guardian",
+        actionable=bool(dormant_pipeline or active_obsolete_authority_count or summary.get("final_submit_preflight_count", 0) == 0),
+    )
+    if needs_sentinel:
+        emit_compact_event(
+            "AION_GUARDIAN_INTEGRITY_ALERT",
+            "Guardian integrity alert",
+            {
+                "overall_state": overall_state,
+                "score": score,
+                "top_blocker": top_blockers[0] if top_blockers else "none",
+                "final_submit_preflight_count": summary.get("final_submit_preflight_count", 0),
+                "final_submit_call_count": summary.get("final_submit_call_count", 0),
+                "order_submitted_count": summary.get("order_submitted_count", 0),
+                "memory_recurring_count": memory_recurring_count,
+            },
+            component="guardian",
+            level="WARN",
+            actionable=True,
+        )
     total_scanned = len(summary.get("candidate_tickers") or [])
     sample_unsafe_price = daily.get("sample_unsafe_price") if isinstance(daily, dict) else None
     report_lines = [
@@ -1950,6 +2364,49 @@ def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any
         f"- dry_run: {'no' if system.get('live_mode') else 'yes'}",
         f"- api_auth_healthy: {'yes' if api_auth_healthy else 'no'}",
         f"- telegram_configured: {'yes' if telegram_configured else 'no'}",
+        f"- simulation_required: {'yes' if simulation_required else 'no'}",
+        f"- simulation_last_run: {simulation_last_run or 'none'}",
+        f"- simulation_last_result: {simulation_last_result}",
+        f"- simulation_failed_phase: {simulation_failed_phase or 'none'}",
+        f"- simulation_issue_count: {simulation_issue_count}",
+        f"- simulation_proven_ticker: {simulation_proven_ticker or 'none'}",
+        f"- simulation_final_submit_preflight: {'yes' if simulation_final_submit_preflight else 'no'}",
+        f"- simulation_order_submitted: {'yes' if simulation_order_submitted else 'no'}",
+        f"- simulation_position_confirmed: {'yes' if simulation_position_confirmed else 'no'}",
+        f"- simulation_exit_handoff_ready: {'yes' if simulation_exit_handoff_ready else 'no'}",
+        f"- live_execution_proven: {'yes' if live_execution_proven else 'no'}",
+        f"- memory_record_count: {memory_record_count}",
+        f"- memory_recurring_count: {memory_recurring_count}",
+        f"- patch_queue_pending_count: {patch_queue_pending_count}",
+        f"- patch_queue_approved_count: {patch_queue_approved_count}",
+        f"- patch_queue_rejected_count: {patch_queue_rejected_count}",
+        f"- patch_queue_verified_count: {patch_queue_verified_count}",
+        f"- canonical_outcome_counts: {json.dumps(dict(canonical_outcome_counts), sort_keys=True, default=str) if canonical_outcome_counts else 'none'}",
+        f"- canonical_state_persisted: {'yes' if bool(canonical_state.get('exists') and canonical_state.get('checksum_ok')) else 'no'}",
+        f"- canonical_state_path: {canonical_state.get('path') or 'none'}",
+        f"- paper30_last_run: {paper30_last_run or 'none'}",
+        f"- paper30_execution_rate: {paper30_execution_rate if paper30_execution_rate is not None else 'none'}",
+        f"- paper30_expected_profit: {paper30_expected_profit if paper30_expected_profit is not None else 'none'}",
+        f"- paper30_hard_block_rate: {paper30_hard_block_rate if paper30_hard_block_rate is not None else 'none'}",
+        f"- paper30_recommended_policy: {paper30_recommended_policy[0] if isinstance(paper30_recommended_policy, list) and paper30_recommended_policy else paper30_recommended_policy or 'none'}",
+        f"- profit_calibration_last_run: {profit_calibration_last_run or 'none'}",
+        f"- best_live_candidate_tiers: {best_live_candidate_tiers or 'none'}",
+        f"- profitable_loosened_rules: {profitable_loosened_rules or 'none'}",
+        f"- dangerous_loosened_rules: {dangerous_loosened_rules or 'none'}",
+        f"- profitable_families: {profitable_families or 'none'}",
+        f"- dangerous_families: {dangerous_families or 'none'}",
+        f"- best_aggressive_candidates: {best_aggressive_candidates or 'none'}",
+        f"- recommended_live_tier_policy: {json.dumps(recommended_live_tier_policy, sort_keys=True, default=str) if recommended_live_tier_policy else 'none'}",
+        f"- recommended_live_policy: {json.dumps(recommended_live_policy, sort_keys=True, default=str) if recommended_live_policy else 'none'}",
+        f"- paper_only_rules: {paper_only_rules or 'none'}",
+        f"- current_profitability_state: {current_profitability_state or 'none'}",
+        f"- execution_vs_profit_balance: {json.dumps(execution_vs_profit_balance, sort_keys=True, default=str) if execution_vs_profit_balance else 'none'}",
+        f"- family_diversity_score: {family_diversity_score if family_diversity_score is not None else 'none'}",
+        f"- families_sampled: {', '.join(families_sampled or ['none']) if isinstance(families_sampled, list) else families_sampled or 'none'}",
+        f"- categories_sampled: {', '.join(categories_sampled or ['none']) if isinstance(categories_sampled, list) else categories_sampled or 'none'}",
+        f"- top_family_share: {top_family_share if top_family_share is not None else 'none'}",
+        f"- latest_family_heatmap_exists: {'yes' if latest_family_heatmap_exists else 'no'}",
+        f"- diversity_sufficient_for_live_promotion: {'yes' if diversity_sufficient_for_live_promotion else 'no'}",
         "",
         "MARKET PIPELINE",
         f"- candidates_scanned_24h: {total_scanned}",
@@ -1965,6 +2422,7 @@ def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any
         f"- realm_vv_aggressive_buy_count: {summary.get('realm_vv_aggressive_buy_count', 0)}",
         f"- edge_zero_suspect_count: {summary.get('edge_zero_suspect_count', 0)}",
         f"- execution_gate_count: {summary.get('execution_gate_count', 0)}",
+        f"- execution_candidate_count: {summary.get('execution_candidate_count', 0)}",
         f"- orderbook_usable_count: {summary.get('orderbook_usable_count', 0)}",
         f"- orderbook_blocked_count: {summary.get('orderbook_blocked_count', 0)}",
         f"- thin_book_override_count: {summary.get('thin_book_override_count', 0)}",
@@ -1977,15 +2435,65 @@ def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any
         f"- closest_ticker_to_execution: {closest_ticker}",
         f"- dormant_pipeline: {'yes' if dormant_pipeline else 'no'}",
         "",
-        "BLOCKERS",
-        f"- top_blockers: {', '.join(summary.get('top_blockers') or ['none'])}",
-        f"- newly_appearing: {', '.join(new_blockers or ['none'])}",
-        f"- recurring_blockers: {', '.join(repeated_blockers or ['none'])}",
-        f"- trend: {summary.get('trend')}",
+        "CANONICAL PIPELINE",
+        f"- scanned: {total_scanned}",
+        f"- payload_ready: {summary.get('payload_ready_count', 0)}",
+        f"- realm_vv_seen: {summary.get('realm_vv_seen_count', 0)}",
+        f"- realm_vv_buy: {summary.get('realm_vv_buy_count', 0)}",
+        f"- realm_vv_ready: {summary.get('realm_vv_ready_count', summary.get('phase55_ready_count', 0))}",
+        f"- edge_positive: {summary.get('realm_vv_edge_positive_count', 0)}",
+        f"- aggressive_tradeable: {summary.get('realm_vv_aggressive_tradeable_count', 0)}",
+        f"- execution_gate_pass: {summary.get('execution_gate_count', 0)}",
+        f"- final_preflight: {summary.get('final_submit_preflight_count', 0)}",
+        f"- submit_called: {summary.get('final_submit_call_count', 0)}",
+        f"- submitted: {summary.get('order_submitted_count', 0)}",
+        f"- errors: {summary.get('order_error_count', 0)}",
+        "",
+        "FINAL STATES",
+        f"- canonical_outcome_counts: {json.dumps(dict(canonical_outcome_counts), sort_keys=True, default=str) if canonical_outcome_counts else 'none'}",
+        f"- hard_block_count: {summary.get('blocker_total', 0)}",
+        f"- paper_only_count: {sum(summary.get('soft_warning_counts', Counter()).values()) if isinstance(summary.get('soft_warning_counts', Counter()), Counter) else len(summary.get('soft_warning_counts', []))}",
+        f"- live_small_count: {summary.get('execution_candidate_count', 0)}",
+        f"- live_full_count: {summary.get('final_submit_call_count', 0)}",
+        f"- skipped_count: {sum(summary.get('pass_label_counts', Counter()).values()) if isinstance(summary.get('pass_label_counts', Counter()), Counter) else len(summary.get('pass_label_counts', []))}",
+        "",
+        "REAL BLOCKERS",
+        f"- hard_blockers: {', '.join(summary.get('top_blockers') or ['none'])}",
+        f"- blocker_total: {summary.get('blocker_total', 0)}",
+        f"- new_hard_blockers: {', '.join(new_blockers or ['none'])}",
+        f"- recurring_hard_blockers: {', '.join(repeated_blockers or ['none'])}",
         f"- hidden_blockers: {', '.join(hidden_blockers[:10]) if hidden_blockers else 'none'}",
-        f"- stale_blocker_labels: {'yes' if any(k in {'direct_fields', 'selected_price_above_max', 'selected_price_above_0_99'} for k in blocker_counts.keys()) else 'no'}",
-        f"- top_unsafe_price_reason: {(next((k for k in blocker_counts.keys() if 'unsafe_price' in k), 'none'))}",
-        f"- zero_execution_blockers: {', '.join([k for k, v in blocker_counts.items() if v > 0 and summary.get('live_exec_count', 0) == 0][:10]) or 'none'}",
+        f"- stale_blocker_labels: {'yes' if (daily.get('stale_orderbook_label_count', 0) > 0 or daily.get('active_obsolete_authority_count', 0) > 0) and daily.get('true_hard_orderbook_count', 0) == 0 else 'no'}",
+        f"- top_unsafe_price_reason: {(next((k for k in list(blocker_counts.keys()) + list((summary.get('soft_warning_counts', Counter()) or Counter()).keys()) if 'unsafe_price' in k), 'none'))}",
+        f"- zero_execution_blockers: {', '.join([k for k, v in blocker_counts.items() if v > 0 and summary.get('final_submit_preflight_count', 0) == 0][:10]) or 'none'}",
+        "",
+        "SOFT WARNINGS",
+        f"- pass_labels: {sum(summary.get('pass_label_counts', Counter()).values()) if isinstance(summary.get('pass_label_counts', Counter()), Counter) else len(summary.get('pass_label_counts', []))}",
+        f"- wait_labels: {sum(summary.get('wait_label_counts', Counter()).values()) if isinstance(summary.get('wait_label_counts', Counter()), Counter) else len(summary.get('wait_label_counts', []))}",
+        f"- soft_warning_labels: {sum(summary.get('soft_warning_counts', Counter()).values()) if isinstance(summary.get('soft_warning_counts', Counter()), Counter) else len(summary.get('soft_warning_counts', []))}",
+        f"- obsolete_labels: {sum(summary.get('obsolete_label_counts', Counter()).values()) if isinstance(summary.get('obsolete_label_counts', Counter()), Counter) else len(summary.get('obsolete_label_counts', []))}",
+        f"- error_labels: {sum(summary.get('error_label_counts', Counter()).values()) if isinstance(summary.get('error_label_counts', Counter()), Counter) else len(summary.get('error_label_counts', []))}",
+        "",
+        "PASS LABELS REMOVED FROM BLOCKERS",
+        f"- pass_labels: {', '.join(sorted(PASS_LABELS))}",
+        f"- wait_labels: {', '.join(sorted(WAIT_LABELS))}",
+        f"- soft_warning_labels: {', '.join(sorted(SOFT_WARNING_LABELS))}",
+        "",
+        "FINAL HANDOFF",
+        f"- closest_ticker_to_submit: {closest_ticker}",
+        f"- stopped_at_function: {exact_function}",
+        f"- stopped_at_condition: {current_blocker}",
+        f"- canonical_reason: {current_blocker}",
+        f"- submit_preflight_reached: {'yes' if summary.get('final_submit_preflight_count', 0) > 0 else 'no'}",
+        f"- submit_call_reached: {'yes' if summary.get('final_submit_call_count', 0) > 0 else 'no'}",
+        f"- order_submitted: {'yes' if summary.get('order_submitted_count', 0) > 0 else 'no'}",
+        "",
+        "EXTINCTION SCORE",
+        f"- fake_blockers_remaining: {sum(summary.get('pass_label_counts', Counter()).values()) + sum(summary.get('wait_label_counts', Counter()).values()) + sum(summary.get('soft_warning_counts', Counter()).values())}",
+        f"- unknown_blockers_remaining: {summary.get('error_label_counts', Counter()).get('unknown', 0) + daily.get('unsafe_unknown', 0)}",
+        f"- obsolete_phase55_dependencies_remaining: {daily.get('active_obsolete_authority_count', 0)}",
+        f"- submit_handoff_contradiction: {'yes' if summary.get('execution_candidate_count', 0) > 0 and summary.get('final_submit_preflight_count', 0) == 0 else 'no'}",
+        f"- next_single_blocker_to_kill: {top_blockers[0] if top_blockers else 'none'}",
         "",
         "🧭 Aggression:",
         f"- aggression_profile: {aggression.get('active_profile')}",
@@ -2007,19 +2515,22 @@ def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any
         f"- unexecutable_price_count: {daily.get('unexecutable_price_count', 0)}",
         f"- both_sides_unexecutable_count: {daily.get('both_sides_unexecutable_count', 0)}",
         f"- selected_price_above_0_99_count: {daily.get('selected_price_above_0_99_count', 0)}",
-        f"- phase55_reachability_bridge_count: {daily.get('phase55_reachability_bridge_count', 0)}",
+        f"- archive_phase55_reachability_bridge_count: {daily.get('phase55_reachability_bridge_count', 0)}",
         f"- stale_orderbooks: {blocker_counts.get('stale_orderbook', 0)}",
+        f"- true_hard_orderbook_count: {daily.get('true_hard_orderbook_count', 0)}",
+        f"- stale_orderbook_label_count: {daily.get('stale_orderbook_label_count', 0)}",
+        f"- active_obsolete_authority_count: {daily.get('active_obsolete_authority_count', 0)}",
         f"- malformed_books: {blocker_counts.get('orderbook_shape_unrecognized', 0)}",
         f"- empty_books: {blocker_counts.get('empty_orderbook', 0)}",
         f"- unsafe_price_propagation: {daily.get('unsafe_unknown', 0)}",
         f"- sample_unsafe_price: {json.dumps(sample_unsafe_price, sort_keys=True, default=str) if sample_unsafe_price else 'none'}",
         "",
         "REALM V.V HEALTH",
-        f"- persistence_working: {'yes' if daily.get('realm_vv_record_written', daily.get('phase55_record_written', 0)) > 0 else 'no'}",
-        f"- readback_working: {'yes' if summary.get('realm_vv_ready_count', summary.get('phase55_ready_count', 0)) > 0 else 'no'}",
+        f"- persistence_working: {'yes' if bool(canonical_state.get('exists') and canonical_state.get('checksum_ok')) else 'no'}",
+        f"- readback_working: {'yes' if bool(canonical_state.get('exists') and canonical_state.get('checksum_ok')) else 'no'}",
         f"- placeholder_overwrite_detection: {'yes' if daily.get('placeholder_overwrite', 0) > 0 else 'no'}",
-        f"- phase55_compat_alias_count: {daily.get('phase55_compat_alias_count', 0)}",
-        f"- stale_phase55_dependency_count: {daily.get('stale_phase55_dependency_count', 0)}",
+        f"- archive_phase55_compat_alias_count: {daily.get('phase55_compat_alias_count', 0)}",
+        f"- archive_stale_phase55_dependency_count: {daily.get('stale_phase55_dependency_count', 0)}",
         f"- trigger_wait: {blocker_counts.get('trigger_wait', 0)}",
         f"- pullback_wait: {blocker_counts.get('pullback_wait', 0)}",
         f"- psychology_block: {blocker_counts.get('psychology_block', 0)}",
@@ -2049,6 +2560,18 @@ def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any
     ]
     report = "\n".join(report_lines).strip() + "\n"
     print(
+        "[AION-LEGACY-PHASE55-PURGED] "
+        + json.dumps(
+            {
+                "active_phase55_dependencies_remaining": int(daily.get("active_obsolete_authority_count", 0) or 0) if isinstance(daily, dict) else 0,
+                "legacy_telemetry_only_count": int(daily.get("phase55_compat_alias_count", 0) or 0) if isinstance(daily, dict) else 0,
+                "submit_blocking_legacy_count": 0,
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
+    print(
         "[AION-DAILY-INTEGRITY-BUILD] "
         + json.dumps(
             {
@@ -2061,6 +2584,7 @@ def _build_daily_integrity_report(system: Dict[str, Any], summary: Dict[str, Any
                 "payload_ready_count": summary.get('payload_ready_count', 0),
                 "phase55_ready_count": summary.get('realm_vv_ready_count', summary.get('phase55_ready_count', 0)),
                 "realm_vv_ready_count": summary.get('realm_vv_ready_count', summary.get('phase55_ready_count', 0)),
+                "execution_candidate_count": summary.get('execution_candidate_count', 0),
                 "live_exec_count": summary.get('live_exec_count', 0),
                 "top_blockers": summary.get('top_blockers')[:5],
             },
@@ -2080,6 +2604,7 @@ def _run_daily_integrity_audit(*, dry_run: bool = False) -> int:
     system = _system_status()
     summary = _summarize(entries, state)
     daily = _integrity_daily_counts(entries)
+    memory_summary = latest_memory_summary()
     report = _build_daily_integrity_report(system, summary, daily, entries, state)
     report_payload = {
         "created_at": time.time(),
@@ -2088,11 +2613,98 @@ def _run_daily_integrity_audit(*, dry_run: bool = False) -> int:
         "system": system,
         "summary": summary,
         "daily": daily,
+        "memory": memory_summary,
         "report": report,
+        "memory": memory_summary,
     }
+    score, overall_state, _, _ = _compute_health_score(system, daily, summary)
+    current_blocker = "waiting"
+    current_blocker_ticker = "none"
+    exact_trace = _latest_matching(entries, ("AION-QUOTE-USABILITY-BLOCK", "AION-QUOTE-USABILITY-FINAL", "AION-PAYLOAD-MISSING-TRACE", "AION-PHASE55-HANDOFF-TRACE", "AION-PHASE55-PERSISTENCE-TRACE", "AION-PRICE-VALIDATION-MODE", "AION-PRICE-BOUNDS-TRACE", "AION-SIDE-PRICE-SELECTION-TRACE", "AION-CANONICAL-PRICE-CONSUMED", "AION-ORDERBOOK-PAYLOAD-TRACE", "AION-QUOTE-HYDRATION-FAIL", "AION-QUOTE-HYDRATION-BUILD")) or {}
+    exact_function = exact_trace.get("payload", {}).get("blocker_source_function") or exact_trace.get("payload", {}).get("source_path") or "unknown"
+    exact_line = exact_trace.get("payload", {}).get("blocker_source_line") or exact_trace.get("payload", {}).get("source_line") or "unknown"
+    needs_sentinel = bool(
+        daily.get("stale_orderbook_label_count", 0)
+        or daily.get("active_obsolete_authority_count", 0)
+        or summary.get("blocker_total", 0)
+        or summary.get("final_submit_preflight_count", 0) == 0
+    )
+    emit_compact_event(
+        "AION_GUARDIAN_SENTINEL_HANDOFF",
+        "Guardian handoff to Sentinel prepared",
+        {
+            "state": overall_state,
+            "score": score,
+            "needs_sentinel": needs_sentinel,
+            "top_blocker": summary.get("top_blockers", ["none"])[0] if summary.get("top_blockers") else "none",
+            "memory_record_count": memory_summary.get("record_count", 0),
+            "memory_recurring_count": memory_summary.get("recurring_count", 0),
+            "stale_blocker_labels": bool(daily.get("stale_orderbook_label_count", 0) or daily.get("active_obsolete_authority_count", 0)),
+        },
+        component="guardian",
+        actionable=needs_sentinel,
+    )
+    if needs_sentinel:
+        emit_compact_event(
+            "AION_GUARDIAN_INTEGRITY_ALERT",
+            "Guardian detected integrity risk",
+            {
+                "state": overall_state,
+                "score": score,
+                "top_blocker": summary.get("top_blockers", ["none"])[0] if summary.get("top_blockers") else "none",
+                "final_submit_preflight_count": summary.get("final_submit_preflight_count", 0),
+                "final_submit_call_count": summary.get("final_submit_call_count", 0),
+                "order_submitted_count": summary.get("order_submitted_count", 0),
+                "memory_recurring_count": memory_summary.get("recurring_count", 0),
+            },
+            component="guardian",
+            level="WARN" if overall_state != "CRITICAL" else "ERROR",
+            actionable=True,
+        )
+    flush_cycle_summary(
+        component="guardian",
+        summary={
+            "state": overall_state,
+            "score": score,
+            "payload_ready_count": summary.get("payload_ready_count", 0),
+            "realm_vv_ready_count": summary.get("realm_vv_ready_count", 0),
+            "execution_candidate_count": summary.get("execution_candidate_count", 0),
+            "live_exec_count": summary.get("live_exec_count", 0),
+            "blocker_total": summary.get("blocker_total", 0),
+            "active_obsolete_authority_count": daily.get("active_obsolete_authority_count", 0),
+        },
+        human_summary="\n".join([
+            "AION GUARDIAN SUMMARY",
+            f"- state: {overall_state}",
+            f"- score: {score}/100",
+            f"- top_blocker: {summary.get('top_blockers', ['none'])[0] if summary.get('top_blockers') else 'none'}",
+            f"- payload_ready_count: {summary.get('payload_ready_count', 0)}",
+            f"- realm_vv_ready_count: {summary.get('realm_vv_ready_count', 0)}",
+            f"- execution_candidate_count: {summary.get('execution_candidate_count', 0)}",
+            f"- live_exec_count: {summary.get('live_exec_count', 0)}",
+            f"- next_action: {('fix the dominant blocker path' if overall_state != 'CLEAN' else 'review raw blocker trace samples')}",
+        ]),
+        codex_diagnostic="\n".join([
+            f"top_blockers={', '.join(summary.get('top_blockers')[:5]) if summary.get('top_blockers') else 'none'}",
+            f"fake_blockers_remaining={sum(summary.get('pass_label_counts', Counter()).values()) + sum(summary.get('wait_label_counts', Counter()).values()) + sum(summary.get('soft_warning_counts', Counter()).values())}",
+            f"unknown_blockers_remaining={summary.get('error_label_counts', Counter()).get('unknown', 0) + daily.get('unsafe_unknown', 0)}",
+            f"exact_emitter={exact_function}:{exact_line}",
+        ]),
+    )
     if dry_run:
         print(report)
         _safe_atomic_json_write(last_report_path, report_payload)
+        emit_event(
+            "AION-GUARDIAN-SUMMARY",
+            {
+                "state": overall_state,
+                "score": score,
+                "blocker_total": summary.get("blocker_total", 0),
+                "active_obsolete_authority_count": daily.get("active_obsolete_authority_count", 0),
+            },
+            component="guardian",
+            stdout=False,
+        )
         return 0
     sent = _send_telegram_message(report)
     if sent:
@@ -2102,8 +2714,30 @@ def _run_daily_integrity_audit(*, dry_run: bool = False) -> int:
         _store_state(state_path, state)
         _safe_atomic_json_write(last_report_path, report_payload)
         print("[AION-DAILY-INTEGRITY-SENT] " + json.dumps({"telegram_configured": bool(_telegram_config()[0] and _telegram_config()[1]), "health_score": _compute_health_score(system, daily, summary)[0]}, sort_keys=True, default=str))
+        emit_event(
+            "AION-GUARDIAN-SUMMARY",
+            {
+                "state": overall_state,
+                "score": score,
+                "blocker_total": summary.get("blocker_total", 0),
+                "active_obsolete_authority_count": daily.get("active_obsolete_authority_count", 0),
+            },
+            component="guardian",
+            stdout=False,
+        )
         return 0
     print("[AION-DAILY-INTEGRITY-ERROR] " + json.dumps({"reason": "telegram_send_failed", "telegram_configured": bool(_telegram_config()[0] and _telegram_config()[1])}, sort_keys=True, default=str))
+    emit_event(
+        "AION-GUARDIAN-SUMMARY",
+        {
+            "state": overall_state,
+            "score": score,
+            "blocker_total": summary.get("blocker_total", 0),
+            "active_obsolete_authority_count": daily.get("active_obsolete_authority_count", 0),
+        },
+        component="guardian",
+        stdout=False,
+    )
     return 2
 
 def _run_aggression_simulation(*, minutes: int = LOOKBACK_MINUTES, dry_run: bool = True) -> int:
@@ -2173,6 +2807,7 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
     system = _system_status()
     summary = _summarize(entries, state)
     daily = _integrity_daily_counts(entries)
+    memory_summary = latest_memory_summary()
     report = _build_report(summary, system, state, entries, daily=daily)
     funnel = _execution_funnel_summary(entries)
     report_payload = {
@@ -2185,8 +2820,8 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
             "top_tickers": summary["top_tickers"],
             "trend": summary["trend"],
             "payload_ready_count": summary["payload_ready_count"],
-            "phase55_ready_count": summary.get("realm_vv_ready_count", summary["phase55_ready_count"]),
-            "realm_vv_ready_count": summary.get("realm_vv_ready_count", summary["phase55_ready_count"]),
+            "phase55_ready_count": summary.get("realm_vv_ready_count", 0),
+            "realm_vv_ready_count": summary.get("realm_vv_ready_count", 0),
             "live_exec_count": summary["live_exec_count"],
             "exit_count": summary["exit_count"],
             "execution_funnel": {
@@ -2204,6 +2839,7 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
                 or "all_guards_passed",
             },
         },
+        "memory": memory_summary,
         "report": report,
     }
     print(
@@ -2216,8 +2852,8 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
                 "send_gate_reason": send_gate_reason,
                 "blocker_total": summary["blocker_total"],
                 "payload_ready_count": summary["payload_ready_count"],
-                "phase55_ready_count": summary.get("realm_vv_ready_count", summary["phase55_ready_count"]),
-                "realm_vv_ready_count": summary.get("realm_vv_ready_count", summary["phase55_ready_count"]),
+                "phase55_ready_count": summary.get("realm_vv_ready_count", 0),
+                "realm_vv_ready_count": summary.get("realm_vv_ready_count", 0),
                 "live_exec_count": summary["live_exec_count"],
                 "exit_count": summary["exit_count"],
                 "top_blockers": summary["top_blockers"][:5],
@@ -2232,6 +2868,18 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
         print(report)
         _safe_atomic_json_write(last_report_path, report_payload)
         return 0
+    emit_compact_event(
+        "AION_GUARDIAN_SENTINEL_HANDOFF",
+        "Guardian handoff to Sentinel prepared",
+        {
+            "state": "report_build",
+            "send_gate_reason": send_gate_reason,
+            "memory_record_count": memory_summary.get("record_count", 0),
+            "memory_recurring_count": memory_summary.get("recurring_count", 0),
+        },
+        component="guardian",
+        actionable=True,
+    )
     if not can_send:
         print(
             "[AION-GUARDIAN-REPORT-ERROR] "
@@ -2253,8 +2901,8 @@ def build_and_send_report(*, force: bool = False, dry_run: bool = False) -> int:
         state["last_counts"] = {
             "blocker_total": summary["blocker_total"],
             "payload_ready_count": summary["payload_ready_count"],
-            "phase55_ready_count": summary.get("realm_vv_ready_count", summary["phase55_ready_count"]),
-            "realm_vv_ready_count": summary.get("realm_vv_ready_count", summary["phase55_ready_count"]),
+            "phase55_ready_count": summary.get("realm_vv_ready_count", 0),
+            "realm_vv_ready_count": summary.get("realm_vv_ready_count", 0),
             "live_exec_count": summary["live_exec_count"],
             "exit_count": summary["exit_count"],
         }

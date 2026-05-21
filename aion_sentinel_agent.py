@@ -10,11 +10,17 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import aion_patch_queue as patch_queue
+from aion_memory_store import find_match as memory_find_match, latest_memory_summary, record_issue as memory_record_issue
+from aion_telemetry import emit_compact_event, emit_event, emit_error_event, emit_once_per_key, emit_rate_limited, emit_state_transition, emit_summary_counter, flush_cycle_summary, redact_sensitive_fields, telemetry_print as print
 from runtime.paths import ensure_runtime_layout, runtime_state_file, safe_atomic_json_write
 
 
@@ -24,6 +30,8 @@ INCIDENTS_ROOT = RUNTIME_SENTINEL_ROOT / "incidents"
 BACKUPS_ROOT = RUNTIME_SENTINEL_ROOT / "backups"
 LOGS_ROOT = RUNTIME_SENTINEL_ROOT / "logs"
 RECIPES_ROOT = RUNTIME_SENTINEL_ROOT / "recipes"
+SIMULATION_ROOT = REPO_ROOT / "runtime" / "simulation"
+SIMULATION_ISSUES_ROOT = SIMULATION_ROOT / "issues"
 STATE_FILE = RUNTIME_SENTINEL_ROOT / "sentinel_state.json"
 RECIPES_STATE_FILE = RECIPES_ROOT / "learned_recipes.json"
 
@@ -31,6 +39,19 @@ KALSHI_SERVICE = "kalshi-bot.service"
 KALSHI_UNIT = "kalshi-bot.service"
 GUARDIAN_CMD = [sys.executable, str(REPO_ROOT / "aion_guardian_report.py"), "--daily-integrity-audit"]
 PY_COMPILE_CMD = [sys.executable, "-m", "py_compile", str(REPO_ROOT / "kalshi_web.py"), str(REPO_ROOT / "aion_guardian_report.py")]
+SIMULATION_CMD = [sys.executable, str(REPO_ROOT / "aion_execution_simulator.py"), "--full-execution"]
+
+AI_AUTO_APPLY_DENYLIST = (
+    "delete critical files",
+    "remove risk guards",
+    "disable telemetry",
+    "disable phase gates",
+    "disable duplicate protections",
+    "live order execution changes",
+    "automatic service restarts",
+    "change credentials",
+    "change secrets",
+)
 
 NAME_ERROR_RE = re.compile(
     r"(?:NameError|UnboundLocalError|local variable '([^']+)' referenced before assignment|name '([^']+)' is not defined|referenced before assignment)",
@@ -42,7 +63,11 @@ PHASE55_ACTIVE_RE = re.compile(
     r"(phase55_ready|phase55_status|phase55_live_execution_gate_by_ticker|placeholder_phase55_record|raw_phase55_status|entry_timing_pass)",
     re.IGNORECASE,
 )
-STALE_BLOCKER_RE = re.compile(r"(unsafe_spread|unsafe_price|quote_missing|orderbook_not_usable|stale_blocker|phase55)", re.IGNORECASE)
+STALE_BLOCKER_RE = re.compile(r"(unsafe_spread|unsafe_price|quote_missing|orderbook_not_usable|stale_blocker|phase55|spread_wait|direct_fields|unknown)", re.IGNORECASE)
+OBSOLETE_AUTHORITY_RE = re.compile(
+    r"(phase55_reachability_bridge|placeholder_phase55|phase55_active|direct_fields|spread_wait|unknown blocker|legacy bridge|compatibility alias)",
+    re.IGNORECASE,
+)
 
 DEFAULT_RECIPE_FILES = {
     "scope_bug_recipes.json": {
@@ -67,6 +92,26 @@ DEFAULT_RECIPE_FILES = {
                 "requires_restart": True,
                 "rollback_on_failure": True,
                 "notes": "Safe false initializer for boolean readiness flags; never defaults to True.",
+            },
+            {
+                "name": "missing_relaxed_aggressive_boolean_initializer",
+                "enabled": True,
+                "issue_type": "scope_bug",
+                "matches": [
+                    r"name '(.+_aggressive)' is not defined",
+                    r"local variable '(.+_aggressive)' referenced before assignment",
+                    r"name '(relaxed_.+)' is not defined",
+                    r"local variable '(relaxed_.+)' referenced before assignment",
+                ],
+                "variable_pattern": r"(relaxed_.+|.+_aggressive)",
+                "initializer_strategy": "false",
+                "default_value": False,
+                "patch_location": "function_top",
+                "allowed": True,
+                "requires_compile": True,
+                "requires_restart": True,
+                "rollback_on_failure": True,
+                "notes": "Safe false initializer for relaxed/aggressive boolean gates; only promote from canonical evidence.",
             },
             {
                 "name": "missing_status_initializer",
@@ -830,12 +875,12 @@ class SentinelAgent:
             lowered = explicit_kind
         if lowered.startswith("canonical_") and lowered.endswith("_allowed"):
             return "False", "bool"
-        bool_tokens = ("pass", "ready", "allowed", "enabled", "present", "valid", "executable", "confirmed", "applied", "found", "ok", "exists", "tradeable", "relaxed", "blocked")
+        bool_tokens = ("pass", "ready", "allowed", "enabled", "present", "valid", "executable", "confirmed", "applied", "found", "ok", "exists", "tradeable", "relaxed", "blocked", "aggressive")
         list_tokens = ("_list", "_fields", "_reasons", "_history", "_keys", "_messages", "_hits", "_records", "_frames")
         dict_tokens = ("_state", "_record", "_payload", "_context", "_detail", "_details", "_diagnostic", "_mapping", "_bucket", "_summary")
         numeric_tokens = ("edge", "score", "prob", "confidence", "threshold", "price", "cost", "size", "liquidity", "margin", "count", "age", "volume", "spread")
         string_tokens = ("status", "reason", "blocker", "source", "mode", "decision", "branch", "label", "state")
-        if name in {"price_bounds_pass", "quote_ready", "orderbook_ready", "payload_ready", "auth_ready", "final_submit_allowed_by_realm_vv", "selected_side_has_price", "selected_side_has_liquidity", "depth_available", "beast_spread_override_applied", "tradeable"} or any(token in lowered for token in bool_tokens):
+        if name in {"price_bounds_pass", "quote_ready", "orderbook_ready", "payload_ready", "auth_ready", "final_submit_allowed_by_realm_vv", "selected_side_has_price", "selected_side_has_liquidity", "depth_available", "beast_spread_override_applied", "tradeable", "relaxed_survivable_aggressive"} or any(token in lowered for token in bool_tokens) or lowered.startswith("relaxed_") or lowered.endswith("_aggressive"):
             return "False", "bool"
         if any(lowered.endswith(token) for token in list_tokens):
             return "[]", "list"
@@ -913,6 +958,50 @@ class SentinelAgent:
         rc, journal_out, journal_err = _run_command(journal_cmd, timeout=120, allow_sudo_fallback=True)
         guardian_rc, guardian_out, guardian_err = _run_command(GUARDIAN_CMD, timeout=240, allow_sudo_fallback=True)
         state_files = _load_state_files()
+        paper30_summary = {}
+        profit_engine_summary = {}
+        family_heatmap_summary = {}
+        try:
+            paper30_candidates = [
+                Path(REPO_ROOT / "runtime" / "simulation" / "paper30" / "latest_summary.json"),
+                Path("/tmp") / "kalshi-bot" / "runtime" / "simulation" / "paper30" / "latest_summary.json",
+            ]
+            for paper30_path in paper30_candidates:
+                if paper30_path.exists():
+                    paper30_summary = json.loads(paper30_path.read_text(encoding="utf-8"))
+                    break
+        except Exception:
+            paper30_summary = {}
+        try:
+            profit_candidates = [
+                Path(REPO_ROOT / "runtime" / "profit_engine" / "latest_summary.json"),
+                Path("/tmp") / "kalshi-bot" / "runtime" / "profit_engine" / "latest_summary.json",
+            ]
+            for profit_path in profit_candidates:
+                if profit_path.exists():
+                    profit_engine_summary = json.loads(profit_path.read_text(encoding="utf-8"))
+                    break
+        except Exception:
+            profit_engine_summary = {}
+        try:
+            family_candidates = [
+                Path(REPO_ROOT / "runtime" / "profit_engine" / "latest_family_heatmap.json"),
+                Path("/tmp") / "kalshi-bot" / "runtime" / "profit_engine" / "latest_family_heatmap.json",
+            ]
+            for family_path in family_candidates:
+                if family_path.exists():
+                    family_heatmap_summary = json.loads(family_path.read_text(encoding="utf-8"))
+                    break
+        except Exception:
+            family_heatmap_summary = {}
+        try:
+            memory_summary = latest_memory_summary()
+        except Exception:
+            memory_summary = {}
+        try:
+            patch_queue_summary = patch_queue.summarize_queue()
+        except Exception:
+            patch_queue_summary = {}
         telegram_hits = []
         for source_name, blob in (("journal", journal_out), ("guardian", guardian_out), ("guardian_err", guardian_err), ("journal_err", journal_err)):
             if TELEGRAM_ERROR_RE.search(blob or ""):
@@ -922,13 +1011,20 @@ class SentinelAgent:
             "journal": {"returncode": rc, "stdout": journal_out, "stderr": journal_err},
             "guardian": {"returncode": guardian_rc, "stdout": guardian_out, "stderr": guardian_err},
             "states": state_files,
+            "paper30": paper30_summary,
+            "profit_engine": profit_engine_summary,
+            "family_heatmap": family_heatmap_summary,
+            "memory": memory_summary,
+            "patch_queue": patch_queue_summary,
             "telegram_hits": telegram_hits,
         }
 
     def detect_issue(self, evidence: Dict[str, Any]) -> Optional[SentinelIssue]:
         journal_text = evidence.get("journal", {}).get("stdout", "") or ""
         guardian_text = evidence.get("guardian", {}).get("stdout", "") or ""
-        combined = "\n".join([journal_text, guardian_text, evidence.get("journal", {}).get("stderr", "") or "", evidence.get("guardian", {}).get("stderr", "") or ""])
+        simulation_text = evidence.get("simulation", {}).get("stdout", "") or ""
+        simulation_err = evidence.get("simulation", {}).get("stderr", "") or ""
+        combined = "\n".join([journal_text, guardian_text, simulation_text, evidence.get("journal", {}).get("stderr", "") or "", evidence.get("guardian", {}).get("stderr", "") or "", simulation_err])
         analysis = self.scope_handler.analyze(combined)
         variable = analysis.get("variable") or _extract_variable(combined)
         function_name = analysis.get("function_name")
@@ -968,6 +1064,34 @@ class SentinelAgent:
         if evidence.get("telegram_hits") and not variable and not re.search(r"(NameError|UnboundLocalError|referenced before assignment|is not defined)", combined, re.IGNORECASE):
             return None
         guardian_state = self._parse_guardian_audit(guardian_text)
+        raw_blocker_samples = [
+            line
+            for line in "\n".join([journal_text, simulation_text]).splitlines()
+            if any(
+                token in line
+                for token in (
+                    "AION-RAW-BLOCKER-SAMPLE",
+                    "AION-SELECTED-PRICE-REJECTED",
+                    "AION-SELECTED-PRICE-RESOLVED",
+                    "selected_price_above_0_99",
+                    "payload_missing:selected_price_above_0_99",
+                    "quote_not_usable",
+                    "orderbook_not_usable",
+                    "base_sports_threshold",
+                    "spread_wait",
+                    "direct_fields",
+                    "unknown",
+                    "all_guards_passed",
+                    "entry_ready",
+                    "tradeable",
+                    "eligible",
+                    "liquidity_soft_pass",
+                    "targeted_any_size_present",
+                    "priority_sports_family",
+                    "controlled_sports_promotion",
+                )
+            )
+        ]
         if evidence.get("telegram_hits"):
             return SentinelIssue(
                 issue_type="telegram_runtime_alert",
@@ -992,23 +1116,55 @@ class SentinelAgent:
             )
         stale_phase55 = int(guardian_state.get("stale_phase55_dependency_count", 0) or 0)
         compat_alias = int(guardian_state.get("phase55_compat_alias_count", 0) or 0)
-        if stale_phase55 > 0 or compat_alias > 0:
+        active_obsolete = int(guardian_state.get("active_obsolete_authority_count", 0) or 0)
+        archive_bridge = int(guardian_state.get("phase55_reachability_bridge_count", 0) or 0)
+        if active_obsolete > 0 or (archive_bridge > 0 and (stale_phase55 > 0 or compat_alias > 0)):
             return SentinelIssue(
-                issue_type="legacy_authority",
+                issue_type="obsolete_authority",
                 severity="medium",
                 autopatch_allowed=True,
                 file_path=str(REPO_ROOT / "kalshi_web.py"),
-                evidence={"guardian": guardian_state, "journal_excerpt": journal_text[-3000:], "suggested_recipe_template": self.scope_handler.suggest_recipe_template(issue_type="legacy_authority", analysis=analysis), "failure_count": failure_count},
+                evidence={
+                    "guardian": guardian_state,
+                    "journal_excerpt": journal_text[-3000:],
+                    "suggested_recipe_template": self.scope_handler.suggest_recipe_template(issue_type="obsolete_authority", analysis=analysis),
+                    "failure_count": failure_count,
+                    "active_obsolete_authority_count": active_obsolete,
+                    "archive_phase55_bridge_count": archive_bridge,
+                },
                 patch_recipe="realm_vv_authority_guard",
-                remaining_blocker="compatibility_alias_only",
+                remaining_blocker="obsolete_authority",
             )
-        if any(token in guardian_text for token in ("quote_not_usable", "orderbook_not_usable", "unsafe_spread")):
+        if OBSOLETE_AUTHORITY_RE.search(combined) and (active_obsolete > 0 or archive_bridge > 0):
+            return SentinelIssue(
+                issue_type="obsolete_authority",
+                severity="medium",
+                autopatch_allowed=True,
+                file_path=str(REPO_ROOT / "kalshi_web.py"),
+                evidence={
+                    "guardian": guardian_state,
+                    "journal_excerpt": journal_text[-3000:],
+                    "suggested_recipe_template": self.scope_handler.suggest_recipe_template(issue_type="obsolete_authority", analysis=analysis),
+                    "failure_count": failure_count,
+                    "active_obsolete_authority_count": active_obsolete,
+                    "archive_phase55_bridge_count": archive_bridge,
+                },
+                patch_recipe="realm_vv_authority_guard",
+                remaining_blocker="obsolete_authority",
+            )
+        if any(token in guardian_text for token in ("quote_not_usable", "orderbook_not_usable", "unsafe_spread", "spread_wait", "direct_fields", "unknown")):
             return SentinelIssue(
                 issue_type="stale_blocker_propagation",
                 severity="medium",
                 autopatch_allowed=True,
                 file_path=str(REPO_ROOT / "kalshi_web.py"),
-                evidence={"guardian_excerpt": guardian_text[-5000:], "journal_excerpt": journal_text[-3000:], "suggested_recipe_template": self.scope_handler.suggest_recipe_template(issue_type="stale_blocker_propagation", analysis=analysis), "failure_count": failure_count},
+                evidence={
+                    "guardian_excerpt": guardian_text[-5000:],
+                    "journal_excerpt": journal_text[-3000:],
+                    "raw_blocker_samples": raw_blocker_samples[-25:],
+                    "suggested_recipe_template": self.scope_handler.suggest_recipe_template(issue_type="stale_blocker_propagation", analysis=analysis),
+                    "failure_count": failure_count,
+                },
                 patch_recipe="canonical_blocker_override",
                 remaining_blocker="stale_blocker_label",
             )
@@ -1025,6 +1181,685 @@ class SentinelAgent:
                 if isinstance(data, dict):
                     guardian_state.update(data)
         return guardian_state
+
+    def _guardian_requires_simulation(self, guardian_state: Dict[str, Any], guardian_text: str) -> Tuple[bool, str]:
+        guardian_state = guardian_state if isinstance(guardian_state, dict) else {}
+        text = "\n".join([
+            json.dumps(guardian_state, sort_keys=True, default=str),
+            guardian_text or "",
+        ])
+        if any(bool(guardian_state.get(key)) for key in ("stale_blocker_labels", "dormant_pipeline")):
+            return True, "guardian_state_trigger"
+        for key in ("final_submit_preflight_count", "final_submit_call_count", "order_submitted_count"):
+            try:
+                if int(guardian_state.get(key, 0) or 0) == 0:
+                    return True, f"{key}_zero"
+            except Exception:
+                continue
+        if any(token in text.lower() for token in ("next_fix", "review raw blocker trace samples", "hidden blockers", "fake blockers", "payload rejection", "reachability collapse")):
+            return True, "guardian_recommendation"
+        return False, "none"
+
+    def _ai_escalation_enabled(self) -> bool:
+        if "AION_SENTINEL_AI_ENABLED" in os.environ:
+            return _env_bool("AION_SENTINEL_AI_ENABLED", False)
+        return False
+
+    def _require_human_confirm_for_ai_patch(self) -> bool:
+        if "AION_SENTINEL_REQUIRE_HUMAN_CONFIRM" in os.environ:
+            return _env_bool("AION_SENTINEL_REQUIRE_HUMAN_CONFIRM", True)
+        if "AION_SENTINEL_REQUIRE_HUMAN_CONFIRM_FOR_AI_PATCH" in os.environ:
+            return _env_bool("AION_SENTINEL_REQUIRE_HUMAN_CONFIRM_FOR_AI_PATCH", True)
+        return True
+
+    def _ai_simulation_enabled(self) -> bool:
+        return _env_bool("AION_SENTINEL_AI_SIMULATION", False)
+
+    def _ai_model_name(self) -> str:
+        return str(os.environ.get("AION_SENTINEL_AI_MODEL", "gpt-4.1") or "gpt-4.1").strip()
+
+    def _ai_allowed_by_denylist(self, structured: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        text_blob = json.dumps(redact_sensitive_fields(structured or {}), sort_keys=True, default=str).lower()
+        hits = [phrase for phrase in AI_AUTO_APPLY_DENYLIST if phrase in text_blob]
+        return (not hits), hits
+
+    def _score_ai_patch_proposal(self, *, issue: SentinelIssue, structured: Dict[str, Any], recipe: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        structured = structured if isinstance(structured, dict) else {}
+        recipe = recipe if isinstance(recipe, dict) else {}
+        diagnosis = str(structured.get("diagnosis") or "").strip()
+        root_cause = str(structured.get("root_cause") or "").strip()
+        patch_plan = structured.get("patch_plan") if isinstance(structured.get("patch_plan"), list) else []
+        verification_commands = structured.get("verification_commands") if isinstance(structured.get("verification_commands"), list) else []
+        risk_level = str(structured.get("risk_level") or "unknown").strip().lower()
+        allow_by_recipe = bool(recipe)
+        allowed, deny_hits = self._ai_allowed_by_denylist(structured)
+        confidence = 0.35
+        if diagnosis and root_cause:
+            confidence += 0.2
+        if patch_plan:
+            confidence += min(0.2, 0.05 * len(patch_plan))
+        if verification_commands:
+            confidence += min(0.15, 0.05 * len(verification_commands))
+        if issue.variable:
+            confidence += 0.1
+        if issue.function_name:
+            confidence += 0.05
+        confidence = max(0.0, min(1.0, confidence))
+        risk = 0.25
+        if risk_level in {"high", "critical"}:
+            risk += 0.45
+        elif risk_level in {"medium"}:
+            risk += 0.2
+        if issue.issue_type in {"telegram_runtime_alert"}:
+            risk += 0.1
+        if not allow_by_recipe:
+            risk += 0.15
+        if deny_hits:
+            risk += 0.5
+        if not verification_commands:
+            risk += 0.1
+        safety = max(0.0, min(1.0, 1.0 - risk))
+        approved = bool(allow_by_recipe and not deny_hits and confidence >= 0.5 and safety >= 0.5 and str(structured.get("action") or "").strip().lower() == "approve")
+        return {
+            "confidence_score": round(confidence, 4),
+            "risk_score": round(risk, 4),
+            "safety_score": round(safety, 4),
+            "denylist_hits": deny_hits,
+            "approved": approved,
+            "auto_apply_allowed": False,
+            "require_human_confirm": bool(self._require_human_confirm_for_ai_patch()),
+        }
+
+    def _build_ai_escalation_package(self, *, issue: SentinelIssue, evidence: Dict[str, Any], incident_dir: Optional[Path], persist: bool = True) -> Dict[str, Any]:
+        blocker_tags = _safe_unique(
+            [str(item) for item in (evidence.get("telegram_hits") or []) if str(item).strip()]
+            + [str(item) for item in (evidence.get("blocker_tags") or []) if str(item).strip()]
+            + [str(item) for item in (evidence.get("raw_blockers") or []) if str(item).strip()]
+        )
+        telemetry_lines: List[str] = []
+        for key in ("guardian", "journal", "simulation"):
+            blob = evidence.get(key) if isinstance(evidence, dict) else None
+            if isinstance(blob, dict):
+                stdout = str(blob.get("stdout") or "")
+                stderr = str(blob.get("stderr") or "")
+                if stdout:
+                    telemetry_lines.extend([line for line in stdout.splitlines() if line.strip()][-40:])
+                if stderr:
+                    telemetry_lines.extend([line for line in stderr.splitlines() if line.strip()][-20:])
+        telemetry_lines = telemetry_lines[-80:]
+        recent_patch_history = []
+        for item in list((self.state or {}).get("recent_patches") or [])[-10:]:
+            if isinstance(item, dict):
+                recent_patch_history.append(redact_sensitive_fields(item))
+        memory_summary = latest_memory_summary()
+        memory_match = memory_find_match(issue.to_dict())
+        patch_queue_summary = evidence.get("patch_queue") if isinstance(evidence, dict) else {}
+        safety_state = {
+            "dry_run": bool(self.dry_run),
+            "autopatch_enabled": bool(self.autopatch),
+            "ai_enabled": bool(self._ai_escalation_enabled()),
+            "require_human_confirm": bool(self._require_human_confirm_for_ai_patch()),
+            "simulation": bool(self._ai_simulation_enabled()),
+            "compile_required": _env_bool("AION_SENTINEL_REQUIRE_COMPILE", True),
+            "restart_verify_required": _env_bool("AION_SENTINEL_REQUIRE_RESTART_VERIFY", True),
+        }
+        issue_package = {
+            "timestamp": _now_iso(),
+            "trace_id": incident_dir.name if incident_dir is not None else f"ai_{uuid.uuid4().hex[:12]}",
+            "unresolved_issue_type": issue.issue_type,
+            "issue": issue.to_dict(),
+            "failing_blocker_tags": blocker_tags,
+            "affected_files_functions": {
+                "file_path": issue.file_path,
+                "function_name": issue.function_name,
+                "nearby_scope": issue.traceback_context or {},
+            },
+            "current_safety_state": safety_state,
+            "recent_telemetry_lines": telemetry_lines,
+            "patch_history": recent_patch_history,
+            "memory_summary": memory_summary,
+            "memory_match": memory_match,
+            "patch_queue_summary": patch_queue_summary if isinstance(patch_queue_summary, dict) else {},
+            "explicit_instruction": (
+                "Produce diagnosis, root cause hypothesis, proposed patch plan, verification commands, and risk level. "
+                "Return strict JSON only with no markdown."
+            ),
+        }
+        prompt = (
+            "You are AION Sentinel. Return STRICT JSON only.\n"
+            "Goal: recommend a safe deterministic patch for a runtime issue.\n"
+            "Constraints:\n"
+            "- never relax hard safety\n"
+            "- never change credentials or secrets\n"
+            "- prefer safe initializers / scope reconciliation / telemetry-only fixes\n"
+            "- if uncertain, set action to reject\n"
+            "- auto_apply_allowed must always be false for now\n\n"
+            f"issue_package: {json.dumps(redact_sensitive_fields(issue_package), sort_keys=True, default=str)[:18000]}\n\n"
+            "Return JSON with keys:\n"
+            "- diagnosis\n"
+            "- root_cause\n"
+            "- proposed_files\n"
+            "- patch_plan\n"
+            "- verification_commands\n"
+            "- risk_level\n"
+            "- action: approve|reject\n"
+            "- patch_type: scope_initializer|telemetry|obsolete_authority|other\n"
+            "- variable\n"
+            "- function_name\n"
+            "- file_path\n"
+            "- initializer_strategy\n"
+            "- default_value\n"
+            "- notes\n"
+            "- auto_apply_allowed\n"
+            "- require_human_confirm\n"
+        )
+        package_path = None
+        prompt_path = None
+        if persist and incident_dir is not None:
+            safe_atomic_json_write(
+                incident_dir / "escalation_package.json",
+                {
+                    "timestamp": _now_iso(),
+                    "issue": issue.to_dict(),
+                    "issue_package": redact_sensitive_fields(issue_package),
+                    "prompt_path": str(incident_dir / "codex_prompt.txt"),
+                },
+                sort_keys=True,
+                indent=2,
+            )
+            _write_text(incident_dir / "codex_prompt.txt", prompt)
+            prompt_path = str(incident_dir / "codex_prompt.txt")
+            package_path = str(incident_dir / "escalation_package.json")
+        return {"prompt": prompt, "prompt_path": prompt_path, "package_path": package_path, "issue_package": issue_package}
+
+    def _extract_ai_response_text(self, response: Any) -> str:
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        if isinstance(response, dict):
+            for key in ("output_text", "text", "content"):
+                value = response.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            try:
+                for output_item in response.get("output", []) or []:
+                    if not isinstance(output_item, dict):
+                        continue
+                    for content_item in output_item.get("content", []) or []:
+                        if not isinstance(content_item, dict):
+                            continue
+                        text = content_item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            return text
+            except Exception:
+                pass
+        for attr in ("output_text", "text", "content"):
+            try:
+                value = getattr(response, attr, None)
+                if isinstance(value, str) and value.strip():
+                    return value
+            except Exception:
+                continue
+        try:
+            if hasattr(response, "model_dump"):
+                payload = response.model_dump()
+            elif hasattr(response, "dict"):
+                payload = response.dict()
+            else:
+                payload = None
+            if isinstance(payload, dict):
+                return self._extract_ai_response_text(payload)
+        except Exception:
+            pass
+        return ""
+
+    def _parse_ai_response_bundle(self, raw: str, *, issue: SentinelIssue, simulated: bool = False) -> Dict[str, Any]:
+        parsed = _safe_json_load(raw)
+        if not isinstance(parsed, dict):
+            parsed = {}
+        structured = {
+            "diagnosis": str(parsed.get("diagnosis") or parsed.get("reason") or parsed.get("notes") or "unknown"),
+            "root_cause": str(parsed.get("root_cause") or parsed.get("cause") or parsed.get("diagnosis") or "unknown"),
+            "proposed_files": parsed.get("proposed_files") if isinstance(parsed.get("proposed_files"), list) else ([parsed.get("file_path")] if parsed.get("file_path") else []),
+            "patch_plan": parsed.get("patch_plan") if isinstance(parsed.get("patch_plan"), list) else ([parsed.get("initializer_strategy")] if parsed.get("initializer_strategy") else []),
+            "verification_commands": parsed.get("verification_commands") if isinstance(parsed.get("verification_commands"), list) else [],
+            "risk_level": str(parsed.get("risk_level") or "unknown"),
+            "auto_apply_allowed": False,
+            "require_human_confirm": bool(self._require_human_confirm_for_ai_patch()),
+            "action": str(parsed.get("action") or "reject"),
+            "patch_type": str(parsed.get("patch_type") or "other"),
+            "variable": str(parsed.get("variable") or issue.variable or ""),
+            "function_name": str(parsed.get("function_name") or issue.function_name or ""),
+            "file_path": str(parsed.get("file_path") or issue.file_path or ""),
+            "initializer_strategy": str(parsed.get("initializer_strategy") or "unknown"),
+            "default_value": parsed.get("default_value"),
+            "notes": str(parsed.get("notes") or parsed.get("reason") or ""),
+            "raw": raw,
+            "simulated": bool(simulated),
+        }
+        if structured["default_value"] is None:
+            strategy = structured["initializer_strategy"]
+            if strategy in {"false"}:
+                structured["default_value"] = False
+            elif strategy in {"string_unknown", "unknown"}:
+                structured["default_value"] = "unknown"
+            elif strategy in {"dict_empty", "empty_dict"}:
+                structured["default_value"] = {}
+            elif strategy in {"list_empty", "empty_list"}:
+                structured["default_value"] = []
+            elif strategy in {"number_zero", "zero"}:
+                structured["default_value"] = 0.0
+        return structured
+
+    def _openai_responses_create(self, *, prompt: str, issue: SentinelIssue, incident_dir: Optional[Path] = None, simulate: bool = False) -> Dict[str, Any]:
+        event_data = {
+            "issue_type": issue.issue_type,
+            "variable": issue.variable,
+            "function_name": issue.function_name,
+            "model": self._ai_model_name(),
+            "simulation": bool(simulate),
+            "require_human_confirm": bool(self._require_human_confirm_for_ai_patch()),
+        }
+        if simulate:
+            emit_compact_event("AION_SENTINEL_AI_ESCALATION", "AI escalation simulation started", event_data, component="sentinel", actionable=True)
+            emit_compact_event("AION_SENTINEL_AI_REQUEST", "AI request prepared for simulation", event_data | {"prompt_excerpt": prompt[:1200]}, component="sentinel", actionable=True)
+            mock_payload = {
+                "diagnosis": "scope_initializer_missing",
+                "root_cause": f"{issue.variable or 'unknown'} referenced before assignment in {issue.function_name or 'unknown'}",
+                "proposed_files": [issue.file_path or str(REPO_ROOT / "kalshi_web.py")],
+                "patch_plan": [
+                    "initialize the variable at function entry",
+                    "keep canonical fallback order",
+                    "preserve hard safety and telemetry",
+                ],
+                "verification_commands": [
+                    "python3 -m py_compile /opt/kalshi-bot/aion_sentinel_agent.py",
+                    "python3 /opt/kalshi-bot/aion_sentinel_agent.py --simulate-ai-escalation",
+                ],
+                "risk_level": "low",
+                "action": "reject" if self._require_human_confirm_for_ai_patch() else "approve",
+                "patch_type": "scope_initializer",
+                "variable": issue.variable or "unknown",
+                "function_name": issue.function_name or "unknown",
+                "file_path": issue.file_path or str(REPO_ROOT / "kalshi_web.py"),
+                "initializer_strategy": "false",
+                "default_value": False,
+                "notes": "simulation_only",
+                "auto_apply_allowed": False,
+                "require_human_confirm": True,
+            }
+            raw = json.dumps(mock_payload, sort_keys=True, default=str)
+            if incident_dir is not None:
+                _write_text(incident_dir / "ai_response.txt", raw)
+            emit_compact_event("AION_SENTINEL_AI_RESPONSE", "AI simulation response generated", {"simulation": True, "response_keys": sorted(mock_payload.keys())}, component="sentinel", actionable=True)
+            emit_compact_event("AION_SENTINEL_AI_SIMULATION", "AI simulation path exercised", {"simulation": True, "mode": "mock_response"}, component="sentinel", actionable=True)
+            if self._require_human_confirm_for_ai_patch():
+                emit_compact_event("AION_SENTINEL_AI_REQUIRE_HUMAN_CONFIRM", "AI result requires human confirmation", {"simulation": True, "reason": "env_true"}, component="sentinel", level="WARN")
+            return {"enabled": True, "ok": True, "simulation": True, "raw": raw, "parsed": mock_payload, "structured": self._parse_ai_response_bundle(raw, issue=issue, simulated=True)}
+
+        if not self._ai_escalation_enabled():
+            emit_compact_event("AION_SENTINEL_AI_DISABLED", "AI bridge disabled by environment", event_data | {"reason": "disabled_by_env"}, component="sentinel", level="WARN")
+            return {"enabled": False, "reason": "disabled", "structured": {"auto_apply_allowed": False}}
+        api_key = str(os.environ.get("OPENAI_API_KEY") or "").strip()
+        if not api_key:
+            emit_compact_event("AION_SENTINEL_AI_KEY_MISSING", "AI bridge missing OPENAI_API_KEY", event_data | {"reason": "missing_api_key"}, component="sentinel", level="WARN")
+            emit_compact_event("AION_SENTINEL_AI_ERROR", "AI bridge cannot start without OPENAI_API_KEY", event_data | {"reason": "missing_api_key"}, component="sentinel", level="ERROR")
+            emit_compact_event("AION_SENTINEL_AI_DISABLED", "AI bridge disabled because API key is missing", event_data | {"reason": "missing_api_key"}, component="sentinel", level="WARN")
+            return {"enabled": True, "reason": "missing_api_key", "structured": {"auto_apply_allowed": False}}
+        emit_compact_event("AION_SENTINEL_AI_ESCALATION", "AI escalation bridge called", event_data, component="sentinel", actionable=True)
+        emit_compact_event("AION_SENTINEL_AI_REQUEST", "AI request prepared", event_data | {"prompt_excerpt": prompt[:1200]}, component="sentinel", actionable=True)
+        payload = {"model": self._ai_model_name(), "input": prompt}
+        try:
+            response_obj = None
+            raw = ""
+            try:
+                from openai import OpenAI  # type: ignore
+            except Exception:
+                OpenAI = None  # type: ignore
+            if OpenAI is not None:
+                client = OpenAI(api_key=api_key)
+                response_obj = client.responses.create(model=self._ai_model_name(), input=prompt)
+                if hasattr(response_obj, "model_dump_json"):
+                    raw = response_obj.model_dump_json()
+                elif hasattr(response_obj, "model_dump"):
+                    raw = json.dumps(response_obj.model_dump(), sort_keys=True, default=str)
+                else:
+                    raw = json.dumps({"output_text": self._extract_ai_response_text(response_obj)}, sort_keys=True, default=str)
+            else:
+                request = urllib.request.Request(
+                    "https://api.openai.com/v1/responses",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=60) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+            if incident_dir is not None:
+                _write_text(incident_dir / "ai_response.txt", raw)
+            response_text = self._extract_ai_response_text(response_obj) if response_obj is not None else ""
+            response_payload = _safe_json_load(raw) or {}
+            if not isinstance(response_payload, dict):
+                response_payload = {}
+            if not response_text:
+                response_text = self._extract_ai_response_text(response_payload)
+            emit_compact_event("AION_SENTINEL_AI_RESPONSE", "AI response received", {"simulation": False, "response_keys": sorted(response_payload.keys()) if isinstance(response_payload, dict) else [], "response_text_found": bool(response_text)}, component="sentinel", actionable=True)
+            return {"enabled": True, "ok": True, "raw": raw, "parsed": response_payload, "structured": self._parse_ai_response_bundle(response_text or raw, issue=issue, simulated=False)}
+        except Exception as exc:
+            raw = json.dumps({"error": exc.__class__.__name__, "reason": str(exc)}, sort_keys=True, default=str)
+            if incident_dir is not None:
+                _write_text(incident_dir / "ai_response.txt", raw)
+            emit_compact_event("AION_SENTINEL_AI_ERROR", "AI bridge request failed", event_data | {"reason": exc.__class__.__name__}, component="sentinel", level="ERROR")
+            return {"enabled": True, "ok": False, "reason": exc.__class__.__name__, "error": str(exc), "raw": raw, "structured": {"auto_apply_allowed": False}}
+
+    def _ai_patch_to_recipe(self, response: Dict[str, Any], issue: SentinelIssue) -> Optional[Dict[str, Any]]:
+        parsed = response.get("parsed") if isinstance(response, dict) else {}
+        if not isinstance(parsed, dict):
+            return None
+        if str(parsed.get("action") or "").strip().lower() != "approve":
+            return None
+        variable = str(parsed.get("variable") or issue.variable or "").strip()
+        if not variable:
+            return None
+        strategy = str(parsed.get("initializer_strategy") or "").strip().lower()
+        default_value = parsed.get("default_value")
+        if strategy not in {"false", "string_unknown", "unknown", "dict_empty", "empty_dict", "list_empty", "empty_list", "number_zero", "zero", "derive_selected_price", "telemetry_guard"}:
+            return None
+        return {
+            "name": f"ai_bridge_{re.sub(r'[^A-Za-z0-9_.-]+', '_', variable) or 'unknown'}",
+            "enabled": True,
+            "issue_type": issue.issue_type,
+            "matches": [rf"name '{re.escape(variable)}' is not defined", rf"local variable '{re.escape(variable)}' referenced before assignment"],
+            "variable_pattern": re.escape(variable),
+            "initializer_strategy": strategy,
+            "default_value": default_value if default_value is not None else False,
+            "patch_location": "function_top",
+            "allowed": True,
+            "requires_compile": True,
+            "requires_restart": True,
+            "rollback_on_failure": True,
+            "notes": str(parsed.get("notes") or parsed.get("reason") or "AI bridge suggestion"),
+        }
+
+    def _structured_ai_proposal_seed(self, issue: SentinelIssue, structured: Dict[str, Any]) -> Dict[str, Any]:
+        structured = structured if isinstance(structured, dict) else {}
+        variable = str(structured.get("variable") or issue.variable or "").strip()
+        return {
+            "name": structured.get("name") or f"ai_bridge_{re.sub(r'[^A-Za-z0-9_.-]+', '_', variable or 'unknown')}",
+            "patch_type": str(structured.get("patch_type") or "scope_initializer").strip().lower(),
+            "variable": variable,
+            "function_name": str(structured.get("function_name") or issue.function_name or "").strip(),
+            "file_path": str(structured.get("file_path") or issue.file_path or "").strip(),
+            "initializer_strategy": str(structured.get("initializer_strategy") or "false").strip().lower(),
+            "default_value": structured.get("default_value", False),
+            "notes": str(structured.get("notes") or structured.get("reason") or "AI bridge suggestion"),
+            "proposed_files": structured.get("proposed_files") if isinstance(structured.get("proposed_files"), list) else ([issue.file_path] if issue.file_path else []),
+            "verification_commands": structured.get("verification_commands") if isinstance(structured.get("verification_commands"), list) else [],
+            "rollback_plan": structured.get("rollback_plan") or "restore backup and re-verify",
+            "risk_level": str(structured.get("risk_level") or "unknown"),
+        }
+
+    def _maybe_run_ai_bridge(self, issue: SentinelIssue, evidence: Dict[str, Any], incident_dir: Path) -> Dict[str, Any]:
+        package = self._build_ai_escalation_package(issue=issue, evidence=evidence, incident_dir=incident_dir)
+        if self._ai_simulation_enabled():
+            response = self._openai_responses_create(prompt=package["prompt"], issue=issue, incident_dir=None, simulate=True)
+            structured = response.get("structured") if isinstance(response, dict) else {}
+            proposal = self._ai_patch_to_recipe(response, issue)
+            verdict = self._score_ai_patch_proposal(issue=issue, structured=structured, recipe=proposal)
+            proposal_seed = proposal or self._structured_ai_proposal_seed(issue, structured)
+            patch_preview, preview_kind = self._build_scope_initializer_preview(
+                Path(issue.file_path) if issue.file_path else Path(REPO_ROOT / "kalshi_web.py"),
+                issue.variable,
+                function_name=issue.function_name,
+                context=issue.traceback_context,
+                recipe=proposal_seed,
+            )
+            queue_record = self._create_patch_queue_record(
+                issue=issue,
+                ai_bridge_result={
+                    **response,
+                    "package": package,
+                    "proposal": proposal_seed,
+                },
+                verification=verdict,
+                incident_dir=incident_dir,
+                patch_preview=patch_preview or proposal_seed.get("notes", ""),
+                unified_diff_patch=patch_preview,
+                source="ai_bridge_simulation",
+            )
+            emit_compact_event(
+                "AION_SENTINEL_AI_PATCH_PROPOSAL",
+                "AI patch proposal prepared",
+                {
+                    "issue_type": issue.issue_type,
+                    "variable": issue.variable or "unknown",
+                    "function_name": issue.function_name or "unknown",
+                    "proposal": proposal_seed,
+                    "risk_score": verdict["risk_score"],
+                    "confidence_score": verdict["confidence_score"],
+                    "safety_score": verdict["safety_score"],
+                    "queue_status": queue_record.get("status"),
+                },
+                component="sentinel",
+                actionable=True,
+            )
+            emit_compact_event(
+                "AION_SENTINEL_AI_VERIFICATION",
+                "AI patch verification completed",
+                {
+                    "verification_commands": structured.get("verification_commands") if isinstance(structured, dict) else [],
+                    "risk_score": verdict["risk_score"],
+                    "confidence_score": verdict["confidence_score"],
+                    "safety_score": verdict["safety_score"],
+                    "denylist_hits": verdict.get("denylist_hits", []),
+                    "auto_apply_allowed": False,
+                    "require_human_confirm": True,
+                },
+                component="sentinel",
+                actionable=True,
+            )
+            approved = bool(verdict.get("approved"))
+            emit_compact_event(
+                "AION_SENTINEL_AI_APPROVED" if approved else "AION_SENTINEL_AI_REJECTED",
+                "AI patch proposal approved" if approved else "AI patch proposal rejected",
+                {
+                    "issue_type": issue.issue_type,
+                    "variable": issue.variable or "unknown",
+                    "function_name": issue.function_name or "unknown",
+                    "risk_score": verdict["risk_score"],
+                    "confidence_score": verdict["confidence_score"],
+                    "safety_score": verdict["safety_score"],
+                    "auto_apply_allowed": False,
+                    "require_human_confirm": True,
+                    "denylist_hits": verdict.get("denylist_hits", []),
+                },
+                component="sentinel",
+                level="WARN" if not approved else "INFO",
+                actionable=True,
+            )
+            if self._require_human_confirm_for_ai_patch():
+                emit_compact_event(
+                    "AION_SENTINEL_AI_REQUIRE_HUMAN_CONFIRM",
+                    "AI patch requires human confirmation",
+                    {"issue_type": issue.issue_type, "variable": issue.variable, "function_name": issue.function_name},
+                    component="sentinel",
+                    level="WARN",
+                )
+            return {
+                "enabled": True,
+                "simulation": True,
+                "reason": "simulation",
+                "package": package,
+                "response": response,
+                "structured": structured,
+                "proposal": proposal_seed,
+                "verification": verdict,
+                "patch_preview": patch_preview,
+                "queue_record": queue_record,
+                "require_human_confirm": bool(self._require_human_confirm_for_ai_patch()),
+                "auto_apply_allowed": False,
+                "applied": False,
+            }
+        response = self._openai_responses_create(prompt=package["prompt"], issue=issue, incident_dir=incident_dir, simulate=False)
+        if not response.get("ok"):
+            return {
+                "enabled": bool(self._ai_escalation_enabled()),
+                "reason": response.get("reason") or "ai_request_failed",
+                "package": package,
+                "response": response,
+                "auto_apply_allowed": False,
+                "applied": False,
+            }
+        structured = response.get("structured") if isinstance(response, dict) else {}
+        proposal = self._ai_patch_to_recipe(response, issue)
+        verdict = self._score_ai_patch_proposal(issue=issue, structured=structured, recipe=proposal)
+        proposal_seed = proposal or self._structured_ai_proposal_seed(issue, structured)
+        patch_preview, preview_kind = self._build_scope_initializer_preview(
+            Path(issue.file_path) if issue.file_path else Path(REPO_ROOT / "kalshi_web.py"),
+            issue.variable,
+            function_name=issue.function_name,
+            context=issue.traceback_context,
+            recipe=proposal_seed,
+        )
+        queue_record = self._create_patch_queue_record(
+            issue=issue,
+            ai_bridge_result={
+                **response,
+                "package": package,
+                "proposal": proposal_seed,
+            },
+            verification=verdict,
+            incident_dir=incident_dir,
+            patch_preview=patch_preview or proposal_seed.get("notes", ""),
+            unified_diff_patch=patch_preview,
+            source="ai_bridge",
+        )
+        emit_compact_event(
+            "AION_SENTINEL_AI_PATCH_PROPOSAL",
+            "AI patch proposal prepared",
+            {
+                "issue_type": issue.issue_type,
+                "variable": issue.variable or "unknown",
+                "function_name": issue.function_name or "unknown",
+                "proposal": proposal_seed,
+                "risk_score": verdict["risk_score"],
+                "confidence_score": verdict["confidence_score"],
+                "safety_score": verdict["safety_score"],
+                "queue_status": queue_record.get("status"),
+            },
+            component="sentinel",
+            actionable=True,
+        )
+        emit_compact_event(
+            "AION_SENTINEL_AI_VERIFICATION",
+            "AI patch verification completed",
+            {
+                "verification_commands": structured.get("verification_commands") if isinstance(structured, dict) else [],
+                "risk_score": verdict["risk_score"],
+                "confidence_score": verdict["confidence_score"],
+                "safety_score": verdict["safety_score"],
+                "denylist_hits": verdict.get("denylist_hits", []),
+                "auto_apply_allowed": False,
+                "require_human_confirm": True,
+            },
+            component="sentinel",
+            actionable=True,
+        )
+        approved = bool(verdict.get("approved"))
+        emit_compact_event(
+            "AION_SENTINEL_AI_APPROVED" if approved else "AION_SENTINEL_AI_REJECTED",
+            "AI patch proposal approved" if approved else "AI patch proposal rejected",
+            {
+                "issue_type": issue.issue_type,
+                "variable": issue.variable or "unknown",
+                "function_name": issue.function_name or "unknown",
+                "risk_score": verdict["risk_score"],
+                "confidence_score": verdict["confidence_score"],
+                "safety_score": verdict["safety_score"],
+                "auto_apply_allowed": False,
+                "require_human_confirm": True,
+                "denylist_hits": verdict.get("denylist_hits", []),
+            },
+            component="sentinel",
+            level="WARN" if not approved else "INFO",
+            actionable=True,
+        )
+        if self._require_human_confirm_for_ai_patch():
+            emit_compact_event(
+                "AION_SENTINEL_AI_REQUIRE_HUMAN_CONFIRM",
+                "AI patch requires human confirmation",
+                {"issue_type": issue.issue_type, "variable": issue.variable, "function_name": issue.function_name},
+                component="sentinel",
+                level="WARN",
+            )
+        return {
+            "enabled": True,
+            "reason": "require_human_confirm" if self._require_human_confirm_for_ai_patch() else "proposed",
+            "package": package,
+            "response": response,
+            "structured": structured,
+            "proposal": proposal_seed,
+            "verification": verdict,
+            "patch_preview": patch_preview,
+            "queue_record": queue_record,
+            "require_human_confirm": bool(self._require_human_confirm_for_ai_patch()),
+            "auto_apply_allowed": False,
+            "applied": False,
+        }
+
+    def _maybe_emit_profit_recommendation(self, evidence: Dict[str, Any], guardian_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        guardian_state = guardian_state if isinstance(guardian_state, dict) else {}
+        profit = evidence.get("profit_engine") if isinstance(evidence, dict) else {}
+        profit = profit if isinstance(profit, dict) else {}
+        family_heatmap = evidence.get("family_heatmap") if isinstance(evidence, dict) else {}
+        family_heatmap = family_heatmap if isinstance(family_heatmap, dict) else {}
+        if not profit:
+            return None
+        profitable_rules = list(profit.get("profitable_loosened_rules") or [])
+        current_state = str(profit.get("current_profitability_state") or "").strip().lower()
+        avg_ev = float(profit.get("average_expected_value") or profit.get("total_expected_value") or 0.0)
+        avg_conf = float(profit.get("average_confidence") or 0.0)
+        execution_rate = float(profit.get("execution_rate") or 0.0)
+        profitable_families = list(family_heatmap.get("profitable_families") or [])
+        execution_too_low = any(
+            bool(guardian_state.get(key)) for key in ("dormant_pipeline",)
+        ) or any(
+            int(guardian_state.get(key, 0) or 0) == 0 for key in ("final_submit_preflight_count", "final_submit_call_count", "order_submitted_count")
+        )
+        if not execution_too_low or (not profitable_rules and not profitable_families) or avg_ev <= 0.0 or avg_conf < 0.60:
+            return None
+        recommendation = {
+            "timestamp": _now_iso(),
+            "execution_too_low": True,
+            "current_profitability_state": current_state or "unknown",
+            "average_expected_value": avg_ev,
+            "average_confidence": avg_conf,
+            "execution_rate": execution_rate,
+            "profitable_rules": profitable_rules[:10],
+            "dangerous_rules": list(profit.get("dangerous_loosened_rules") or [])[:10],
+            "profitable_families": profitable_families[:20],
+            "recommended_live_policy": profit.get("recommended_live_policy") or {},
+            "paper_only_rules": profit.get("paper_only_rules") or [],
+        }
+        print("[SENTINEL-PROFIT-POLICY-RECOMMENDATION] " + json.dumps(recommendation, sort_keys=True, default=str))
+        self._send_telegram_summary({
+            "telegram_text": (
+                "AION Sentinel\n"
+                f"- tags: SENTINEL-PROFIT-POLICY-RECOMMENDATION\n"
+                f"- current_profitability_state: {current_state or 'unknown'}\n"
+                f"- average_expected_value: {avg_ev}\n"
+                f"- average_confidence: {avg_conf}\n"
+                f"- execution_rate: {execution_rate}\n"
+                f"- profitable_rules: {', '.join(profitable_rules[:10]) or 'none'}\n"
+                f"- profitable_families: {', '.join(profitable_families[:20]) or 'none'}\n"
+                f"- dangerous_rules: {', '.join((profit.get('dangerous_loosened_rules') or [])[:10]) or 'none'}\n"
+                f"- recommended_live_policy: {json.dumps(profit.get('recommended_live_policy') or {}, sort_keys=True, default=str)}"
+            )
+        })
+        return recommendation
 
     def _backup_files(self, files: List[Path], incident_dir: Path) -> Path:
         backup_dir = BACKUPS_ROOT / incident_dir.name
@@ -1231,19 +2066,30 @@ class SentinelAgent:
         ]
         tags = [tag for tag in tags if tag]
         suggested_recipe = issue.evidence.get("suggested_recipe_template") if isinstance(issue.evidence, dict) else None
+        ai_bridge = issue.evidence.get("ai_bridge") if isinstance(issue.evidence, dict) else {}
+        ai_verification = ai_bridge.get("verification") if isinstance(ai_bridge, dict) else {}
+        ai_proposal = ai_bridge.get("proposal") if isinstance(ai_bridge, dict) else {}
         return (
             "AION Sentinel\n"
             f"- tags: {', '.join(tags) or 'none'}\n"
             f"- issue_type: {issue.issue_type}\n"
+            f"- severity: {issue.severity}\n"
             f"- variable: {issue.variable or 'unknown'}\n"
             f"- function_name: {issue.function_name or 'unknown'}\n"
+            f"- root_cause: {issue.evidence.get('journal_excerpt', 'unknown')[:240] if isinstance(issue.evidence, dict) else 'unknown'}\n"
+            f"- affected_files: {', '.join([p for p in [issue.file_path] if p]) or 'unknown'}\n"
             f"- recipe: {issue.patch_recipe or 'none'}\n"
             f"- patch_applied: {bool(patch_result.get('applied'))}\n"
             f"- patch_reason: {patch_result.get('reason') or 'none'}\n"
+            f"- ai_risk_score: {ai_verification.get('risk_score', 'n/a')}\n"
+            f"- ai_confidence_score: {ai_verification.get('confidence_score', 'n/a')}\n"
+            f"- ai_safety_score: {ai_verification.get('safety_score', 'n/a')}\n"
+            f"- ai_proposed_files: {', '.join(ai_proposal.get('proposed_files') or []) if isinstance(ai_proposal, dict) else 'none'}\n"
             f"- failure_count: {issue.evidence.get('failure_count') if isinstance(issue.evidence, dict) else 'unknown'}\n"
             f"- compile_ok: {bool(compile_result.get('ok'))}\n"
             f"- restart_ok: {bool(restart_result.get('ok'))}\n"
             f"- fresh_error_clean: {bool(verify_result.get('clean'))}\n"
+            f"- human_action_required: {'yes' if not verify_result.get('clean') or not compile_result.get('ok') else 'maybe'}\n"
             f"- remaining_blocker: {issue.remaining_blocker or 'none'}\n"
             f"- suggested_recipe: {json.dumps(suggested_recipe, sort_keys=True, default=str) if suggested_recipe else 'none'}"
         )
@@ -1280,9 +2126,434 @@ class SentinelAgent:
             )
         )
 
+    def _build_scope_initializer_preview(
+        self,
+        path: Path,
+        variable: Optional[str],
+        *,
+        function_name: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        recipe: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str]:
+        if not path.exists() or not variable:
+            return "", "no_preview_available"
+        try:
+            before_text = path.read_text(encoding="utf-8")
+        except Exception:
+            return "", "preview_read_failed"
+        blocks = self._find_all_function_blocks_for_variable(before_text, variable, function_name=function_name)
+        if not blocks:
+            return "", "function_not_found"
+        resolved_function_name, block = blocks[0]
+        initializer_expr, initializer_kind = self.scope_handler.derive_initializer(variable, recipe=recipe, context=context)
+        if recipe is None or str(recipe.get("initializer_strategy") or "").strip().lower() == "derive_selected_price":
+            fallback_expr, fallback_kind = self._classify_initializer(variable, context=context)
+            if initializer_expr == "False" and fallback_expr not in ("False", '"unknown"', "{}", "[]", "0.0"):
+                initializer_expr, initializer_kind = fallback_expr, fallback_kind
+        block_text = before_text[block[0]:block[1]]
+        function_indent_match = re.match(r"^([ \t]*)def\s+", block_text)
+        function_indent = function_indent_match.group(1) if function_indent_match else ""
+        body_indent = f"{function_indent}    "
+        insertion_at = block[0] + self._function_insertion_offset(block_text, function_indent=function_indent)
+        before_preview = before_text
+        after_preview = before_text[:insertion_at] + ("\n" if not before_text[:insertion_at].endswith("\n") else "") + f"{body_indent}{variable} = {initializer_expr}\n" + before_text[insertion_at:]
+        preview = self._diff_for_files(before_preview, after_preview, str(path.relative_to(REPO_ROOT)) if path.is_relative_to(REPO_ROOT) else str(path))
+        preview_header = (
+            f"Initialize {variable} at function top in {resolved_function_name} using {initializer_expr} ({initializer_kind}).\n"
+            f"Patch location: function_top\n"
+        )
+        return preview_header + preview, initializer_kind
+
+    def _run_py_compile_paths(self, paths: List[Path]) -> Dict[str, Any]:
+        unique_paths: List[str] = []
+        for path in paths:
+            if path is None:
+                continue
+            resolved = str(path)
+            if resolved not in unique_paths and resolved:
+                unique_paths.append(resolved)
+        if not unique_paths:
+            return {"ok": False, "reason": "no_paths", "returncode": None, "stdout": "", "stderr": ""}
+        rc, out, err = _run_command([sys.executable, "-m", "py_compile", *unique_paths], timeout=300, allow_sudo_fallback=False)
+        return {"ok": rc == 0, "returncode": rc, "stdout": out, "stderr": err, "paths": unique_paths}
+
+    def _create_patch_queue_record(
+        self,
+        *,
+        issue: SentinelIssue,
+        ai_bridge_result: Dict[str, Any],
+        verification: Dict[str, Any],
+        incident_dir: Optional[Path],
+        patch_preview: str,
+        unified_diff_patch: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        package = ai_bridge_result.get("package") if isinstance(ai_bridge_result, dict) else {}
+        structured = ai_bridge_result.get("structured") if isinstance(ai_bridge_result, dict) else {}
+        proposal = ai_bridge_result.get("proposal") if isinstance(ai_bridge_result, dict) else {}
+        current_safety_state = (package or {}).get("issue_package", {}).get("current_safety_state") if isinstance(package, dict) else {}
+        queue_record = patch_queue.create_proposal(
+            issue=issue.to_dict(),
+            ai_bridge=ai_bridge_result,
+            structured=structured if isinstance(structured, dict) else {},
+            proposal=proposal if isinstance(proposal, dict) else {},
+            verification=verification if isinstance(verification, dict) else {},
+            unified_diff_patch=unified_diff_patch,
+            patch_preview=patch_preview,
+            source=source,
+            status="pending",
+            incident_dir=incident_dir,
+            current_safety_state=current_safety_state if isinstance(current_safety_state, dict) else issue.evidence.get("safety_state", {}),
+        )
+        issue.evidence["patch_queue_record"] = queue_record
+        return queue_record
+
+    def _load_patch_proposal(self, proposal_id: str) -> Optional[Dict[str, Any]]:
+        return patch_queue.load_proposal(proposal_id)
+
+    def _apply_patch_proposal(self, proposal_id: str) -> Dict[str, Any]:
+        proposal = self._load_patch_proposal(proposal_id)
+        if not proposal:
+            return {"applied": False, "reason": "proposal_not_found", "proposal_id": proposal_id}
+        if str(proposal.get("status") or "").lower() not in {"approved"}:
+            return {"applied": False, "reason": "proposal_not_approved", "proposal_id": proposal_id, "status": proposal.get("status")}
+        deny_hits = patch_queue.check_denylist(proposal)
+        if deny_hits:
+            patch_queue.update_proposal_status(
+                proposal_id,
+                "rejected",
+                actor="sentinel",
+                reason="denylist_block",
+                details={"denylist_hits": deny_hits},
+            )
+            emit_compact_event(
+                "AION_PATCH_DENYLIST_BLOCK",
+                "patch proposal rejected by denylist",
+                {"proposal_id": proposal_id, "denylist_hits": deny_hits, "status": proposal.get("status")},
+                component="sentinel",
+                level="ERROR",
+                actionable=True,
+            )
+            return {"applied": False, "reason": "denylist_block", "denylist_hits": deny_hits, "proposal_id": proposal_id}
+        files = [Path(path) for path in _safe_unique([str(path) for path in (proposal.get("affected_files") or []) if str(path).strip()])]
+        if not files and proposal.get("file_path"):
+            files = [Path(str(proposal.get("file_path")))]
+        files = [path for path in files if path.exists()]
+        if not files:
+            patch_queue.update_proposal_status(proposal_id, "failed", actor="sentinel", reason="missing_affected_files")
+            return {"applied": False, "reason": "missing_affected_files", "proposal_id": proposal_id}
+        incident_dir = BACKUPS_ROOT / f"proposal_{proposal_id}"
+        incident_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir = self._backup_files(files, incident_dir)
+        before_snapshots = {str(path): _read_text(path) for path in files}
+        patch_type = str(proposal.get("patch_type") or "").strip().lower()
+        applied = False
+        apply_reason = "unsupported_patch_type"
+        changed_functions: List[str] = []
+        diff_text = ""
+        if patch_type == "scope_initializer":
+            target_path = files[0]
+            variable = str(proposal.get("variable") or "").strip()
+            function_name = str(proposal.get("function_name") or "").strip() or None
+            context = {
+                "kind": proposal.get("initializer_strategy"),
+                "selected_price": proposal.get("default_value"),
+                "selected_price_cents": proposal.get("default_value"),
+            }
+            recipe = {
+                "name": proposal.get("proposal_id") or "approved_patch",
+                "enabled": True,
+                "issue_type": proposal.get("issue_type") or "scope_bug",
+                "matches": [rf"name '{re.escape(variable)}' is not defined", rf"local variable '{re.escape(variable)}' referenced before assignment"] if variable else [],
+                "variable_pattern": re.escape(variable) if variable else r".+",
+                "initializer_strategy": proposal.get("initializer_strategy") or "false",
+                "default_value": proposal.get("default_value"),
+                "patch_location": "function_top",
+                "allowed": True,
+                "requires_compile": True,
+                "requires_restart": bool(proposal.get("requires_restart", True)),
+                "rollback_on_failure": True,
+                "notes": proposal.get("notes") or "approved patch proposal",
+            }
+            applied, apply_reason, changed_functions = self._apply_scope_initializer_patch(
+                target_path,
+                variable,
+                function_name=function_name,
+                context=context,
+                recipe=recipe,
+                patch_all=bool(proposal.get("scope_reconciled")),
+            )
+        elif patch_type == "telemetry":
+            applied = False
+            apply_reason = "telemetry_only"
+        else:
+            applied = False
+            apply_reason = "unsupported_patch_type"
+        after_snapshots = {str(path): _read_text(path) for path in files}
+        if applied:
+            diffs = []
+            for path_str, before_text in before_snapshots.items():
+                after_text = after_snapshots.get(path_str, "")
+                if before_text != after_text:
+                    diffs.append(self._diff_for_files(before_text, after_text, str(Path(path_str).relative_to(REPO_ROOT)) if Path(path_str).is_relative_to(REPO_ROOT) else str(path_str)))
+            diff_text = "\n".join(diffs)
+        compile_result = {"ok": False, "reason": "not_run"}
+        replay_result = {"ok": False, "reason": "not_run"}
+        restart_result = {"ok": False, "reason": "not_run"}
+        guardian_result = {"ok": False, "reason": "not_run"}
+        verify_result = {"clean": False, "matches": [], "reason": "not_run"}
+        if not applied:
+            patch_queue.update_proposal_status(proposal_id, "failed", actor="sentinel", reason=apply_reason, details={"backup_dir": str(backup_dir), "patch_type": patch_type, "changed_functions": changed_functions})
+            return {"applied": False, "reason": apply_reason, "proposal_id": proposal_id, "backup_dir": str(backup_dir)}
+        emit_compact_event(
+            "AION_PATCH_APPLY_START",
+            "patch application started",
+            {"proposal_id": proposal_id, "files": [str(path) for path in files], "patch_type": patch_type, "changed_functions": changed_functions},
+            component="sentinel",
+            actionable=True,
+        )
+        patch_queue.update_proposal_status(
+            proposal_id,
+            "applied",
+            actor="sentinel",
+            reason="patch_applied",
+            details={
+                "backup_dir": str(backup_dir),
+                "patch_type": patch_type,
+                "changed_functions": changed_functions,
+                "diff": diff_text,
+            },
+        )
+        compile_result = self._run_py_compile_paths(files)
+        if not compile_result.get("ok"):
+            restore_result = self._restore_backup_dir(backup_dir, files)
+            patch_queue.update_proposal_status(proposal_id, "rolled_back", actor="sentinel", reason="compile_failed", details={"restore_result": restore_result, "compile_result": compile_result})
+            emit_compact_event(
+                "AION_PATCH_APPLY_FAILED",
+                "patch application failed during compile",
+                {"proposal_id": proposal_id, "reason": "compile_failed", "compile_ok": False},
+                component="sentinel",
+                level="ERROR",
+                actionable=True,
+            )
+            emit_compact_event(
+                "AION_PATCH_ROLLBACK",
+                "patch rollback completed after compile failure",
+                {"proposal_id": proposal_id, "restore_result": restore_result, "reason": "compile_failed"},
+                component="sentinel",
+                level="WARN",
+                actionable=True,
+            )
+            return {
+                "applied": True,
+                "reason": "compile_failed",
+                "proposal_id": proposal_id,
+                "backup_dir": str(backup_dir),
+                "compile_result": compile_result,
+                "restore_result": restore_result,
+                "rolled_back": True,
+            }
+        replay_cmd = [sys.executable, str(REPO_ROOT / "aion_execution_simulator.py"), "--replay-latest-issue"]
+        replay_rc, replay_out, replay_err = _run_command(replay_cmd, timeout=900, allow_sudo_fallback=False)
+        replay_result = {"ok": replay_rc == 0, "returncode": replay_rc, "stdout": replay_out, "stderr": replay_err}
+        if bool(proposal.get("requires_restart", True)):
+            restart_result = self._run_restart()
+            if not restart_result.get("ok"):
+                restore_result = self._restore_backup_dir(backup_dir, files)
+                patch_queue.update_proposal_status(
+                    proposal_id,
+                    "rolled_back",
+                    actor="sentinel",
+                    reason="restart_failed",
+                    details={"restore_result": restore_result, "compile_result": compile_result, "restart_result": restart_result, "replay_result": replay_result},
+                )
+                emit_compact_event(
+                    "AION_PATCH_APPLY_FAILED",
+                    "patch application failed during restart",
+                    {"proposal_id": proposal_id, "reason": "restart_failed", "restart_ok": False},
+                    component="sentinel",
+                    level="ERROR",
+                    actionable=True,
+                )
+                emit_compact_event(
+                    "AION_PATCH_ROLLBACK",
+                    "patch rollback completed after restart failure",
+                    {"proposal_id": proposal_id, "restore_result": restore_result, "reason": "restart_failed"},
+                    component="sentinel",
+                    level="WARN",
+                    actionable=True,
+                )
+                return {
+                    "applied": True,
+                    "reason": "restart_failed",
+                    "proposal_id": proposal_id,
+                    "backup_dir": str(backup_dir),
+                    "compile_result": compile_result,
+                    "restart_result": restart_result,
+                    "replay_result": replay_result,
+                    "restore_result": restore_result,
+                    "rolled_back": True,
+                }
+            guardian_result = self._run_guardian()
+            verify_result = self._verify_fresh()
+            if not guardian_result.get("ok") or not verify_result.get("clean"):
+                restore_result = self._restore_backup_dir(backup_dir, files)
+                patch_queue.update_proposal_status(
+                    proposal_id,
+                    "rolled_back",
+                    actor="sentinel",
+                    reason="verification_failed",
+                    details={
+                        "restore_result": restore_result,
+                        "compile_result": compile_result,
+                        "restart_result": restart_result,
+                        "guardian_result": guardian_result,
+                        "verify_result": verify_result,
+                        "replay_result": replay_result,
+                    },
+                )
+                emit_compact_event(
+                    "AION_PATCH_APPLY_FAILED",
+                    "patch application failed during verification",
+                    {"proposal_id": proposal_id, "reason": "verification_failed", "guardian_ok": bool(guardian_result.get("ok")), "fresh_error_clean": bool(verify_result.get("clean"))},
+                    component="sentinel",
+                    level="ERROR",
+                    actionable=True,
+                )
+                emit_compact_event(
+                    "AION_PATCH_ROLLBACK",
+                    "patch rollback completed after verification failure",
+                    {"proposal_id": proposal_id, "restore_result": restore_result, "reason": "verification_failed"},
+                    component="sentinel",
+                    level="WARN",
+                    actionable=True,
+                )
+                return {
+                    "applied": True,
+                    "reason": "verification_failed",
+                    "proposal_id": proposal_id,
+                    "backup_dir": str(backup_dir),
+                    "compile_result": compile_result,
+                    "restart_result": restart_result,
+                    "guardian_result": guardian_result,
+                    "verify_result": verify_result,
+                    "replay_result": replay_result,
+                    "restore_result": restore_result,
+                    "rolled_back": True,
+                }
+            patch_queue.update_proposal_status(
+                proposal_id,
+                "verified",
+                actor="sentinel",
+                reason="verification_passed",
+                details={
+                    "compile_result": compile_result,
+                    "restart_result": restart_result,
+                    "guardian_result": guardian_result,
+                    "verify_result": verify_result,
+                    "replay_result": replay_result,
+                },
+            )
+            emit_compact_event(
+                "AION_PATCH_VERIFIED",
+                "patch verification completed",
+                {"proposal_id": proposal_id, "compile_ok": True, "restart_ok": True, "guardian_ok": bool(guardian_result.get("ok")), "fresh_error_clean": bool(verify_result.get("clean"))},
+                component="sentinel",
+                actionable=True,
+            )
+        else:
+            patch_queue.update_proposal_status(
+                proposal_id,
+                "verified",
+                actor="sentinel",
+                reason="verification_skipped_no_restart",
+                details={"compile_result": compile_result, "replay_result": replay_result},
+            )
+            emit_compact_event(
+                "AION_PATCH_VERIFIED",
+                "patch verification completed",
+                {"proposal_id": proposal_id, "compile_ok": True, "restart_ok": False, "guardian_ok": False, "fresh_error_clean": None, "replay_ok": bool(replay_result.get("ok"))},
+                component="sentinel",
+                actionable=True,
+            )
+        return {
+            "applied": True,
+            "reason": "applied",
+            "proposal_id": proposal_id,
+            "backup_dir": str(backup_dir),
+            "compile_result": compile_result,
+            "restart_result": restart_result,
+            "guardian_result": guardian_result,
+            "verify_result": verify_result,
+            "replay_result": replay_result,
+            "diff": diff_text,
+            "changed_functions": changed_functions,
+            "rolled_back": False,
+        }
+
+    def _rollback_patch_proposal(self, proposal_id: str, *, actor: str = "sentinel", reason: str = "rollback_requested") -> Dict[str, Any]:
+        proposal = self._load_patch_proposal(proposal_id)
+        if not proposal:
+            return {"rolled_back": False, "reason": "proposal_not_found", "proposal_id": proposal_id}
+        backup_dir = proposal.get("backup_dir")
+        if not backup_dir:
+            return {"rolled_back": False, "reason": "missing_backup_dir", "proposal_id": proposal_id}
+        files = [Path(path) for path in _safe_unique([str(path) for path in (proposal.get("affected_files") or []) if str(path).strip()])]
+        if not files and proposal.get("file_path"):
+            files = [Path(str(proposal.get("file_path")))]
+        files = [path for path in files if path.exists()]
+        if not files:
+            return {"rolled_back": False, "reason": "missing_affected_files", "proposal_id": proposal_id}
+        backup_path = Path(str(backup_dir))
+        restore_result = self._restore_backup_dir(backup_path, files)
+        compile_result = self._run_py_compile_paths(files)
+        patch_queue.update_proposal_status(
+            proposal_id,
+            "rolled_back",
+            actor=actor,
+            reason=reason,
+            details={"restore_result": restore_result, "compile_result": compile_result},
+        )
+        emit_compact_event(
+            "AION_PATCH_ROLLBACK",
+            "patch rollback executed",
+            {"proposal_id": proposal_id, "restore_result": restore_result, "compile_ok": bool(compile_result.get("ok"))},
+            component="sentinel",
+            level="WARN",
+            actionable=True,
+        )
+        return {
+            "rolled_back": True,
+            "proposal_id": proposal_id,
+            "reason": reason,
+            "restore_result": restore_result,
+            "compile_result": compile_result,
+        }
+
     def _run_one_cycle(self, simulate_nameerror: bool = False) -> Dict[str, Any]:
         _ensure_dirs()
         evidence = self.collect_evidence()
+        guardian_state = self._parse_guardian_audit(evidence.get("guardian", {}).get("stdout", "") or "")
+        should_simulate, simulation_reason = self._guardian_requires_simulation(guardian_state, evidence.get("guardian", {}).get("stdout", "") or "")
+        if should_simulate:
+            print(
+                "[SENTINEL-SIMULATION-TRIGGERED] "
+                + json.dumps(
+                    {
+                        "reason": simulation_reason,
+                        "guardian_state": guardian_state,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            sim_rc, sim_out, sim_err = _run_command(SIMULATION_CMD, timeout=600, allow_sudo_fallback=True)
+            evidence["simulation"] = {
+                "returncode": sim_rc,
+                "stdout": sim_out,
+                "stderr": sim_err,
+            }
+        self._maybe_emit_profit_recommendation(evidence, guardian_state)
         if simulate_nameerror:
             return self._run_simulated_nameerror_cycle()
         issue = self.detect_issue(evidence)
@@ -1298,6 +2569,25 @@ class SentinelAgent:
             print("[SENTINEL-FRESH-ERROR-CLEAN] " + json.dumps(summary, sort_keys=True, default=str))
             print("[AION-SENTINEL-IDLE] " + json.dumps(summary, sort_keys=True, default=str))
             return summary
+
+        memory_match = memory_find_match(issue.to_dict(), emit=False)
+        memory_record = memory_record_issue(
+            issue.to_dict(),
+            verification={
+                "guardian": guardian_state,
+                "fresh_error_clean": False,
+            },
+            proposal={
+                "patch_recipe": issue.patch_recipe,
+                "remaining_blocker": issue.remaining_blocker,
+                "file_path": issue.file_path,
+                "function_name": issue.function_name,
+            },
+        )
+        issue.evidence["memory_record"] = memory_record
+        issue.evidence["memory_summary"] = latest_memory_summary()
+        if memory_match is not None:
+            issue.evidence["memory_match"] = memory_match
 
         incident_dir = INCIDENTS_ROOT / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.getpid()}"
         incident_dir.mkdir(parents=True, exist_ok=True)
@@ -1335,6 +2625,21 @@ class SentinelAgent:
                 )
             )
         patch_result = self._apply_patch_recipe(issue, incident_dir)
+        ai_bridge_result = None
+        if not patch_result.get("applied") and issue.autopatch_allowed:
+            ai_bridge_result = self._maybe_run_ai_bridge(issue, evidence, incident_dir)
+            if ai_bridge_result.get("applied") and isinstance(ai_bridge_result.get("patch_result"), tuple):
+                changed, reason, changed_functions = ai_bridge_result["patch_result"]
+                patch_result = {
+                    "applied": bool(changed),
+                    "reason": reason,
+                    "files_changed": [issue.file_path] if changed else [],
+                    "functions_patched": changed_functions if changed else [],
+                    "recipe": ai_bridge_result.get("recipe"),
+                }
+                if ai_bridge_result.get("reason") == "human_confirmation_required":
+                    patch_result["applied"] = False
+                    patch_result["reason"] = "human_confirmation_required"
         after_snapshots = {str(path): _read_text(path) for path in files_to_backup if path.exists()}
         if patch_result.get("applied"):
             diffs = []
@@ -1503,6 +2808,8 @@ class SentinelAgent:
                         default=str,
                     )
                 )
+        if ai_bridge_result is not None:
+            evidence["ai_bridge"] = ai_bridge_result
         bundle = self._incident_bundle(issue, evidence, patch_result, compile_result, restart_result, guardian_result, verify_result, incident_dir)
         sent = self._send_telegram_summary(
             {
@@ -1566,21 +2873,270 @@ class SentinelAgent:
         print("[AION-SENTINEL-SIMULATION] " + json.dumps(bundle, sort_keys=True, default=str))
         return bundle
 
+    def _run_simulated_unresolved_issue_cycle(self) -> Dict[str, Any]:
+        return self._run_simulated_ai_escalation_cycle()
+
+    def _run_simulated_ai_escalation_cycle(self) -> Dict[str, Any]:
+        _ensure_dirs()
+        issue = SentinelIssue(
+            issue_type="scope_bug",
+            severity="high",
+            autopatch_allowed=False,
+            variable="canonical_final_submit_allowed",
+            file_path=str(REPO_ROOT / "kalshi_web.py"),
+            function_name="maybe_emit_summary",
+            evidence={
+                "simulation": True,
+                "blocker_tags": ["runtime_scope_crash"],
+                "telegram_hits": ["local variable 'canonical_final_submit_allowed' referenced before assignment"],
+                "journal_excerpt": "local variable 'canonical_final_submit_allowed' referenced before assignment",
+            },
+            patch_recipe="learned_canonical_tradeability",
+            remaining_blocker="runtime_scope_crash",
+            traceback_context={"function_name": "maybe_emit_summary", "variable": "canonical_final_submit_allowed"},
+        )
+        package = self._build_ai_escalation_package(issue=issue, evidence=issue.evidence, incident_dir=None, persist=False)
+        response = self._openai_responses_create(prompt=package["prompt"], issue=issue, incident_dir=None, simulate=True)
+        structured = response.get("structured") if isinstance(response, dict) else {}
+        proposal_seed = self._structured_ai_proposal_seed(issue, structured)
+        verdict = self._score_ai_patch_proposal(issue=issue, structured=structured if isinstance(structured, dict) else {}, recipe=proposal_seed)
+        patch_preview, preview_kind = self._build_scope_initializer_preview(
+            Path(issue.file_path) if issue.file_path else Path(REPO_ROOT / "kalshi_web.py"),
+            issue.variable,
+            function_name=issue.function_name,
+            context=issue.traceback_context,
+            recipe=proposal_seed,
+        )
+        queue_record = patch_queue.create_proposal(
+            issue=issue.to_dict(),
+            ai_bridge={
+                **response,
+                "package": package,
+                "proposal": proposal_seed,
+            },
+            structured=structured if isinstance(structured, dict) else {},
+            proposal=proposal_seed,
+            verification=verdict,
+            unified_diff_patch=patch_preview,
+            patch_preview=patch_preview or proposal_seed.get("notes", ""),
+            source="ai_bridge_simulation",
+            status="pending",
+            current_safety_state=issue.evidence.get("safety_state", {}),
+        )
+        bundle = {
+            "timestamp": _now_iso(),
+            "issue": issue.to_dict(),
+            "package": package,
+            "enabled": response.get("enabled"),
+            "called": bool(response.get("response") or response.get("raw")),
+            "applied": False,
+            "simulation": True,
+            "structured": response.get("structured"),
+            "queue_record": queue_record,
+            "verification": verdict,
+            "patch_preview": patch_preview,
+        }
+        emit_event("AION_SENTINEL_AI_SIMULATION", {"bundle": bundle}, component="sentinel", actionable=True)
+        return bundle
+
+    def _latest_simulation_issue_path(self) -> Optional[Path]:
+        if not SIMULATION_ISSUES_ROOT.exists():
+            return None
+        try:
+            issue_files = sorted(
+                [path for path in SIMULATION_ISSUES_ROOT.glob("*.json") if path.is_file()],
+                key=lambda path: path.stat().st_mtime,
+            )
+        except Exception:
+            return None
+        return issue_files[-1] if issue_files else None
+
+    def _simulation_issue_to_sentinel_issue(self, issue_data: Dict[str, Any]) -> SentinelIssue:
+        issue_data = issue_data if isinstance(issue_data, dict) else {}
+        bug_type = str(issue_data.get("bug_type") or "").strip()
+        failed_phase = str(issue_data.get("failed_phase") or "").strip()
+        blocker_label = str(issue_data.get("blocker_label") or issue_data.get("reason") or failed_phase or "simulation_failure").strip()
+        variable = issue_data.get("variable")
+        if not variable and isinstance(issue_data.get("raw_candidate"), dict):
+            variable = issue_data["raw_candidate"].get("selected_price_source_used") or issue_data["raw_candidate"].get("selected_side")
+        issue_type = "simulation_failure"
+        if bug_type in {"NameError", "UnboundLocalError", "AttributeError", "TypeError", "ValueError", "SyntaxError"}:
+            issue_type = "scope_bug"
+        elif any(token in blocker_label for token in ("unsafe_spread", "unsafe_price", "quote_missing", "orderbook_not_usable", "phase55")):
+            issue_type = "stale_blocker_propagation"
+        elif "telegram" in str(issue_data.get("issue_type") or "").lower():
+            issue_type = "telegram_runtime_alert"
+        return SentinelIssue(
+            issue_type=issue_type,
+            severity=str(issue_data.get("severity") or "high"),
+            autopatch_allowed=True,
+            variable=variable,
+            file_path=issue_data.get("file") or str(REPO_ROOT / "kalshi_web.py"),
+            function_name=issue_data.get("function") or issue_data.get("function_name"),
+            evidence={
+                "simulation_issue": issue_data,
+                "raw_candidate": issue_data.get("raw_candidate"),
+                "canonical_execution_state": issue_data.get("canonical_execution_state"),
+                "payload": issue_data.get("payload"),
+                "stacktrace": issue_data.get("stacktrace"),
+                "suggested_fix": issue_data.get("suggested_fix"),
+                "repeat_count": issue_data.get("repeat_count"),
+            },
+            patch_recipe=issue_data.get("patch_recipe") or issue_data.get("suggested_recipe") or (
+                "missing_price_bounds_pass" if str(variable or "").strip() == "price_bounds_pass" else None
+            ),
+            remaining_blocker=blocker_label,
+            traceback_context={
+                "variable": variable,
+                "function_name": issue_data.get("function") or issue_data.get("function_name"),
+                "file_path": issue_data.get("file"),
+                "failed_phase": failed_phase,
+            },
+        )
+
+    def _run_simulation_remediation(self, *, max_attempts: int = 5) -> Dict[str, Any]:
+        _ensure_dirs()
+        results: List[Dict[str, Any]] = []
+        latest_issue_path = self._latest_simulation_issue_path()
+        issue_data = None
+        if latest_issue_path and latest_issue_path.exists():
+            try:
+                issue_data = json.loads(latest_issue_path.read_text(encoding="utf-8"))
+            except Exception:
+                issue_data = None
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            sim_rc, sim_out, sim_err = _run_command(SIMULATION_CMD, timeout=900, allow_sudo_fallback=True)
+            sim_pass = sim_rc == 0 and "AION-SIMULATION-PASS" in (sim_out or "")
+            result = {
+                "attempt": attempt,
+                "simulation": {"returncode": sim_rc, "stdout": sim_out[-10000:], "stderr": sim_err[-5000:]},
+                "simulation_pass": sim_pass,
+            }
+            if sim_pass:
+                result["status"] = "pass"
+                results.append(result)
+                break
+            latest_issue_path = self._latest_simulation_issue_path()
+            if latest_issue_path and latest_issue_path.exists():
+                try:
+                    issue_data = json.loads(latest_issue_path.read_text(encoding="utf-8"))
+                except Exception:
+                    issue_data = issue_data or {}
+            if not isinstance(issue_data, dict):
+                issue_data = {}
+            issue = self._simulation_issue_to_sentinel_issue(issue_data)
+            issue.evidence.setdefault("simulation", result["simulation"])
+            issue.evidence.setdefault("telegram_hits", [])
+            patch_result = {"applied": False, "files_changed": [], "reason": "no_recipe"}
+            if self.autopatch and not self.dry_run and issue.autopatch_allowed:
+                incident_dir = INCIDENTS_ROOT / f"simulation_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.getpid()}"
+                incident_dir.mkdir(parents=True, exist_ok=True)
+                files_to_backup = [REPO_ROOT / "kalshi_web.py", REPO_ROOT / "aion_guardian_report.py"]
+                backup_dir = self._backup_files(files_to_backup, incident_dir)
+                issue.evidence["backup_dir"] = str(backup_dir)
+                before_snapshots = {str(path): _read_text(path) for path in files_to_backup if path.exists()}
+                patch_result = self._apply_patch_recipe(issue, incident_dir)
+                after_snapshots = {str(path): _read_text(path) for path in files_to_backup if path.exists()}
+                if patch_result.get("applied"):
+                    diffs = []
+                    for path_str, before_text in before_snapshots.items():
+                        after_text = after_snapshots.get(path_str, "")
+                        if before_text != after_text:
+                            diffs.append(self._diff_for_files(before_text, after_text, str(Path(path_str).relative_to(REPO_ROOT))))
+                    patch_result["diff"] = "\n".join(diffs)
+                    compile_result = self._run_compile()
+                    if compile_result.get("ok"):
+                        restart_result = self._run_restart()
+                        guardian_result = self._run_guardian() if restart_result.get("ok") else {"ok": False, "reason": "restart_failed"}
+                        verify_result = self._verify_fresh() if restart_result.get("ok") else {"clean": False, "matches": [], "reason": "restart_failed"}
+                    else:
+                        restart_result = {"ok": False, "reason": "compile_failed"}
+                        guardian_result = {"ok": False, "reason": "compile_failed"}
+                        verify_result = {"clean": False, "matches": [], "reason": "compile_failed"}
+                else:
+                    patch_result["diff"] = ""
+                    compile_result = {"ok": False, "returncode": None}
+                    restart_result = {"ok": False, "returncode": None}
+                    guardian_result = {"ok": False, "returncode": None}
+                    verify_result = {"clean": False, "matches": []}
+            result.update(
+                {
+                    "issue": issue.to_dict(),
+                    "patch": patch_result,
+                    "status": "failed",
+                }
+            )
+            results.append(result)
+            if issue_data.get("repeat_count", 0) and int(issue_data.get("repeat_count") or 0) >= int(os.environ.get("AION_SENTINEL_ESCALATE_AFTER_ATTEMPTS", "3") or 3):
+                print(
+                    "[AUTO-PATCH-ESCALATED] "
+                    + json.dumps(
+                        {
+                            "issue_type": issue.issue_type,
+                            "variable": issue.variable,
+                            "function_name": issue.function_name,
+                            "repeat_count": issue_data.get("repeat_count"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                break
+        payload = {"attempts": results, "passed": bool(results and results[-1].get("simulation_pass"))}
+        print("[SENTINEL-SIMULATION-REMEDIATION] " + json.dumps(payload, sort_keys=True, default=str))
+        return payload
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AION Sentinel Auto-Patch Agent")
     parser.add_argument("--once", action="store_true", help="Run one detection/patch cycle and exit.")
     parser.add_argument("--daemon", action="store_true", help="Run forever, sleeping 30 seconds between cycles.")
     parser.add_argument("--simulate-nameerror", action="store_true", help="Run a safe dry simulation of a NameError-style incident.")
+    parser.add_argument("--simulate-unresolved-issue", action="store_true", help="Run a safe dry simulation of an unresolved issue through the AI escalation bridge.")
+    parser.add_argument("--simulate-ai-escalation", action="store_true", help="Run a safe dry simulation of the AI escalation bridge without modifying files or restarting services.")
+    parser.add_argument("--run-simulation-remediation", action="store_true", help="Run the simulator remediation loop until the simulation passes or escalation is required.")
     parser.add_argument("--dry-run", action="store_true", help="Detect and bundle incidents without applying patches.")
     args = parser.parse_args()
     agent = SentinelAgent(dry_run=bool(args.dry_run), autopatch=bool(_env_bool("AION_SENTINEL_AUTOPATCH", True)))
+    if args.simulate_ai_escalation or _env_bool("AION_SENTINEL_AI_SIMULATION", False):
+        result = agent._run_simulated_ai_escalation_cycle()
+        print(json.dumps(result, sort_keys=True, default=str))
+        return 0
+    if args.simulate_unresolved_issue:
+        result = agent._run_simulated_ai_escalation_cycle()
+        print(json.dumps(result, sort_keys=True, default=str))
+        return 0
+    if args.run_simulation_remediation:
+        remediation_result = agent._run_simulation_remediation()
+        flush_cycle_summary(
+            component="sentinel",
+            summary={"run_simulation_remediation": remediation_result},
+            human_summary="\n".join([
+                "AION SENTINEL SUMMARY",
+                f"- simulation_remediation_passed: {'yes' if bool(remediation_result.get('passed')) else 'no'}",
+                f"- issue_type: {remediation_result.get('issue_type') or 'none'}",
+                f"- patched: {remediation_result.get('patched')}",
+            ]),
+            codex_diagnostic=json.dumps(remediation_result, sort_keys=True, default=str),
+        )
+        return 0 if bool(remediation_result.get("passed")) else 1
     if args.daemon:
         poll_seconds = int(os.environ.get("AION_SENTINEL_POLL_SECONDS", "30") or 30)
         while True:
             agent._run_one_cycle(simulate_nameerror=args.simulate_nameerror)
             time.sleep(max(1, poll_seconds))
     result = agent._run_one_cycle(simulate_nameerror=args.simulate_nameerror)
+    flush_cycle_summary(
+        component="sentinel",
+        summary=result if isinstance(result, dict) else {"result": result},
+        human_summary="\n".join([
+            "AION SENTINEL SUMMARY",
+            f"- issue_detected: {'yes' if result.get('issue_detected') else 'no'}" if isinstance(result, dict) else "- issue_detected: unknown",
+            f"- patch_applied: {result.get('patch_applied')}" if isinstance(result, dict) else "- patch_applied: unknown",
+            f"- fresh_error_clean: {result.get('fresh_error_clean')}" if isinstance(result, dict) else "- fresh_error_clean: unknown",
+        ]),
+        codex_diagnostic=json.dumps(result, sort_keys=True, default=str) if isinstance(result, dict) else str(result),
+    )
     print(json.dumps(result, sort_keys=True, default=str))
     return 0
 

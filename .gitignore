@@ -1,8 +1,11 @@
 .env
 .env.*
+*.env
 !.env.example
 *.pem
 *.key
+*.secret
+*.secrets
 keys/
 .venv/
 runtime/tmp/
@@ -48,3 +51,5 @@ data/seraph_interface_state.json
 runtime/
 __pycache__/
 *.pyc
+aion_patch_queue/
+aion_audit/

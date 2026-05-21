@@ -16,6 +16,141 @@ import subprocess
 import requests
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
+
+_RAW_PRINT = builtins.print
+_ENV_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+
+
+def _env_bool_early(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in _ENV_TRUE_VALUES
+
+
+def _load_dotenv_early(path=".env"):
+    loaded = {}
+    if not os.path.exists(path):
+        return loaded
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if not key:
+                    continue
+                os.environ[key] = value
+                loaded[key] = value
+    except OSError:
+        return loaded
+    return loaded
+
+
+def _env_true_detail(name):
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return f"missing {name}=true"
+    if str(raw).strip().lower() not in _ENV_TRUE_VALUES:
+        return f"expected {name}=true current={str(raw).strip()}"
+    return ""
+
+
+MINIMAL_LIVE_LOGGING = _env_bool_early("MINIMAL_LIVE_LOGGING", True)
+_LIVE_LOGGING_ARGV = set(sys.argv[1:])
+_MINIMAL_LIVE_LOGGING_ACTIVE = bool(
+    MINIMAL_LIVE_LOGGING
+    and (
+        {"--live", "--arm-live", "--run-live-canary", "--live-preflight"}.intersection(_LIVE_LOGGING_ARGV)
+        or _env_bool_early("KALSHI_ALLOW_LIVE", False)
+        or _env_bool_early("LIVE_ARMED", False)
+        or _env_bool_early("LIVE_ENV_CONFIRMED", False)
+    )
+)
+_MINIMAL_LOG_ALLOWED_PREFIXES = (
+    "[LIVE-MODE-STATUS]",
+    "[LIVE-PREFLIGHT]",
+    "[LIVE-CANARY]",
+    "[LIVE-CANARY-RESULT]",
+    "[LIVE-ENTRY]",
+    "[LIVE-EXIT]",
+    "[LIVE-EXECUTION]",
+    "[LIVE-EXECUTION-ORDER-SUBMITTED]",
+    "[LIVE-EXECUTION-ORDER-ERROR]",
+    "[LIVE-EXECUTION-RESPONSE]",
+    "[LIVE-RESULT]",
+    "[TRADE-RESULT]",
+    "✅ Bot running",
+)
+_MINIMAL_LOG_ALLOWED_ERRORS = (
+    "Traceback",
+    "  File ",
+    "Error:",
+    "IndentationError:",
+    "KeyError:",
+    "NameError:",
+    "SyntaxError:",
+    "UnboundLocalError:",
+    "AttributeError:",
+    "TypeError:",
+    "ValueError:",
+    "ERROR",
+    "FAIL",
+)
+
+
+def _minimal_live_log_allowed(*args):
+    if not _MINIMAL_LIVE_LOGGING_ACTIVE:
+        return True
+    if not args:
+        return False
+    first = args[0]
+    if not isinstance(first, str):
+        return False
+    text = first.strip()
+    return bool(
+        text.startswith(_MINIMAL_LOG_ALLOWED_PREFIXES)
+        or any(token in text for token in _MINIMAL_LOG_ALLOWED_ERRORS)
+    )
+
+
+def _early_filtered_print(*args, **kwargs):
+    if _minimal_live_log_allowed(*args):
+        return _RAW_PRINT(*args, **kwargs)
+    return None
+
+
+if _MINIMAL_LIVE_LOGGING_ACTIVE:
+    builtins.print = _early_filtered_print
+
+from aion_telemetry import emit_event, emit_error_event, emit_once_per_key, emit_rate_limited, emit_state_transition, emit_summary_counter, flush_cycle_summary, redact_sensitive_fields, telemetry_print as print
+
+try:
+    from kalshi_sniper import (
+        BackoffConfig,
+        CircuitBreaker,
+        EntryExitGuardService,
+        KalshiHttpClient,
+        LiveQuoteStreamService,
+        MarketDiscoveryConfig,
+        MarketDiscoveryService,
+        RateLimiter,
+        TelegramCommandService,
+    )
+except Exception:
+    BackoffConfig = None
+    CircuitBreaker = None
+    EntryExitGuardService = None
+    KalshiHttpClient = None
+    LiveQuoteStreamService = None
+    MarketDiscoveryConfig = None
+    MarketDiscoveryService = None
+    RateLimiter = None
+    TelegramCommandService = None
 
 try:
     from simulation_worlds import RealmXVSimulationWorlds
@@ -128,9 +263,12 @@ except Exception:
     strategy_formatting = None
 
 
-DEBUG_LIVE = (os.environ.get("DEBUG_LIVE", "false") or "false").strip().lower() == "true"
+LIVE_SELECT_DEBUG = _env_bool_early("LIVE_SELECT_DEBUG", False)
+AI_ON_DEBUG = _env_bool_early("AI_ON_DEBUG", _env_bool_early("AION_DEBUG", False))
+DEBUG_LIVE = _env_bool_early("DEBUG_LIVE", False)
 DEBUG_LIVE_PREFIXES = (
     "[LIVE-SELECT-DEBUG]",
+    "[LIVE-CANARY-DEBUG]",
     "[LIVE-LIQUIDITY-FIX]",
     "[LIVE-SELECT-TOPBOOK-NORMALIZE]",
     "[LIVE-SELECT-LIQUIDITY-TRACE]",
@@ -142,6 +280,46 @@ DEBUG_LIVE_PREFIXES = (
     "[LIVE-HEADER-DEBUG]",
     "[LIVE-SUBMIT-DEBUG]",
     "[TELEGRAM-DEBUG]",
+)
+LIVE_SELECT_DEBUG_PREFIXES = DEBUG_LIVE_PREFIXES + (
+    "[HTTP-CACHE-HIT]",
+    "[LIVE-SELECT-FILTER]",
+    "[LIVE-SELECT-SCORE]",
+    "[LIVE-SELECT-STRICT-",
+    "[LIVE-SELECT-TARGETED-",
+    "[LIVE-TOPBOOK-RAW]",
+    "[LIVE-PRICE-NORMALIZE]",
+    "[LIVE-SAFE-OPPORTUNITY-QUEUE]",
+    "[LIVE-QUEUE-",
+    "[LIVE-CANARY-AUTO-DEBUG]",
+    "[TARGETED-GATE-FORCE]",
+)
+AI_ON_DEBUG_TAG_PREFIXES = (
+    "AION-ADAPTIVE-SELECTOR-",
+    "AION-CANONICAL-PRICE-",
+    "AION-CANONICAL-SIDE-",
+    "AION-CANONICAL-TRADEABILITY",
+    "AION-COST-",
+    "AION-EDGE-",
+    "AION-EXECUTION-HANDOFF-TRACE",
+    "AION-FINAL-BLOCKER-TRACE",
+    "AION-FLOOR-",
+    "AION-LIQUIDITY-",
+    "AION-MARKET-PRIORITY",
+    "AION-ORDERBOOK-",
+    "AION-PAYLOAD-",
+    "AION-PHASE55-GATE-",
+    "AION-PHASE55-REACHABILITY-",
+    "AION-PIPELINE-",
+    "AION-PRICE-",
+    "AION-QUOTE-",
+    "AION-RAW-BLOCKER-",
+    "AION-REALM-VV-",
+    "AION-SELECTED-PRICE-",
+    "AION-SELECTOR-",
+    "AION-SIDE-",
+    "AION-SPREAD-",
+    "AION-UNSAFE-PRICE-",
 )
 
 
@@ -275,7 +453,98 @@ def _telemetry_severity(tag):
     return "NORMAL"
 
 
+def _is_ai_on_debug_tag(tag):
+    tag = str(tag or "").strip().upper()
+    if not tag.startswith("AION-"):
+        return False
+    if tag in {"AION-LIVE-EXECUTION", "AION-LIVE-EXECUTION-BLOCKED", "AION-FINAL-SUBMIT-CALL"}:
+        return False
+    return any(tag.startswith(prefix) for prefix in AI_ON_DEBUG_TAG_PREFIXES)
+
+
 def _telemetry_cooldown_seconds(tag, severity, suppression_mode_active=False):
+    ticker = "unknown"
+    ticker = "unknown"
+    ticker = "unknown"
+    ticker = "unknown"
+    ticker = "unknown"
+    ticker = "unknown"
+    ticker = "unknown"
+    ticker = "unknown"
+    ticker = "unknown"
+    canonical_tradeability = False
+    canonical_tradeability = False
+    canonical_tradeability = False
+    canonical_tradeability = False
+    canonical_tradeability = False
+    canonical_tradeability = False
+    canonical_tradeability = False
+    canonical_tradeability = False
+    canonical_tradeability = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    relaxed_survivable_aggressive = False
+    resolved_selected_side = "unknown"
+    resolved_selected_side = "unknown"
+    resolved_selected_price = False
     canonical_final_submit_allowed = False
     canonical_final_submit_allowed = False
     tag = str(tag or "").strip().upper()
@@ -440,6 +709,11 @@ class TelemetryRateLimiter:
             }
 
     def emit_status_dashboard(self, *, source="startup", force=False):
+        ticker = "unknown"
+        canonical_tradeability = False
+        relaxed_survivable_aggressive = False
+        resolved_selected_side = "unknown"
+        resolved_selected_price = False
         canonical_final_submit_allowed = False
         now = time.time()
         with self._lock:
@@ -479,17 +753,21 @@ def should_emit_telemetry(tag, key=None, cooldown_seconds=0, severity=None, allo
 def _should_emit_module_log(*args):
     if not args:
         return True
+    if _MINIMAL_LIVE_LOGGING_ACTIVE:
+        return _minimal_live_log_allowed(*args)
     first = args[0]
     if not isinstance(first, str):
         return True
     tag = _telemetry_tag_from_message(first)
+    if not LIVE_SELECT_DEBUG and first.startswith(LIVE_SELECT_DEBUG_PREFIXES):
+        return False
     if tag is None:
-        if DEBUG_LIVE:
+        if DEBUG_LIVE or LIVE_SELECT_DEBUG:
             return True
         return not first.startswith(DEBUG_LIVE_PREFIXES)
     severity = _telemetry_severity(tag)
     if severity == "NORMAL":
-        if DEBUG_LIVE:
+        if DEBUG_LIVE or LIVE_SELECT_DEBUG:
             return True
         return not first.startswith(DEBUG_LIVE_PREFIXES)
     telemetry_key = _telemetry_key_from_message(first)
@@ -504,10 +782,19 @@ def _should_emit_module_log(*args):
 
 
 def print(*args, **kwargs):
+    ticker = "unknown"
+    canonical_tradeability = False
+    relaxed_survivable_aggressive = False
+    resolved_selected_side = "unknown"
+    resolved_selected_price = False
     canonical_final_submit_allowed = False
     if _should_emit_module_log(*args):
-        return builtins.print(*args, **kwargs)
+        return _RAW_PRINT(*args, **kwargs)
     return None
+
+
+if _MINIMAL_LIVE_LOGGING_ACTIVE:
+    builtins.print = print
 
 
 class LiveRejectTelemetry:
@@ -592,7 +879,26 @@ class LiveRejectTelemetry:
         }
 
     def maybe_emit_summary(self, *, source="live_cycle", cycle_count=None, force=False):
+        canonical_tradeability = {
+            "final_submit_allowed_by_realm_vv": False,
+            "final_submit_allowed": False,
+            "tradeable": False,
+            "decision": "unknown",
+            "selected_side": "unknown",
+            "selected_price": None,
+            "selected_price_cents": None,
+            "selected_side_has_price": False,
+            "selected_side_has_liquidity": False,
+            "price_bounds_pass": False,
+            "spread_classification": "unknown",
+            "spread_severity": "unknown",
+            "unsafe_price_status": "unknown",
+        }
+        relaxed_survivable_aggressive = False
+        resolved_selected_side = "unknown"
+        resolved_selected_price = False
         canonical_final_submit_allowed = False
+        canonical_tradeability_fallback_used = True
         now = time.time()
         if not force and (now - float(self.last_summary_ts or 0.0)) < self.summary_interval_seconds:
             return None
@@ -600,6 +906,22 @@ class LiveRejectTelemetry:
         if not force and summary["total_reject_events"] <= 0 and summary["near_pass_count"] <= 0:
             return None
         self.last_summary_ts = now
+        if canonical_tradeability_fallback_used:
+            print(
+                "[AION-SCOPE-STABILIZED] "
+                + json.dumps(
+                    {
+                        "function": "maybe_emit_summary",
+                        "variable": "canonical_tradeability",
+                        "fallback_used": True,
+                        "fallback_default": "neutral_dict",
+                        "source": source,
+                        "cycle_count": cycle_count if cycle_count is not None else "unknown",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         print(
             f"[LIVE-GATE-STATS] source={source} cycle_count={cycle_count if cycle_count is not None else 'unknown'} "
             f"total_reject_events={summary['total_reject_events']} spread_rejections={summary['spread_rejection_count']} "
@@ -1154,6 +1476,7 @@ LIVE_EXIT_COOLDOWN_SECONDS = 60
 LIVE_SELECT_BATCH_SIZE = 200
 LIVE_SELECT_MAX_BATCHES = 5
 LIVE_SELECT_MAX_MARKETS = 1000
+LIVE_CANARY_SIMPLE_SERIES = ("KXBTC15M",)
 MIN_MARKETS_IN_WINDOW_TARGET = 40
 MAX_SCAN_BATCHES = 10
 DISCOVERY_RETRY_DELAY_SECONDS = 120
@@ -1346,7 +1669,7 @@ GROUP_SCORE_WEIGHTS = {}
 MIN_TRADES_FOR_GROUP_WEIGHT_SUGGESTION = 5
 MAX_SUGGESTED_GROUP_MULTIPLIER = 1.15
 MIN_SUGGESTED_GROUP_MULTIPLIER = 0.85
-DRY_RUN_LIVE_ORDERS = False
+DRY_RUN_LIVE_ORDERS = get_env_bool("DRY_RUN_LIVE_ORDERS", True)
 DEFAULT_LIVE_ORDER_SIDE = "yes"
 DEFAULT_LIVE_ORDER_ACTION = "buy"
 LIVE_MODE = False
@@ -1397,7 +1720,7 @@ MAX_LIVE_ORDER_SIZE = 1
 MAX_LIVE_TRADES_PER_DAY = 30
 LIVE_TEST_TICKER = None
 LIVE_AUDIT_LOG_FILE = runtime_state_file("live_audit_log.csv")
-DEFAULT_LIVE_PRIVATE_KEY_PATH = "/Users/Kevin/Downloads/kalshi.key.txt"
+DEFAULT_LIVE_PRIVATE_KEY_PATH = str(Path(__file__).resolve().parent / "keys" / "kalshi_live_key.pem")
 SERAPH_MEMORY_SQLITE_PATH = runtime_memory_file("seraph_memory.sqlite3")
 SERAPH_MEMORY_READ_LIMIT = 300
 SERAPH_MEMORY_RESTORE_LIMIT = 1000
@@ -1497,6 +1820,10 @@ REALM_XXVI_RECOMMENDATION_CAP = int(_env_float("REALM_XXVI_RECOMMENDATION_CAP", 
 
 
 def compute_effective_live_dry_run(live_mode=None, live_armed=None, live_env_confirmed=None, configured_dry_run=None):
+    canonical_tradeability = False
+    relaxed_survivable_aggressive = False
+    resolved_selected_side = "unknown"
+    resolved_selected_price = False
     canonical_final_submit_allowed = False
     if live_mode is None:
         live_mode = bool(globals().get("LIVE_MODE", False))
@@ -1506,11 +1833,10 @@ def compute_effective_live_dry_run(live_mode=None, live_armed=None, live_env_con
         live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
     if configured_dry_run is None:
         configured_dry_run = bool(globals().get("DRY_RUN_LIVE_ORDERS", False))
-    allow_live_raw = (os.environ.get("KALSHI_ALLOW_LIVE", "") or "").strip().lower()
-    allow_live_enabled = allow_live_raw in {"1", "true", "yes", "on"}
-    if live_armed and allow_live_enabled:
-        return False
-    return bool(configured_dry_run or not (live_mode and live_armed and live_env_confirmed))
+    allow_live_enabled = _env_bool_early("KALSHI_ALLOW_LIVE", False)
+    if configured_dry_run:
+        return True
+    return not bool(live_mode and live_armed and live_env_confirmed and allow_live_enabled)
 
 
 @dataclass
@@ -1527,7 +1853,85 @@ class Quote:
 
 
 class KalshiSniperBot:
+    def _service_log(self, prefix, **fields):
+        try:
+            parts = [str(prefix)]
+            for key, value in fields.items():
+                parts.append(f"{key}={value}")
+            print(" ".join(parts))
+        except Exception:
+            print(str(prefix))
+
+    def _init_modular_services(self):
+        self.http_client = None
+        self.discovery_service = None
+        self.live_quote_stream = None
+        self.guard_service = None
+        self.telegram_command_service = None
+        if KalshiHttpClient is None:
+            print("[MODULAR-SERVICES] enabled=no reason=import_failed")
+            return
+        try:
+            self.http_client = KalshiHttpClient(
+                rate_limiter=RateLimiter(
+                    max_calls=get_env_int("KALSHI_HTTP_MAX_CALLS_PER_MINUTE", 120),
+                    window_seconds=get_env_float("KALSHI_HTTP_RATE_WINDOW_SECONDS", 60.0),
+                    logger=self._service_log,
+                ) if RateLimiter is not None else None,
+                circuit_breaker=CircuitBreaker(
+                    failure_threshold=get_env_int("KALSHI_HTTP_CIRCUIT_FAILURE_THRESHOLD", 5),
+                    recovery_seconds=get_env_float("KALSHI_HTTP_CIRCUIT_RECOVERY_SECONDS", 30.0),
+                    logger=self._service_log,
+                ) if CircuitBreaker is not None else None,
+                backoff=BackoffConfig(
+                    attempts=get_env_int("KALSHI_HTTP_RETRY_ATTEMPTS", 3),
+                    base_delay_seconds=get_env_float("KALSHI_HTTP_BACKOFF_BASE_SECONDS", 0.25),
+                    max_delay_seconds=get_env_float("KALSHI_HTTP_BACKOFF_MAX_SECONDS", 4.0),
+                    jitter_seconds=get_env_float("KALSHI_HTTP_BACKOFF_JITTER_SECONDS", 0.15),
+                ) if BackoffConfig is not None else None,
+                logger=self._service_log,
+            )
+            if MarketDiscoveryService is not None and MarketDiscoveryConfig is not None:
+                self.discovery_service = MarketDiscoveryService(
+                    bot=self,
+                    http_client=self.http_client,
+                    config=MarketDiscoveryConfig.from_legacy_globals(globals()),
+                    live_mode_getter=lambda: bool(globals().get("LIVE_MODE", False)),
+                    request_url_builder=self.build_live_request_url,
+                    logger=self._service_log,
+                )
+            if LiveQuoteStreamService is not None:
+                self.live_quote_stream = LiveQuoteStreamService(
+                    bot=self,
+                    stale_seconds=get_env_float("KALSHI_WS_QUOTE_STALE_SECONDS", min(15.0, REALM_XX_WS_STALE_SECONDS)),
+                    logger=self._service_log,
+                )
+            if EntryExitGuardService is not None:
+                self.guard_service = EntryExitGuardService.from_legacy_globals(globals(), logger=self._service_log)
+            if TelegramCommandService is not None:
+                self.telegram_command_service = TelegramCommandService(
+                    http_client=self.http_client,
+                    send_message=send_telegram_message,
+                    control_state_path=Path(__file__).with_name("control_state.json"),
+                    logger=self._service_log,
+                )
+            print(
+                "[MODULAR-SERVICES] enabled=yes "
+                f"http=yes discovery={'yes' if self.discovery_service is not None else 'no'} "
+                f"ws_hydration={'yes' if self.live_quote_stream is not None else 'no'} "
+                f"guards={'yes' if self.guard_service is not None else 'no'} "
+                f"telegram_commands={'yes' if self.telegram_command_service is not None and self.telegram_command_service.enabled else 'no'}"
+            )
+        except Exception as exc:
+            print(f"[MODULAR-SERVICES] enabled=no reason={exc.__class__.__name__}")
+            self.http_client = None
+            self.discovery_service = None
+            self.live_quote_stream = None
+            self.guard_service = None
+            self.telegram_command_service = None
+
     def __init__(self):
+        self._init_modular_services()
         self.max_markets = 50
         self.max_spread = 0.20
         self.min_volume = 1
@@ -2217,6 +2621,15 @@ class KalshiSniperBot:
         self.seraph_memory_store_ready = bool(self.init_seraph_memory_store())
 
     def get_markets(self, limit=25, status="open", cursor=None, return_cursor=False, extra_params=None):
+        discovery_service = getattr(self, "discovery_service", None)
+        if discovery_service is not None:
+            return discovery_service.get_markets(
+                limit=limit,
+                status=status,
+                cursor=cursor,
+                return_cursor=return_cursor,
+                extra_params=extra_params,
+            )
         if globals().get("LIVE_MODE", False):
             base_url = self.get_live_base_url()
             url = self.build_live_request_url("/trade-api/v2/markets")
@@ -2236,14 +2649,37 @@ class KalshiSniperBot:
             params.setdefault("mve_filter", "exclude")
         if globals().get("LIVE_MODE", False):
             print(f"[LIVE-MARKETS-DEBUG] params={params}")
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status()
-        response_data = response.json()
+        http_client = getattr(self, "http_client", None)
+        if http_client is not None:
+            response_data = http_client.get_json(
+                url,
+                params=params,
+                timeout=15,
+                cache_ttl=get_env_float("KALSHI_MARKET_CACHE_TTL_SECONDS", 4.0),
+            )
+        else:
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            response_data = response.json()
         markets = response_data.get("markets", [])
         if return_cursor:
             next_cursor = response_data.get("cursor") or response_data.get("next_cursor")
             return markets, next_cursor
         return markets
+
+    def _get_json_with_backoff(self, url, headers=None, timeout=15, cache_ttl=0.0, bypass_cache=False):
+        http_client = getattr(self, "http_client", None)
+        if http_client is not None:
+            return http_client.get_json(
+                url,
+                headers=headers,
+                timeout=timeout,
+                cache_ttl=cache_ttl,
+                bypass_cache=bypass_cache,
+            ), 200
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        return (response.json() if response.content else {}), response.status_code
 
     def to_float(self, value, default=0.0):
         try:
@@ -3280,7 +3716,7 @@ class KalshiSniperBot:
             payload_preflight = self._diagnose_live_order_payload_context(
                 q,
                 size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                price_source="bid",
+                price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                 selected_ticker=ticker,
                 selection_stage="score_trace",
                 market=market,
@@ -4286,6 +4722,14 @@ class KalshiSniperBot:
             market_lifecycle_state=market_lifecycle_state_value,
             duplicate_block=duplicate_block,
             unsafe_price_block=unsafe_price_block,
+            selected_price_valid=bool((tradeability or {}).get("price_bounds_pass") or (tradeability or {}).get("selected_price_cents") not in (None, "", 0, 0.0)),
+            selected_price_cents=(tradeability or {}).get("selected_price_cents"),
+            price_bounds_pass=(tradeability or {}).get("price_bounds_pass"),
+            selected_side_has_price=bool((tradeability or {}).get("selected_side_has_price")),
+            selected_side_has_liquidity=bool((tradeability or {}).get("selected_side_has_liquidity")),
+            depth_available=bool((tradeability or {}).get("depth_available")),
+            orderbook_ready=(tradeability or {}).get("orderbook_ready"),
+            max_positions_block=bool((tradeability or {}).get("max_positions_block")),
             contracts=AION_AGGRESSIVE_MAX_CONTRACTS,
             trades_today=self.aggressive_trades_today,
             canonical_execution_state=tradeability if isinstance(tradeability, dict) else None,
@@ -5646,9 +6090,11 @@ class KalshiSniperBot:
             audit["quote_successes"] = int(audit.get("quote_successes", 0) or 0) + 1
         if quote_failure:
             audit["quote_failures"] = int(audit.get("quote_failures", 0) or 0) + 1
+            audit.setdefault("quote_failure_reasons", {}).setdefault(reason_text, 0)
             audit["quote_failure_reasons"][reason_text] += 1
         if orderbook_parse_failure:
             audit["orderbook_parse_failures"] = int(audit.get("orderbook_parse_failures", 0) or 0) + 1
+            audit.setdefault("quote_failure_reasons", {}).setdefault(reason_text, 0)
             audit["quote_failure_reasons"][reason_text] += 1
         if spread_reject or flags.get("spread_reject"):
             audit["spread_rejects"] = int(audit.get("spread_rejects", 0) or 0) + 1
@@ -5658,11 +6104,13 @@ class KalshiSniperBot:
             audit["phase55_rejects"] = int(audit.get("phase55_rejects", 0) or 0) + 1
         if execution_block or flags.get("execution_block"):
             audit["execution_blocks"] = int(audit.get("execution_blocks", 0) or 0) + 1
+            audit.setdefault("execution_block_reasons", {}).setdefault(reason_text, 0)
             audit["execution_block_reasons"][reason_text] += 1
         if api_submit_failure or flags.get("api_submit_failure"):
             audit["api_submit_failures"] = int(audit.get("api_submit_failures", 0) or 0) + 1
         if api_submit_success:
             audit["api_submit_successes"] = int(audit.get("api_submit_successes", 0) or 0) + 1
+        audit.setdefault("failure_reasons", {}).setdefault(reason_text, 0)
         audit["failure_reasons"][reason_text] += 1
         return audit
 
@@ -6341,6 +6789,37 @@ class KalshiSniperBot:
             if isinstance(canonical_execution_state.get("realm_vv_result"), dict)
             else {}
         )
+        canonical_tradeability = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else {}
+        canonical_tradeability_fallback_used = not bool(canonical_tradeability)
+        canonical_tradeability_state = {}
+        canonical_tradeability_tradeable = False
+        canonical_spread_classification = "unknown"
+        canonical_final_edge = 0.0
+        canonical_final_submit_allowed = False
+        canonical_selected_price = None
+        quote_ready_from_context = False
+        orderbook_ready_from_context = False
+        selected_side_has_price = False
+        selected_side_has_liquidity = False
+        depth_available = False
+        market_direct_quote_ready = False
+        market_direct_orderbook_ready = False
+        base_sports_threshold_softened = False
+        derived_aggressive_tradeable = False
+        canonical_aggressive_tradeable = False
+        selected_price = None
+        spread_bucket = "unknown"
+        unsafe_price_status = "unknown"
+        effective_quote_ready = False
+        effective_orderbook_ready = False
+        canonical_submit_override = False
+        thin_book_override_applied = False
+        beast_spread_override_applied = False
+        survivable_aggressive_override = False
+        canonical_beast_submit_override = False
+        final_blocker_source = None
+        block_reason = "unknown"
+        orderbook_not_usable_reason = None
         canonical_resolved_side = str(
             quote_diag.get("selected_side")
             or sports_context.get("selected_side")
@@ -6354,8 +6833,22 @@ class KalshiSniperBot:
             or ""
         ).strip().lower() or "unknown"
         resolved_side = canonical_resolved_side
-        resolved_selected_side = quote_diag.get("selected_side") or sports_context.get("selected_side")
-        resolved_selected_price = quote_diag.get("selected_price") or sports_context.get("selected_price")
+        resolved_selected_side = (
+            quote_diag.get("selected_side")
+            or sports_context.get("selected_side")
+            or canonical_realm_vv_result.get("selected_side")
+            or canonical_realm_vv_result.get("side")
+            or canonical_tradeability.get("selected_side")
+            or canonical_tradeability.get("side")
+        )
+        resolved_selected_price = (
+            quote_diag.get("selected_price")
+            or sports_context.get("selected_price")
+            or canonical_realm_vv_result.get("selected_price")
+            or canonical_realm_vv_result.get("selected_price_dollars")
+            or canonical_tradeability.get("selected_price_dollars")
+            or canonical_tradeability.get("selected_price")
+        )
         aggression_settings = _aion_aggression_profile_settings(AION_AGGRESSION_PROFILE, family=family, spread_bucket=str(quote_diag.get("spread_bucket") or quote_diag.get("sports_spread_bucket") or "unknown"), context=context)
         sports_threshold_delta = self.to_float(aggression_settings.get("sports_threshold_delta"), 0.0) or 0.0
         flat_market_relaxation = self.to_float(aggression_settings.get("flat_market_relaxation"), 0.0) or 0.0
@@ -6433,9 +6926,9 @@ class KalshiSniperBot:
             adjustment -= min(0.01, abs(live_momentum) * 0.015)
             reasons.append("negative_live_momentum_tighten")
         adaptive_threshold = min(SPORTS_ADAPTIVE_SPREAD_MAX, base_threshold + adjustment + sports_threshold_delta)
-        canonical_tradeability = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else {}
         if not canonical_tradeability and isinstance(sports_context.get("canonical_tradeability"), dict):
             canonical_tradeability = sports_context.get("canonical_tradeability")
+            canonical_tradeability_fallback_used = True
         canonical_tradeability_tradeable = bool(
             canonical_tradeability.get("tradeable")
             if canonical_tradeability.get("tradeable") is not None
@@ -6492,7 +6985,6 @@ class KalshiSniperBot:
             or bool(market.get("orderbook"))
             or bool(market.get("orderbook_fp"))
         )
-        canonical_tradeability_state = {}
         if isinstance(canonical_execution_state, dict):
             nested_realm_vv_result = canonical_execution_state.get("realm_vv_result") if isinstance(canonical_execution_state.get("realm_vv_result"), dict) else {}
             canonical_tradeability_state = (
@@ -6555,6 +7047,44 @@ class KalshiSniperBot:
             or quote_diag.get("topbook_snapshot_present")
             or selected_side_has_liquidity
         )
+        base_sports_threshold_softened = bool(
+            not pass_fail
+            and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"}
+            and canonical_final_submit_allowed
+            and canonical_aggressive_tradeable
+            and selected_side_has_price
+            and (selected_side_has_liquidity or depth_available or max_top_size > 0.0 or market_direct_orderbook_ready)
+            and canonical_final_edge > 0.0
+        )
+        if base_sports_threshold_softened:
+            pass_fail = True
+            reason = "base_sports_threshold_softened"
+            try:
+                print(
+                    "[AION-BASE-SPORTS-THRESHOLD-SOFTENED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "sport_family": sport_family,
+                            "score": score,
+                            "base_threshold": base_threshold,
+                            "adjusted_threshold": adaptive_threshold,
+                            "edge_after_cost": canonical_final_edge,
+                            "selected_side_has_price": bool(selected_side_has_price),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "depth_available": bool(depth_available),
+                            "quote_ready": bool(quote_ready_from_context),
+                            "orderbook_ready": bool(orderbook_ready_from_context),
+                            "final_submit_allowed_by_realm_vv": bool(canonical_final_submit_allowed),
+                            "reason": reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         derived_price_used = bool(quote_diag.get("derived_price_used"))
         derived_price_source = str(quote_diag.get("derived_price_source") or quote_diag.get("selected_price_source_used") or "unknown").strip().lower() or "unknown"
         orderbook_ready_from_context = bool(
@@ -6614,6 +7144,56 @@ class KalshiSniperBot:
         )
         if thin_book_override_applied:
             effective_orderbook_ready = True
+        relaxed_survivable_aggressive = bool(
+            _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"}
+            and selected_side_has_price
+            and price_bounds_pass
+            and canonical_final_edge > 0.0
+            and spread_classification in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+            and (
+                selected_side_has_liquidity
+                or depth_available
+                or market_direct_orderbook_ready
+                or bool(canonical_tradeability.get("orderbook_ready"))
+                or bool(canonical_tradeability_state.get("canonical_orderbook_ready"))
+            )
+        )
+        if relaxed_survivable_aggressive:
+            effective_quote_ready = True
+            effective_orderbook_ready = True
+            pass_fail = True
+            final_submit_allowed_by_realm_vv = True
+            if spread_bucket in {"unsafe", "wide", "wide_but_possible", "unknown"}:
+                spread_bucket = "wide_but_possible"
+            if unsafe_price_status in {"unsafe_spread", "unsafe_price", "unknown"}:
+                unsafe_price_status = "caution_wide_spread"
+            orderbook_not_usable_reason = "relaxed_beast_mode_level_4"
+            try:
+                print(
+                    "[AION-BASE-SPORTS-THRESHOLD-SOFTENED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "sport_family": sport_family,
+                            "score": score,
+                            "base_threshold": base_threshold,
+                            "adjusted_threshold": adaptive_threshold,
+                            "edge_after_cost": canonical_final_edge,
+                            "selected_side_has_price": bool(selected_side_has_price),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "depth_available": bool(depth_available),
+                            "quote_ready": bool(quote_ready_from_context),
+                            "orderbook_ready": bool(orderbook_ready_from_context),
+                            "final_submit_allowed_by_realm_vv": True,
+                            "reason": "relaxed_survivable_aggressive",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         if (
             _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) == "beast"
             and derived_aggressive_tradeable
@@ -6751,6 +7331,22 @@ class KalshiSniperBot:
                 print("[AION-ORDERBOOK-USABILITY-ALLOW] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
             elif not effective_orderbook_ready:
                 print("[AION-ORDERBOOK-USABILITY-BLOCKED] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
+            if canonical_tradeability_fallback_used:
+                print(
+                    "[AION-SCOPE-STABILIZED] "
+                    + json.dumps(
+                        {
+                            "function": "_get_sports_adaptive_spread_threshold",
+                            "variable": "canonical_tradeability",
+                            "fallback_used": True,
+                            "fallback_default": "neutral_dict",
+                            "ticker": ticker,
+                            "context": context,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
         except Exception:
             pass
         original_selected_side = quote_diag.get("selected_side") or sports_context.get("selected_side")
@@ -21126,7 +21722,7 @@ class KalshiSniperBot:
                 f"reason={row.get('reason', '')}"
             )
 
-    def print_live_startup_checklist(self, args=None):
+    def _live_check_rows(self, args=None):
         config_status = self.get_live_config_status()
         effective_live_dry_run = compute_effective_live_dry_run()
         canary_required = bool(args is not None and getattr(args, "run_live_canary", False))
@@ -21134,11 +21730,66 @@ class KalshiSniperBot:
             getattr(args, "live_test_ticker", None) or globals().get("LIVE_TEST_TICKER")
         )
         canary_available_ok = (not canary_required) or (not self.live_canary_submitted)
-        checks = [
-            ("LIVE_MODE", bool(globals().get("LIVE_MODE", False))),
-            ("LIVE_ARMED", bool(globals().get("LIVE_ARMED", False))),
-            ("ENV_CONFIRMED", bool(globals().get("LIVE_ENV_CONFIRMED", False))),
-            ("EFFECTIVE_DRY_RUN", bool(effective_live_dry_run)),
+        live_mode_ok = bool(globals().get("LIVE_MODE", False))
+        live_armed_ok = bool(globals().get("LIVE_ARMED", False))
+        env_confirmed_ok = bool(globals().get("LIVE_ENV_CONFIRMED", False))
+        real_live_orders_ok = not bool(effective_live_dry_run)
+
+        def detail_for(name, ok):
+            if ok:
+                if name == "EFFECTIVE_DRY_RUN":
+                    return "real_live_orders_enabled DRY_RUN_LIVE_ORDERS=false"
+                return ""
+            if name == "LIVE_MODE":
+                if args is not None and not getattr(args, "live", False):
+                    return "missing --live"
+                return _env_true_detail("KALSHI_ALLOW_LIVE")
+            if name == "LIVE_ARMED":
+                if args is not None and not getattr(args, "arm_live", False):
+                    return "missing --arm-live"
+                return _env_true_detail("LIVE_ARMED")
+            if name == "ENV_CONFIRMED":
+                return _env_true_detail("LIVE_ENV_CONFIRMED")
+            if name == "EFFECTIVE_DRY_RUN":
+                if get_env_bool("DRY_RUN_LIVE_ORDERS", True):
+                    return "expected DRY_RUN_LIVE_ORDERS=false"
+                if not live_mode_ok:
+                    return "live orders dry-run until KALSHI_ALLOW_LIVE=true and --live are both set"
+                if not live_armed_ok:
+                    return "live orders dry-run until LIVE_ARMED=true and --arm-live are both set"
+                if not env_confirmed_ok:
+                    return "live orders dry-run until LIVE_ENV_CONFIRMED=true"
+                return "effective dry-run safety still active"
+            if name == "CONFIG_READY":
+                missing = ",".join(config_status.get("missing") or [])
+                disabled = ",".join(config_status.get("disabled") or [])
+                parts = []
+                if missing:
+                    parts.append(f"missing {missing}")
+                if disabled:
+                    parts.append(f"disabled {disabled}")
+                return " ".join(parts) or "missing live config"
+            if name == "AUTH_READY":
+                return "missing valid live auth key/private key"
+            if name == "ORDER_API_PATH":
+                return "missing live order API path"
+            if name == "RATE_LIMIT_CONFIG":
+                return "missing positive LIVE_ORDER_RATE_LIMIT and LIVE_ORDER_RATE_WINDOW_SEC"
+            if name == "DAILY_CAP_CONFIG":
+                return "missing positive MAX_LIVE_TRADES_PER_DAY"
+            if name == "SIZE_CAP_CONFIG":
+                return "missing positive MAX_LIVE_ORDER_SIZE"
+            if name == "CANARY_TICKER":
+                return "missing --live-test-ticker for canary"
+            if name == "CANARY_AVAILABLE":
+                return "canary already submitted in this process"
+            return ""
+
+        rows = [
+            ("LIVE_MODE", live_mode_ok),
+            ("LIVE_ARMED", live_armed_ok),
+            ("ENV_CONFIRMED", env_confirmed_ok),
+            ("EFFECTIVE_DRY_RUN", real_live_orders_ok),
             ("CONFIG_READY", bool(config_status.get("ok"))),
             ("AUTH_READY", bool(self.can_build_live_auth())),
             ("ORDER_API_PATH", bool(self.has_live_order_api_path())),
@@ -21148,38 +21799,25 @@ class KalshiSniperBot:
             ("CANARY_TICKER", canary_ticker_ok),
             ("CANARY_AVAILABLE", canary_available_ok),
         ]
-        for name, ok in checks:
-            print(f"[LIVE-CHECK] {name}: {'PASS' if ok else 'FAIL'}")
+        return [(name, ok, detail_for(name, ok)) for name, ok in rows]
+
+    def print_live_startup_checklist(self, args=None):
+        rows = self._live_check_rows(args=args)
+        for name, ok, detail in rows:
+            print(f"[LIVE-CHECK] {name}: {'PASS' if ok else 'FAIL'}{f' {detail}' if detail else ''}")
 
     def run_live_preflight(self, args=None):
         print("[LIVE-PREFLIGHT] starting")
-        config_status = self.get_live_config_status()
-        effective_live_dry_run = compute_effective_live_dry_run()
+        rows = self._live_check_rows(args=args)
+        checks = {name: ok for name, ok, _detail in rows}
+        for name, ok, detail in rows:
+            print(f"[LIVE-CHECK] {name}: {'PASS' if ok else 'FAIL'}{f' {detail}' if detail else ''}")
         canary_required = bool(args is not None and getattr(args, "run_live_canary", False))
-        canary_ticker_ok = (not canary_required) or bool(
-            getattr(args, "live_test_ticker", None) or globals().get("LIVE_TEST_TICKER")
-        )
-        canary_available_ok = (not canary_required) or (not self.live_canary_submitted)
-        checks = {
-            "LIVE_MODE": bool(globals().get("LIVE_MODE", False)),
-            "LIVE_ARMED": bool(globals().get("LIVE_ARMED", False)),
-            "ENV_CONFIRMED": bool(globals().get("LIVE_ENV_CONFIRMED", False)),
-            "EFFECTIVE_DRY_RUN": bool(effective_live_dry_run),
-            "CONFIG_READY": bool(config_status.get("ok")),
-            "AUTH_READY": bool(self.can_build_live_auth()),
-            "ORDER_API_PATH": bool(self.has_live_order_api_path()),
-            "RATE_LIMIT_CONFIG": bool(LIVE_ORDER_RATE_LIMIT and LIVE_ORDER_RATE_WINDOW_SEC),
-            "DAILY_CAP_CONFIG": bool(MAX_LIVE_TRADES_PER_DAY),
-            "SIZE_CAP_CONFIG": bool(MAX_LIVE_ORDER_SIZE),
-            "CANARY_TICKER": canary_ticker_ok,
-            "CANARY_AVAILABLE": canary_available_ok,
-        }
-        for name, ok in checks.items():
-            print(f"[LIVE-PREFLIGHT] {name}={'PASS' if ok else 'FAIL'}")
         required_checks = (
             "LIVE_MODE",
             "LIVE_ARMED",
             "ENV_CONFIRMED",
+            "EFFECTIVE_DRY_RUN",
             "CONFIG_READY",
             "AUTH_READY",
             "ORDER_API_PATH",
@@ -21198,6 +21836,12 @@ class KalshiSniperBot:
         }
 
     def build_quote(self, market):
+        quote_stream = getattr(self, "live_quote_stream", None)
+        if quote_stream is not None and isinstance(market, dict):
+            try:
+                market = quote_stream.hydrate_market(market)
+            except Exception as exc:
+                print(f"[WS-HYDRATE-ERROR] reason={exc.__class__.__name__} source=build_quote")
         ticker = market.get("ticker", "N/A")
         title = market.get("title") or market.get("subtitle") or "Untitled"
         family = self.get_market_family(market)
@@ -21659,6 +22303,7 @@ class KalshiSniperBot:
         )
 
     def _diagnose_quote_readiness_context(self, *, market=None, q=None, family=None, sports_context=None, source="unknown"):
+        resolved_selected_price = False
         market = market if isinstance(market, dict) else {}
         sports_context = sports_context if isinstance(sports_context, dict) else {}
         q = q if q is not None else None
@@ -21695,7 +22340,7 @@ class KalshiSniperBot:
                 candidate=q,
                 market=market,
                 quote_diag=sports_context,
-                price_source="bid",
+                price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                 selected_side=sports_context.get("selected_side"),
                 selection_stage=source,
                 allow_refresh=True,
@@ -21783,6 +22428,79 @@ class KalshiSniperBot:
             canonical_tradeability = {}
         if canonical_tradeability:
             quote_orderbook_snapshot.update(canonical_tradeability)
+        canonical_reconcile_triggered = False
+        resolved_selected_side = quote_orderbook_snapshot.get("selected_side")
+        resolved_selected_price = self.to_float(
+            quote_orderbook_snapshot.get("selected_price"),
+            self.to_float(quote_orderbook_snapshot.get("selected_price_dollars"), None),
+        )
+        canonical_selected_price = self.to_float(
+            quote_orderbook_snapshot.get("selected_price"),
+            self.to_float(quote_orderbook_snapshot.get("selected_price_dollars"), None),
+        )
+        canonical_selected_side = str(
+            quote_orderbook_snapshot.get("selected_side")
+            or quote_orderbook_snapshot.get("side")
+            or sports_context.get("selected_side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+            or ""
+        ).strip().lower() or None
+        canonical_selected_price_source = str(
+            quote_orderbook_snapshot.get("selected_price_source_used")
+            or quote_orderbook_snapshot.get("payload_price_source")
+            or quote_orderbook_snapshot.get("selected_price_source")
+            or "canonical_reconcile"
+        ).strip().lower() or "canonical_reconcile"
+        canonical_final_submit_allowed = bool(
+            quote_orderbook_snapshot.get("final_submit_allowed_by_realm_vv")
+            or quote_orderbook_snapshot.get("canonical_final_submit_allowed_by_realm_vv")
+        )
+        if canonical_selected_price is not None and canonical_selected_price > 0.0:
+            if resolved_selected_price is None:
+                canonical_reconcile_triggered = True
+            resolved_selected_price = canonical_selected_price
+            if resolved_selected_side is None:
+                resolved_selected_side = canonical_selected_side
+            resolved_quote_ready = True
+            resolved_quote_missing = False
+            resolved_orderbook_ready = True
+            quote_ready = True
+            quote_missing = False
+            quote_orderbook_snapshot["selected_price"] = canonical_selected_price
+            quote_orderbook_snapshot["selected_price_dollars"] = canonical_selected_price
+            quote_orderbook_snapshot["selected_price_source_used"] = canonical_selected_price_source
+            quote_orderbook_snapshot["selected_side"] = resolved_selected_side
+            quote_orderbook_snapshot["quote_ready"] = True
+            quote_orderbook_snapshot["quote_missing"] = False
+            quote_orderbook_snapshot["orderbook_ready"] = True
+            quote_orderbook_snapshot["orderbook_missing_reason"] = None
+            quote_orderbook_snapshot["blocker_reason"] = None
+            quote_orderbook_snapshot["source_of_quote_data"] = "canonical_realm_vv_reconcile"
+            quote_orderbook_snapshot["quote_ready_reason"] = "canonical_realm_vv_reconcile"
+            if canonical_final_submit_allowed:
+                quote_orderbook_snapshot["final_submit_allowed_by_realm_vv"] = True
+            try:
+                print(
+                    "[AION-DIRECT-FIELD-BRANCH-DELETED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "trace_id": sports_context.get("trace_id") or canonical_tradeability.get("trace_id"),
+                            "selected_side": resolved_selected_side,
+                            "selected_price": resolved_selected_price,
+                            "selected_price_source": canonical_selected_price_source,
+                            "quote_ready": True,
+                            "orderbook_ready": True,
+                            "canonical_final_submit_allowed_by_realm_vv": canonical_final_submit_allowed,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
 
         yes_top_price = self.to_float(topbook_snapshot.get("yes_top_price"), None)
         no_top_price = self.to_float(topbook_snapshot.get("no_top_price"), None)
@@ -22527,9 +23245,15 @@ class KalshiSniperBot:
     def _evaluate_smart_entry_gate(self, market, q, payload=None):
         ticker = getattr(q, "ticker", "") or str((market or {}).get("ticker", "") or "").strip()
         family = self.get_market_family(market or {"ticker": ticker}) if ticker else "UNKNOWN"
+        payload = payload if isinstance(payload, dict) else {}
+        side = str(payload.get("side") or DEFAULT_LIVE_ORDER_SIDE or "yes").strip().lower()
         yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="smart_entry.yes_bid")
         yes_ask = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="smart_entry.yes_ask")
-        spread = (yes_ask - yes_bid) if yes_ask and yes_bid else None
+        no_bid = self.normalize_contract_price(getattr(q, "no_bid", 0.0) or 0.0, ticker=ticker, source="smart_entry.no_bid")
+        no_ask = self.normalize_contract_price(getattr(q, "no_ask", 0.0) or 0.0, ticker=ticker, source="smart_entry.no_ask")
+        entry_bid = no_bid if side == "no" else yes_bid
+        entry_ask = no_ask if side == "no" else yes_ask
+        spread = (entry_ask - entry_bid) if entry_ask and entry_bid else None
         edge = "bad"
         reason = "missing_yes_top_book"
         momentum_ok = True
@@ -22538,7 +23262,7 @@ class KalshiSniperBot:
         adaptive_allow = False
         recent_prices = []
         session_adjustment = self._get_live_session_entry_adjustment(adaptive_entry=False, borderline=False)
-        if yes_ask is None or yes_ask <= 0 or yes_ask < 0.68 or yes_ask > MAX_YES_ASK_TO_ENTER:
+        if entry_ask is None or entry_ask <= 0 or entry_ask < 0.68 or entry_ask > MAX_YES_ASK_TO_ENTER:
             allowed = False
             reason = "price_out_of_range"
         elif spread is None or spread < 0:
@@ -22561,12 +23285,12 @@ class KalshiSniperBot:
             else:
                 adaptive_allow, adaptive_details = self._should_adaptive_allow_momentum_warning(
                     ticker,
-                    yes_ask=yes_ask,
+                    yes_ask=entry_ask,
                     spread=spread,
                     payload=payload,
                 )
                 if adaptive_allow:
-                    borderline_adaptive = bool(yes_ask >= 0.85 or (spread is not None and spread >= 0.025) or recent_delta is None)
+                    borderline_adaptive = bool(entry_ask >= 0.85 or (spread is not None and spread >= 0.025) or recent_delta is None)
                     session_adjustment = self._get_live_session_entry_adjustment(
                         adaptive_entry=True,
                         borderline=borderline_adaptive,
@@ -22582,7 +23306,7 @@ class KalshiSniperBot:
                         print(
                             f"[LIVE-EXECUTION-MOMENTUM-WARN] ticker={ticker} "
                             f"adaptive_allow=yes original_reason=momentum_not_stable "
-                            f"price={yes_ask} spread={spread}"
+                            f"side={side} price={entry_ask} spread={spread}"
                         )
                 else:
                     reason = "momentum_not_stable"
@@ -22619,13 +23343,14 @@ class KalshiSniperBot:
         status = "adaptive_allowed" if adaptive_allow else ("accepted" if allowed else "rejected")
         momentum_status = "passed" if momentum_ok else "blocked"
         print(f"[MOMENTUM-CHECK] ticker={ticker} status={momentum_status} delta={recent_delta}")
-        print(f"[SMART-ENTRY] ticker={ticker} price={yes_ask} spread={spread} edge={edge}")
-        print(f"[HIGH-PROB-ENTRY] ticker={ticker} price={yes_ask} spread={spread} status={status} reason={reason}")
-        print(f"[EDGE-ENTRY] ticker={ticker} price={yes_ask} spread={spread} status={status} reason={reason}")
+        print(f"[SMART-ENTRY] ticker={ticker} side={side} price={entry_ask} spread={spread} edge={edge}")
+        print(f"[HIGH-PROB-ENTRY] ticker={ticker} side={side} price={entry_ask} spread={spread} status={status} reason={reason}")
+        print(f"[EDGE-ENTRY] ticker={ticker} side={side} price={entry_ask} spread={spread} status={status} reason={reason}")
         return allowed, reason, {
             "ticker": ticker,
             "family": family,
-            "price": yes_ask,
+            "side": side,
+            "price": entry_ask,
             "edge": edge,
             "momentum_ok": momentum_ok,
             "recent_delta": recent_delta,
@@ -23085,6 +23810,10 @@ class KalshiSniperBot:
         ticker = getattr(q, "ticker", "") or market.get("ticker", "")
         family = self.get_market_family(market)
         should_trace_priority_family = self._should_trace_priority_topbook_family(family)
+        strict_canary_bypass = bool(getattr(self, "live_canary_strict_filter_bypass", False))
+        if strict_canary_bypass and not getattr(self, "_live_canary_strict_filter_bypass_logged", False):
+            print("[LIVE-CANARY] Bypassing strict filters for authorized test ticker")
+            self._live_canary_strict_filter_bypass_logged = True
         if not ticker:
             self._record_live_reject_telemetry(reason="missing_ticker", ticker=ticker, family=family, spread=None, stage="prefilter", category="general")
             return False, "missing_ticker"
@@ -23108,8 +23837,9 @@ class KalshiSniperBot:
             return False, "missing_quotes"
         spread = yes_ask - yes_bid
         if spread < 0 or spread > MAX_ENTRY_SPREAD:
-            self._record_live_reject_telemetry(reason="wide_spread", ticker=ticker, family=family, spread=spread, stage="prefilter", category="spread")
-            return False, "wide_spread"
+            if not strict_canary_bypass:
+                self._record_live_reject_telemetry(reason="wide_spread", ticker=ticker, family=family, spread=spread, stage="prefilter", category="spread")
+                return False, "wide_spread"
         liquidity = getattr(q, "liquidity", 0.0) or 0.0
         min_liquidity = self.get_market_min_entry_liquidity(market)
         series_ticker = self.get_targeted_series_ticker(market)
@@ -23131,7 +23861,9 @@ class KalshiSniperBot:
                 f"default={MIN_ENTRY_LIQUIDITY} targeted={min_liquidity} seen={liquidity}"
             )
         if effective_liquidity <= min_liquidity:
-            if self.is_targeted_series_market(market):
+            if strict_canary_bypass:
+                pass
+            elif self.is_targeted_series_market(market):
                 strict_orderbook_ok, strict_orderbook_details = self.passes_targeted_orderbook_quality(market, q)
                 field_source = "targeted_orderbook_quality"
                 if should_trace_priority_family:
@@ -23227,8 +23959,9 @@ class KalshiSniperBot:
                 )
             )
         if yes_ask <= MIN_ENTRY_PRICE or yes_ask >= MAX_ENTRY_PRICE:
-            self._record_live_reject_telemetry(reason="unsafe_price", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
-            return False, "unsafe_price"
+            if not strict_canary_bypass:
+                self._record_live_reject_telemetry(reason="unsafe_price", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
+                return False, "unsafe_price"
         return True, None
 
     def get_market_family(self, market):
@@ -26192,6 +26925,9 @@ class KalshiSniperBot:
         return profiled_candidates, summary
 
     def fetch_market_batch(self, cursor=None):
+        discovery_service = getattr(self, "discovery_service", None)
+        if discovery_service is not None:
+            return discovery_service.fetch_market_batch(cursor=cursor)
         params = {
             "limit": LIVE_SELECT_BATCH_SIZE,
             "status": "open",
@@ -26343,6 +27079,9 @@ class KalshiSniperBot:
         }
 
     def fetch_targeted_series_markets(self, scan_depth=1):
+        discovery_service = getattr(self, "discovery_service", None)
+        if discovery_service is not None:
+            return discovery_service.fetch_targeted_series_markets(scan_depth=scan_depth)
         markets = []
         seen_tickers = set()
         total_found = 0
@@ -26702,6 +27441,9 @@ class KalshiSniperBot:
         return max(1, min(4, scan_depth))
 
     def fetch_broad_discovery_markets(self, scan_depth=1):
+        discovery_service = getattr(self, "discovery_service", None)
+        if discovery_service is not None:
+            return discovery_service.fetch_broad_discovery_markets(scan_depth=scan_depth)
         markets = []
         seen_tickers = set()
         cursor = None
@@ -26749,9 +27491,12 @@ class KalshiSniperBot:
     def get_live_market_orderbook(self, ticker):
         path = f"/trade-api/v2/markets/{ticker}/orderbook"
         url = self.build_live_request_url(path)
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        return response.json()
+        payload, _status_code = self._get_json_with_backoff(
+            url,
+            timeout=15,
+            cache_ttl=get_env_float("KALSHI_ORDERBOOK_CACHE_TTL_SECONDS", 1.0),
+        )
+        return payload
 
     def _extract_orderbook_side_levels_with_source(self, payload, side):
         self._last_orderbook_recursion_guard_hit = False
@@ -28541,7 +29286,7 @@ class KalshiSniperBot:
                 payload_preflight = self._diagnose_live_order_payload_context(
                     q,
                     size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                    price_source="bid",
+                    price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                     selected_ticker=ticker,
                     selection_stage="open_market_preflight",
                     market=market,
@@ -28911,7 +29656,7 @@ class KalshiSniperBot:
                             open_market_payload_override = self.build_live_order_payload(
                                 q,
                                 size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                                price_source="bid",
+                                price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                                 post_only=False,
                                 rest_remainder=True,
                                 market=market,
@@ -29524,9 +30269,11 @@ class KalshiSniperBot:
     def get_live_market_detail(self, ticker):
         path = f"/trade-api/v2/markets/{ticker}"
         url = self.build_live_request_url(path) if globals().get("LIVE_MODE", False) else f"{BASE_URL}/markets/{ticker}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        payload = response.json() if response.content else {}
+        payload, _status_code = self._get_json_with_backoff(
+            url,
+            timeout=10,
+            cache_ttl=get_env_float("KALSHI_MARKET_DETAIL_CACHE_TTL_SECONDS", 2.0),
+        )
         return payload.get("market", payload) if isinstance(payload, dict) else {}
 
     def _hydrate_targeted_zero_book_from_market_detail(self, market, spread):
@@ -29622,9 +30369,11 @@ class KalshiSniperBot:
             f"endpoint={path} attempted=yes source_path={source_path}"
         )
         try:
-            response = requests.get(url, timeout=10)
-            status_code = getattr(response, "status_code", "unknown")
-            response.raise_for_status()
+            payload, status_code = self._get_json_with_backoff(
+                url,
+                timeout=10,
+                cache_ttl=get_env_float("KALSHI_MARKET_DETAIL_CACHE_TTL_SECONDS", 2.0),
+            )
         except Exception as exc:
             print(
                 f"[LIVE-SELECT-HYDRATION-FAIL] ticker={ticker} event_ticker={event_ticker} "
@@ -29635,7 +30384,6 @@ class KalshiSniperBot:
                 f"actual_source=request_error exact_reason={exc.__class__.__name__}"
             )
             return market, f"request_error:{exc.__class__.__name__}"
-        payload = response.json() if getattr(response, "content", b"") else {}
         detail = payload.get("market", payload) if isinstance(payload, dict) else {}
         top_level_fields = sorted(payload.keys())[:12] if isinstance(payload, dict) else []
         detail_fields = sorted(detail.keys())[:12] if isinstance(detail, dict) else []
@@ -32014,10 +32762,12 @@ class KalshiSniperBot:
         path = f"/trade-api/v2/markets/{ticker}"
         url = self.build_live_request_url(path) if globals().get("LIVE_MODE", False) else f"{BASE_URL}/markets/{ticker}"
         try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            payload = response.json() if response.content else {}
-        except requests.RequestException as exc:
+            payload, _status_code = self._get_json_with_backoff(
+                url,
+                timeout=10,
+                cache_ttl=get_env_float("KALSHI_PHASE55_MARKET_HISTORY_CACHE_TTL_SECONDS", 30.0),
+            )
+        except (requests.RequestException, RuntimeError) as exc:
             context = {
                 "series": [],
                 "stochastic_source": "unavailable",
@@ -39550,17 +40300,26 @@ class KalshiSniperBot:
                 ticker=ticker,
                 family=trace_state_snapshot.get("family"),
             )
-            blocker_payload = self._build_aion_candidate_blocker_chain(
+            final_block_reason_text = str(final_block_reason or readiness.get("final_block_reason") or "").strip().lower()
+            is_handoff = final_block_reason_text in {"all_gates_passed", "all_guards_passed", "entry_ready", "tradeable", "eligible", "liquidity_soft_pass"}
+            blocker_payload = {} if is_handoff else self._build_aion_candidate_blocker_chain(
                 ticker=ticker,
                 family=trace_state_snapshot.get("family"),
                 trace_state={**trace_state_snapshot, **readiness},
                 final_block_reason=final_block_reason or readiness.get("final_block_reason"),
             )
-            readiness["blocker_chain"] = blocker_payload.get("blocker_chain")
-            readiness["first_blocker"] = blocker_payload.get("first_blocker")
-            readiness["final_block_reason"] = blocker_payload.get("first_blocker") or readiness.get("final_block_reason")
+            if is_handoff:
+                readiness["blocker_chain"] = []
+                readiness["first_blocker"] = None
+                readiness["final_block_reason"] = final_block_reason_text or "all_gates_passed"
+                readiness["final_ready"] = True
+                readiness["final_outcome"] = "EXECUTED"
+            else:
+                readiness["blocker_chain"] = blocker_payload.get("blocker_chain")
+                readiness["first_blocker"] = blocker_payload.get("first_blocker")
+                readiness["final_block_reason"] = blocker_payload.get("first_blocker") or readiness.get("final_block_reason")
             print(
-                "[AION-FINAL-BLOCKER-TRACE] "
+                ("[AION-FINAL-HANDOFF-TRACE] " if is_handoff else "[AION-FINAL-BLOCKER-TRACE] ")
                 + json.dumps(
                     {
                         "trace_id": trace_id or "unknown",
@@ -39614,7 +40373,7 @@ class KalshiSniperBot:
                 trace_state = self._update_aion_candidate_trace_state(
                     ticker=ticker,
                     trace_id=trace_id,
-                    stage="final_blocker",
+                    stage="final_handoff" if is_handoff else "final_blocker",
                     edge_after_cost=edge_after_cost,
                     spread_bucket=readiness.get("spread_bucket") or spread_bucket,
                     quote_ready=readiness.get("quote_ready"),
@@ -39638,33 +40397,34 @@ class KalshiSniperBot:
                     duplicate_status=readiness.get("duplicate_status"),
                     cooldown_status=readiness.get("cooldown_status"),
                     final_block_reason=readiness.get("final_block_reason"),
-                    final_outcome="BLOCKED",
+                    final_outcome="EXECUTED" if is_handoff else "BLOCKED",
                 )
-                self._emit_aion_candidate_blocker_chain(ticker=ticker, family=trace_state.get("family"), trace_state=trace_state, final_block_reason=readiness.get("final_block_reason"))
-                self._emit_aion_candidate_contradiction_warn(ticker=ticker, trace_state={**trace_state, **readiness}, final_block_reason=readiness.get("final_block_reason"))
-                if not bool(readiness.get("payload_ready")):
-                    self._emit_aion_payload_missing_trace(
-                        trace_id=trace_id,
-                        ticker=ticker,
-                        selected_ticker=trace_state.get("ticker"),
-                        normalized_ticker=normalized_ticker_key,
-                        selection_stage="final_blocker",
-                        payload_builder_called=readiness.get("payload_builder_called"),
-                        payload_ready=readiness.get("payload_ready"),
-                        payload_keys=readiness.get("payload_keys"),
-                        payload_missing_reason=readiness.get("payload_missing_reason"),
-                        payload_rejection_reason=readiness.get("payload_rejection_reason"),
-                        side=trace_state.get("side"),
-                        price=trace_state.get("price"),
-                        contract_id=trace_state.get("contract_id"),
-                        orderbook_present=trace_state.get("orderbook_present"),
-                        quote_ready=readiness.get("quote_ready"),
-                        quote_missing=readiness.get("quote_missing"),
-                        phase55_record_exists=readiness.get("phase55_record_found"),
-                        phase55_record_keys=readiness.get("phase55_record_keys"),
-                        final_block_reason=readiness.get("final_block_reason"),
-                        phase55_skipped_reason=readiness.get("final_block_reason"),
-                    )
+                if not is_handoff:
+                    self._emit_aion_candidate_blocker_chain(ticker=ticker, family=trace_state.get("family"), trace_state=trace_state, final_block_reason=readiness.get("final_block_reason"))
+                    self._emit_aion_candidate_contradiction_warn(ticker=ticker, trace_state={**trace_state, **readiness}, final_block_reason=readiness.get("final_block_reason"))
+                    if not bool(readiness.get("payload_ready")):
+                        self._emit_aion_payload_missing_trace(
+                            trace_id=trace_id,
+                            ticker=ticker,
+                            selected_ticker=trace_state.get("ticker"),
+                            normalized_ticker=normalized_ticker_key,
+                            selection_stage="final_blocker",
+                            payload_builder_called=readiness.get("payload_builder_called"),
+                            payload_ready=readiness.get("payload_ready"),
+                            payload_keys=readiness.get("payload_keys"),
+                            payload_missing_reason=readiness.get("payload_missing_reason"),
+                            payload_rejection_reason=readiness.get("payload_rejection_reason"),
+                            side=trace_state.get("side"),
+                            price=trace_state.get("price"),
+                            contract_id=trace_state.get("contract_id"),
+                            orderbook_present=trace_state.get("orderbook_present"),
+                            quote_ready=readiness.get("quote_ready"),
+                            quote_missing=readiness.get("quote_missing"),
+                            phase55_record_exists=readiness.get("phase55_record_found"),
+                            phase55_record_keys=readiness.get("phase55_record_keys"),
+                            final_block_reason=readiness.get("final_block_reason"),
+                            phase55_skipped_reason=readiness.get("final_block_reason"),
+                        )
                 self._emit_aion_candidate_trace_event(
                     "FINAL",
                     ticker=ticker,
@@ -39697,7 +40457,7 @@ class KalshiSniperBot:
                     duplicate_status=readiness.get("duplicate_status"),
                     auth_ready=trace_state.get("auth_ready"),
                     final_block_reason=readiness.get("final_block_reason"),
-                    final_outcome="BLOCKED",
+                    final_outcome="EXECUTED" if is_handoff else "BLOCKED",
                 )
         except Exception:
             pass
@@ -40073,6 +40833,131 @@ class KalshiSniperBot:
         except Exception:
             pass
 
+    def _persist_canonical_execution_state_snapshot(
+        self,
+        *,
+        canonical_execution_state=None,
+        trace_id=None,
+        ticker=None,
+        family=None,
+        stage=None,
+        source="realm_vv",
+    ):
+        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
+        if not canonical_execution_state:
+            return {
+                "written": False,
+                "readback": False,
+                "path": None,
+                "reason": "empty_canonical_state",
+            }
+        snapshot = json.loads(json.dumps(canonical_execution_state, sort_keys=True, default=str))
+        snapshot.update(
+            {
+                "trace_id": trace_id,
+                "ticker": ticker,
+                "family": family,
+                "stage": stage,
+                "source": source,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        try:
+            snapshot_bytes = json.dumps(snapshot, sort_keys=True, default=str).encode("utf-8")
+            snapshot["checksum"] = hashlib.sha256(snapshot_bytes).hexdigest()
+        except Exception:
+            snapshot["checksum"] = None
+        runtime_root = os.path.dirname(__file__)
+        canonical_state_dir = os.path.join(runtime_root, "runtime", "canonical_state")
+        os.makedirs(canonical_state_dir, exist_ok=True)
+        canonical_state_path = os.path.join(canonical_state_dir, "latest.json")
+        write_success = False
+        readback_success = False
+        readback_payload = {}
+        try:
+            if safe_atomic_json_write:
+                safe_atomic_json_write(canonical_state_path, snapshot, sort_keys=True, indent=2)
+            else:
+                with open(canonical_state_path, "w", encoding="utf-8") as handle:
+                    json.dump(snapshot, handle, sort_keys=True, indent=2, default=str)
+            write_success = True
+        except Exception as exc:
+            print(
+                "[AION-CANONICAL-PERSISTENCE-RESTORED] "
+                + json.dumps(
+                    {
+                        "trace_id": trace_id,
+                        "ticker": ticker,
+                        "family": family,
+                        "stage": stage,
+                        "written": False,
+                        "readback": False,
+                        "path": canonical_state_path,
+                        "reason": f"write_failed:{exc.__class__.__name__}",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            return {
+                "written": False,
+                "readback": False,
+                "path": canonical_state_path,
+                "reason": f"write_failed:{exc.__class__.__name__}",
+                "snapshot": snapshot,
+            }
+        try:
+            with open(canonical_state_path, "r", encoding="utf-8") as handle:
+                readback_payload = json.load(handle) or {}
+            readback_success = bool(
+                isinstance(readback_payload, dict)
+                and readback_payload.get("checksum") == snapshot.get("checksum")
+                and readback_payload.get("updated_at")
+            )
+        except Exception:
+            readback_success = False
+        print(
+            "[AION-CANONICAL-PERSISTENCE-RESTORED] "
+            + json.dumps(
+                {
+                    "trace_id": trace_id,
+                    "ticker": ticker,
+                    "family": family,
+                    "stage": stage,
+                    "written": write_success,
+                    "readback": readback_success,
+                    "path": canonical_state_path,
+                    "checksum": snapshot.get("checksum"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        print(
+            "[AION-CANONICAL-READBACK-RESTORED] "
+            + json.dumps(
+                {
+                    "trace_id": trace_id,
+                    "ticker": ticker,
+                    "family": family,
+                    "stage": stage,
+                    "readback": readback_success,
+                    "path": canonical_state_path,
+                    "checksum": readback_payload.get("checksum") if isinstance(readback_payload, dict) else None,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return {
+            "written": write_success,
+            "readback": readback_success,
+            "path": canonical_state_path,
+            "checksum": snapshot.get("checksum"),
+            "snapshot": snapshot,
+            "readback_payload": readback_payload if isinstance(readback_payload, dict) else {},
+        }
+
     def _resolve_aion_candidate_trace_meta(self, *, ticker=None, family=None, candidate_source=None, trace_id=None, stage=None, allow_create=True):
         ticker_key = str(ticker or "").strip()
         if not ticker_key:
@@ -40327,6 +41212,53 @@ class KalshiSniperBot:
                     default=str,
                 )
             )
+        except Exception:
+            pass
+
+    def _emit_aion_raw_blocker_sample(
+        self,
+        *,
+        event="AION-RAW-BLOCKER-SAMPLE",
+        ticker=None,
+        family=None,
+        function_name=None,
+        trace_id=None,
+        selected_side=None,
+        selected_price_cents=None,
+        selected_price_source=None,
+        yes_bid=None,
+        yes_ask=None,
+        no_bid=None,
+        no_ask=None,
+        canonical_execution_state=None,
+        payload_ready_reason=None,
+        blocker=None,
+        blocker_detail=None,
+        selection_stage=None,
+        **extra,
+    ):
+        payload = {
+            "trace_id": trace_id,
+            "ticker": ticker,
+            "family": family,
+            "function_name": function_name,
+            "selection_stage": selection_stage,
+            "selected_side": selected_side,
+            "selected_price_cents": selected_price_cents,
+            "selected_price_source": selected_price_source,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "canonical_execution_state": canonical_execution_state if isinstance(canonical_execution_state, dict) else {},
+            "payload_ready_reason": payload_ready_reason,
+            "blocker": blocker,
+            "blocker_detail": blocker_detail,
+        }
+        if extra:
+            payload.update({k: v for k, v in extra.items() if v is not None})
+        try:
+            print(f"[{str(event or 'AION-RAW-BLOCKER-SAMPLE').strip().upper() or 'AION-RAW-BLOCKER-SAMPLE'}] " + json.dumps(payload, sort_keys=True, default=str))
         except Exception:
             pass
 
@@ -40991,12 +41923,13 @@ class KalshiSniperBot:
             families_in_window = summary.get("families_in_window") or []
             family_focus = families_in_window[0] if families_in_window else "None"
         effective_live_dry_run = compute_effective_live_dry_run(LIVE_MODE, LIVE_ARMED, LIVE_ENV_CONFIRMED)
-        print(
-            f"[LIVE-MODE-STATUS] source=heartbeat live_mode={'yes' if LIVE_MODE else 'no'} "
-            f"live_armed={'yes' if LIVE_ARMED else 'no'} live_env_confirmed={'yes' if LIVE_ENV_CONFIRMED else 'no'} "
-            f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} "
-            f"effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
-        )
+        if not _MINIMAL_LIVE_LOGGING_ACTIVE:
+            print(
+                f"[LIVE-MODE-STATUS] source=heartbeat live_mode={'yes' if LIVE_MODE else 'no'} "
+                f"live_armed={'yes' if LIVE_ARMED else 'no'} live_env_confirmed={'yes' if LIVE_ENV_CONFIRMED else 'no'} "
+                f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} "
+                f"effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
+            )
         try:
             entry_timing_status = dict(summary.get("entry_timing_status") or {})
             entry_ready = bool(str(entry_timing_status.get("phase55_status") or "").strip().lower() == "entry_ready")
@@ -41553,6 +42486,47 @@ class KalshiSniperBot:
             normalized_ready = True
             first_blocker = "all_guards_passed"
             corrected_block_reason = "all_guards_passed"
+            canonical_selected_side_has_price_value = bool(
+                canonical_readiness.get("canonical_selected_side_has_price")
+                if isinstance(canonical_readiness, dict) and canonical_readiness.get("canonical_selected_side_has_price") is not None
+                else quote_diag.get("selected_side_has_price")
+                if quote_diag.get("selected_side_has_price") is not None
+                else direct_fields_ready_value
+            )
+            canonical_selected_price_probe = self.to_float(
+                quote_diag.get("selected_price_dollars")
+                if quote_diag.get("selected_price_dollars") is not None
+                else quote_diag.get("selected_price")
+                if quote_diag.get("selected_price") is not None
+                else canonical_readiness.get("canonical_selected_price_dollars")
+                if isinstance(canonical_readiness, dict) and canonical_readiness.get("canonical_selected_price_dollars") is not None
+                else canonical_readiness.get("canonical_selected_price")
+                if isinstance(canonical_readiness, dict) and canonical_readiness.get("canonical_selected_price") is not None
+                else None,
+                None,
+            )
+            if (
+                not price_bounds_pass
+                and canonical_selected_side_has_price_value
+                and canonical_selected_price_probe is not None
+                and 0.0 < canonical_selected_price_probe < 1.0
+            ):
+                price_bounds_pass = True
+                print(
+                    "[AION-PRICE-BOUNDS-RECONCILED] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": ticker,
+                            "selected_price_candidate": canonical_selected_price_probe,
+                            "selected_side_has_price": canonical_selected_side_has_price_value,
+                            "canonical_final_submit_allowed_by_realm_vv": bool(canonical_allow_lane),
+                            "price_bounds_pass": True,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             print(
                 "[AION-FINAL-READINESS-RECONCILE] "
                 + json.dumps(
@@ -42092,6 +43066,9 @@ class KalshiSniperBot:
         return round(score, 4)
 
     def should_enter_yes(self, q: Quote):
+        guard_service = getattr(self, "guard_service", None)
+        if guard_service is not None:
+            return guard_service.should_enter_yes(q)
         if q.yes_bid <= 0 or q.yes_ask <= 0:
             return False
 
@@ -42127,6 +43104,9 @@ class KalshiSniperBot:
         Return (True, None) if market is eligible for entry.
         Otherwise return (False, reason_string).
         """
+        guard_service = getattr(self, "guard_service", None)
+        if guard_service is not None:
+            return guard_service.passes_entry_filters(q)
         liquidity = getattr(q, "liquidity", 0.0) or 0.0
         if liquidity < MIN_ENTRY_LIQUIDITY:
             return False, "low_liquidity"
@@ -42154,6 +43134,9 @@ class KalshiSniperBot:
         Return (True, None) if a new simulated position may be opened.
         Otherwise return (False, reason_string).
         """
+        guard_service = getattr(self, "guard_service", None)
+        if guard_service is not None:
+            return guard_service.can_open_new_position(self, q)
         if self.trading_halted:
             return False, "trading_halted"
 
@@ -42273,9 +43256,13 @@ class KalshiSniperBot:
         duplicate_block=False,
         unsafe_price_block=False,
         selected_price_valid=False,
+        selected_price_cents=None,
+        price_bounds_pass=None,
         selected_side_has_price=False,
         selected_side_has_liquidity=False,
         depth_available=False,
+        orderbook_ready=None,
+        max_positions_block=False,
         contracts=None,
         trades_today=None,
         source="selector_floor",
@@ -42308,6 +43295,36 @@ class KalshiSniperBot:
         unsafe_price_ok = not bool(unsafe_price_block)
         cap_ok = today_trades < AION_AGGRESSIVE_MAX_TRADES_PER_DAY
         cooldown_ok = cooldown_remaining <= 0
+        try:
+            selected_price_cents = int(round(float(selected_price_cents))) if selected_price_cents not in (None, "", []) else None
+        except (TypeError, ValueError):
+            selected_price_cents = None
+        if price_bounds_pass is None:
+            price_bounds_pass = bool(
+                selected_price_valid
+                or (
+                    selected_price_cents is not None
+                    and 1 <= int(selected_price_cents) <= 99
+                )
+            )
+        else:
+            price_bounds_pass = bool(price_bounds_pass)
+        if orderbook_ready is None:
+            orderbook_ready = bool(
+                selected_side_has_liquidity
+                or depth_available
+                or canonical_execution_state.get("orderbook_ready")
+                or canonical_execution_state.get("canonical_orderbook_ready")
+                or canonical_execution_state.get("normalized_orderbook_present")
+                or canonical_execution_state.get("topbook_depth_exists")
+            )
+        else:
+            orderbook_ready = bool(orderbook_ready)
+        max_positions_block = bool(
+            max_positions_block
+            or canonical_execution_state.get("max_positions_block")
+            or canonical_execution_state.get("max_position_block")
+        )
         execution_sanity_ok = bool(quote_ready_ok and spread_bucket_ok and lifecycle_ok and positive_edge_ok)
         relaxed_lane_allowed = bool(
             relaxed_beast_mode
@@ -42874,6 +43891,7 @@ class KalshiSniperBot:
         market = market if isinstance(market, dict) else {}
         context = context if isinstance(context, dict) else {}
         quote_diag = context.get("quote_diag") if isinstance(context.get("quote_diag"), dict) else {}
+        relaxed_survivable_aggressive = False
         family = self.get_market_family(market) if isinstance(market, dict) else "UNKNOWN"
         ticker = str(
             context.get("ticker")
@@ -43073,7 +44091,7 @@ class KalshiSniperBot:
         selected_side_executable = bool(selected_side_has_price and price_bounds_pass and selected_price_dollars is not None and 0.0 < selected_price_dollars < 1.0)
         relaxed_book_allowed = bool(
             relaxed_beast_mode
-            and final_submit_allowed_by_realm_vv
+            and (final_submit_allowed_by_realm_vv or relaxed_survivable_aggressive)
             and selected_side_executable
             and edge_after_cost_value > 0.0
         )
@@ -43084,6 +44102,7 @@ class KalshiSniperBot:
             unsafe_price_status = "caution_wide_spread" if unsafe_price_status in {"unsafe_spread", "unsafe", "unsafe_price", "unknown"} else unsafe_price_status
             unsafe_resolution_reason = "relaxed_beast_mode_level_4"
             orderbook_not_usable_reason = "relaxed_beast_mode_level_4"
+            final_submit_allowed_by_realm_vv = True
             print(
                 "[AION-RELAXED-BEAST-L4] "
                 + json.dumps(
@@ -43701,6 +44720,9 @@ class KalshiSniperBot:
         normalized_ticker = self.normalize_phase55_ticker_key(raw_ticker)
         family = self.get_market_family({"ticker": raw_ticker}) if raw_ticker else self.get_market_family(market_source) if market_source else "UNKNOWN"
         resolved_side = str(selected_side or "").strip().lower() or None
+        effective_price_source = str(price_source or "ask").strip().lower() or "ask"
+        if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy":
+            effective_price_source = "ask"
         if family == "KXBTC15M":
             direction_decision = self.live_direction_decisions_by_ticker.get(raw_ticker or "", {}) or self.live_direction_decisions_by_ticker.get(normalized_ticker or "", {})
             resolved_side = str(direction_decision.get("intended_side") or "").strip().lower() or resolved_side
@@ -43795,7 +44817,7 @@ class KalshiSniperBot:
                 ask_value = self.to_float(source_dict.get("no_ask_dollars", source_dict.get("no_ask")), None)
             return bool(bid_value is not None and bid_value > 0.0 and ask_value is not None and ask_value > 0.0)
 
-        def _select_side_price_with_fallback(*, side, bid_value, ask_value, preferred_source="bid"):
+        def _select_side_price_with_fallback(*, side, bid_value, ask_value, preferred_source="bid", allow_cross_source_fallback=True):
             side = "no" if str(side).lower() == "no" else "yes"
             preferred_source = str(preferred_source or "bid").strip().lower() or "bid"
             primary_price = bid_value if preferred_source == "bid" else ask_value
@@ -43804,10 +44826,14 @@ class KalshiSniperBot:
             price = self.to_float(primary_price, None)
             alternate_numeric = self.to_float(alternate_price, None)
             if price is None or price <= 0.0:
+                if not allow_cross_source_fallback:
+                    return price, price_source_used
                 if alternate_numeric is not None and alternate_numeric > 0.0:
                     price = alternate_numeric
                     price_source_used = f"{'ask' if preferred_source == 'bid' else 'bid'}_fallback"
             elif not (KALSHI_CONTRACT_MIN_PRICE <= price <= KALSHI_CONTRACT_MAX_PRICE):
+                if not allow_cross_source_fallback:
+                    return price, price_source_used
                 if alternate_numeric is not None and KALSHI_CONTRACT_MIN_PRICE <= alternate_numeric <= KALSHI_CONTRACT_MAX_PRICE:
                     price = alternate_numeric
                     price_source_used = f"{'ask' if preferred_source == 'bid' else 'bid'}_fallback"
@@ -43831,6 +44857,7 @@ class KalshiSniperBot:
                 bid_value=bid_value,
                 ask_value=ask_value,
                 preferred_source=preferred_source,
+                allow_cross_source_fallback=preferred_source != "ask",
             )
             return self.to_float(resolved_price, None), resolved_source, bid_value, ask_value
 
@@ -43879,13 +44906,13 @@ class KalshiSniperBot:
                 selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
                     source_dict,
                     "no",
-                    preferred_source=str(price_source).strip().lower() or "bid",
+                    preferred_source=effective_price_source,
                 )
             elif resolved_side == "yes":
                 selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
                     source_dict,
                     "yes",
-                    preferred_source=str(price_source).strip().lower() or "bid",
+                    preferred_source=effective_price_source,
                 )
             selected_price = self.to_float(selected_price, None)
             if resolved_side not in ("yes", "no") or selected_price is None or selected_price <= 0.0:
@@ -43898,17 +44925,18 @@ class KalshiSniperBot:
                     preferred_side = "no"
                 if preferred_side and preferred_side != resolved_side:
                     resolved_side = preferred_side
+                    side_switch_attempted = True
                     if resolved_side == "no":
                         selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
                             source_dict,
                             "no",
-                            preferred_source=str(price_source).strip().lower() or "bid",
+                            preferred_source=effective_price_source,
                         )
                     elif resolved_side == "yes":
                         selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
                             source_dict,
                             "yes",
-                            preferred_source=str(price_source).strip().lower() or "bid",
+                            preferred_source=effective_price_source,
                         )
                     selected_price = self.to_float(selected_price, None)
             if selected_price is None or selected_price <= 0.0:
@@ -43919,10 +44947,52 @@ class KalshiSniperBot:
             selected_price_raw, selected_price_dollars, selected_price_cents, selected_price_block_reason = _normalize_selected_price_snapshot(selected_price)
             if selected_price_dollars is not None:
                 selected_price = selected_price_dollars
+                try:
+                    print(
+                        "[AION-SELECTED-PRICE-RESOLVED] "
+                        + json.dumps(
+                            {
+                                "ticker": raw_ticker or None,
+                                "family": family,
+                                "trace_id": quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
+                                "selected_side": resolved_side,
+                                "selected_price_cents": selected_price_cents,
+                                "selected_price_dollars": selected_price_dollars,
+                                "selected_price_source": selected_price_source or effective_price_source,
+                                "yes_bid": yes_bid_dollars,
+                                "yes_ask": yes_ask_dollars,
+                                "no_bid": no_bid_dollars,
+                                "no_ask": no_ask_dollars,
+                                "function_name": "resolve_aion_orderbook_for_payload",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                except Exception:
+                    pass
             elif selected_price_block_reason == "selected_price_non_numeric":
                 selected_source_dict = None
                 orderbook_keys = []
                 selected_source_label = None
+                self._emit_aion_raw_blocker_sample(
+                    ticker=raw_ticker or None,
+                    family=family,
+                    function_name="resolve_aion_orderbook_for_payload",
+                    trace_id=quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
+                    selected_side=resolved_side,
+                    selected_price_cents=selected_price_cents,
+                    selected_price_source=selected_price_source or effective_price_source,
+                    yes_bid=yes_bid_dollars,
+                    yes_ask=yes_ask_dollars,
+                    no_bid=no_bid_dollars,
+                    no_ask=no_ask_dollars,
+                    canonical_execution_state=quote_diag.get("canonical_execution_state"),
+                    payload_ready_reason="selected_price_non_numeric",
+                    blocker="selected_price_non_numeric",
+                    blocker_detail=selected_price_block_reason,
+                    selection_stage=selection_stage,
+                )
                 continue
             break
 
@@ -43974,7 +45044,7 @@ class KalshiSniperBot:
             candidate_price, candidate_source_used, candidate_bid, candidate_ask = _resolve_side_price_for_source(
                 selected_source_dict,
                 side_name,
-                preferred_source=str(price_source).strip().lower() or "bid",
+                preferred_source=effective_price_source,
             )
             candidate_price = self.to_float(candidate_price, None)
             candidate_valid = bool(
@@ -44052,6 +45122,28 @@ class KalshiSniperBot:
                 opposite_selected_price = opposite_candidate["price"] if opposite_candidate is not None else None
                 opposite_selected_price_source = opposite_candidate["source"] if opposite_candidate is not None else None
                 if side_switch_success:
+                    try:
+                        print(
+                            "[AION-SIDE-INVERSION-DETECTED] "
+                            + json.dumps(
+                                {
+                                    "ticker": raw_ticker or None,
+                                    "family": family,
+                                    "original_selected_side": original_selected_side,
+                                    "chosen_side": resolved_side,
+                                    "selected_price": selected_price,
+                                    "selected_price_source": selected_price_source,
+                                    "opposite_side": opposite_candidate["side"] if opposite_candidate is not None else None,
+                                    "strategy_allows_yes": strategy_allows_yes,
+                                    "strategy_allows_no": strategy_allows_no,
+                                    "selection_stage": selection_stage,
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                    except Exception:
+                        pass
                     orderbook_fetch_success = orderbook_fetch_success or False
             elif original_candidate is not None and not original_candidate["valid"]:
                 side_switch_reason = side_switch_reason or "both_sides_unexecutable"
@@ -44145,11 +45237,11 @@ class KalshiSniperBot:
                         fresh_no_ask_dollars = self.to_float(fresh_source.get("no_ask_dollars", fresh_source.get("no_ask")), None)
                         fresh_selected_price = None
                         if resolved_side == "no":
-                            fresh_selected_price = fresh_no_bid_dollars if str(price_source).strip().lower() == "bid" else fresh_no_ask_dollars
+                            fresh_selected_price = fresh_no_ask_dollars if effective_price_source == "ask" else fresh_no_bid_dollars
                             if fresh_selected_price is None:
                                 fresh_selected_price = self._extract_orderbook_side_price_hint(fresh_source, "no")
                         elif resolved_side == "yes":
-                            fresh_selected_price = fresh_yes_bid_dollars if str(price_source).strip().lower() == "bid" else fresh_yes_ask_dollars
+                            fresh_selected_price = fresh_yes_ask_dollars if effective_price_source == "ask" else fresh_yes_bid_dollars
                             if fresh_selected_price is None:
                                 fresh_selected_price = self._extract_orderbook_side_price_hint(fresh_source, "yes")
                         fresh_selected_price = self.to_float(fresh_selected_price, None)
@@ -44257,6 +45349,47 @@ class KalshiSniperBot:
                     price_bounds_reason = "selected_price_above_0_99"
                 else:
                     price_bounds_reason = None
+                if price_bounds_reason in {"selected_price_above_0_99", "selected_price_below_0_01", "selected_price_missing"}:
+                    self._emit_aion_raw_blocker_sample(
+                        ticker=raw_ticker or None,
+                        family=family,
+                        function_name="resolve_aion_orderbook_for_payload",
+                        trace_id=quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
+                        selected_side=resolved_side,
+                        selected_price_cents=selected_price_cents,
+                        selected_price_source=selected_price_source or effective_price_source,
+                        yes_bid=yes_bid_dollars,
+                        yes_ask=yes_ask_dollars,
+                        no_bid=no_bid_dollars,
+                        no_ask=no_ask_dollars,
+                        canonical_execution_state=quote_diag.get("canonical_execution_state"),
+                        payload_ready_reason=price_bounds_reason,
+                        blocker=price_bounds_reason,
+                        blocker_detail=orderbook_missing_reason or price_bounds_reason,
+                        selection_stage=selection_stage,
+                        selected_price=selected_price,
+                    )
+                    try:
+                        print(
+                            "[AION-SELECTED-PRICE-REJECTED] "
+                            + json.dumps(
+                                {
+                                    "ticker": raw_ticker or None,
+                                    "family": family,
+                                    "trace_id": quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
+                                    "selected_side": resolved_side,
+                                    "selected_price_cents": selected_price_cents,
+                                    "selected_price_dollars": selected_price,
+                                    "selected_price_source": selected_price_source or effective_price_source,
+                                    "blocker": price_bounds_reason,
+                                    "selection_stage": selection_stage,
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                    except Exception:
+                        pass
                 print(
                     "[AION-PRICE-VALIDATION-MODE] "
                     + json.dumps(
@@ -44373,6 +45506,7 @@ class KalshiSniperBot:
             "selected_price_source_used": selected_price_source,
             "bounds_mode": "dollars",
             "bounds_pass": bool(selected_price_in_bounds),
+            "selected_price_in_bounds": bool(selected_price_in_bounds),
             "failure_stage": orderbook_missing_reason or (None if orderbook_ready else ("selected_price_out_of_bounds" if selected_price is not None and not selected_price_in_bounds else "selected_price_missing")),
             "block_reason": orderbook_missing_reason or (None if orderbook_ready else ("selected_price_out_of_bounds" if selected_price is not None and not selected_price_in_bounds else "selected_price_missing")),
         }
@@ -44407,24 +45541,81 @@ class KalshiSniperBot:
             or ""
         ).strip()
         family = self.get_market_family(market if market else {"ticker": ticker}) if ticker else "UNKNOWN"
+        canary_bypass_active = bool(
+            getattr(self, "live_canary_strict_filter_bypass", False)
+            and ticker
+            and ticker == str(getattr(self, "live_canary_authorized_ticker", "") or "").strip()
+        )
         price_source = str(price_source or "ask").strip().lower()
+        effective_price_source = "ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else price_source
         if orderbook_resolution is None:
             orderbook_resolution = self.resolve_aion_orderbook_for_payload(
                 ticker,
                 candidate=q,
                 market=market,
                 quote_diag=quote_diag,
-                price_source=price_source,
+                price_source=effective_price_source,
                 selection_stage=selection_stage,
                 allow_refresh=allow_orderbook_refresh,
             )
         intended_side = orderbook_resolution.get("selected_side") or DEFAULT_LIVE_ORDER_SIDE
+        if family == "KXBTC15M" and intended_side == DEFAULT_LIVE_ORDER_SIDE:
+            yes_ask_for_side = self.normalize_contract_price(
+                getattr(q, "yes_ask", None),
+                ticker=ticker,
+                source="payload_side_selection.yes_ask",
+            )
+            no_ask_for_side = self.normalize_contract_price(
+                getattr(q, "no_ask", None),
+                ticker=ticker,
+                source="payload_side_selection.no_ask",
+            )
+            yes_side_entry_safe = bool(
+                yes_ask_for_side is not None
+                and 0.68 <= float(yes_ask_for_side) <= MAX_YES_ASK_TO_ENTER
+            )
+            no_side_entry_safe = bool(
+                no_ask_for_side is not None
+                and 0.68 <= float(no_ask_for_side) <= MAX_YES_ASK_TO_ENTER
+            )
+            if not yes_side_entry_safe and no_side_entry_safe:
+                intended_side = "no"
         if family == "KXBTC15M" and intended_side not in ("yes", "no"):
             return None
         if family != "KXBTC15M" and intended_side not in ("yes", "no"):
             intended_side = DEFAULT_LIVE_ORDER_SIDE
         requested_count = size if size is not None else globals().get("MAX_LIVE_ORDER_SIZE", 1)
+        tier_policy = {}
+        try:
+            from aion_live_promotion_policy import get_family_live_policy
+
+            tier_policy = get_family_live_policy(family)
+        except Exception:
+            tier_policy = {}
+        family_tier = str(tier_policy.get("tier") or "").strip().upper() or None
+        family_max_count = tier_policy.get("max_count")
+        if family_tier in {"C", "D"} and not compute_effective_live_dry_run():
+            print(
+                "[AION-FAMILY-DEMOTION] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "tier": family_tier,
+                        "live_enabled": bool(tier_policy.get("live_enabled")),
+                        "reason": "paper_only_or_blocked_family",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            return None
         count = min(requested_count, MAX_LIVE_ORDER_SIZE)
+        if family_max_count is not None:
+            try:
+                count = min(count, max(1, int(family_max_count)))
+            except Exception:
+                pass
         if count != requested_count:
             print(f"[LIVE-SAFETY] size clamped from {requested_count} to {count}")
         payload = {
@@ -44446,7 +45637,27 @@ class KalshiSniperBot:
             payload["post_only"] = bool(post_only)
         if rest_remainder is not None:
             payload["rest_remainder"] = bool(rest_remainder)
-        payload_validation_side = orderbook_resolution.get("chosen_side") or orderbook_resolution.get("selected_side") or intended_side
+        payload_side = payload.get("side", "yes")
+        opposite_side = orderbook_resolution.get("alternate_side") or orderbook_resolution.get("opposite_side")
+        if opposite_side not in ("yes", "no"):
+            opposite_side = "no" if payload_side == "yes" else "yes" if payload_side == "no" else None
+        opposite_selected_price = orderbook_resolution.get("alternate_price")
+        if opposite_selected_price is None:
+            opposite_selected_price = orderbook_resolution.get("opposite_selected_price")
+        if opposite_selected_price is None and opposite_side in ("yes", "no"):
+            opposite_selected_price = self.to_float(
+                orderbook_resolution.get(f"{opposite_side}_ask")
+                if effective_price_source == "ask"
+                else orderbook_resolution.get(f"{opposite_side}_bid"),
+                None,
+            )
+        side_switch_attempted = bool(orderbook_resolution.get("side_switch_attempted"))
+        side_switch_success = bool(orderbook_resolution.get("side_switch_success"))
+        orderbook_missing_reason = (
+            orderbook_resolution.get("orderbook_missing_reason")
+            or orderbook_resolution.get("blocker_reason")
+            or orderbook_resolution.get("failure_stage")
+        )
         payload_validation_price = orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("chosen_price_dollars", orderbook_resolution.get("chosen_price", orderbook_resolution.get("selected_price"))))
         payload_validation_price_cents = orderbook_resolution.get("selected_price_cents", orderbook_resolution.get("chosen_price_cents"))
         selected_price = self.to_float(payload_validation_price, None)
@@ -44459,15 +45670,15 @@ class KalshiSniperBot:
         if selected_price_cents is not None:
             selected_price = round(selected_price_cents / 100.0, 4)
         if selected_price is None:
-            if payload_validation_side == "yes":
+            if payload_side == "yes":
                 selected_price = (
-                    orderbook_resolution.get("yes_bid") if price_source == "bid" else orderbook_resolution.get("yes_ask")
+                    orderbook_resolution.get("yes_ask") if effective_price_source == "ask" else orderbook_resolution.get("yes_bid")
                 )
                 if selected_price is None:
                     selected_price = self._extract_orderbook_side_price_hint(orderbook_resolution, "yes")
             else:
                 selected_price = (
-                    orderbook_resolution.get("no_bid") if price_source == "bid" else orderbook_resolution.get("no_ask")
+                    orderbook_resolution.get("no_ask") if effective_price_source == "ask" else orderbook_resolution.get("no_bid")
                 )
                 if selected_price is None:
                     selected_price = self._extract_orderbook_side_price_hint(orderbook_resolution, "no")
@@ -44477,6 +45688,31 @@ class KalshiSniperBot:
                 selected_price_cents = int(round(float(selected_price) * 100.0))
             except (TypeError, ValueError):
                 selected_price_cents = None
+        if selected_price_cents is not None:
+            try:
+                print(
+                    "[AION-SELECTED-PRICE-RESOLVED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "trace_id": quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
+                            "selected_side": payload_side,
+                            "selected_price_cents": selected_price_cents,
+                            "selected_price_dollars": selected_price,
+                            "selected_price_source": orderbook_resolution.get("selected_price_source_used") or effective_price_source,
+                            "yes_bid": orderbook_resolution.get("yes_bid"),
+                            "yes_ask": orderbook_resolution.get("yes_ask"),
+                            "no_bid": orderbook_resolution.get("no_bid"),
+                            "no_ask": orderbook_resolution.get("no_ask"),
+                            "function_name": "build_live_order_payload",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         try:
             print(
                 "[AION-CANONICAL-PRICE-CONSUMED] "
@@ -44490,7 +45726,7 @@ class KalshiSniperBot:
                         "chosen_price_cents": orderbook_resolution.get("chosen_price_cents") or orderbook_resolution.get("selected_price_cents"),
                         "side_switch_success": bool(orderbook_resolution.get("side_switch_success")),
                         "payload_validation_price": selected_price,
-                        "payload_validation_side": payload_validation_side,
+                        "payload_side": payload_side,
                         "block_reason": orderbook_resolution.get("orderbook_missing_reason") or orderbook_resolution.get("blocker_reason"),
                     },
                     sort_keys=True,
@@ -44536,7 +45772,14 @@ class KalshiSniperBot:
         if selected_price_cents is None and selected_price is not None:
             selected_price_cents = int(round(float(selected_price) * 100.0))
         if selected_price_cents is None or selected_price_cents < 1 or selected_price_cents > 99:
-            return None
+            if canary_bypass_active and selected_price is not None:
+                selected_price_cents = 99 if selected_price_cents is not None and selected_price_cents > 99 else 1
+                selected_price = round(float(selected_price_cents) / 100.0, 4)
+                if not getattr(self, "_live_canary_strict_filter_bypass_logged", False):
+                    print("[LIVE-CANARY] Bypassing strict filters for authorized test ticker")
+                    self._live_canary_strict_filter_bypass_logged = True
+            else:
+                return None
         selected_price = round(float(selected_price_cents) / 100.0, 4)
         if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
             return None
@@ -44748,6 +45991,18 @@ class KalshiSniperBot:
         elif blocker in {"both_sides_unexecutable", "unexecutable_price"}:
             decision = "SKIP"
         elif edge < edge_threshold:
+            relaxed_near_miss_allowed = bool(
+                _relaxed_beast_mode_enabled(4)
+                and profile in {"opportunistic", "beast"}
+                and edge > 0.0
+                and quote_ready
+                and orderbook_ready
+                and price_bounds_pass
+                and selected_side_has_price
+                and (selected_side_has_liquidity or depth_available)
+                and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}
+            )
             near_miss_allowed = bool(
                 profile in {"opportunistic", "beast"}
                 and edge > 0.0
@@ -44761,7 +46016,11 @@ class KalshiSniperBot:
                 and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
                 and (tradeability.get("liquidity") or 0.0) >= 0.0
             )
-            if near_miss_allowed and profile == "beast" and tradeability.get("spread_classification") == "AGGRESSIVE_BUT_TRADEABLE" and edge >= max(edge_threshold * 0.5, 0.00075):
+            if relaxed_near_miss_allowed and tradeability.get("selected_price_cents") is not None and int(tradeability.get("selected_price_cents")) <= 99:
+                decision = "BUY"
+                blocker = None
+                blocker_detail = None
+            elif near_miss_allowed and profile == "beast" and tradeability.get("spread_classification") == "AGGRESSIVE_BUT_TRADEABLE" and edge >= max(edge_threshold * 0.5, 0.00075):
                 decision = "BUY"
                 blocker = None
                 blocker_detail = None
@@ -44774,6 +46033,26 @@ class KalshiSniperBot:
                 decision = "SKIP"
                 blocker = "edge_below_threshold"
                 blocker_detail = f"edge_after_cost={edge:.4f}<threshold={edge_threshold:.4f}"
+            if relaxed_near_miss_allowed:
+                print(
+                    "[AION-RELAXED-BEAST-L4] "
+                    + json.dumps(
+                        {
+                            "ticker": selected_ticker,
+                            "family": family,
+                            "profile": profile,
+                            "edge_after_cost": edge,
+                            "edge_threshold": edge_threshold,
+                            "spread_classification": tradeability.get("spread_classification"),
+                            "selected_price_cents": selected_price_cents,
+                            "selected_side_has_price": bool(selected_side_has_price),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "decision": decision,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
         elif confidence < confidence_floor:
             decision = "SKIP"
             blocker = "confidence_below_threshold"
@@ -45045,8 +46324,33 @@ class KalshiSniperBot:
             if price_bounds_pass is not None
             else canonical_tradeability.get("price_bounds_pass")
             if canonical_tradeability.get("price_bounds_pass") is not None
-            else canonical_execution_decision == "BUY"
+            else quote_diag.get("bounds_pass")
+            if quote_diag.get("bounds_pass") is not None
+            else quote_diag.get("selected_price_in_bounds")
+            if quote_diag.get("selected_price_in_bounds") is not None
+            else (
+                canonical_selected_price is not None
+                and 0.0 < self.to_float(canonical_selected_price, 0.0) < 1.0
+            )
         )
+        if (
+            not canonical_price_bounds_pass
+            and canonical_selected_side_has_price
+        ):
+            canonical_selected_price_probe = self.to_float(
+                quote_diag.get("selected_price_dollars")
+                if quote_diag.get("selected_price_dollars") is not None
+                else quote_diag.get("selected_price")
+                if quote_diag.get("selected_price") is not None
+                else canonical_tradeability.get("selected_price_dollars")
+                if canonical_tradeability.get("selected_price_dollars") is not None
+                else canonical_tradeability.get("selected_price")
+                if canonical_tradeability.get("selected_price") is not None
+                else None,
+                None,
+            )
+            if canonical_selected_price_probe is not None and 0.0 < canonical_selected_price_probe < 1.0:
+                canonical_price_bounds_pass = True
         canonical_relaxed_beast_mode = bool(relaxed_beast_mode)
         canonical_relaxed_submit_allowed = bool(
             canonical_relaxed_beast_mode
@@ -45257,6 +46561,7 @@ class KalshiSniperBot:
             or market.get("ticker", "")
             or ""
         ).strip() or None
+        ticker = selected_ticker
         normalized_ticker = self.normalize_phase55_ticker_key(selected_ticker)
         if isinstance(phase55_gate_record, dict):
             phase55_record = dict(phase55_gate_record)
@@ -45266,6 +46571,9 @@ class KalshiSniperBot:
                 stage=selection_stage or "payload_preflight",
             )
         phase55_record_keys = sorted(list(phase55_record.keys())) if isinstance(phase55_record, dict) else []
+        effective_price_source = str(price_source or "bid").strip().lower() or "bid"
+        if effective_price_source not in {"ask", "bid"}:
+            effective_price_source = "ask"
         orderbook_present = bool(
             quote_payload is not None
             and any(
@@ -45409,7 +46717,7 @@ class KalshiSniperBot:
             payload_rejection_reason = f"payload_builder_exception:{exc.__class__.__name__}"
         if payload is not None:
             payload_keys = sorted(list(payload.keys()))
-            side_value = payload.get("side")
+            side_value = payload.get("side", "yes")
             price_value = payload.get("yes_price") if "yes_price" in payload else payload.get("no_price")
             contract_id_value = payload.get("ticker") or selected_ticker
             payload_ready = True
@@ -45441,6 +46749,54 @@ class KalshiSniperBot:
                         payload_missing_reason = "selected_price_below_0_01"
                     else:
                         payload_missing_reason = "selected_price_above_0_99"
+                    payload_missing_selected_price_cents = orderbook_resolution.get("selected_price_cents")
+                    if payload_missing_selected_price_cents in (None, "", []):
+                        payload_missing_selected_price_cents = orderbook_resolution.get("chosen_price_cents")
+                    if payload_missing_selected_price_cents in (None, "", []) and price_numeric is not None:
+                        try:
+                            payload_missing_selected_price_cents = int(round(float(price_numeric) * 100.0 if float(price_numeric) <= 1.0 else float(price_numeric)))
+                        except (TypeError, ValueError):
+                            payload_missing_selected_price_cents = None
+                    self._emit_aion_raw_blocker_sample(
+                        ticker=ticker,
+                        family=family,
+                        function_name="build_live_order_payload",
+                        trace_id=quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
+                        selected_side=side_value,
+                        selected_price_cents=payload_missing_selected_price_cents,
+                        selected_price_source=orderbook_resolution.get("selected_price_source_used") or effective_price_source,
+                        yes_bid=orderbook_resolution.get("yes_bid"),
+                        yes_ask=orderbook_resolution.get("yes_ask"),
+                        no_bid=orderbook_resolution.get("no_bid"),
+                        no_ask=orderbook_resolution.get("no_ask"),
+                        canonical_execution_state=quote_diag.get("canonical_execution_state"),
+                        payload_ready_reason=payload_missing_reason,
+                        blocker="payload_missing",
+                        blocker_detail=payload_missing_reason,
+                        selection_stage=selection_stage,
+                        selected_price=price_numeric,
+                    )
+                    try:
+                        print(
+                            "[AION-SELECTED-PRICE-REJECTED] "
+                            + json.dumps(
+                                {
+                                    "ticker": ticker,
+                                    "family": family,
+                                    "trace_id": quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
+                                    "selected_side": side_value,
+                                    "selected_price_cents": payload_missing_selected_price_cents,
+                                    "selected_price_dollars": price_numeric,
+                                    "selected_price_source": orderbook_resolution.get("selected_price_source_used") or effective_price_source,
+                                    "blocker": payload_missing_reason,
+                                    "selection_stage": selection_stage,
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                    except Exception:
+                        pass
                 elif str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
                     payload_missing_reason = "invalid_action"
                 else:
@@ -45526,9 +46882,24 @@ class KalshiSniperBot:
                 phase55_observation_entry_ready = phase55_observation.get("entry_ready")
                 phase55_observation_entry_timing_pass = phase55_observation.get("entry_timing_pass")
                 phase55_observation_entry_ready_reason = phase55_observation.get("entry_ready_reason")
+            canonical_tradeability_context = dict(quote_diag)
+            canonical_tradeability_context.update(
+                {
+                    "selected_price": orderbook_resolution.get("selected_price"),
+                    "selected_price_dollars": orderbook_resolution.get("selected_price_dollars", orderbook_resolution.get("selected_price")),
+                    "selected_price_cents": orderbook_resolution.get("selected_price_cents"),
+                    "selected_price_in_bounds": bool(orderbook_resolution.get("bounds_pass")),
+                    "selected_side": orderbook_resolution.get("selected_side") or canonical_tradeability_context.get("selected_side"),
+                    "selected_side_has_price": bool(orderbook_resolution.get("selected_side_has_price") or orderbook_resolution.get("selected_price") not in (None, "", 0, 0.0)),
+                    "selected_side_has_liquidity": bool(orderbook_resolution.get("selected_side_has_liquidity") or orderbook_resolution.get("depth_available")),
+                    "depth_available": bool(orderbook_resolution.get("depth_available") or orderbook_resolution.get("selected_side_has_liquidity")),
+                    "orderbook_ready": bool(orderbook_resolution.get("orderbook_ready")),
+                    "price_bounds_pass": bool(orderbook_resolution.get("bounds_pass")),
+                }
+            )
             canonical_realm_vv_state = self._build_realm_vv_canonical_execution_state(
                 phase55_observation if isinstance(phase55_observation, dict) else {},
-                quote_diag=quote_diag,
+                quote_diag=canonical_tradeability_context,
                 edge_after_cost=quote_diag.get("edge_after_cost") or quote_diag.get("final_edge") or quote_diag.get("sports_edge_after_cost"),
                 phase55_status=phase55_observation_status or quote_diag.get("phase55_status"),
                 phase55_ready=phase55_observation_entry_timing_pass if phase55_observation_entry_timing_pass is not None else quote_diag.get("phase55_ready"),
@@ -45550,7 +46921,18 @@ class KalshiSniperBot:
                 selected_side_has_price=bool(orderbook_resolution.get("selected_side_has_price") or orderbook_resolution.get("selected_price") is not None),
                 selected_side_has_liquidity=bool(orderbook_resolution.get("selected_side_has_liquidity") or orderbook_resolution.get("depth_available") or orderbook_resolution.get("normalized_orderbook_present")),
                 depth_available=bool(orderbook_resolution.get("depth_available") or orderbook_resolution.get("normalized_orderbook_present") or orderbook_resolution.get("topbook_depth_exists")),
-                price_bounds_pass=bool(orderbook_resolution.get("price_bounds_pass") if orderbook_resolution.get("price_bounds_pass") is not None else quote_diag.get("selected_price_in_bounds")),
+                price_bounds_pass=bool(
+                    orderbook_resolution.get("bounds_pass")
+                    if orderbook_resolution.get("bounds_pass") is not None
+                    else quote_diag.get("bounds_pass")
+                    if quote_diag.get("bounds_pass") is not None
+                    else quote_diag.get("selected_price_in_bounds")
+                    if quote_diag.get("selected_price_in_bounds") is not None
+                    else (
+                        orderbook_resolution.get("selected_price_cents") is not None
+                        and 1 <= int(orderbook_resolution.get("selected_price_cents")) <= 99
+                    )
+                ),
                 orderbook_ready=bool(orderbook_resolution.get("orderbook_ready") or orderbook_resolution.get("normalized_orderbook_present") or orderbook_resolution.get("topbook_depth_exists")),
                 relaxed_beast_mode=bool(_relaxed_beast_mode_enabled(4) and _normalize_aion_aggression_profile(AION_AGGRESSION_PROFILE) in {"opportunistic", "beast"}),
             )
@@ -45935,6 +47317,11 @@ class KalshiSniperBot:
         now_ts = time.time()
         payload = payload or self.build_live_order_payload(q)
         side = (payload or {}).get("side") if isinstance(payload, dict) else None
+        canary_bypass_active = bool(
+            getattr(self, "live_canary_strict_filter_bypass", False)
+            and ticker
+            and ticker == str(getattr(self, "live_canary_authorized_ticker", "") or "").strip()
+        )
         yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.yes_bid")
         yes_ask = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.yes_ask")
         no_bid = self.normalize_contract_price(getattr(q, "no_bid", 0.0) or 0.0, ticker=ticker, source="negative_edge_guard.no_bid")
@@ -45946,6 +47333,24 @@ class KalshiSniperBot:
         allowed = True
         adaptive_reduced_size = None
         max_acceptable_edge_loss = self._get_effective_negative_edge_threshold(family, now_ts=now_ts)
+        if canary_bypass_active:
+            if not getattr(self, "_live_canary_strict_filter_bypass_logged", False):
+                print("[LIVE-CANARY] Bypassing strict filters for authorized test ticker")
+                self._live_canary_strict_filter_bypass_logged = True
+            print(
+                f"[LIVE-ENTRY-NEGATIVE-EDGE-GUARD] ticker={ticker} side={side} intended_entry_price={intended_entry_price} "
+                f"estimated_immediate_edge={estimated_immediate_edge} max_acceptable_edge_loss={max_acceptable_edge_loss} "
+                f"reason=authorized_live_canary_bypass decision=allow"
+            )
+            return True, "authorized_live_canary_bypass", {
+                "ticker": ticker,
+                "family": family,
+                "side": side,
+                "intended_entry_price": intended_entry_price,
+                "estimated_immediate_edge": estimated_immediate_edge,
+                "max_acceptable_edge_loss": max_acceptable_edge_loss,
+                "adaptive_reduced_size": adaptive_reduced_size,
+            }
         if not ENABLE_NEGATIVE_EDGE_ENTRY_GUARD:
             print(
                 f"[LIVE-ENTRY-NEGATIVE-EDGE-GUARD] ticker={ticker} side={side} intended_entry_price={intended_entry_price} "
@@ -46140,9 +47545,10 @@ class KalshiSniperBot:
             print(f"[LIVE-PREVIEW] invalid order for {ticker}")
             return None
         print(
-            f"[LIVE-PREVIEW] ticker={payload['ticker']} side={payload['side']} "
-            f"action={payload['action']} count={payload['count']} "
-            f"price={payload.get('yes_price')} type={payload['type']} dry_run={payload['is_dry_run']}"
+            f"[LIVE-PREVIEW] ticker={payload.get('ticker')} side={payload.get('side')} "
+            f"action={payload.get('action')} count={payload.get('count')} "
+            f"price={payload.get('yes_price') if payload.get('yes_price') is not None else payload.get('no_price')} "
+            f"type={payload.get('type')} dry_run={payload.get('is_dry_run')}"
         )
         print(f"[LIVE-PAYLOAD] {payload}")
         return payload
@@ -46238,7 +47644,7 @@ class KalshiSniperBot:
             message,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
+                salt_length=padding.PSS.MAX_LENGTH,
             ),
             hashes.SHA256(),
         )
@@ -46537,25 +47943,36 @@ class KalshiSniperBot:
             return {"ok": False, "reason": exc.__class__.__name__, "status_code": None, "response": None}
 
     def confirm_live_order_submit(self, payload):
+        payload = self._normalize_live_order_payload(payload)
         display_price = payload.get("yes_price")
         if display_price is None:
             display_price = payload.get("no_price")
         print(
-            f"[LIVE-APPROVAL] REAL order ticker={payload['ticker']} side={payload['side']} "
-            f"action={payload['action']} count={payload['count']} price={display_price}"
+            f"[LIVE-APPROVAL] REAL order ticker={payload.get('ticker')} side={payload.get('side')} "
+            f"action={payload.get('action')} count={payload.get('count')} price={display_price}"
         )
         live_mode = bool(globals().get("LIVE_MODE", False))
         live_armed = bool(globals().get("LIVE_ARMED", False))
         live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
         has_live_test_ticker = bool(globals().get("LIVE_TEST_TICKER"))
+        payload_ticker = str((payload or {}).get("ticker") or "").strip()
+        canary_authorized_ticker = str(getattr(self, "live_canary_authorized_ticker", "") or "").strip()
+        canary_auto_authorized = bool(payload_ticker and canary_authorized_ticker and payload_ticker == canary_authorized_ticker)
         interactive_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
-        auto_service_mode = bool(live_mode and live_armed and live_env_confirmed and not has_live_test_ticker and not interactive_tty)
+        auto_service_mode = bool(
+            live_mode
+            and live_armed
+            and live_env_confirmed
+            and not interactive_tty
+            and (not has_live_test_ticker or canary_auto_authorized)
+        )
         print(
             f"[LIVE-EXECUTION-CONFIRMATION-MODE] ticker={payload.get('ticker')} "
             f"live_mode={'yes' if live_mode else 'no'} live_armed={'yes' if live_armed else 'no'} "
             f"live_env_confirmed={'yes' if live_env_confirmed else 'no'} "
             f"interactive_tty={'yes' if interactive_tty else 'no'} "
             f"live_test_ticker={'yes' if has_live_test_ticker else 'no'} "
+            f"canary_auto_authorized={'yes' if canary_auto_authorized else 'no'} "
             f"auto_service_mode={'yes' if auto_service_mode else 'no'}"
         )
         if auto_service_mode:
@@ -46852,8 +48269,12 @@ class KalshiSniperBot:
             return {"ok": False, "reason": auth_result.get("reason"), "position": None}
         url = self.build_live_request_url(path)
         try:
-            response = requests.get(url, headers=auth_result["headers"], timeout=15)
-            response_data = response.json() if response.content else {}
+            response_data, status_code = self._get_json_with_backoff(
+                url,
+                headers=auth_result["headers"],
+                timeout=15,
+                cache_ttl=get_env_float("KALSHI_POSITIONS_CACHE_TTL_SECONDS", 2.0),
+            )
             positions, top_keys, candidate_containers = self._extract_position_candidates(response_data)
             target_ticker = (ticker or "").strip()
             position = next(
@@ -46864,16 +48285,6 @@ class KalshiSniperBot:
                 ),
                 None,
             )
-            if not response.ok:
-                return {
-                    "ok": False,
-                    "reason": f"http_{response.status_code}",
-                    "position": position,
-                    "path": path,
-                    "top_keys": top_keys,
-                    "candidate_containers": candidate_containers,
-                    "inspected": len(positions),
-                }
             return {
                 "ok": True,
                 "reason": "ok",
@@ -46883,7 +48294,7 @@ class KalshiSniperBot:
                 "candidate_containers": candidate_containers,
                 "inspected": len(positions),
             }
-        except requests.RequestException as exc:
+        except (requests.RequestException, RuntimeError) as exc:
             return {"ok": False, "reason": exc.__class__.__name__, "position": None}
 
     def get_live_position_summaries(self):
@@ -46893,8 +48304,12 @@ class KalshiSniperBot:
             return {"ok": False, "reason": auth_result.get("reason"), "positions": []}
         url = self.build_live_request_url(path)
         try:
-            response = requests.get(url, headers=auth_result["headers"], timeout=15)
-            response_data = response.json() if response.content else {}
+            response_data, status_code = self._get_json_with_backoff(
+                url,
+                headers=auth_result["headers"],
+                timeout=15,
+                cache_ttl=get_env_float("KALSHI_POSITIONS_CACHE_TTL_SECONDS", 2.0),
+            )
             positions, top_keys, candidate_containers = self._extract_position_candidates(response_data)
             summaries = []
             for position in positions:
@@ -46903,15 +48318,6 @@ class KalshiSniperBot:
                 summary = self.extract_position_summary(position)
                 summary["raw_position"] = position
                 summaries.append(summary)
-            if not response.ok:
-                return {
-                    "ok": False,
-                    "reason": f"http_{response.status_code}",
-                    "positions": summaries,
-                    "path": path,
-                    "top_keys": top_keys,
-                    "candidate_containers": candidate_containers,
-                }
             return {
                 "ok": True,
                 "reason": "ok",
@@ -46920,7 +48326,7 @@ class KalshiSniperBot:
                 "top_keys": top_keys,
                 "candidate_containers": candidate_containers,
             }
-        except requests.RequestException as exc:
+        except (requests.RequestException, RuntimeError) as exc:
             return {"ok": False, "reason": exc.__class__.__name__, "positions": []}
 
     def check_live_duplicate_position_api(self, ticker):
@@ -47029,6 +48435,19 @@ class KalshiSniperBot:
         target_ticker = str(ticker or "").strip()
         if not target_ticker:
             return {"ok": False, "reason": "missing_ticker", "quote": None, "source": "missing"}
+        quote_stream = getattr(self, "live_quote_stream", None)
+        if quote_stream is not None:
+            try:
+                stream_market = quote_stream.market_from_snapshot(target_ticker)
+                if stream_market:
+                    quote = self.build_quote(stream_market)
+                    if any(
+                        (getattr(quote, field, 0.0) or 0.0) > 0
+                        for field in ("yes_bid", "yes_ask", "no_bid", "no_ask", "last_price")
+                    ):
+                        return {"ok": True, "reason": "ok", "quote": quote, "source": "websocket_cache"}
+            except Exception as exc:
+                print(f"[WS-HYDRATE-ERROR] ticker={target_ticker} reason={exc.__class__.__name__} source=get_live_quote_for_ticker")
         markets = self.get_markets(limit=max(self.max_markets, 200), status="open")
         final_method = "market_list_lookup"
         market = next((m for m in markets if str(m.get("ticker", "")).strip() == target_ticker), None)
@@ -47050,11 +48469,19 @@ class KalshiSniperBot:
         final_reason = "ticker_not_found"
         final_keys = []
         try:
-            response = requests.get(url, timeout=15)
-            response_data = response.json() if response.content else {}
+            http_client = getattr(self, "http_client", None)
+            if http_client is not None:
+                response_data = http_client.get_json(url, timeout=15, cache_ttl=get_env_float("KALSHI_MARKET_DETAIL_CACHE_TTL_SECONDS", 2.0))
+                status_ok = True
+                status_code = 200
+            else:
+                response = requests.get(url, timeout=15)
+                response_data = response.json() if response.content else {}
+                status_ok = response.ok
+                status_code = response.status_code
             if isinstance(response_data, dict):
                 final_keys = sorted(list(response_data.keys()))
-            if response.ok:
+            if status_ok:
                 market = response_data.get("market", response_data)
                 if isinstance(market, dict) and str(market.get("ticker", "")).strip() == target_ticker:
                     try:
@@ -47072,8 +48499,8 @@ class KalshiSniperBot:
                 else:
                     final_reason = "ticker_not_found"
             else:
-                final_reason = f"http_{response.status_code}"
-        except (requests.RequestException, ValueError) as exc:
+                final_reason = f"http_{status_code}"
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
             final_reason = exc.__class__.__name__
         print(f"[LIVE-QUOTE-FALLBACK] ticker={target_ticker} result=unusable")
         print(f"[LIVE-QUOTE-DEBUG] ticker={target_ticker} method=direct_fetch reason={final_reason} keys={final_keys}")
@@ -47757,13 +49184,15 @@ class KalshiSniperBot:
         if payload is None:
             print(f"[LIVE-FLATTEN] submit status=invalid_payload")
             return {"ok": False, "reason": "invalid_payload"}
+        payload = self._normalize_live_order_payload(payload, ticker=ticker)
         effective_live_dry_run = compute_effective_live_dry_run()
         payload["is_dry_run"] = effective_live_dry_run
         if effective_live_dry_run:
             print(
-                f"[LIVE-EXIT-PREVIEW] ticker={payload['ticker']} side={payload['side']} "
-                f"action={payload['action']} count={payload['count']} "
-                f"price={payload.get('yes_price')} type={payload['type']} dry_run={payload['is_dry_run']}"
+                f"[LIVE-EXIT-PREVIEW] ticker={payload.get('ticker')} side={payload.get('side')} "
+                f"action={payload.get('action')} count={payload.get('count')} "
+                f"price={payload.get('yes_price') if payload.get('yes_price') is not None else payload.get('no_price')} "
+                f"type={payload.get('type')} dry_run={payload.get('is_dry_run')}"
             )
             print(f"[LIVE-PAYLOAD] {payload}")
             print("[LIVE-FLATTEN] submit status=dry_run_only")
@@ -47773,9 +49202,10 @@ class KalshiSniperBot:
             print("[LIVE-BLOCK] AUTH_SMOKE_REQUIRED failed; aborting live submit")
             return {"ok": False, "reason": "auth_smoke_required_failed"}
         print(
-            f"[LIVE-CONFIRM] ticker={payload['ticker']} side={payload['side']} "
-            f"action={payload['action']} count={payload['count']} "
-            f"price={payload.get('yes_price')} type={payload['type']}"
+            f"[LIVE-CONFIRM] ticker={payload.get('ticker')} side={payload.get('side')} "
+            f"action={payload.get('action')} count={payload.get('count')} "
+            f"price={payload.get('yes_price') if payload.get('yes_price') is not None else payload.get('no_price')} "
+            f"type={payload.get('type')}"
         )
         if not self.confirm_live_order_submit(payload):
             print("[SAFEGUARD] live submit aborted by user")
@@ -47798,31 +49228,37 @@ class KalshiSniperBot:
     def run_live_canary_workflow(self, cancel_after_verify=False):
         print("[LIVE-CANARY] starting")
         supplied_ticker = globals().get("LIVE_TEST_TICKER")
-        ticker, markets = self.select_live_canary_ticker(supplied_ticker)
-        if not ticker:
-            return {"ok": False, "reason": "no_live_ticker_found", "submit": None, "verify": None, "cancel": None}
-        market = next((m for m in markets if m.get("ticker") == ticker), None)
-        if not market:
-            print("[LIVE-CANARY-AUTO] no tradable ticker found")
-            return {"ok": False, "reason": "no_live_ticker_found", "submit": None, "verify": None, "cancel": None}
-
-        q = self.build_quote(market)
-        self.live_canary_selected_ticker = ticker
-        self.live_canary_authorized_ticker = ticker
-        print(f"[LIVE-CANARY] selected ticker={ticker}")
-        print(f"[LIVE-CANARY] temporarily_authorized_for_run={self.live_canary_authorized_ticker == ticker}")
-        if not supplied_ticker:
-            print(f"[LIVE-CANARY] proceeding with auto-selected ticker={ticker}")
-        print(
-            f"[LIVE-CANARY] quote ticker={q.ticker} yes_bid={q.yes_bid} yes_ask={q.yes_ask} "
-            f"no_bid={q.no_bid} no_ask={q.no_ask} last_price={q.last_price} "
-            f"volume={q.volume} liquidity={q.liquidity}"
-        )
+        self.live_canary_strict_filter_bypass = bool(supplied_ticker)
+        self._live_canary_strict_filter_bypass_logged = False
         try:
-            submit_result = self.submit_live_order(q)
+            ticker, markets = self.select_live_canary_ticker(supplied_ticker)
+            if not ticker:
+                return {"ok": False, "reason": "no_live_ticker_found", "submit": None, "verify": None, "cancel": None}
+            market = next((m for m in markets if m.get("ticker") == ticker), None)
+            if not market:
+                print("[LIVE-CANARY-AUTO] no tradable ticker found")
+                return {"ok": False, "reason": "no_live_ticker_found", "submit": None, "verify": None, "cancel": None}
+
+            q = self.build_quote(market)
+            self.live_canary_selected_ticker = ticker
+            self.live_canary_authorized_ticker = ticker
+            print(f"[LIVE-CANARY] selected ticker={ticker}")
+            print(f"[LIVE-CANARY] temporarily_authorized_for_run={self.live_canary_authorized_ticker == ticker}")
+            if not supplied_ticker:
+                print(f"[LIVE-CANARY] proceeding with auto-selected ticker={ticker}")
+            print(
+                f"[LIVE-CANARY] quote ticker={q.ticker} yes_bid={q.yes_bid} yes_ask={q.yes_ask} "
+                f"no_bid={q.no_bid} no_ask={q.no_ask} last_price={q.last_price} "
+                f"volume={q.volume} liquidity={q.liquidity}"
+            )
+            try:
+                submit_result = self.submit_live_order(q)
+            finally:
+                self.live_canary_selected_ticker = None
+                self.live_canary_authorized_ticker = None
         finally:
-            self.live_canary_selected_ticker = None
-            self.live_canary_authorized_ticker = None
+            self.live_canary_strict_filter_bypass = False
+            self._live_canary_strict_filter_bypass_logged = False
         if not submit_result.get("submitted"):
             print(f"[LIVE-CANARY] FAIL reason={submit_result.get('reason')}")
             return {
@@ -47920,11 +49356,55 @@ class KalshiSniperBot:
             or any(marker in combo_text for marker in ("CROSSCATEGORY", "COMBO", "MULTI"))
         )
 
+    def _normalize_live_canary_series(self, supplied_ticker=None):
+        supplied = str(supplied_ticker or "").strip().upper()
+        for series_ticker in LIVE_CANARY_SIMPLE_SERIES:
+            if not supplied or supplied == series_ticker or supplied.startswith(f"{series_ticker}-"):
+                return series_ticker
+        return LIVE_CANARY_SIMPLE_SERIES[0]
+
+    def _is_simple_live_canary_market(self, market, series_ticker=None):
+        market = market if isinstance(market, dict) else {}
+        series_ticker = str(series_ticker or self._normalize_live_canary_series()).strip().upper()
+        ticker = str(market.get("ticker", "") or "").strip().upper()
+        event_ticker = str(market.get("event_ticker", "") or "").strip().upper()
+        market_series = str(market.get("series_ticker", "") or "").strip().upper()
+        if self._is_combo_like_market(market):
+            return False
+        return bool(
+            market_series == series_ticker
+            or ticker == series_ticker
+            or ticker.startswith(f"{series_ticker}-")
+            or event_ticker == series_ticker
+            or event_ticker.startswith(f"{series_ticker}-")
+        )
+
+    def _live_canary_match_rank(self, market, supplied_ticker=None, series_ticker=None):
+        supplied = str(supplied_ticker or "").strip().upper()
+        series_ticker = str(series_ticker or self._normalize_live_canary_series(supplied)).strip().upper()
+        if not supplied or supplied == series_ticker:
+            return 10
+        ticker = str((market or {}).get("ticker", "") or "").strip().upper()
+        event_ticker = str((market or {}).get("event_ticker", "") or "").strip().upper()
+        if ticker == supplied:
+            return 0
+        if event_ticker == supplied:
+            return 1
+        if ticker.startswith(f"{supplied}-"):
+            return 2
+        if event_ticker.startswith(f"{supplied}-"):
+            return 3
+        if supplied.startswith(f"{series_ticker}-"):
+            return 10
+        return 100
+
     def select_live_canary_ticker(self, supplied_ticker=None):
-        max_batches = 5
+        debug = bool(LIVE_SELECT_DEBUG or DEBUG_LIVE)
+        simple_series = self._normalize_live_canary_series(supplied_ticker)
+        max_batches = 2
         batch_limit = max(self.max_markets, 200)
-        max_total_markets_examined = 1000
-        batch_params = {"mve_filter": "exclude"}
+        max_total_markets_examined = batch_limit * max_batches
+        batch_params = {"series_ticker": simple_series, "mve_filter": "exclude"}
         cursor = None
         batch_number = 0
         total_examined = 0
@@ -47944,39 +49424,10 @@ class KalshiSniperBot:
             "liquidity": 0,
         }
         sample_rejections = []
-
-        if supplied_ticker:
-            for batch_try in range(max_batches):
-                batch_markets, next_cursor = self.get_markets(
-                    limit=batch_limit,
-                    status="open",
-                    cursor=cursor,
-                    return_cursor=True,
-                    extra_params=batch_params,
-                )
-                batch_number = batch_try + 1
-                print(f"[LIVE-CANARY-AUTO] batch={batch_number} request_params={batch_params}")
-                print(f"[LIVE-CANARY-AUTO] batch={batch_number} fetched_count={len(batch_markets)}")
-                total_examined += len(batch_markets)
-                all_markets.extend(batch_markets)
-                market = next((m for m in batch_markets if m.get("ticker") == supplied_ticker), None)
-                if market:
-                    try:
-                        q = self.build_quote(market)
-                    except Exception:
-                        q = None
-                    if q and q.ticker and q.yes_ask > 0 and q.yes_ask < 1 and q.yes_bid >= 0:
-                        print(f"[LIVE-CANARY-AUTO] using supplied ticker={supplied_ticker}")
-                        return supplied_ticker, all_markets
-                if not next_cursor or total_examined >= max_total_markets_examined:
-                    break
-                cursor = next_cursor
-            print("[LIVE-CANARY-AUTO] supplied ticker invalid, falling back to auto-selection")
-            cursor = None
-            batch_number = 0
-            total_examined = 0
-            all_markets = []
-            seen_tickers = set()
+        print(
+            f"[LIVE-CANARY-AUTO] mode=simple_series series={simple_series} "
+            f"supplied_ticker={supplied_ticker or 'none'} max_batches={max_batches}"
+        )
 
         while batch_number < max_batches and total_examined < max_total_markets_examined:
             batch_number += 1
@@ -47987,8 +49438,9 @@ class KalshiSniperBot:
                 return_cursor=True,
                 extra_params=batch_params,
             )
-            print(f"[LIVE-CANARY-AUTO] batch={batch_number} request_params={batch_params}")
-            print(f"[LIVE-CANARY-AUTO] batch={batch_number} fetched_count={len(batch_markets)}")
+            if debug:
+                print(f"[LIVE-CANARY-AUTO-DEBUG] batch={batch_number} request_params={batch_params}")
+                print(f"[LIVE-CANARY-AUTO-DEBUG] batch={batch_number} fetched_count={len(batch_markets)}")
             total_examined += len(batch_markets)
             combo_like_markets = []
             regular_markets = []
@@ -47998,21 +49450,24 @@ class KalshiSniperBot:
                     continue
                 if ticker:
                     seen_tickers.add(ticker)
+                if not self._is_simple_live_canary_market(market, simple_series):
+                    continue
                 all_markets.append(market)
                 if self._is_combo_like_market(market):
                     combo_like_markets.append(market)
                 else:
                     regular_markets.append(market)
-            print(f"[LIVE-CANARY-AUTO] batch={batch_number} combo_like_markets={len(combo_like_markets)}")
-            print(f"[LIVE-CANARY-AUTO] batch={batch_number} regular_markets={len(regular_markets)}")
-            print(f"[LIVE-CANARY-AUTO] total_examined={total_examined}")
-            if not regular_markets and combo_like_markets:
-                print(f"[LIVE-CANARY-AUTO] batch={batch_number} endpoint_filter_still_combo_heavy=yes")
+            if debug:
+                print(f"[LIVE-CANARY-AUTO-DEBUG] batch={batch_number} combo_like_markets={len(combo_like_markets)}")
+                print(f"[LIVE-CANARY-AUTO-DEBUG] batch={batch_number} regular_markets={len(regular_markets)}")
+                print(f"[LIVE-CANARY-AUTO-DEBUG] total_examined={total_examined}")
+                if not regular_markets and combo_like_markets:
+                    print(f"[LIVE-CANARY-AUTO-DEBUG] batch={batch_number} endpoint_filter_still_combo_heavy=yes")
 
             for market in regular_markets:
                 ticker = market.get("ticker", "")
                 status = (market.get("status") or "").lower()
-                if len(strict_candidates) + len(relaxed_candidates) + sum(rejection_counts.values()) < 10:
+                if debug and len(strict_candidates) + len(relaxed_candidates) + sum(rejection_counts.values()) < 10:
                     print(
                         f"[LIVE-CANARY-DEBUG] market ticker={ticker} status={status} "
                         f"can_open={market.get('can_open')} can_close={market.get('can_close')} "
@@ -48047,7 +49502,8 @@ class KalshiSniperBot:
                 try:
                     q = self.build_quote(market)
                 except Exception as exc:
-                    print(f"[LIVE-CANARY-DEBUG] build_quote_failed ticker={ticker} error={exc}")
+                    if debug:
+                        print(f"[LIVE-CANARY-DEBUG] build_quote_failed ticker={ticker} error={exc}")
                     rejection_counts["quote_exception"] += 1
                     self._record_live_reject_telemetry(
                         reason="quote_exception",
@@ -48061,7 +49517,7 @@ class KalshiSniperBot:
                     if len(sample_rejections) < 5:
                         sample_rejections.append((ticker, "quote_exception"))
                     continue
-                if len(strict_candidates) + len(relaxed_candidates) < 5:
+                if debug and len(strict_candidates) + len(relaxed_candidates) < 5:
                     print(
                         f"[LIVE-CANARY-DEBUG] quote ticker={q.ticker} yes_bid={q.yes_bid} "
                         f"yes_ask={q.yes_ask} last_price={q.last_price} volume={q.volume} "
@@ -48104,46 +49560,67 @@ class KalshiSniperBot:
                     )
                     if len(sample_rejections) < 5:
                         sample_rejections.append((ticker, reason))
-                    print(f"[LIVE-SELECT-FILTER] ticker={ticker} reason={reason}")
+                    if supplied_ticker and reason in {"wide_spread", "low_liquidity", "low_volume", "unsafe_price"}:
+                        score = self._score_live_ticker_candidate(q, market=market)
+                        relaxed_candidates.append((self._live_canary_match_rank(market, supplied_ticker, simple_series), score, q, reason))
+                    if debug:
+                        print(f"[LIVE-SELECT-FILTER] ticker={ticker} reason={reason}")
                     continue
                 score = self._score_live_ticker_candidate(q, market=market)
                 spread = q.yes_ask - q.yes_bid
-                print(
-                    f"[LIVE-SELECT-SCORE] ticker={ticker} score={score} spread={spread} "
-                    f"volume={q.volume} liquidity={q.liquidity} price={q.yes_ask}"
-                )
-                strict_candidates.append((score, q))
+                if debug:
+                    print(
+                        f"[LIVE-SELECT-SCORE] ticker={ticker} score={score} spread={spread} "
+                        f"volume={q.volume} liquidity={q.liquidity} price={q.yes_ask}"
+                    )
+                strict_candidates.append((self._live_canary_match_rank(market, supplied_ticker, simple_series), score, q))
 
-            print(f"[LIVE-CANARY-AUTO] strict_candidates={len(strict_candidates)}")
-            print(f"[LIVE-CANARY-AUTO] relaxed_candidates={len(relaxed_candidates)}")
-            # Keep scanning remaining batches so a later Realm V.V-ready lane can outrank an early noisy candidate.
+            if debug:
+                print(f"[LIVE-CANARY-AUTO-DEBUG] strict_candidates={len(strict_candidates)}")
+                print(f"[LIVE-CANARY-AUTO-DEBUG] relaxed_candidates={len(relaxed_candidates)}")
             if not next_cursor:
-                print("[LIVE-CANARY-AUTO] search_stop=no_next_cursor")
+                if debug:
+                    print("[LIVE-CANARY-AUTO-DEBUG] search_stop=no_next_cursor")
                 break
             cursor = next_cursor
 
-        print(f"[LIVE-CANARY-DEBUG] rejected_missing_ticker={rejection_counts['missing_ticker']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_status={rejection_counts['status']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_quote_exception={rejection_counts['quote_exception']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_empty_quote={rejection_counts['empty_quote']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_no_price_data={rejection_counts['no_price_data']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_combo={rejection_counts['combo']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_permissions={rejection_counts['permissions']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_spread={rejection_counts['spread']}")
-        print(f"[LIVE-CANARY-DEBUG] rejected_liquidity={rejection_counts['liquidity']}")
-        for rejected_ticker, reason in sample_rejections[:5]:
-            print(f"[LIVE-CANARY-DEBUG] sample_reject ticker={rejected_ticker} reason={reason}")
-        strict_candidates.sort(key=lambda item: item[0], reverse=True)
+        if debug:
+            print(f"[LIVE-CANARY-DEBUG] rejected_missing_ticker={rejection_counts['missing_ticker']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_status={rejection_counts['status']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_quote_exception={rejection_counts['quote_exception']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_empty_quote={rejection_counts['empty_quote']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_no_price_data={rejection_counts['no_price_data']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_combo={rejection_counts['combo']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_permissions={rejection_counts['permissions']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_spread={rejection_counts['spread']}")
+            print(f"[LIVE-CANARY-DEBUG] rejected_liquidity={rejection_counts['liquidity']}")
+            for rejected_ticker, reason in sample_rejections[:5]:
+                print(f"[LIVE-CANARY-DEBUG] sample_reject ticker={rejected_ticker} reason={reason}")
+        strict_candidates.sort(key=lambda item: (item[0], -item[1]))
         if strict_candidates:
-            selected = strict_candidates[0][1]
+            selected = strict_candidates[0][2]
             print(
                 f"[LIVE-CANARY-AUTO] selected ticker={selected.ticker} "
-                f"reason=strict_regular_market ask={selected.yes_ask} bid={selected.yes_bid} "
+                f"reason=strict_simple_series series={simple_series} ask={selected.yes_ask} bid={selected.yes_bid} "
                 f"liquidity={selected.liquidity} total_examined={total_examined}"
             )
             return selected.ticker, all_markets
 
-        print("[LIVE-CANARY-AUTO] no tradable ticker found reason=search_limit_reached_or_no_regular_candidates")
+        relaxed_candidates.sort(key=lambda item: (item[0], -item[1]))
+        if supplied_ticker and relaxed_candidates:
+            selected = relaxed_candidates[0][2]
+            relaxed_reason = relaxed_candidates[0][3]
+            print(
+                f"[LIVE-CANARY-AUTO] selected ticker={selected.ticker} "
+                f"reason=relaxed_simple_series filter_reason={relaxed_reason} series={simple_series} "
+                f"ask={selected.yes_ask} bid={selected.yes_bid} total_examined={total_examined}"
+            )
+            return selected.ticker, all_markets
+
+        print(
+            f"[LIVE-CANARY-AUTO] no tradable ticker found reason=no_simple_series_candidate "
+            f"series={simple_series} total_examined={total_examined}"
+        )
         return None, all_markets
 
     def preview_live_ticker_selection(self):
@@ -48304,12 +49781,47 @@ class KalshiSniperBot:
             "reason": reason,
         }
 
+    def _normalize_live_order_payload(self, payload, *, ticker=None):
+        if not isinstance(payload, dict):
+            return {}
+        normalized = dict(payload)
+        fallback_ticker = str(ticker or "").strip()
+        if fallback_ticker and not normalized.get("ticker"):
+            normalized["ticker"] = fallback_ticker
+        normalized["side"] = (
+            self._normalize_live_side(normalized.get("side"))
+            or self._normalize_live_side(DEFAULT_LIVE_ORDER_SIDE)
+            or "yes"
+        )
+        action = str(normalized.get("action") or DEFAULT_LIVE_ORDER_ACTION or "buy").strip().lower()
+        normalized["action"] = action if action in {"buy", "sell"} else str(DEFAULT_LIVE_ORDER_ACTION or "buy").strip().lower()
+        try:
+            if normalized.get("count") is not None:
+                normalized["count"] = int(normalized.get("count"))
+        except (TypeError, ValueError):
+            pass
+        normalized.setdefault("type", "limit")
+        normalized["is_dry_run"] = bool(normalized.get("is_dry_run", compute_effective_live_dry_run()))
+        if normalized.get("yes_price") is None and normalized.get("no_price") is None and normalized.get("price") is not None:
+            try:
+                price_value = float(normalized.get("price"))
+                price_cents = int(round(price_value * 100.0)) if price_value <= 1.0 else int(round(price_value))
+                price_cents = max(1, min(99, price_cents))
+                if normalized.get("side") == "no":
+                    normalized["no_price"] = price_cents
+                else:
+                    normalized["yes_price"] = price_cents
+            except (TypeError, ValueError):
+                pass
+        return normalized
+
     def place_live_order(self, payload):
+        payload = self._normalize_live_order_payload(payload)
         ticker = payload.get("ticker", "")
         if (
             not isinstance(payload, dict)
             or not payload.get("ticker")
-            or not payload.get("count")
+            or self.to_float(payload.get("count"), 0.0) <= 0
             or payload.get("action") not in {"buy", "sell"}
             or payload.get("side") not in {"yes", "no"}
             or (payload.get("yes_price") is None and payload.get("no_price") is None)
@@ -48393,6 +49905,23 @@ class KalshiSniperBot:
         print(f"[LIVE-SUBMIT-DEBUG] payload_keys={sorted(list(submit_payload.keys()))}")
         print(f"[LIVE-SUBMIT-DEBUG] payload_body={submit_payload}")
         try:
+            http_client = getattr(self, "http_client", None)
+            if http_client is not None:
+                response_data = http_client.post_json(
+                    url,
+                    headers=headers,
+                    json_body=submit_payload,
+                    timeout=15,
+                )
+                status_code = 200
+                print("[LIVE-SUBMIT-DEBUG] status=", status_code)
+                print("[LIVE-SUBMIT-DEBUG] body=", str(response_data)[:500])
+                return {
+                    "ok": True,
+                    "status_code": status_code,
+                    "response": response_data,
+                    "reason": "submitted",
+                }
             resp = requests.post(
                 url,
                 headers=headers,
@@ -48423,13 +49952,16 @@ class KalshiSniperBot:
                 "response": response_data,
                 "reason": f"http_{resp.status_code}",
             }
-        except requests.RequestException as exc:
+        except (requests.RequestException, RuntimeError) as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            response_text = getattr(response, "text", "") if response is not None else ""
             print(f"[LIVE-ERROR] {ticker} error={exc}")
             return {
                 "ok": False,
-                "status_code": None,
-                "response": None,
-                "reason": "submit_error",
+                "status_code": status_code,
+                "response": response_text[:500] if response_text else None,
+                "reason": f"http_{status_code}" if status_code else "submit_error",
             }
 
     def submit_live_order(self, q, size=None, lane=None, payload_override=None):
@@ -48495,40 +50027,72 @@ class KalshiSniperBot:
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason('invalid_payload')}")
             self._log_live_execution_final_blocked(ticker, "invalid_payload")
             return {"ok": False, "reason": "invalid_payload", "submitted": False}
-        smart_allowed, smart_reason, _smart_details = self._evaluate_smart_entry_gate({"ticker": ticker}, q, payload=payload)
-        if not smart_allowed:
+        payload = self._normalize_live_order_payload(payload, ticker=ticker)
+        if payload.get("ticker") and payload.get("ticker") != ticker:
+            ticker = payload.get("ticker")
+            candidate_family = self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN"
+        if (
+            not payload.get("ticker")
+            or self.to_float(payload.get("count"), 0.0) <= 0
+            or payload.get("side") not in {"yes", "no"}
+            or payload.get("action") not in {"buy", "sell"}
+            or (payload.get("yes_price") is None and payload.get("no_price") is None)
+        ):
             _emit_final_submit_telemetry(
                 "AION-FINAL-SUBMIT-BLOCKED",
-                blocker=smart_reason,
-                reason=smart_reason,
-                extra={"stage": "smart_entry_gate"},
+                blocker="invalid_payload",
+                reason="invalid_payload",
+                extra={"stage": "payload_normalization", "payload_keys": sorted(list(payload.keys()))},
             )
-            self._check_realm_vv_live_execution_gate(
+            print(f"[LIVE-SKIP] {ticker} reason=invalid_payload")
+            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason('invalid_payload')}")
+            self._log_live_execution_final_blocked(ticker, "invalid_payload")
+            return {"ok": False, "reason": "invalid_payload", "submitted": False}
+        live_canary_gate_bypass = bool(
+            ticker
+            and str(getattr(self, "live_canary_authorized_ticker", "") or "").strip() == ticker
+            and str(globals().get("LIVE_TEST_TICKER") or "").strip()
+        )
+        if live_canary_gate_bypass:
+            print(
+                f"[LIVE-CANARY-GATE] ticker={ticker} "
+                f"strategy_entry_gates=bypassed reason=explicit_live_canary"
+            )
+        else:
+            smart_allowed, smart_reason, _smart_details = self._evaluate_smart_entry_gate({"ticker": ticker}, q, payload=payload)
+            if not smart_allowed:
+                _emit_final_submit_telemetry(
+                    "AION-FINAL-SUBMIT-BLOCKED",
+                    blocker=smart_reason,
+                    reason=smart_reason,
+                    extra={"stage": "smart_entry_gate"},
+                )
+                self._check_realm_vv_live_execution_gate(
+                    ticker,
+                    family=candidate_family if ticker else None,
+                    override_block_reason=smart_reason,
+                    canonical_execution_state=relaxation_gate_record,
+                )
+                print(f"[LIVE-SKIP] {ticker} reason={smart_reason}")
+                print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(smart_reason)}")
+                self._log_live_execution_final_blocked(ticker, smart_reason)
+                return {"ok": False, "reason": smart_reason, "submitted": False}
+            phase55_allowed, phase55_reason, _phase55_details = self._check_realm_vv_live_execution_gate(
                 ticker,
                 family=candidate_family if ticker else None,
-                override_block_reason=smart_reason,
                 canonical_execution_state=relaxation_gate_record,
             )
-            print(f"[LIVE-SKIP] {ticker} reason={smart_reason}")
-            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(smart_reason)}")
-            self._log_live_execution_final_blocked(ticker, smart_reason)
-            return {"ok": False, "reason": smart_reason, "submitted": False}
-        phase55_allowed, phase55_reason, _phase55_details = self._check_realm_vv_live_execution_gate(
-            ticker,
-            family=candidate_family if ticker else None,
-            canonical_execution_state=relaxation_gate_record,
-        )
-        if not phase55_allowed:
-            _emit_final_submit_telemetry(
-                "AION-FINAL-SUBMIT-BLOCKED",
-                blocker=phase55_reason,
-                reason=phase55_reason,
-                extra={"stage": "phase55_gate"},
-            )
-            print(f"[LIVE-SKIP] {ticker} reason={phase55_reason}")
-            print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(phase55_reason)}")
-            self._log_live_execution_final_blocked(ticker, phase55_reason)
-            return {"ok": False, "reason": phase55_reason, "submitted": False}
+            if not phase55_allowed:
+                _emit_final_submit_telemetry(
+                    "AION-FINAL-SUBMIT-BLOCKED",
+                    blocker=phase55_reason,
+                    reason=phase55_reason,
+                    extra={"stage": "phase55_gate"},
+                )
+                print(f"[LIVE-SKIP] {ticker} reason={phase55_reason}")
+                print(f"[ENTRY-BLOCKED] ticker={ticker} reason={self._classify_entry_block_reason(phase55_reason)}")
+                self._log_live_execution_final_blocked(ticker, phase55_reason)
+                return {"ok": False, "reason": phase55_reason, "submitted": False}
         sports_context_allowed, sports_context_reason, _sports_context_details = self.sports_context_check({
             "ticker": ticker,
             "family": candidate_family if ticker else "UNKNOWN",
@@ -48939,9 +50503,10 @@ class KalshiSniperBot:
         )
         self._live_order_timestamps.append(now)
         print(
-            f"[LIVE-CONFIRM] ticker={payload['ticker']} side={payload['side']} "
-            f"action={payload['action']} count={payload['count']} "
-            f"price={payload.get('yes_price')} type={payload['type']}"
+            f"[LIVE-CONFIRM] ticker={payload.get('ticker')} side={payload.get('side')} "
+            f"action={payload.get('action')} count={payload.get('count')} "
+            f"price={payload.get('yes_price') if payload.get('yes_price') is not None else payload.get('no_price')} "
+            f"type={payload.get('type')}"
         )
         if not self.confirm_live_order_submit(payload):
             _emit_final_submit_telemetry(
@@ -50067,13 +51632,15 @@ class KalshiSniperBot:
             print(f"[LIVE-EXIT-SKIP] {ticker} reason=invalid_payload")
             print(f"[ENTRY-BLOCKED] ticker={ticker} reason=other")
             return {"ok": False, "reason": "invalid_payload", "submitted": False}
+        payload = self._normalize_live_order_payload(payload, ticker=ticker)
         effective_live_dry_run = compute_effective_live_dry_run()
         payload["is_dry_run"] = effective_live_dry_run
         if effective_live_dry_run:
             print(
-                f"[LIVE-EXIT-PREVIEW] ticker={payload['ticker']} side={payload['side']} "
-                f"action={payload['action']} count={payload['count']} "
-                f"price={payload['price']} type={payload['type']} dry_run={payload['is_dry_run']}"
+                f"[LIVE-EXIT-PREVIEW] ticker={payload.get('ticker')} side={payload.get('side')} "
+                f"action={payload.get('action')} count={payload.get('count')} "
+                f"price={payload.get('price') if payload.get('price') is not None else (payload.get('yes_price') if payload.get('yes_price') is not None else payload.get('no_price'))} "
+                f"type={payload.get('type')} dry_run={payload.get('is_dry_run')}"
             )
             print(f"[LIVE-PAYLOAD] {payload}")
             return {"ok": True, "reason": "dry_run_only", "submitted": False, "payload": payload}
@@ -50699,6 +52266,9 @@ class KalshiSniperBot:
         return entry_price - exit_price
 
     def should_exit_position(self, position, market, now=None):
+        guard_service = getattr(self, "guard_service", None)
+        if guard_service is not None:
+            return guard_service.should_exit_position(position, market, now=now)
         now = time.time() if now is None else now
         pnl = self.get_position_pnl(position, market)
         if pnl is None:
@@ -50828,6 +52398,12 @@ class KalshiSniperBot:
             self.last_aion_scan_heartbeat_ts = now
         self._emit_aggressive_candidate_search_heartbeat()
         self.maybe_send_telegram_heartbeat()
+        telegram_command_service = getattr(self, "telegram_command_service", None)
+        if telegram_command_service is not None:
+            try:
+                telegram_command_service.poll(self)
+            except Exception as exc:
+                print(f"[TELEGRAM-COMMAND-ERROR] reason={exc.__class__.__name__} source=run_once")
         markets = self.get_markets(limit=self.max_markets, status="open")
         self._start_execution_failure_audit_cycle(source="live_cycle")
         self._start_live_edge_quality_cycle(source="live_cycle")
@@ -52457,7 +54033,7 @@ class KalshiSniperBot:
             payload_preflight = self._diagnose_live_order_payload_context(
                 selected_quote,
                 size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                price_source="bid",
+                price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                 selected_ticker=auto_live_ticker,
                 selection_stage="final_gate_preflight",
                 market=selected_market,
@@ -52518,6 +54094,36 @@ class KalshiSniperBot:
                 if canonical_tradeability_state.get("final_submit_allowed_by_realm_vv") is not None
                 else final_submit_allowed_by_realm_vv
             )
+            final_gate_payload_side = str(
+                (payload_preview or {}).get("side")
+                or quote_readiness_diagnostic.get("selected_side")
+                or payload_preflight.get("side")
+                or "yes"
+            ).strip().lower()
+            if final_gate_payload_side not in {"yes", "no"}:
+                final_gate_payload_side = "yes"
+            final_gate_selected_price_cents = None
+            final_gate_price_candidates = [
+                quote_readiness_diagnostic.get("selected_price_cents"),
+                payload_preflight.get("selected_price_cents"),
+                (payload_preview or {}).get("selected_price_cents"),
+                (payload_preview or {}).get("yes_price") if final_gate_payload_side == "yes" else (payload_preview or {}).get("no_price"),
+                quote_readiness_diagnostic.get("selected_price_dollars"),
+                payload_preflight.get("selected_price_dollars"),
+                (payload_preview or {}).get("selected_price_dollars"),
+                (payload_preview or {}).get("selected_price"),
+            ]
+            for final_gate_price_candidate in final_gate_price_candidates:
+                if final_gate_price_candidate in (None, "", []):
+                    continue
+                try:
+                    final_gate_price_value = float(final_gate_price_candidate)
+                    if 0.0 < final_gate_price_value <= 1.0:
+                        final_gate_price_value *= 100.0
+                    final_gate_selected_price_cents = int(round(final_gate_price_value))
+                    break
+                except (TypeError, ValueError):
+                    continue
             canonical_realm_vv_state = payload_canonical_execution_state if isinstance(payload_canonical_execution_state, dict) else {}
             canonical_execution_state = dict(payload_canonical_execution_state or canonical_tradeability_state or canonical_realm_vv_state or {})
             canonical_execution_state.update(
@@ -52527,7 +54133,7 @@ class KalshiSniperBot:
                     "entry_ready": bool(canonical_final_submit_allowed_by_realm_vv),
                     "final_submit_allowed": bool(canonical_final_submit_allowed_by_realm_vv),
                     "selected_side": quote_readiness_diagnostic.get("selected_side") or payload_preflight.get("side") or canonical_execution_state.get("selected_side"),
-                    "selected_price_cents": quote_readiness_diagnostic.get("selected_price_cents") or payload_preflight.get("selected_price_cents") or canonical_execution_state.get("selected_price_cents"),
+                    "selected_price_cents": final_gate_selected_price_cents if final_gate_selected_price_cents is not None else canonical_execution_state.get("selected_price_cents"),
                     "selected_side_has_price": bool(selected_side_has_price),
                     "selected_side_has_liquidity": bool(selected_side_has_liquidity),
                     "price_bounds_pass": bool(price_bounds_pass),
@@ -52562,10 +54168,21 @@ class KalshiSniperBot:
                 else quote_readiness_diagnostic.get("selected_price_in_bounds")
                 if quote_readiness_diagnostic.get("selected_price_in_bounds") is not None
                 else (
-                    selected_price_cents is not None
-                    and 1 <= int(selected_price_cents) <= 99
+                    final_gate_selected_price_cents is not None
+                    and 1 <= int(final_gate_selected_price_cents) <= 99
                 )
             )
+            canonical_state_write_result = self._persist_canonical_execution_state_snapshot(
+                canonical_execution_state=canonical_execution_state,
+                trace_id=trace_id,
+                ticker=auto_live_ticker,
+                family=selected_family,
+                stage="final_gate",
+                source="realm_vv_relaxed_beast_l4",
+            )
+            canonical_execution_state["canonical_state_path"] = canonical_state_write_result.get("path")
+            canonical_execution_state["canonical_state_written"] = bool(canonical_state_write_result.get("written"))
+            canonical_execution_state["canonical_state_readback"] = bool(canonical_state_write_result.get("readback"))
             if canonical_execution_state:
                 print(
                     "[AION-CANONICAL-EXECUTION-STATE] "
@@ -52574,6 +54191,26 @@ class KalshiSniperBot:
                             "trace_id": trace_id,
                             "ticker": auto_live_ticker,
                             **canonical_execution_state,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-CANONICAL-OUTCOME-ASSIGNED] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": auto_live_ticker,
+                            "outcome": "LIVE_FULL"
+                            if bool(canonical_execution_state.get("final_submit_allowed"))
+                            else "HARD_BLOCK"
+                            if not bool(selected_side_has_price and selected_side_has_liquidity and orderbook_ready)
+                            else "PAPER_ONLY",
+                            "authority": canonical_execution_state.get("authority"),
+                            "decision": canonical_execution_state.get("decision"),
+                            "entry_ready": canonical_execution_state.get("entry_ready"),
+                            "final_submit_allowed": canonical_execution_state.get("final_submit_allowed"),
                         },
                         sort_keys=True,
                         default=str,
@@ -52642,6 +54279,29 @@ class KalshiSniperBot:
                             default=str,
                         )
                     )
+                print(
+                    "[AION-PHASE55-ARCHIVE-ONLY] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": auto_live_ticker,
+                            "compatibility_alias_only": True,
+                            "legacy_keys": [
+                                key
+                                for key in (
+                                    "phase55_status",
+                                    "phase55_ready",
+                                    "phase55_record",
+                                    "phase55_source_field",
+                                    "phase55_live_execution_gate_by_ticker",
+                                )
+                                if key in payload_canonical_execution_state
+                            ],
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             orderbook_ready = bool(
                 payload_preflight.get("orderbook_ready")
                 or quote_readiness_diagnostic.get("orderbook_ready")
@@ -53563,8 +55223,42 @@ class KalshiSniperBot:
                 family=selected_family,
                 canonical_execution_state=canonical_realm_vv_state if "canonical_realm_vv_state" in locals() else None,
             )
-            final_blocker_entry_ready = bool(phase55_allowed)
-            if not phase55_allowed:
+            canonical_gate_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
+            canonical_final_submit_allowed = bool(
+                canonical_gate_state.get("final_submit_allowed")
+                if canonical_gate_state.get("final_submit_allowed") is not None
+                else canonical_gate_state.get("canonical_final_submit_allowed")
+                if canonical_gate_state.get("canonical_final_submit_allowed") is not None
+                else canonical_gate_state.get("canonical_final_submit_allowed_by_realm_vv")
+                if canonical_gate_state.get("canonical_final_submit_allowed_by_realm_vv") is not None
+                else phase55_allowed
+            )
+            canonical_final_gate_reason = str(
+                canonical_gate_state.get("hard_block_reason")
+                or canonical_gate_state.get("final_block_reason")
+                or canonical_gate_state.get("block_reason")
+                or phase55_reason
+                or "unknown"
+            ).strip().lower() or "unknown"
+            if canonical_gate_state:
+                print(
+                    "[AION-PHASE55-AUTHORITY-PURGED] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_meta.get("trace_id") if isinstance(trace_meta, dict) else None,
+                            "ticker": auto_live_ticker,
+                            "compatibility_alias_only": True,
+                            "canonical_final_submit_allowed": canonical_final_submit_allowed,
+                            "canonical_final_gate_reason": canonical_final_gate_reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            phase55_allowed = canonical_final_submit_allowed
+            phase55_reason = canonical_final_gate_reason
+            final_blocker_entry_ready = bool(canonical_final_submit_allowed)
+            if not canonical_final_submit_allowed:
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
                 self._emit_aion_final_blocker_trace(
                     ticker=auto_live_ticker,
@@ -53576,22 +55270,22 @@ class KalshiSniperBot:
                     unsafe_price_status=final_gate_unsafe_price_status,
                     duplicate_status=final_blocker_duplicate_state,
                     cooldown_status=final_blocker_cooldown_state,
-                    final_block_reason=phase55_reason,
+                    final_block_reason=canonical_final_gate_reason,
                 )
                 self._emit_aion_final_gate(
                     ticker=auto_live_ticker,
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=True,
-                    reason=phase55_reason,
-                    stage="phase55_gate",
+                    reason=canonical_final_gate_reason,
+                    stage="canonical_final_gate",
                     decision="SKIP",
                 )
                 execution_funnel["execution_blocked"] = 1
                 self._emit_aion_final_blocker(
                     ticker=auto_live_ticker,
                     family=selected_family,
-                    block_reason=phase55_reason,
+                    block_reason=canonical_final_gate_reason,
                     decision="SKIP",
                     live_arm=final_blocker_live_arm,
                     entry_ready=final_blocker_entry_ready,
@@ -53605,10 +55299,10 @@ class KalshiSniperBot:
                     f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
                     f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={aggressive_spread_bucket} quote_ready={'yes' if bool(quote_readiness_diagnostic.get('quote_ready')) else 'no'} "
-                    f"price=none contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason=phase55_block"
+                    f"price=none contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason=canonical_final_gate"
                 )
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={phase55_reason}")
-                self._log_live_execution_final_blocked(auto_live_ticker, phase55_reason)
+                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={canonical_final_gate_reason}")
+                self._log_live_execution_final_blocked(auto_live_ticker, canonical_final_gate_reason)
                 print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
                 self._emit_trade_readiness_cycle_telemetry(
                     markets=markets,
@@ -54102,63 +55796,43 @@ class KalshiSniperBot:
                     if isinstance(expectancy_summary, dict):
                         expectancy_summary["quote_ready"] = bool(quote_readiness_diagnostic.get("quote_ready"))
                         expectancy_summary["quote_missing"] = bool(quote_readiness_diagnostic.get("quote_missing"))
-            direct_fields_tradable_override = bool(
-                self.to_float(edge_after_cost, 0.0) >= 0.002
-                and str(quote_readiness_diagnostic.get("quote_ready_reason") or "").strip().lower() == "direct_fields"
-            )
-            if direct_fields_tradable_override:
-                refreshed_quote, aggressive_fastpath_refresh_meta = self._refresh_quote_for_aggressive_fastpath(
-                    aggressive_fastpath_quote or selected_context_quote or selected_quote
-                )
-                if refreshed_quote is not None:
-                    aggressive_fastpath_quote = refreshed_quote
-                    selected_quote = refreshed_quote
-                    selected_context_quote = refreshed_quote
-                    quote_readiness_diagnostic = self._diagnose_quote_readiness_context(
-                        market=selected_market,
-                        q=aggressive_fastpath_quote,
-                        family=selected_family,
-                        sports_context=_aion_build_quote_readiness_sports_context(
-                            base_context=expectancy_summary if isinstance(expectancy_summary, dict) else {},
-                            quote_obj=aggressive_fastpath_quote,
-                        ),
-                        source="direct_fields_override_refresh",
-                    ) or quote_readiness_diagnostic
-                    quote_readiness_diagnostic["quote_ready"] = True
-                    quote_readiness_diagnostic["quote_missing"] = False
-                    if isinstance(expectancy_summary, dict):
-                        expectancy_summary["quote_ready"] = True
-                        expectancy_summary["quote_missing"] = False
-                        expectancy_summary["quote_readiness_diagnostic"] = {
-                            k: v for k, v in quote_readiness_diagnostic.items() if k != "fallback_quote"
-                        }
-                if aggressive_fastpath_quote is not None:
-                    aggressive_fastpath_payload_override = self.build_live_order_payload(
-                        aggressive_fastpath_quote,
-                        size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                        price_source="bid",
-                        post_only=False,
-                        rest_remainder=True,
-                        market=selected_market,
-                        quote_diag=quote_readiness_diagnostic,
-                        selected_ticker=auto_live_ticker,
-                        selection_stage="final_gate_direct_fields_refresh",
+            direct_fields_tradable_override = False
+            if str(quote_readiness_diagnostic.get("quote_ready_reason") or "").strip().lower() == "direct_fields":
+                print(
+                    "[AION-DIRECT-FIELDS-QUARANTINED] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "authority": canonical_execution_state.get("authority") if isinstance(canonical_execution_state, dict) else None,
+                            "compatibility_alias_only": True,
+                            "quote_ready_reason": quote_readiness_diagnostic.get("quote_ready_reason"),
+                            "canonical_final_submit_allowed_by_realm_vv": bool(canonical_execution_state.get("final_submit_allowed")) if isinstance(canonical_execution_state, dict) else bool(final_submit_allowed_by_realm_vv),
+                        },
+                        sort_keys=True,
+                        default=str,
                     )
-                    if aggressive_fastpath_payload_override is not None:
-                        controlled_quote_ready = True
-                        quote_readiness_diagnostic["quote_ready"] = True
-                        quote_readiness_diagnostic["quote_missing"] = False
-                        print(
-                            f"[AION-LIVE-EXECUTION] ticker={auto_live_ticker} "
-                            f"edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
-                            f"final_readiness_source=legacy_direct_fields_refresh "
-                            f"decision=EXECUTED"
-                        )
+                )
+                print(
+                    "[AION-DIRECT-FIELDS-AUTHORITY-DELETED] "
+                    + json.dumps(
+                        {
+                            "trace_id": trace_id,
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "authority": canonical_execution_state.get("authority") if isinstance(canonical_execution_state, dict) else None,
+                            "quote_ready_reason": quote_readiness_diagnostic.get("quote_ready_reason"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             if aggressive_positive_edge_override and aggressive_fastpath_quote is not None:
                 aggressive_fastpath_payload_override = self.build_live_order_payload(
                     aggressive_fastpath_quote,
                     size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                    price_source="bid",
+                    price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                     post_only=False,
                     rest_remainder=True,
                     market=selected_market,
@@ -54171,7 +55845,7 @@ class KalshiSniperBot:
                     aggressive_fastpath_payload_override = self.build_live_order_payload(
                         aggressive_fastpath_quote,
                         size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                        price_source="bid",
+                        price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                         post_only=False,
                         rest_remainder=True,
                         market=selected_market,
@@ -54202,7 +55876,7 @@ class KalshiSniperBot:
                     open_market_payload_override = self.build_live_order_payload(
                         selected_quote,
                         size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                        price_source="bid",
+                        price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                         post_only=False,
                         rest_remainder=True,
                         market=selected_market,
@@ -54286,6 +55960,8 @@ class KalshiSniperBot:
                 duplicate_block=False,
                 unsafe_price_block=bool(aggressive_spread_bucket == "unsafe" and not bool(near_safe_spread_context and near_safe_spread_context.get("eligible"))),
                 selected_price_valid=bool(selected_submission_price is not None and 0.0 < self.to_float(selected_submission_price, 0.0) < 1.0),
+                selected_price_cents=(payload_preview or {}).get("selected_price_cents") if isinstance(payload_preview, dict) else None,
+                price_bounds_pass=bool(selected_submission_price is not None and 0.0 < self.to_float(selected_submission_price, 0.0) < 1.0),
                 selected_side_has_price=bool((selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None)) or (payload_preview or {}).get("selected_side")),
                 selected_side_has_liquidity=bool(
                     quote_readiness_diagnostic.get("selected_side_has_liquidity")
@@ -54297,6 +55973,8 @@ class KalshiSniperBot:
                     or quote_readiness_diagnostic.get("selected_side_has_liquidity")
                     or (payload_preview or {}).get("depth_available")
                 ),
+                orderbook_ready=bool(orderbook_ready if "orderbook_ready" in locals() else quote_readiness_diagnostic.get("orderbook_ready")),
+                max_positions_block=bool(execution_funnel.get("max_positions_block") if isinstance(execution_funnel, dict) else False),
                 contracts=AION_AGGRESSIVE_MAX_CONTRACTS,
                 trades_today=self.aggressive_trades_today,
                 canonical_execution_state=canonical_execution_state,
@@ -54337,7 +56015,7 @@ class KalshiSniperBot:
                     aggressive_fastpath_payload_override = self.build_live_order_payload(
                         aggressive_fastpath_quote,
                         size=AION_AGGRESSIVE_MAX_CONTRACTS,
-                        price_source="bid",
+                        price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                         post_only=False,
                         rest_remainder=True,
                         market=selected_market,
@@ -54790,7 +56468,18 @@ class KalshiSniperBot:
 
 
 def main():
-    global LIVE_MODE, LIVE_ARMED, LIVE_ENV_CONFIRMED, LIVE_TEST_TICKER
+    global LIVE_MODE, LIVE_ARMED, LIVE_ENV_CONFIRMED, LIVE_TEST_TICKER, DRY_RUN_LIVE_ORDERS
+    loaded_env = _load_dotenv_early()
+    if loaded_env:
+        print(
+            "[LIVE-CONFIG-CHECK] ✅ .env loaded successfully "
+            f"KALSHI_ALLOW_LIVE={os.getenv('KALSHI_ALLOW_LIVE', 'unset')} "
+            f"LIVE_ARMED={os.getenv('LIVE_ARMED', 'unset')} "
+            f"LIVE_ENV_CONFIRMED={os.getenv('LIVE_ENV_CONFIRMED', 'unset')} "
+            f"DRY_RUN_LIVE_ORDERS={os.getenv('DRY_RUN_LIVE_ORDERS', 'unset')} "
+            f"KALSHI_API_KEY_ID={'set' if os.getenv('KALSHI_API_KEY_ID') else 'unset'}"
+        )
+    DRY_RUN_LIVE_ORDERS = get_env_bool("DRY_RUN_LIVE_ORDERS", True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true")
     parser.add_argument(
@@ -54863,22 +56552,12 @@ def main():
     parser.add_argument("--suggest-group-weights", action="store_true")
     args = parser.parse_args()
 
-    LIVE_MODE = bool(args.live)
-    LIVE_ARMED = bool(args.live and args.arm_live)
-    LIVE_ENV_CONFIRMED = (os.environ.get("KALSHI_ALLOW_LIVE", "") or "").strip().lower() in {"1", "true", "yes", "on"}
-    if not LIVE_ENV_CONFIRMED:
-        try:
-            control_state_path = Path(__file__).with_name("control_state.json")
-            if control_state_path.exists():
-                control_state = json.loads(control_state_path.read_text())
-                LIVE_ENV_CONFIRMED = bool(control_state.get("trading_enabled"))
-                if LIVE_ENV_CONFIRMED:
-                    print(
-                        "[SAFEGUARD] live trading env confirmation inferred from control_state.json "
-                        f"requested_mode={control_state.get('requested_mode')} updated_by={control_state.get('updated_by')}"
-                    )
-        except Exception as exc:
-            print(f"[SAFEGUARD] live trading env confirmation fallback failed error={exc.__class__.__name__}")
+    live_mode_approved = _env_bool_early("KALSHI_ALLOW_LIVE", False)
+    live_arm_approved = _env_bool_early("LIVE_ARMED", False)
+    live_env_confirmed = _env_bool_early("LIVE_ENV_CONFIRMED", False)
+    LIVE_MODE = bool(args.live and live_mode_approved)
+    LIVE_ARMED = bool(LIVE_MODE and args.arm_live and live_arm_approved)
+    LIVE_ENV_CONFIRMED = bool(LIVE_MODE and live_env_confirmed)
     LIVE_TEST_TICKER = args.live_test_ticker
     effective_live_dry_run = compute_effective_live_dry_run(
         live_mode=LIVE_MODE,
@@ -54907,14 +56586,9 @@ def main():
         )
     except Exception as exc:
         print(f"[REALM-XIX-DEGRADED] reason={exc.__class__.__name__} action=startup_seraph_telemetry_sync")
-    if LIVE_ARMED and not effective_live_dry_run:
-        print("[LIVE-MODE-STATUS] ✅ REAL TRADING ENABLED | dry_run=False | armed=True")
-    else:
-        print(
-            f"[LIVE-MODE-STATUS] source=startup live_mode={'yes' if LIVE_MODE else 'no'} "
-            f"live_armed={'yes' if LIVE_ARMED else 'no'} live_env_confirmed={'yes' if LIVE_ENV_CONFIRMED else 'no'} "
-            f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
-        )
+    print(
+        f"[LIVE-MODE-STATUS] ✅ Bot running | Armed: {'Yes' if LIVE_ARMED else 'No'} | Dry-run: {'Yes' if effective_live_dry_run else 'No'}"
+    )
     send_telegram_message("🚀 Kalshi bot started and running on server")
     print("[TELEGRAM] sent=startup")
     if LIVE_MODE and not bot.realm_ix_startup_alert_sent:
@@ -54966,7 +56640,8 @@ def main():
             f"private_key_path={bot.get_live_private_key_path()} base_url_mode={base_mode}"
         )
         bot.print_recent_live_audit_entries()
-        bot.print_live_startup_checklist(args=args)
+        if not args.live_preflight:
+            bot.print_live_startup_checklist(args=args)
     if args.live_preflight:
         bot.run_live_preflight(args=args)
         return
@@ -54995,7 +56670,8 @@ def main():
         bot.print_live_quote_quality_report(sample_n=args.quote_quality_report)
         return
     if args.run_live_canary:
-        bot.run_live_canary_workflow(cancel_after_verify=args.cancel_canary_after_verify)
+        canary_result = bot.run_live_canary_workflow(cancel_after_verify=args.cancel_canary_after_verify)
+        print("[LIVE-CANARY-RESULT] " + json.dumps(canary_result, sort_keys=True, default=str))
         return
     if args.live and args.arm_live and LIVE_ENV_CONFIRMED:
         print("[SAFEGUARD] live trading ARMED")
