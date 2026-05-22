@@ -99,13 +99,6 @@ class EntryExitGuardService:
             self.logger(prefix, **fields)
 
     def passes_entry_filters(self, q: Any) -> tuple[bool, str | None]:
-        t = self.thresholds
-        liquidity = safe_float(getattr(q, "liquidity", 0.0), 0.0) or 0.0
-        if liquidity < t.min_entry_liquidity:
-            return False, "low_liquidity"
-        volume = safe_float(getattr(q, "volume", 0.0), 0.0) or 0.0
-        if volume < t.min_entry_volume:
-            return False, "low_volume"
         bid = safe_float(getattr(q, "yes_bid", 0.0), 0.0) or 0.0
         ask = safe_float(getattr(q, "yes_ask", 0.0), 0.0) or 0.0
         if bid <= 0 or ask <= 0:
@@ -113,29 +106,29 @@ class EntryExitGuardService:
         spread = ask - bid
         if spread < 0:
             return False, "crossed_or_invalid_spread"
-        if spread > t.max_entry_spread:
-            return False, "wide_spread"
-        if ask >= t.max_yes_ask_to_enter:
-            return False, "yes_too_expensive"
+        if not (0.01 <= bid <= 0.99 and 0.01 <= ask <= 0.99):
+            return False, "price_out_of_bounds"
+        return True, None
+
+    def _should_enter_side(self, q: Any, side: str) -> tuple[bool, str | None]:
+        side = "no" if str(side or "").strip().lower() == "no" else "yes"
+        bid = safe_float(getattr(q, f"{side}_bid", 0.0), 0.0) or 0.0
+        ask = safe_float(getattr(q, f"{side}_ask", 0.0), 0.0) or 0.0
+        if bid <= 0 or ask <= 0:
+            return False, "missing_bid_ask"
+        if ask < bid:
+            return False, "crossed_or_invalid_spread"
+        if not (self.thresholds.min_price <= bid <= self.thresholds.max_price and self.thresholds.min_price <= ask <= self.thresholds.max_price):
+            return False, "price_out_of_bounds"
         return True, None
 
     def should_enter_yes(self, q: Any) -> bool:
-        ok, _reason = self.passes_entry_filters(q)
-        if not ok:
-            return False
-        t = self.thresholds
-        bid = safe_float(getattr(q, "yes_bid", 0.0), 0.0) or 0.0
-        ask = safe_float(getattr(q, "yes_ask", 0.0), 0.0) or 0.0
-        last_price = safe_float(getattr(q, "last_price", 0.0), 0.0) or 0.0
-        if not (t.min_price <= bid <= t.max_price):
-            return False
-        if last_price <= 0:
-            return False
-        mid = (bid + ask) / 2.0
-        stretch_limit = 0.14 if t.profile == "opportunistic" else 0.12
-        if last_price > ask:
-            return False
-        return abs(last_price - mid) <= stretch_limit
+        ok, _reason = self._should_enter_side(q, "yes")
+        return ok
+
+    def should_enter_no(self, q: Any) -> bool:
+        ok, _reason = self._should_enter_side(q, "no")
+        return ok
 
     def can_open_new_position(self, bot: Any, q: Any) -> tuple[bool, str | None]:
         t = self.thresholds

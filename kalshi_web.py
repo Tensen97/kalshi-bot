@@ -5540,7 +5540,53 @@ class KalshiSniperBot:
             f"{' ' + extras if extras else ''}"
         )
 
-    def _record_live_reject_telemetry(self, *, reason, ticker=None, family=None, spread=None, stage=None, category=None, details=None):
+    def _emit_aion_final_reject(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        side=None,
+        selected_price=None,
+        spread=None,
+        liquidity=None,
+        volume=None,
+        exact_rejection_reason=None,
+        subsystem=None,
+        trace_id=None,
+    ):
+        trace_key = str(trace_id or "").strip() or None
+        if not trace_key and ticker:
+            trace_key = self._resolve_aion_candidate_trace_meta(
+                ticker=ticker,
+                family=family,
+                candidate_source=subsystem,
+                stage="final_reject",
+                allow_create=True,
+            ).get("trace_id")
+        dedupe_key = trace_key or f"{str(ticker or '').strip().upper()}|{str(family or 'UNKNOWN').strip().upper()}|{str(subsystem or 'unknown').strip().lower()}|{str(exact_rejection_reason or 'unknown').strip().lower()}"
+        emitted = getattr(self, "_aion_final_reject_emitted_keys", None)
+        if emitted is None:
+            emitted = set()
+            setattr(self, "_aion_final_reject_emitted_keys", emitted)
+        if dedupe_key in emitted:
+            return None
+        emitted.add(dedupe_key)
+        payload = {
+            "trace_id": trace_key,
+            "ticker": str(ticker or "").strip() or None,
+            "family": str(family or "UNKNOWN").strip().upper() or "UNKNOWN",
+            "side": str(side or "").strip().lower() or None,
+            "selected_price": selected_price,
+            "spread": spread,
+            "liquidity": liquidity,
+            "volume": volume,
+            "exact_rejection_reason": str(exact_rejection_reason or "unknown").strip() or "unknown",
+            "subsystem": str(subsystem or "unknown").strip() or "unknown",
+        }
+        print("[AION-FINAL-REJECT] " + json.dumps(payload, sort_keys=True, default=str))
+        return payload
+
+    def _record_live_reject_telemetry(self, *, reason, ticker=None, family=None, spread=None, stage=None, category=None, details=None, subsystem=None):
         self._record_execution_failure_audit(reason=reason, stage=stage, category=category)
         collector = getattr(self, "live_reject_telemetry", None)
         if collector is not None:
@@ -5556,6 +5602,23 @@ class KalshiSniperBot:
         queue_details = details if isinstance(details, dict) else {}
         queue_ticker = str(ticker or queue_details.get("ticker") or queue_details.get("market_ticker") or "").strip()
         queue_family = str(family or queue_details.get("family") or queue_details.get("market_family") or "").strip().upper() or "UNKNOWN"
+        queue_side = str(queue_details.get("side") or queue_details.get("selected_side") or "").strip().lower() or None
+        selected_price = queue_details.get("selected_price")
+        if selected_price is None:
+            selected_price = queue_details.get("yes_ask") if queue_side == "yes" else queue_details.get("no_ask") if queue_side == "no" else queue_details.get("selected_price_dollars") or queue_details.get("selected_price")
+        liquidity = queue_details.get("liquidity")
+        volume = queue_details.get("volume")
+        self._emit_aion_final_reject(
+            ticker=queue_ticker or ticker,
+            family=queue_family,
+            side=queue_side,
+            selected_price=selected_price,
+            spread=spread if spread is not None else queue_details.get("spread"),
+            liquidity=liquidity,
+            volume=volume,
+            exact_rejection_reason=reason,
+            subsystem=subsystem or queue_details.get("subsystem") or stage or category or "unknown",
+        )
         predictive_builder = getattr(self, "_build_predictive_regime_family_summary", None)
         confidence_builder = getattr(self, "_build_adaptive_confidence_family_summary", None)
         rotation_builder = getattr(self, "_build_family_rotation_family_summary", None)
@@ -25620,14 +25683,41 @@ class KalshiSniperBot:
         yes_bid = getattr(q, "yes_bid", 0.0) or 0.0
         yes_ask = getattr(q, "yes_ask", 0.0) or 0.0
         if yes_bid <= 0 or yes_ask <= 0:
-            self._record_live_reject_telemetry(reason="missing_quotes", ticker=ticker, family=family, spread=None, stage="prefilter", category="general")
+            self._record_live_reject_telemetry(
+                reason="missing_quotes",
+                ticker=ticker,
+                family=family,
+                spread=None,
+                stage="prefilter",
+                category="general",
+                details={"subsystem": "kalshi_web._filter_live_entry_candidate", "side": "yes", "yes_bid": yes_bid, "yes_ask": yes_ask, "no_bid": getattr(q, "no_bid", None), "no_ask": getattr(q, "no_ask", None), "liquidity": getattr(q, "liquidity", None), "volume": getattr(q, "volume", None)},
+                subsystem="kalshi_web._filter_live_entry_candidate",
+            )
             return False, "missing_quotes"
         if yes_ask <= 0:
-            self._record_live_reject_telemetry(reason="missing_quotes", ticker=ticker, family=family, spread=None, stage="prefilter", category="general")
+            self._record_live_reject_telemetry(
+                reason="missing_quotes",
+                ticker=ticker,
+                family=family,
+                spread=None,
+                stage="prefilter",
+                category="general",
+                details={"subsystem": "kalshi_web._filter_live_entry_candidate", "side": "yes", "yes_bid": yes_bid, "yes_ask": yes_ask, "liquidity": getattr(q, "liquidity", None), "volume": getattr(q, "volume", None)},
+                subsystem="kalshi_web._filter_live_entry_candidate",
+            )
             return False, "missing_quotes"
         spread = yes_ask - yes_bid
-        if spread < 0 or spread > MAX_ENTRY_SPREAD:
-            self._record_live_reject_telemetry(reason="wide_spread", ticker=ticker, family=family, spread=spread, stage="prefilter", category="spread")
+        if spread < 0:
+            self._record_live_reject_telemetry(
+                reason="wide_spread",
+                ticker=ticker,
+                family=family,
+                spread=spread,
+                stage="prefilter",
+                category="spread",
+                details={"subsystem": "kalshi_web._filter_live_entry_candidate", "side": "yes", "selected_price": yes_ask, "yes_bid": yes_bid, "yes_ask": yes_ask, "liquidity": getattr(q, "liquidity", None), "volume": getattr(q, "volume", None)},
+                subsystem="kalshi_web._filter_live_entry_candidate",
+            )
             return False, "wide_spread"
         liquidity = getattr(q, "liquidity", 0.0) or 0.0
         min_liquidity = self.get_market_min_entry_liquidity(market)
@@ -25649,85 +25739,28 @@ class KalshiSniperBot:
                 f"[LIVE-SELECT-DEBUG] targeted_liquidity ticker={ticker} "
                 f"default={MIN_ENTRY_LIQUIDITY} targeted={min_liquidity} seen={liquidity}"
             )
-        if effective_liquidity <= min_liquidity:
-            if self.is_targeted_series_market(market):
-                strict_orderbook_ok, strict_orderbook_details = self.passes_targeted_orderbook_quality(market, q)
-                field_source = "targeted_orderbook_quality"
-                if should_trace_priority_family:
-                    print(
-                        f"[LIVE-SELECT-STRICT-LIQUIDITY-FIELDS] ticker={ticker} family={family} "
-                        f"reported_liquidity={liquidity} threshold={min_liquidity} "
-                        f"yes_top_size={(strict_orderbook_details or {}).get('yes_top_size')} "
-                        f"no_top_size={(strict_orderbook_details or {}).get('no_top_size')} "
-                        f"min_top_size={(strict_orderbook_details or {}).get('min_top_size')} "
-                        f"spread={spread} source={field_source}"
-                    )
-                    print(
-                        f"[LIVE-SELECT-STRICT-LIQUIDITY-FIX] ticker={ticker} family={family} "
-                        f"yes_top_size={(strict_orderbook_details or {}).get('yes_top_size')} "
-                        f"no_top_size={(strict_orderbook_details or {}).get('no_top_size')} "
-                        f"field_source={field_source} pass={'yes' if strict_orderbook_ok else 'no'}"
-                    )
-                    print(
-                        f"[LIVE-SELECT-STRICT-LIQUIDITY-CHECK] ticker={ticker} family={family} "
-                        f"reported_liquidity={liquidity} threshold={min_liquidity} "
-                        f"yes_top_size={(strict_orderbook_details or {}).get('yes_top_size')} "
-                        f"no_top_size={(strict_orderbook_details or {}).get('no_top_size')} "
-                        f"min_top_size={(strict_orderbook_details or {}).get('min_top_size')} "
-                        f"pass={'yes' if strict_orderbook_ok else 'no'} "
-                        f"reject_reason={'None' if strict_orderbook_ok else 'low_liquidity'} source={field_source}"
-                    )
-                print(
-                    f"[LIVE-SELECT-DEBUG] targeted_liquidity_gate ticker={ticker} "
-                    f"result={'pass' if strict_orderbook_ok else 'fail'} seen={liquidity} threshold={min_liquidity} fallback={field_source}"
-                )
-                if not strict_orderbook_ok:
-                    self._record_live_reject_telemetry(reason="low_liquidity", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
-                    return False, "low_liquidity"
-            else:
-                if should_trace_priority_family:
-                    liquidity_priority = self.get_market_liquidity_priority(market)
-                    print(
-                        f"[LIVE-SELECT-STRICT-LIQUIDITY-FIELDS] ticker={ticker} family={family} "
-                        f"reported_liquidity={liquidity} threshold={min_liquidity} "
-                        f"yes_top_size={liquidity_priority.get('yes_top_size')} no_top_size={liquidity_priority.get('no_top_size')} "
-                        f"min_top_size={self.get_market_min_top_of_book_size(market)} spread={spread} source=strict_low_liquidity_gate"
-                    )
-                    print(
-                        f"[LIVE-SELECT-STRICT-LIQUIDITY-CHECK] ticker={ticker} family={family} "
-                        f"reported_liquidity={liquidity} threshold={min_liquidity} "
-                        f"yes_top_size={liquidity_priority.get('yes_top_size')} no_top_size={liquidity_priority.get('no_top_size')} "
-                        f"min_top_size={self.get_market_min_top_of_book_size(market)} pass=no reject_reason=low_liquidity "
-                        f"source=strict_low_liquidity_gate"
-                    )
-                self._record_live_reject_telemetry(reason="low_liquidity", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
-                return False, "low_liquidity"
-        else:
-            if should_trace_priority_family:
-                liquidity_priority = self.get_market_liquidity_priority(market)
-                print(
-                    f"[LIVE-SELECT-STRICT-LIQUIDITY-FIELDS] ticker={ticker} family={family} "
-                    f"reported_liquidity={liquidity} threshold={min_liquidity} "
-                    f"yes_top_size={liquidity_priority.get('yes_top_size')} no_top_size={liquidity_priority.get('no_top_size')} "
-                    f"min_top_size={self.get_market_min_top_of_book_size(market)} spread={spread} source=strict_low_liquidity_gate"
-                )
-                print(
-                    f"[LIVE-SELECT-STRICT-LIQUIDITY-CHECK] ticker={ticker} family={family} "
-                    f"reported_liquidity={liquidity} threshold={min_liquidity} "
-                    f"yes_top_size={liquidity_priority.get('yes_top_size')} no_top_size={liquidity_priority.get('no_top_size')} "
-                    f"min_top_size={self.get_market_min_top_of_book_size(market)} pass=yes reject_reason=None "
-                    f"source=strict_low_liquidity_gate"
-                )
-            if self.is_targeted_series_market(market):
-                print(
-                    f"[LIVE-SELECT-DEBUG] targeted_liquidity_gate ticker={ticker} "
-                    f"result=pass seen={liquidity} threshold={min_liquidity}"
-                )
+        if should_trace_priority_family:
+            liquidity_priority = self.get_market_liquidity_priority(market)
+            print(
+                f"[LIVE-SELECT-STRICT-LIQUIDITY-FIELDS] ticker={ticker} family={family} "
+                f"reported_liquidity={liquidity} threshold={min_liquidity} "
+                f"yes_top_size={liquidity_priority.get('yes_top_size')} no_top_size={liquidity_priority.get('no_top_size')} "
+                f"min_top_size={self.get_market_min_top_of_book_size(market)} spread={spread} source=soft_liquidity_gate"
+            )
+            print(
+                f"[LIVE-SELECT-STRICT-LIQUIDITY-CHECK] ticker={ticker} family={family} "
+                f"reported_liquidity={liquidity} threshold={min_liquidity} "
+                f"yes_top_size={liquidity_priority.get('yes_top_size')} no_top_size={liquidity_priority.get('no_top_size')} "
+                f"min_top_size={self.get_market_min_top_of_book_size(market)} pass=yes reject_reason=None "
+                f"source=soft_liquidity_gate"
+            )
+        if self.is_targeted_series_market(market):
+            print(
+                f"[LIVE-SELECT-DEBUG] targeted_liquidity_gate ticker={ticker} "
+                f"result=pass seen={liquidity} threshold={min_liquidity}"
+            )
         if getattr(q, "volume", 0.0) <= MIN_ENTRY_VOLUME:
             realm_vv_priority, priority_boost, gate_record = self._realm_vv_selection_priority(market, q)
-            if not realm_vv_priority:
-                self._record_live_reject_telemetry(reason="low_volume", ticker=ticker, family=family, spread=spread, stage="prefilter", category="general")
-                return False, "low_volume"
             print(
                 "[LIVE-SELECT-REALM-VV-PRIORITY] "
                 + json.dumps(
@@ -25739,7 +25772,7 @@ class KalshiSniperBot:
                         "final_submit_allowed_by_realm_vv": bool(gate_record.get("final_submit_allowed_by_realm_vv")),
                         "selected_price": getattr(q, "yes_ask", None),
                         "priority_boost": round(priority_boost, 4),
-                        "reason": "low_volume_override",
+                        "reason": "low_volume_soft_allow",
                     },
                     sort_keys=True,
                     default=str,
@@ -42832,6 +42865,19 @@ class KalshiSniperBot:
             readiness["blocker_chain"] = blocker_payload.get("blocker_chain")
             readiness["first_blocker"] = blocker_payload.get("first_blocker")
             readiness["final_block_reason"] = blocker_payload.get("first_blocker") or readiness.get("final_block_reason")
+            if not bool(readiness.get("final_ready")):
+                self._emit_aion_final_reject(
+                    ticker=ticker,
+                    family=trace_state_snapshot.get("family"),
+                    side=readiness.get("selected_side") or trace_state_snapshot.get("selected_side") or trace_state_snapshot.get("side"),
+                    selected_price=readiness.get("selected_price") or trace_state_snapshot.get("selected_price") or trace_state_snapshot.get("selected_price_dollars"),
+                    spread=readiness.get("spread") or trace_state_snapshot.get("spread") or trace_state_snapshot.get("spread_cents"),
+                    liquidity=readiness.get("liquidity") or trace_state_snapshot.get("liquidity"),
+                    volume=readiness.get("volume") or trace_state_snapshot.get("volume"),
+                    exact_rejection_reason=readiness.get("final_block_reason") or blocker_payload.get("first_blocker") or "unknown",
+                    subsystem="kalshi_web._emit_aion_final_blocker_trace",
+                    trace_id=trace_id,
+                )
             print(
                 "[AION-FINAL-BLOCKER-TRACE] "
                 + json.dumps(
@@ -43999,6 +44045,15 @@ class KalshiSniperBot:
         spread_bucket_value = str(spread_bucket_value or "unknown").strip().lower() or "unknown"
         if spread_bucket_found:
             _note_source("safety_context.spread_bucket")
+        canonical_spread_classification_value = str(
+            _first_defined(
+                canonical_execution_state.get("canonical_spread_classification"),
+                canonical_execution_state.get("spread_classification"),
+                safety_context.get("spread_classification"),
+                safety_context.get("canonical_spread_classification"),
+            )
+            or ""
+        ).strip().upper() or "UNKNOWN"
         executable_quote_gate = self._resolve_aion_quote_content_gate(
             caller="resolve_aion_trade_readiness",
             quote_payload=quote,
@@ -44059,9 +44114,15 @@ class KalshiSniperBot:
         elif not direct_fields_ready_value:
             final_block_reason = "quote_invalid"
         elif unsafe_price_status_value == "unknown":
-            final_block_reason = "unsafe_price_status"
+            if canonical_spread_classification_value in {"AGGRESSIVE_BUT_TRADEABLE", "SAFE", "CAUTION_WAIT"} or spread_bucket_value in {"wide_but_possible", "tight", "ultra_tight"}:
+                final_block_reason = "passed"
+            else:
+                final_block_reason = "unsafe_price_status"
         elif unsafe_price_status_value in {"unsafe", "unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}:
-            final_block_reason = "unsafe_price_status"
+            if canonical_spread_classification_value in {"AGGRESSIVE_BUT_TRADEABLE", "SAFE", "CAUTION_WAIT"} or spread_bucket_value in {"wide_but_possible", "tight", "ultra_tight"}:
+                final_block_reason = "passed"
+            else:
+                final_block_reason = "unsafe_price_status"
         elif spread_bucket_value == "unsafe":
             final_block_reason = "unsafe_spread_bucket"
         elif duplicate_status_value not in {"unknown", "clear", "unknown_clear", "none"}:
@@ -44289,9 +44350,11 @@ class KalshiSniperBot:
             return "quote_missing"
         if not quote_ready_value:
             return "quote_invalid"
+        if spread_classification_value in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"} and spread_severity_value in {"survivable", "unknown", "safe"}:
+            return "all_guards_passed"
         if beast_spread_override_applied_value and spread_classification_value == "AGGRESSIVE_BUT_TRADEABLE" and spread_severity_value in {"survivable", "unknown"}:
             return "all_guards_passed"
-        if unsafe_price_value in {"unsafe", "blocked", "unsafe_spread", "unexecutable_price", "both_sides_unexecutable"}:
+        if unsafe_price_value in {"unsafe", "blocked", "unsafe_spread", "unexecutable_price", "both_sides_unexecutable"} and spread_classification_value not in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}:
             return "unsafe_price"
         if unsafe_price_value == "caution_wide_spread" and not bool(high_liquidity_relaxed_unsafe_value):
             return "unsafe_price"
@@ -51552,6 +51615,40 @@ class KalshiSniperBot:
             if submission_price is None and isinstance(payload_preview, dict):
                 submission_price = payload_preview.get("no_price")
             print(
+                "[AION-QUALIFIED] "
+                + json.dumps(
+                    {
+                        "ticker": auto_live_ticker,
+                        "family": selected_family,
+                        "side": selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None) or getattr(selected_quote_for_submission, "side", None) or None,
+                        "selected_price": submission_price,
+                        "spread_bucket": controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get("eligible")) else aggressive_spread_bucket,
+                        "liquidity": quote_readiness_diagnostic.get("liquidity") or (payload_preview or {}).get("liquidity"),
+                        "volume": (payload_preview or {}).get("volume") or (quote_readiness_diagnostic or {}).get("volume"),
+                        "reason": "all_gates_passed",
+                        "subsystem": "kalshi_web.final_execution",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[AION-DISPATCH] "
+                + json.dumps(
+                    {
+                        "ticker": auto_live_ticker,
+                        "family": selected_family,
+                        "side": selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None) or getattr(selected_quote_for_submission, "side", None) or None,
+                        "selected_price": submission_price,
+                        "spread_bucket": controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get('eligible')) else aggressive_spread_bucket,
+                        "reason": "submit_live_order",
+                        "subsystem": "kalshi_web.final_execution",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
                 f"[AION-LIVE-EXECUTION] ticker={auto_live_ticker} "
                 f"family={selected_family} "
                 f"edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
@@ -51654,6 +51751,22 @@ class KalshiSniperBot:
             if result.get("submitted"):
                 self.live_execution_attempt_cooldowns[auto_live_ticker] = time.time() + execution_attempt_cooldown_seconds
                 print(
+                    "[ORDER-SUBMIT] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "side": (result.get("payload") or payload_preview or {}).get("side"),
+                            "price": (result.get("payload") or payload_preview or {}).get("price"),
+                            "count": (result.get("payload") or payload_preview or {}).get("count", int(AION_AGGRESSIVE_MAX_CONTRACTS)),
+                            "reason": submit_reason,
+                            "subsystem": "kalshi_web.submit_live_order",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
                     f"[AION-LIVE-EXECUTION] ticker={auto_live_ticker} "
                     f"edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get('eligible')) else aggressive_spread_bucket} "
@@ -51678,6 +51791,21 @@ class KalshiSniperBot:
                     size=payload.get("count"),
                     entry_price=payload.get("price"),
                     side=payload.get("side"),
+                )
+                print(
+                    "[POSITION-OPEN] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "side": payload.get("side"),
+                            "price": payload.get("price"),
+                            "count": payload.get("count"),
+                            "subsystem": "kalshi_web.record_live_position",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
             else:
                 execution_funnel["execution_blocked"] = 1
