@@ -18731,6 +18731,32 @@ class KalshiSniperBot:
             self.to_float(microstructure_summary.get("edge_durability_score"), self.to_float(persistence_summary.get("adaptive_persistence_score"), 0.5))
         )
         execution_survivability = self._clamp(self.to_float(microstructure_summary.get("execution_survivability_score"), 0.5))
+        fill_quality_score = self._clamp(
+            execution_survivability * 0.36
+            + quote_stability * 0.28
+            + edge_durability * 0.20
+            + self._clamp(self.to_float(microstructure_summary.get("liquidity_reliability"), 0.5)) * 0.16
+        )
+        fill_quality_bucket = "strong" if fill_quality_score >= 0.7 else "usable" if fill_quality_score >= 0.5 else "fragile"
+        quality_score = 0.0
+        reasons = []
+        print(
+            "[AION-FILL-QUALITY] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "fill_quality_score": round(fill_quality_score, 4),
+                    "fill_quality_bucket": fill_quality_bucket,
+                    "quote_stability": round(quote_stability, 4),
+                    "edge_durability": round(edge_durability, 4),
+                    "execution_survivability": round(execution_survivability, 4),
+                    "reason": "expectancy_fill_quality",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         queue_state = str(queue_summary.get("queue_state") or queue_summary.get("latest_queue_state") or "unknown").strip().lower()
         queue_component = {
             "strong_watch": 0.86,
@@ -18969,6 +18995,8 @@ class KalshiSniperBot:
             "quote_stability": round(quote_stability, 4),
             "edge_durability": round(edge_durability, 4),
             "execution_survivability": round(execution_survivability, 4),
+            "fill_quality_score": round(fill_quality_score, 4),
+            "fill_quality_bucket": fill_quality_bucket,
             "family_component": round(family_component, 4),
             "regime_component": round(regime_component, 4),
             "confidence_modifier": round(confidence_modifier, 4),
@@ -21845,6 +21873,21 @@ class KalshiSniperBot:
                 return value
             return None
 
+        def _as_bool(value, default=None):
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"true", "1", "yes", "y", "on"}:
+                    return True
+                if normalized in {"false", "0", "no", "n", "off", "none", "null", ""}:
+                    return False
+            return bool(value)
+
         def _normalize_price(raw_value, field_label):
             normalized = self.normalize_contract_price(
                 raw_value,
@@ -24279,6 +24322,21 @@ class KalshiSniperBot:
                 f"[LIVE-FAMILY-RANKING-PENALTY] family={family} type=loss_streak "
                 f"loss_streak={loss_streak} penalty={KALSHI_FAMILY_LOSS_STREAK_PENALTY}"
             )
+        print(
+            "[AION-FAMILY-WEIGHT] "
+            + json.dumps(
+                {
+                    "family": family,
+                    "trades": trades,
+                    "pnl": round(pnl, 4),
+                    "loss_streak": loss_streak,
+                    "adjustment": round(adjustment, 4),
+                    "reason": "family_performance_weight",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         print(
             f"[LIVE-FAMILY-PERF-WEIGHT] family={family} trades={trades} pnl={pnl} "
             f"loss_streak={loss_streak} adjustment={round(adjustment, 4)}"
@@ -36182,15 +36240,1037 @@ class KalshiSniperBot:
         }
 
     def rank_final_candidates(self, candidates):
+        def _candidate_rank_key(item):
+            if isinstance(item, dict):
+                quality_score = self.to_float(item.get("quality_score"), self.to_float(item.get("candidate_score"), 0.0))
+                candidate_score = self.to_float(item.get("candidate_score"), 0.0)
+                adjusted_score = self.to_float(item.get("adjusted_score"), candidate_score)
+                spread = self.to_float(item.get("spread"), 0.0)
+                liquidity = self.to_float(item.get("liquidity"), 0.0)
+                volume = self.to_float(item.get("volume"), 0.0)
+                return (
+                    quality_score,
+                    candidate_score,
+                    adjusted_score,
+                    -spread,
+                    liquidity,
+                    volume,
+                )
+            if isinstance(item, (list, tuple)) and item:
+                candidate_score = self.to_float(item[0], 0.0)
+                spread = self.to_float(item[2], 0.0) if len(item) > 2 else 0.0
+                liquidity = self.to_float(getattr(item[1], "liquidity", 0.0), 0.0) if len(item) > 1 else 0.0
+                volume = self.to_float(getattr(item[1], "volume", 0.0), 0.0) if len(item) > 1 else 0.0
+                return (
+                    candidate_score,
+                    -spread,
+                    liquidity,
+                    volume,
+                )
+            return (0.0, 0.0, 0.0, 0.0)
+
         return sorted(
             candidates,
-            key=lambda item: (
-                -item[0],
-                item[2],
-                -getattr(item[1], "liquidity", 0.0),
-                -getattr(item[1], "volume", 0.0),
-            ),
+            key=_candidate_rank_key,
+            reverse=True,
         )
+
+    def is_market_pre_candidate_tradeable(self, raw_market=None, orderbook=None, family=None, ticker=None):
+        raw_market = raw_market if isinstance(raw_market, dict) else {}
+        orderbook = orderbook if isinstance(orderbook, dict) else {}
+
+        def _pick(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        def _as_bool(value, default=None):
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"true", "1", "yes", "y", "on"}:
+                    return True
+                if normalized in {"false", "0", "no", "n", "off", "none", "null", ""}:
+                    return False
+            return bool(value)
+
+        def _num(value):
+            return self.to_float(value, None)
+
+        family = str(family or raw_market.get("family") or self.get_market_family(raw_market) or "UNKNOWN").strip().upper() or "UNKNOWN"
+        ticker = str(ticker or raw_market.get("ticker") or orderbook.get("ticker") or "").strip() or None
+        selected_side = str(
+            _pick(
+                raw_market.get("selected_side"),
+                raw_market.get("side"),
+                orderbook.get("selected_side"),
+                orderbook.get("side"),
+            )
+            or ""
+        ).strip().lower() or None
+        yes_bid = _num(_pick(
+            raw_market.get("yes_bid"),
+            raw_market.get("yes_bid_dollars"),
+            orderbook.get("yes_bid"),
+            orderbook.get("yes_bid_dollars"),
+            orderbook.get("yes_top_price"),
+        ))
+        yes_ask = _num(_pick(
+            raw_market.get("yes_ask"),
+            raw_market.get("yes_ask_dollars"),
+            orderbook.get("yes_ask"),
+            orderbook.get("yes_ask_dollars"),
+            orderbook.get("yes_top_price"),
+        ))
+        no_bid = _num(_pick(
+            raw_market.get("no_bid"),
+            raw_market.get("no_bid_dollars"),
+            orderbook.get("no_bid"),
+            orderbook.get("no_bid_dollars"),
+            orderbook.get("no_top_price"),
+        ))
+        no_ask = _num(_pick(
+            raw_market.get("no_ask"),
+            raw_market.get("no_ask_dollars"),
+            orderbook.get("no_ask"),
+            orderbook.get("no_ask_dollars"),
+            orderbook.get("no_top_price"),
+        ))
+        selected_price = _num(_pick(
+            raw_market.get("selected_price"),
+            raw_market.get("selected_price_dollars"),
+            orderbook.get("selected_price"),
+            orderbook.get("selected_price_dollars"),
+        ))
+        selected_price_cents = self.to_float(
+            _pick(
+                raw_market.get("selected_price_cents"),
+                orderbook.get("selected_price_cents"),
+            ),
+            None,
+        )
+        if selected_price_cents is None and selected_price is not None:
+            selected_price_cents = int(round(float(selected_price) * 100.0))
+        if selected_price is None and selected_price_cents is not None:
+            selected_price = round(float(selected_price_cents) / 100.0, 4)
+        spread_cents = self.to_float(
+            _pick(
+                raw_market.get("spread_cents"),
+                orderbook.get("spread_cents"),
+                orderbook.get("spread"),
+            ),
+            None,
+        )
+        if spread_cents is None and yes_bid is not None and yes_ask is not None:
+            spread_cents = int(round(max(0.0, float(yes_ask) - float(yes_bid)) * 100.0))
+        if spread_cents is None and no_bid is not None and no_ask is not None:
+            spread_cents = int(round(max(0.0, float(no_ask) - float(no_bid)) * 100.0))
+
+        liquidity = _num(_pick(
+            raw_market.get("liquidity"),
+            raw_market.get("volume"),
+            orderbook.get("liquidity"),
+            orderbook.get("volume"),
+        ))
+        liquidity_depth = _num(_pick(
+            raw_market.get("liquidity_depth"),
+            raw_market.get("liquidity_size"),
+            orderbook.get("liquidity_depth"),
+            orderbook.get("liquidity_size"),
+            orderbook.get("yes_top_size"),
+            orderbook.get("no_top_size"),
+        ))
+        spread_bucket = str(
+            _pick(
+                raw_market.get("spread_bucket"),
+                orderbook.get("spread_bucket"),
+            )
+            or ""
+        ).strip().lower() or None
+        spread_is_catastrophic = _as_bool(
+            _pick(
+                raw_market.get("spread_is_catastrophic"),
+                orderbook.get("spread_is_catastrophic"),
+                spread_bucket in {"catastrophic", "unsafe"},
+            ),
+            default=spread_bucket in {"catastrophic", "unsafe"},
+        )
+        orderbook_ready = _as_bool(
+            _pick(
+                raw_market.get("orderbook_ready"),
+                orderbook.get("orderbook_ready"),
+            ),
+            default=None,
+        )
+        orderbook_usable = _as_bool(
+            _pick(
+                raw_market.get("orderbook_usable"),
+                orderbook.get("orderbook_usable"),
+            ),
+            default=None,
+        )
+        both_sides_unexecutable = _as_bool(
+            _pick(
+                raw_market.get("both_sides_unexecutable"),
+                orderbook.get("both_sides_unexecutable"),
+            ),
+            default=None,
+        )
+        executable_side_present = _as_bool(
+            _pick(
+                raw_market.get("executable_side_present"),
+                orderbook.get("executable_side_present"),
+            ),
+            default=None,
+        )
+        quote_ready = _as_bool(
+            _pick(
+                raw_market.get("quote_ready"),
+                orderbook.get("quote_ready"),
+            ),
+            default=None,
+        )
+        payload_ready = _as_bool(
+            _pick(
+                raw_market.get("payload_ready"),
+                orderbook.get("payload_ready"),
+            ),
+            default=None,
+        )
+        edge_source = str(
+            _pick(
+                raw_market.get("edge_source"),
+                orderbook.get("edge_source"),
+            )
+            or ""
+        ).strip().lower() or None
+        edge_after_cost = _num(_pick(
+            raw_market.get("edge_after_cost"),
+            orderbook.get("edge_after_cost"),
+        ))
+
+        yes_pair_valid = bool(yes_bid is not None and yes_ask is not None and yes_bid > 0.0 and yes_ask > 0.0)
+        no_pair_valid = bool(no_bid is not None and no_ask is not None and no_bid > 0.0 and no_ask > 0.0)
+        if executable_side_present is None:
+            executable_side_present = bool(yes_pair_valid or no_pair_valid)
+        if both_sides_unexecutable is None:
+            both_sides_unexecutable = bool(not yes_pair_valid and not no_pair_valid)
+        if quote_ready is None:
+            quote_ready = bool(executable_side_present)
+        if payload_ready is None:
+            payload_ready = bool(quote_ready)
+        if orderbook_ready is None:
+            orderbook_ready = bool(orderbook_usable if orderbook_usable is not None else executable_side_present)
+        if orderbook_usable is None:
+            orderbook_usable = bool(orderbook_ready if orderbook_ready is not None else executable_side_present)
+
+        synthetic_yes_book = bool(yes_bid is not None and yes_ask is not None and yes_bid == 0.0 and yes_ask >= 0.99)
+        synthetic_no_book = bool(no_bid is not None and no_ask is not None and no_bid <= 0.01 and no_ask >= 0.99)
+        boundary_price = bool(
+            (selected_price_cents is not None and (selected_price_cents <= 0 or selected_price_cents >= 100))
+            or (selected_price is not None and (selected_price <= 0.01 or selected_price >= 0.99))
+        )
+        catastrophic_spread = bool(
+            spread_is_catastrophic
+            or (spread_bucket in {"catastrophic", "unsafe"})
+            or (spread_cents is not None and spread_cents >= 90)
+        )
+        fake_liquidity = bool(
+            liquidity is not None and liquidity_depth is not None and liquidity <= 0.0 and liquidity_depth <= 0.0
+        )
+        unusable_orderbook = bool(orderbook_ready is False or orderbook_usable is False)
+        unexecutable = bool(
+            both_sides_unexecutable
+            or not executable_side_present
+            or quote_ready is False
+            or payload_ready is False
+            or edge_source == "fallback_zero"
+            or (edge_after_cost is not None and edge_after_cost <= 0.0)
+            or (not yes_pair_valid and not no_pair_valid)
+        )
+        additional_boundary = bool(
+            yes_bid is not None and yes_ask is not None and yes_bid <= 0.0 and yes_ask >= 0.95
+        ) or bool(
+            no_bid is not None and no_ask is not None and no_bid <= 0.05 and no_ask >= 0.99
+        )
+
+        skip_reason = None
+        if boundary_price:
+            skip_reason = "boundary_price"
+        elif catastrophic_spread:
+            skip_reason = "catastrophic_spread"
+        elif unusable_orderbook:
+            skip_reason = "unusable_orderbook"
+        elif fake_liquidity:
+            skip_reason = "fake_liquidity"
+        elif unexecutable:
+            skip_reason = "unexecutable"
+        elif synthetic_yes_book or synthetic_no_book:
+            skip_reason = "synthetic_book"
+        elif additional_boundary:
+            skip_reason = "boundary_book"
+
+        details = {
+            "ticker": ticker,
+            "family": family,
+            "selected_side": selected_side,
+            "selected_price": self._safe_round(selected_price, 4, None),
+            "selected_price_cents": int(round(selected_price_cents)) if selected_price_cents is not None else None,
+            "spread_cents": int(round(spread_cents)) if spread_cents is not None else None,
+            "spread_bucket": spread_bucket,
+            "spread_is_catastrophic": bool(spread_is_catastrophic),
+            "orderbook_ready": bool(orderbook_ready),
+            "orderbook_usable": bool(orderbook_usable),
+            "both_sides_unexecutable": bool(both_sides_unexecutable),
+            "executable_side_present": bool(executable_side_present),
+            "quote_ready": bool(quote_ready),
+            "payload_ready": bool(payload_ready),
+            "edge_source": edge_source,
+            "edge_after_cost": self._safe_round(edge_after_cost, 4, None),
+            "liquidity": self._safe_round(liquidity, 4, None),
+            "liquidity_depth": self._safe_round(liquidity_depth, 4, None),
+            "yes_bid": self._safe_round(yes_bid, 4, None),
+            "yes_ask": self._safe_round(yes_ask, 4, None),
+            "no_bid": self._safe_round(no_bid, 4, None),
+            "no_ask": self._safe_round(no_ask, 4, None),
+            "synthetic_yes_book": bool(synthetic_yes_book),
+            "synthetic_no_book": bool(synthetic_no_book),
+            "boundary_price": bool(boundary_price),
+            "catastrophic_spread": bool(catastrophic_spread),
+            "fake_liquidity": bool(fake_liquidity),
+            "unexecutable": bool(unexecutable),
+            "additional_boundary": bool(additional_boundary),
+            "skip_reason": skip_reason,
+        }
+        return skip_reason is None, skip_reason or "ok", details
+
+    def _sanitize_tradeable_candidates(self, candidates, markets=None):
+        markets = markets if isinstance(markets, list) else []
+        market_lookup = {
+            str(market.get("ticker", "") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+        }
+
+        def _source_value(source, key, default=None):
+            if isinstance(source, dict):
+                value = source.get(key, default)
+            else:
+                value = getattr(source, key, default)
+            return default if value is None else value
+
+        def _pick(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        summary = {
+            "total_candidates_seen": 0,
+            "removed_non_tradeable": 0,
+            "remaining_tradeable": 0,
+            "removed_boundary_price": 0,
+            "removed_catastrophic_spread": 0,
+            "removed_unusable_orderbook": 0,
+            "removed_fake_liquidity": 0,
+            "removed_unexecutable": 0,
+            "selected_tradeable_candidate": None,
+        }
+        sanitized = []
+        best_selected = None
+        best_selected_score = None
+
+        for item in candidates or []:
+            summary["total_candidates_seen"] += 1
+            if isinstance(item, dict):
+                raw_score = self.to_float(item.get("score"), self.to_float(item.get("raw_score"), 0.0))
+                q = _pick(item.get("q"), item.get("quote"), item.get("candidate"))
+                spread = self.to_float(item.get("spread"), None)
+                family = str(item.get("family") or "").strip().upper() or None
+            elif isinstance(item, (list, tuple)) and len(item) >= 4:
+                raw_score, q, spread, family = item[:4]
+                raw_score = self.to_float(raw_score, 0.0)
+                family = str(family or "").strip().upper() or None
+            else:
+                summary["removed_non_tradeable"] += 1
+                summary["removed_unexecutable"] += 1
+                continue
+
+            ticker = str(getattr(q, "ticker", "") or _source_value(q, "ticker", "") or "").strip()
+            market = market_lookup.get(ticker, {})
+            selected_side = str(
+                _pick(
+                    _source_value(q, "selected_side", None),
+                    _source_value(q, "side", None),
+                    item.get("selected_side") if isinstance(item, dict) else None,
+                    item.get("side") if isinstance(item, dict) else None,
+                    market.get("selected_side"),
+                    market.get("side"),
+                )
+                or ""
+            ).strip().lower() or None
+            yes_bid = self.to_float(
+                _pick(
+                    _source_value(q, "yes_bid", None),
+                    _source_value(q, "yes_bid_dollars", None),
+                    item.get("yes_bid") if isinstance(item, dict) else None,
+                    item.get("yes_bid_dollars") if isinstance(item, dict) else None,
+                    market.get("yes_bid"),
+                    market.get("yes_bid_dollars"),
+                ),
+                None,
+            )
+            yes_ask = self.to_float(
+                _pick(
+                    _source_value(q, "yes_ask", None),
+                    _source_value(q, "yes_ask_dollars", None),
+                    item.get("yes_ask") if isinstance(item, dict) else None,
+                    item.get("yes_ask_dollars") if isinstance(item, dict) else None,
+                    market.get("yes_ask"),
+                    market.get("yes_ask_dollars"),
+                ),
+                None,
+            )
+            no_bid = self.to_float(
+                _pick(
+                    _source_value(q, "no_bid", None),
+                    _source_value(q, "no_bid_dollars", None),
+                    item.get("no_bid") if isinstance(item, dict) else None,
+                    item.get("no_bid_dollars") if isinstance(item, dict) else None,
+                    market.get("no_bid"),
+                    market.get("no_bid_dollars"),
+                ),
+                None,
+            )
+            no_ask = self.to_float(
+                _pick(
+                    _source_value(q, "no_ask", None),
+                    _source_value(q, "no_ask_dollars", None),
+                    item.get("no_ask") if isinstance(item, dict) else None,
+                    item.get("no_ask_dollars") if isinstance(item, dict) else None,
+                    market.get("no_ask"),
+                    market.get("no_ask_dollars"),
+                ),
+                None,
+            )
+            selected_price = self.to_float(
+                _pick(
+                    _source_value(q, "selected_price", None),
+                    _source_value(q, "selected_price_dollars", None),
+                    item.get("selected_price") if isinstance(item, dict) else None,
+                    item.get("selected_price_dollars") if isinstance(item, dict) else None,
+                    yes_ask if selected_side == "yes" else None,
+                    no_ask if selected_side == "no" else None,
+                    yes_ask if yes_ask is not None else yes_bid,
+                    no_ask if no_ask is not None else no_bid,
+                ),
+                None,
+            )
+            selected_price_cents = self.to_float(
+                _pick(
+                    _source_value(q, "selected_price_cents", None),
+                    item.get("selected_price_cents") if isinstance(item, dict) else None,
+                    market.get("selected_price_cents"),
+                ),
+                None,
+            )
+            if selected_price_cents is None and selected_price is not None:
+                selected_price_cents = int(round(float(selected_price) * 100.0))
+            if selected_price is None and selected_price_cents is not None:
+                selected_price = round(float(selected_price_cents) / 100.0, 4)
+            yes_pair_valid = bool(yes_bid is not None and yes_ask is not None and yes_bid > 0.0 and yes_ask > 0.0)
+            no_pair_valid = bool(no_bid is not None and no_ask is not None and no_bid > 0.0 and no_ask > 0.0)
+            executable_side_present = bool(
+                _as_bool(
+                    _pick(
+                        _source_value(q, "executable_side_present", None),
+                        item.get("executable_side_present") if isinstance(item, dict) else None,
+                        yes_pair_valid or no_pair_valid,
+                    ),
+                    default=yes_pair_valid or no_pair_valid,
+                )
+            )
+            both_sides_unexecutable = bool(
+                _as_bool(
+                    _pick(
+                        _source_value(q, "both_sides_unexecutable", None),
+                        item.get("both_sides_unexecutable") if isinstance(item, dict) else None,
+                        (not yes_pair_valid and not no_pair_valid),
+                    ),
+                    default=not yes_pair_valid and not no_pair_valid,
+                )
+            )
+            quote_ready_value = _pick(
+                _source_value(q, "quote_ready", None),
+                item.get("quote_ready") if isinstance(item, dict) else None,
+                market.get("quote_ready"),
+            )
+            quote_ready = _as_bool(quote_ready_value, default=executable_side_present)
+            payload_ready_value = _pick(
+                _source_value(q, "payload_ready", None),
+                item.get("payload_ready") if isinstance(item, dict) else None,
+                market.get("payload_ready"),
+            )
+            payload_ready = _as_bool(payload_ready_value, default=quote_ready)
+            orderbook_ready_value = _pick(
+                _source_value(q, "orderbook_ready", None),
+                item.get("orderbook_ready") if isinstance(item, dict) else None,
+                market.get("orderbook_ready"),
+            )
+            orderbook_usable_value = _pick(
+                _source_value(q, "orderbook_usable", None),
+                item.get("orderbook_usable") if isinstance(item, dict) else None,
+                market.get("orderbook_usable"),
+            )
+            orderbook_ready = _as_bool(orderbook_ready_value, default=None)
+            orderbook_usable = _as_bool(orderbook_usable_value, default=None)
+            spread_bucket = str(
+                _pick(
+                    _source_value(q, "spread_bucket", None),
+                    item.get("spread_bucket") if isinstance(item, dict) else None,
+                    market.get("spread_bucket"),
+                )
+                or ""
+            ).strip().lower() or None
+            spread_is_catastrophic = bool(
+                _as_bool(
+                    _pick(
+                        _source_value(q, "spread_is_catastrophic", None),
+                        item.get("spread_is_catastrophic") if isinstance(item, dict) else None,
+                        market.get("spread_is_catastrophic"),
+                        spread_bucket in {"catastrophic", "unsafe"},
+                    ),
+                    default=spread_bucket in {"catastrophic", "unsafe"},
+                )
+            )
+            edge_source = str(
+                _pick(
+                    _source_value(q, "edge_source", None),
+                    item.get("edge_source") if isinstance(item, dict) else None,
+                    market.get("edge_source"),
+                )
+                or ""
+            ).strip().lower() or None
+            edge_after_cost = self.to_float(
+                _pick(
+                    _source_value(q, "edge_after_cost", None),
+                    item.get("edge_after_cost") if isinstance(item, dict) else None,
+                    market.get("edge_after_cost"),
+                ),
+                None,
+            )
+            liquidity = self.to_float(
+                _pick(
+                    _source_value(q, "liquidity", None),
+                    item.get("liquidity") if isinstance(item, dict) else None,
+                    market.get("liquidity"),
+                ),
+                None,
+            )
+            liquidity_depth = self.to_float(
+                _pick(
+                    _source_value(q, "liquidity_depth", None),
+                    _source_value(q, "liquidity_size", None),
+                    item.get("liquidity_depth") if isinstance(item, dict) else None,
+                    item.get("liquidity_size") if isinstance(item, dict) else None,
+                    market.get("liquidity_depth"),
+                    market.get("liquidity_size"),
+                ),
+                None,
+            )
+            boundary_price = bool(
+                (selected_price_cents is not None and (selected_price_cents <= 0 or selected_price_cents >= 100))
+                or (selected_price is not None and (selected_price <= 0.01 or selected_price >= 0.99))
+                or (yes_bid is not None and yes_ask is not None and yes_bid == 0.0 and yes_ask >= 0.99)
+                or (no_bid is not None and no_ask is not None and no_bid <= 0.01 and no_ask >= 0.99)
+            )
+            fake_liquidity = bool(
+                liquidity is not None
+                and liquidity_depth is not None
+                and liquidity <= 0.0
+                and liquidity_depth <= 0.0
+            )
+            unexecutable = bool(
+                both_sides_unexecutable
+                or not executable_side_present
+                or quote_ready is False
+                or payload_ready is False
+                or edge_source == "fallback_zero"
+                or (edge_after_cost is not None and edge_after_cost <= 0.0)
+            )
+            unusable_orderbook = bool(
+                (orderbook_ready is False)
+                or (orderbook_usable is False)
+                or (not yes_pair_valid and not no_pair_valid and orderbook_ready is None and orderbook_usable is None)
+            )
+            remove_reasons = []
+            if boundary_price:
+                remove_reasons.append("removed_boundary_price")
+            if spread_is_catastrophic:
+                remove_reasons.append("removed_catastrophic_spread")
+            if unusable_orderbook:
+                remove_reasons.append("removed_unusable_orderbook")
+            if fake_liquidity:
+                remove_reasons.append("removed_fake_liquidity")
+            if unexecutable:
+                remove_reasons.append("removed_unexecutable")
+
+            if remove_reasons:
+                summary["removed_non_tradeable"] += 1
+                for reason in remove_reasons:
+                    summary[reason] += 1
+                continue
+
+            sanitized.append(item)
+            if best_selected is None or raw_score > best_selected_score:
+                best_selected = item
+                best_selected_score = raw_score
+
+        summary["remaining_tradeable"] = len(sanitized)
+        if best_selected is not None:
+            if isinstance(best_selected, dict):
+                best_q = _pick(best_selected.get("q"), best_selected.get("quote"), best_selected.get("candidate"))
+                best_score = self.to_float(best_selected.get("score"), self.to_float(best_selected.get("raw_score"), 0.0))
+                best_family = str(best_selected.get("family") or "").strip().upper() or None
+                best_spread = self.to_float(best_selected.get("spread"), None)
+            else:
+                best_score, best_q, best_spread, best_family = best_selected[:4]
+                best_score = self.to_float(best_score, 0.0)
+                best_family = str(best_family or "").strip().upper() or None
+            selected_price_cents_value = self.to_float(
+                _pick(
+                    _source_value(best_q, "selected_price_cents", None),
+                ),
+                None,
+            )
+            summary["selected_tradeable_candidate"] = {
+                "ticker": str(getattr(best_q, "ticker", "") or _source_value(best_q, "ticker", "") or "").strip() or None,
+                "family": best_family,
+                "side": str(
+                    _pick(
+                        _source_value(best_q, "selected_side", None),
+                        _source_value(best_q, "side", None),
+                    )
+                    or ""
+                ).strip().lower() or None,
+                "selected_price": self.to_float(
+                    _pick(
+                        _source_value(best_q, "selected_price", None),
+                        _source_value(best_q, "selected_price_dollars", None),
+                    ),
+                    None,
+                ),
+                "selected_price_cents": int(round(selected_price_cents_value)) if selected_price_cents_value is not None else None,
+                "raw_score": round(best_score, 4),
+                "spread": self._safe_round(best_spread, 4, None),
+            }
+        self.last_candidate_sanitization_summary = dict(summary)
+        return sanitized, summary
+
+    def _evaluate_aion_candidate_quality(self, market=None, q=None, expectancy_summary=None, tradeability=None):
+        market = market if isinstance(market, dict) else {}
+        expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+        tradeability = tradeability if isinstance(tradeability, dict) else {}
+
+        def _pick(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        def _to_cents(value):
+            value = self.to_float(value, None)
+            if value is None:
+                return None
+            try:
+                return int(round(float(value) * 100.0))
+            except (TypeError, ValueError):
+                return None
+
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = str(
+            expectancy_summary.get("family")
+            or tradeability.get("family")
+            or self.get_market_family(market)
+            or getattr(q, "family", "")
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+        selected_side = str(
+            _pick(
+                getattr(q, "selected_side", None),
+                getattr(q, "side", None),
+                expectancy_summary.get("selected_side"),
+                tradeability.get("selected_side"),
+                tradeability.get("side"),
+            )
+            or ""
+        ).strip().lower() or None
+        yes_bid = self.to_float(_pick(
+            getattr(q, "yes_bid", None),
+            getattr(q, "yes_bid_dollars", None),
+            market.get("yes_bid"),
+            market.get("yes_bid_dollars"),
+            expectancy_summary.get("yes_bid"),
+            tradeability.get("yes_bid"),
+            tradeability.get("yes_bid_dollars"),
+        ), None)
+        yes_ask = self.to_float(_pick(
+            getattr(q, "yes_ask", None),
+            getattr(q, "yes_ask_dollars", None),
+            market.get("yes_ask"),
+            market.get("yes_ask_dollars"),
+            expectancy_summary.get("yes_ask"),
+            tradeability.get("yes_ask"),
+            tradeability.get("yes_ask_dollars"),
+        ), None)
+        no_bid = self.to_float(_pick(
+            getattr(q, "no_bid", None),
+            getattr(q, "no_bid_dollars", None),
+            market.get("no_bid"),
+            market.get("no_bid_dollars"),
+            expectancy_summary.get("no_bid"),
+            tradeability.get("no_bid"),
+            tradeability.get("no_bid_dollars"),
+        ), None)
+        no_ask = self.to_float(_pick(
+            getattr(q, "no_ask", None),
+            getattr(q, "no_ask_dollars", None),
+            market.get("no_ask"),
+            market.get("no_ask_dollars"),
+            expectancy_summary.get("no_ask"),
+            tradeability.get("no_ask"),
+            tradeability.get("no_ask_dollars"),
+        ), None)
+
+        if selected_side == "yes":
+            selected_price = _pick(
+                getattr(q, "selected_price", None),
+                getattr(q, "selected_price_dollars", None),
+                expectancy_summary.get("selected_price"),
+                expectancy_summary.get("selected_price_dollars"),
+                tradeability.get("selected_price"),
+                tradeability.get("selected_price_dollars"),
+                yes_ask if yes_ask is not None else yes_bid,
+                no_ask if no_ask is not None else no_bid,
+            )
+        elif selected_side == "no":
+            selected_price = _pick(
+                getattr(q, "selected_price", None),
+                getattr(q, "selected_price_dollars", None),
+                expectancy_summary.get("selected_price"),
+                expectancy_summary.get("selected_price_dollars"),
+                tradeability.get("selected_price"),
+                tradeability.get("selected_price_dollars"),
+                no_ask if no_ask is not None else no_bid,
+                yes_ask if yes_ask is not None else yes_bid,
+            )
+        else:
+            selected_price = _pick(
+                getattr(q, "selected_price", None),
+                getattr(q, "selected_price_dollars", None),
+                expectancy_summary.get("selected_price"),
+                expectancy_summary.get("selected_price_dollars"),
+                tradeability.get("selected_price"),
+                tradeability.get("selected_price_dollars"),
+                yes_ask if yes_ask is not None else yes_bid,
+                no_ask if no_ask is not None else no_bid,
+            )
+        selected_price = self.to_float(selected_price, None)
+        selected_price_cents = _to_cents(
+            _pick(
+                getattr(q, "selected_price_cents", None),
+                expectancy_summary.get("selected_price_cents"),
+                tradeability.get("selected_price_cents"),
+            )
+        )
+        if selected_price_cents is None and selected_price is not None:
+            selected_price_cents = _to_cents(selected_price)
+        if selected_price is None and selected_price_cents is not None:
+            selected_price = round(int(selected_price_cents) / 100.0, 4)
+
+        yes_pair_valid = bool(yes_bid is not None and yes_ask is not None and yes_bid > 0.0 and yes_ask > 0.0)
+        no_pair_valid = bool(no_bid is not None and no_ask is not None and no_bid > 0.0 and no_ask > 0.0)
+        selected_side_executable = bool(
+            selected_side == "yes" and yes_pair_valid and selected_price is not None and 0.0 < selected_price < 1.0
+        ) or bool(
+            selected_side == "no" and no_pair_valid and selected_price is not None and 0.0 < selected_price < 1.0
+        )
+        executable_side_present = bool(selected_side_executable or yes_pair_valid or no_pair_valid)
+        quote_ready = bool(
+            expectancy_summary.get("quote_ready")
+            if "quote_ready" in expectancy_summary
+            else executable_side_present
+        )
+        orderbook_usable = bool(
+            tradeability.get("orderbook_ready")
+            if "orderbook_ready" in tradeability
+            else executable_side_present
+        )
+        payload_ready = bool(
+            expectancy_summary.get("payload_ready")
+            if "payload_ready" in expectancy_summary
+            else (
+                quote_ready
+                and orderbook_usable
+                and selected_price_cents is not None
+                and 1 <= int(selected_price_cents) <= 99
+            )
+        )
+        selected_price_in_bounds = bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99)
+        boundary_price_candidate = bool(selected_price_cents in {0, 100} or selected_price in {0.0, 1.0})
+        synthetic_yes_book = bool(yes_bid is not None and yes_ask is not None and yes_bid <= 0.0 and yes_ask <= 0.0)
+        synthetic_no_book = bool(no_bid is not None and no_ask is not None and no_bid >= 0.99 and no_ask >= 0.99)
+        spread_classification = str(
+            tradeability.get("spread_classification")
+            or expectancy_summary.get("spread_classification")
+            or expectancy_summary.get("spread_bucket")
+            or "unknown"
+        ).strip().upper() or "UNKNOWN"
+        orderbook_age_seconds = self.to_float(
+            _pick(
+                tradeability.get("orderbook_age_seconds"),
+                expectancy_summary.get("orderbook_age_seconds"),
+                expectancy_summary.get("cache_age_seconds"),
+                market.get("staleness_seconds"),
+            ),
+            None,
+        )
+        fill_quality_score = self.to_float(expectancy_summary.get("fill_quality_score"), None)
+        family_weight = self.to_float(expectancy_summary.get("family_weight"), None)
+        if family_weight is None:
+            try:
+                family_weight = self._get_family_performance_weight(family)
+            except Exception:
+                family_weight = 0.0
+        market_activity_score = 0.0
+        recent_activity = bool(
+            (self.to_float(getattr(q, "volume", None), self.to_float(market.get("volume"), 0.0)) or 0.0) > 0.0
+            or (self.to_float(getattr(q, "liquidity", None), self.to_float(market.get("liquidity"), 0.0)) or 0.0) > 0.0
+            or (orderbook_age_seconds is not None and orderbook_age_seconds <= 120.0)
+        )
+        if recent_activity:
+            market_activity_score += 8.0
+            reasons.append("recent_activity")
+        if orderbook_age_seconds is not None:
+            if orderbook_age_seconds <= 30.0:
+                market_activity_score += 6.0
+                reasons.append("fresh_orderbook")
+            elif orderbook_age_seconds <= 120.0:
+                market_activity_score += 4.0
+                reasons.append("recent_orderbook")
+            elif orderbook_age_seconds <= 300.0:
+                market_activity_score += 1.0
+                reasons.append("warm_orderbook")
+            else:
+                market_activity_score -= 6.0
+                reasons.append("stale_orderbook")
+        else:
+            market_activity_score -= 2.0
+            reasons.append("missing_orderbook_age")
+        quality_score += market_activity_score
+        print(
+            "[AION-MARKET-ACTIVITY] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "recent_activity": bool(recent_activity),
+                    "orderbook_age_seconds": orderbook_age_seconds,
+                    "market_activity_score": round(market_activity_score, 4),
+                    "fill_quality_score": None if fill_quality_score is None else round(fill_quality_score, 4),
+                    "reason": "selection_activity_ranking",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        if family_weight:
+            family_weight_effect = max(-8.0, min(8.0, float(family_weight)))
+            quality_score += family_weight_effect
+            reasons.append("family_weight")
+        else:
+            family_weight_effect = 0.0
+        if fill_quality_score is not None:
+            fill_quality_effect = (self._clamp(fill_quality_score) - 0.5) * 16.0
+            quality_score += fill_quality_effect
+            reasons.append("fill_quality")
+        else:
+            fill_quality_effect = 0.0
+
+        if executable_side_present:
+            quality_score += 18.0
+            reasons.append("executable_side_present")
+        else:
+            quality_score -= 28.0
+            reasons.append("no_executable_side")
+
+        if selected_side_executable:
+            quality_score += 14.0
+            reasons.append("selected_side_executable")
+        else:
+            quality_score -= 14.0
+            reasons.append("selected_side_not_executable")
+
+        if selected_price_in_bounds:
+            quality_score += 18.0
+            reasons.append("selected_price_in_bounds")
+        else:
+            quality_score -= 24.0
+            reasons.append("selected_price_out_of_range")
+
+        if boundary_price_candidate:
+            quality_score -= 32.0
+            reasons.append("boundary_or_synthetic_price")
+
+        if synthetic_yes_book:
+            quality_score -= 45.0
+            reasons.append("yes_book_synthetic")
+
+        if synthetic_no_book:
+            quality_score -= 45.0
+            reasons.append("no_book_synthetic")
+
+        if quote_ready:
+            quality_score += 10.0
+            reasons.append("quote_ready")
+        else:
+            quality_score -= 8.0
+            reasons.append("quote_not_ready")
+
+        if payload_ready:
+            quality_score += 8.0
+            reasons.append("payload_ready")
+        else:
+            quality_score -= 8.0
+            reasons.append("payload_not_ready")
+
+        if orderbook_usable:
+            quality_score += 14.0
+            reasons.append("orderbook_usable")
+        else:
+            quality_score -= 22.0
+            reasons.append("orderbook_not_usable")
+
+        if spread_classification in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE"}:
+            quality_score += 8.0
+            reasons.append("spread_classification_safe")
+        elif spread_classification == "CAUTION_WAIT":
+            quality_score += 2.0
+            reasons.append("spread_classification_caution")
+        elif spread_classification in {"UNSAFE", "UNSAFE_SPREAD"}:
+            quality_score -= 10.0
+            reasons.append("spread_classification_unsafe")
+
+        if orderbook_age_seconds is not None:
+            if orderbook_age_seconds <= 30.0:
+                quality_score += 5.0
+                reasons.append("fresh_orderbook")
+            elif orderbook_age_seconds <= 120.0:
+                quality_score += 4.0
+                reasons.append("recent_orderbook")
+            elif orderbook_age_seconds <= 300.0:
+                quality_score += 1.0
+                reasons.append("stale_but_usable")
+            elif orderbook_age_seconds > 900.0:
+                quality_score -= 6.0
+                reasons.append("stale_orderbook")
+
+        if yes_pair_valid:
+            quality_score += 4.0
+            reasons.append("yes_pair_valid")
+        if no_pair_valid:
+            quality_score += 4.0
+            reasons.append("no_pair_valid")
+        if yes_pair_valid and no_pair_valid:
+            quality_score += 3.0
+            reasons.append("both_sides_valid")
+
+        if synthetic_yes_book or synthetic_no_book or boundary_price_candidate:
+            preferred_reason = "synthetic_or_boundary_book"
+        elif not orderbook_usable:
+            preferred_reason = "orderbook_not_usable"
+        elif not selected_price_in_bounds:
+            preferred_reason = "selected_price_out_of_range"
+        elif not executable_side_present:
+            preferred_reason = "no_executable_side"
+        elif not payload_ready:
+            preferred_reason = "payload_not_ready"
+        elif not quote_ready:
+            preferred_reason = "quote_not_ready"
+        elif selected_side_executable and yes_pair_valid and no_pair_valid:
+            preferred_reason = "dual_side_executable_book"
+        elif selected_side_executable:
+            preferred_reason = "selected_side_executable"
+        else:
+            preferred_reason = "clean_executable_book"
+
+        quality_score = round(quality_score, 4)
+        quality_adjustment = round(max(-20.0, min(20.0, quality_score / 5.0)), 4)
+        if quality_score >= 40.0:
+            quality_bucket = "excellent"
+        elif quality_score >= 15.0:
+            quality_bucket = "good"
+        elif quality_score >= 0.0:
+            quality_bucket = "mixed"
+        elif quality_score >= -20.0:
+            quality_bucket = "boundary"
+        else:
+            quality_bucket = "garbage"
+
+        return {
+            "ticker": ticker or None,
+            "family": family,
+            "selected_side": selected_side,
+            "selected_price": round(selected_price, 4) if selected_price is not None else None,
+            "selected_price_cents": selected_price_cents,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "quote_ready": bool(quote_ready),
+            "payload_ready": bool(payload_ready),
+            "orderbook_usable": bool(orderbook_usable),
+            "executable_side_present": bool(executable_side_present),
+            "selected_side_executable": bool(selected_side_executable),
+            "selected_price_in_bounds": bool(selected_price_in_bounds),
+            "boundary_price_candidate": bool(boundary_price_candidate),
+            "synthetic_yes_book": bool(synthetic_yes_book),
+            "synthetic_no_book": bool(synthetic_no_book),
+            "spread_classification": spread_classification,
+            "orderbook_age_seconds": orderbook_age_seconds,
+            "recent_activity": bool(recent_activity),
+            "market_activity_score": round(market_activity_score, 4),
+            "family_weight": round(family_weight_effect, 4),
+            "fill_quality_score": round(fill_quality_score, 4) if fill_quality_score is not None else None,
+            "fill_quality_effect": round(fill_quality_effect, 4),
+            "quality_score": quality_score,
+            "quality_adjustment": quality_adjustment,
+            "quality_bucket": quality_bucket,
+            "quality_bucket_rank": {
+                "excellent": 4,
+                "good": 3,
+                "mixed": 2,
+                "boundary": 1,
+                "garbage": 0,
+            }.get(quality_bucket, 0),
+            "preferred_reason": preferred_reason,
+            "reason_tags": reasons[:12],
+        }
 
     def score_final_candidate_decision(self, market, q, spread, family):
         ticker = getattr(q, "ticker", "") or str((market or {}).get("ticker", "") or "").strip()
@@ -39617,6 +40697,50 @@ class KalshiSniperBot:
             f"families_represented={sorted({prescore.get('family') for prescore, _market in strict_pool if prescore.get('family')})} "
             f"all_prefilter_survivors_removed_before_pool={'yes' if prefilter_survivors_total > 0 and strict_pool_after_family_suppression_count == 0 else 'no'}"
         )
+        layer1_sanity_summary = {
+            "total_markets_seen": len(strict_pool),
+            "skipped_non_tradeable": 0,
+            "passed_to_candidate_construction": 0,
+            "skipped_boundary_price": 0,
+            "skipped_catastrophic_spread": 0,
+            "skipped_unusable_orderbook": 0,
+            "skipped_fake_liquidity": 0,
+            "skipped_unexecutable": 0,
+            "top_skip_reasons": [],
+            "sample_passed_ticker": None,
+        }
+        layer1_skip_reason_counts = Counter()
+        layer1_filtered_pool = []
+        for prescore, market in strict_pool:
+            family = prescore.get("family") or self.get_market_family(market)
+            ticker = str(market.get("ticker", "") or "").strip()
+            tradeable, skip_reason, sanity_details = self.is_market_pre_candidate_tradeable(
+                raw_market=market,
+                orderbook=market,
+                family=family,
+                ticker=ticker,
+            )
+            if tradeable:
+                layer1_filtered_pool.append((prescore, market))
+                layer1_sanity_summary["passed_to_candidate_construction"] += 1
+                if layer1_sanity_summary["sample_passed_ticker"] is None:
+                    layer1_sanity_summary["sample_passed_ticker"] = ticker or None
+                continue
+            layer1_sanity_summary["skipped_non_tradeable"] += 1
+            layer1_skip_reason_counts[str(skip_reason or "unknown")] += 1
+            if sanity_details.get("boundary_price"):
+                layer1_sanity_summary["skipped_boundary_price"] += 1
+            if sanity_details.get("catastrophic_spread"):
+                layer1_sanity_summary["skipped_catastrophic_spread"] += 1
+            if sanity_details.get("unusable_orderbook"):
+                layer1_sanity_summary["skipped_unusable_orderbook"] += 1
+            if sanity_details.get("fake_liquidity"):
+                layer1_sanity_summary["skipped_fake_liquidity"] += 1
+            if sanity_details.get("unexecutable"):
+                layer1_sanity_summary["skipped_unexecutable"] += 1
+        layer1_sanity_summary["top_skip_reasons"] = layer1_skip_reason_counts.most_common(5)
+        strict_pool = layer1_filtered_pool
+        print("[AION-MARKET-SANITY] " + json.dumps(layer1_sanity_summary, sort_keys=True, default=str))
         surviving_family_counts = {}
         for prescore, _market in strict_pool:
             family = prescore.get("family")
@@ -40542,7 +41666,9 @@ class KalshiSniperBot:
         predictive_candidates, predictive_summary = self.profile_predictive_momentum(markets, adaptive_candidates)
         position_candidates, position_summary = self.profile_position_intelligence(markets, predictive_candidates, open_positions=self._get_open_live_positions())
         memory_candidates, memory_summary = self.profile_memory_intelligence(markets, position_candidates)
-        multi_agent_candidates, multi_agent_summary = self.profile_multi_agent_network(markets, memory_candidates)
+        sanitized_candidates, candidate_sanitization_summary = self._sanitize_tradeable_candidates(memory_candidates, markets=markets)
+        print("[AION-CANDIDATE-SANITIZED] " + json.dumps(candidate_sanitization_summary, sort_keys=True, default=str))
+        multi_agent_candidates, multi_agent_summary = self.profile_multi_agent_network(markets, sanitized_candidates)
         ranked = self.rank_final_candidates(multi_agent_candidates)
         # AION EXPECTANCY ACTIVATION HOOK
         self.expectancy_cycle_context = {
@@ -40829,6 +41955,7 @@ class KalshiSniperBot:
         ranked = self._apply_execution_diversity_bonus(ranked, markets)
         expectancy_summary_by_ticker = {}
         expectancy_ranked_items = []
+        quality_summary_by_ticker = {}
         aggressive_candidate_search_counts = Counter()
         aggressive_candidate_missing_reasons = Counter()
         aggressive_candidate_found_items = []
@@ -40837,18 +41964,28 @@ class KalshiSniperBot:
             for item in (markets or [])
             if isinstance(item, dict)
         }
+        pre_quality_ranked_top = None
         # AION CONTROLLED LOOSENING HOOK
         if AION_CONTROLLED_LOOSENING_ENABLED and AION_EXPECTANCY_SCORE_ENABLED:
             for score, q, spread, family in ranked:
                 ticker = str(getattr(q, "ticker", "") or "").strip()
                 market = market_lookup.get(ticker)
                 if not ticker:
+                    quality_snapshot = self._evaluate_aion_candidate_quality(
+                        market=market,
+                        q=q,
+                        expectancy_summary={},
+                    )
                     expectancy_ranked_items.append({
                         "raw_score": score,
                         "adjusted_score": score,
                         "q": q,
                         "spread": spread,
                         "family": family,
+                        "quality_snapshot": quality_snapshot,
+                        "quality_score": quality_snapshot.get("quality_score"),
+                        "quality_adjustment": quality_snapshot.get("quality_adjustment"),
+                        "quality_bucket": quality_snapshot.get("quality_bucket"),
                     })
                     continue
                 predictive_regime_summary = self._build_predictive_regime_family_summary(family=family)
@@ -40909,11 +42046,17 @@ class KalshiSniperBot:
                     near_miss_count=int(entry_timing_observation.get("near_miss_count", 0) or 0),
                     phase55_status=entry_timing_observation.get("phase55_status"),
                 )
+                quality_snapshot = self._evaluate_aion_candidate_quality(
+                    market=market,
+                    q=q,
+                    expectancy_summary=expectancy_summary,
+                )
                 adjusted_score = (
                     self.to_float(score_result.get("candidate_score"), score)
                     + self.to_float(expectancy_summary.get("soft_priority_adjustment"), 0.0)
                     + self.to_float(expectancy_summary.get("profit_target_priority_adjustment"), 0.0)
                 )
+                adjusted_score += self.to_float(quality_snapshot.get("quality_adjustment"), 0.0)
                 candidate_final_edge = self.to_float(expectancy_summary.get("final_edge"), self.to_float(expectancy_summary.get("sports_edge_after_cost"), 0.0))
                 aggressive_candidate_search = self._evaluate_aggressive_candidate_search(
                     ticker=ticker,
@@ -40997,6 +42140,10 @@ class KalshiSniperBot:
                     "entry_timing_observation": entry_timing_observation,
                     "expectancy_summary": expectancy_summary,
                     "aggressive_candidate_search": aggressive_candidate_search,
+                    "quality_snapshot": quality_snapshot,
+                    "quality_score": quality_snapshot.get("quality_score"),
+                    "quality_adjustment": quality_snapshot.get("quality_adjustment"),
+                    "quality_bucket": quality_snapshot.get("quality_bucket"),
                 })
             expectancy_ranked_items.sort(
                 key=lambda item: (
@@ -41006,11 +42153,40 @@ class KalshiSniperBot:
                 ),
                 reverse=True,
             )
+            pre_quality_top = expectancy_ranked_items[0] if expectancy_ranked_items else None
+            expectancy_ranked_items.sort(
+                key=lambda item: (
+                    int(bool(item.get("aggressive_priority"))),
+                    self.to_float(item.get("adjusted_score"), self.to_float(item.get("raw_score"), 0.0)),
+                    self.to_float(item.get("quality_adjustment"), 0.0),
+                    self.to_float(item.get("quality_score"), 0.0),
+                    self.to_float(item.get("raw_score"), 0.0),
+                ),
+                reverse=True,
+            )
             expectancy_summary_by_ticker = {
                 str(getattr(item.get("q"), "ticker", "") or "").strip(): item
                 for item in expectancy_ranked_items
                 if item.get("q") is not None
             }
+            quality_summary_by_ticker = {
+                str(getattr(item.get("q"), "ticker", "") or "").strip(): item.get("quality_snapshot") or {}
+                for item in expectancy_ranked_items
+                if item.get("q") is not None
+            }
+            pre_quality_ranked_top = ranked[0] if ranked else None
+            ranked = sorted(
+                ranked,
+                key=lambda item: (
+                    int(bool(quality_summary_by_ticker.get(str(getattr(item[1], "ticker", "") or "").strip(), {}).get("executable_side_present"))),
+                    self.to_float(quality_summary_by_ticker.get(str(getattr(item[1], "ticker", "") or "").strip(), {}).get("quality_adjustment"), 0.0)
+                    + self.to_float(item[0], 0.0),
+                    self.to_float(quality_summary_by_ticker.get(str(getattr(item[1], "ticker", "") or "").strip(), {}).get("quality_score"), 0.0),
+                    self.to_float(item[0], 0.0),
+                    -self.to_float(item[2], 0.0),
+                ),
+                reverse=True,
+            )
             self.last_aggressive_candidate_search_summary = {
                 "seen": int(aggressive_candidate_search_counts.get("seen", 0) or 0),
                 "found": int(aggressive_candidate_search_counts.get("found", 0) or 0),
@@ -42662,6 +43838,80 @@ class KalshiSniperBot:
 
         self.no_candidate_cycle_streak = 0
         score, q, spread, family = selected
+        selected_market = market_lookup.get(str(getattr(q, "ticker", "") or "").strip(), {})
+        selected_quality_snapshot = dict(
+            quality_summary_by_ticker.get(str(getattr(q, "ticker", "") or "").strip(), {}) or {}
+        )
+        if not selected_quality_snapshot:
+            selected_quality_snapshot = self._evaluate_aion_candidate_quality(
+                market=selected_market,
+                q=q,
+                expectancy_summary=expectancy_summary_by_ticker.get(str(getattr(q, "ticker", "") or "").strip(), {}),
+                tradeability=candidate_forensics if isinstance(candidate_forensics, dict) else {},
+            )
+        selected_quality_summary = {
+            "total_candidates": len(ranked),
+            "executable_candidates": sum(
+                1
+                for _score, ranked_q, _spread, _family in ranked
+                if quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("executable_side_present")
+                and quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("selected_price_in_bounds")
+                and quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("quote_ready")
+                and quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("payload_ready")
+                and quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("orderbook_usable")
+            ),
+            "boundary_price_candidates": sum(
+                1
+                for _score, ranked_q, _spread, _family in ranked
+                if quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("boundary_price_candidate")
+                or quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("quality_bucket") == "boundary"
+            ),
+            "unusable_orderbook_candidates": sum(
+                1
+                for _score, ranked_q, _spread, _family in ranked
+                if not quality_summary_by_ticker.get(str(getattr(ranked_q, "ticker", "") or "").strip(), {}).get("orderbook_usable")
+            ),
+            "selected_quality_bucket": selected_quality_snapshot.get("quality_bucket"),
+            "selected_quality_score": selected_quality_snapshot.get("quality_score"),
+            "selected_quality_adjustment": selected_quality_snapshot.get("quality_adjustment"),
+            "selected_quality_reason": selected_quality_snapshot.get("preferred_reason"),
+            "quality_ranking_changed": bool(
+                pre_quality_ranked_top
+                and (
+                    str(getattr(pre_quality_ranked_top[1], "ticker", "") or "").strip() != str(getattr(q, "ticker", "") or "").strip()
+                    or pre_quality_ranked_top[3] != family
+                )
+            ),
+        }
+        print("[AION-CANDIDATE-QUALITY-SUMMARY] " + json.dumps(selected_quality_summary, sort_keys=True, default=str))
+        print(
+            "[AION-CANDIDATE-QUALITY] "
+            + json.dumps(
+                {
+                    "ticker": getattr(q, "ticker", None),
+                    "family": family,
+                    "side": selected_quality_snapshot.get("selected_side") or getattr(q, "selected_side", None) or getattr(q, "side", None),
+                    "selected_price": selected_quality_snapshot.get("selected_price"),
+                    "selected_price_cents": selected_quality_snapshot.get("selected_price_cents"),
+                    "executable_side_present": bool(selected_quality_snapshot.get("executable_side_present")),
+                    "quote_ready": bool(selected_quality_snapshot.get("quote_ready")),
+                    "payload_ready": bool(selected_quality_snapshot.get("payload_ready")),
+                    "orderbook_usable": selected_quality_snapshot.get("orderbook_usable"),
+                    "quality_score": selected_quality_snapshot.get("quality_score"),
+                    "quality_bucket": selected_quality_snapshot.get("quality_bucket"),
+                    "preferred_reason": selected_quality_snapshot.get("preferred_reason"),
+                    "quality_ranking_changed": bool(selected_quality_summary.get("quality_ranking_changed")),
+                    "selected_raw_score": round(self.to_float(score, 0.0), 4),
+                    "selected_adjusted_score": round(
+                        self.to_float(expectancy_summary_by_ticker.get(str(getattr(q, "ticker", "") or "").strip(), {}).get("adjusted_score"), self.to_float(score, 0.0)),
+                        4,
+                    ),
+                    "selected_side_executable": bool(selected_quality_snapshot.get("selected_side_executable")),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         psychology_stats = dict(self.market_psychology_cycle_stats or {})
         self.last_live_select_summary = {
             "original_market_count": original_market_count,
