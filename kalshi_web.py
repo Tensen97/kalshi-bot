@@ -128,6 +128,64 @@ try:
 except Exception:
     strategy_formatting = None
 
+try:
+    from kalshi_sniper.candidate_quality import (
+        build_candidate_quality_summary as candidate_quality_build_candidate_quality_summary,
+        build_expectancy_score as candidate_quality_build_expectancy_score,
+        compute_candidate_quality as candidate_quality_compute_candidate_quality,
+        compute_family_weight as candidate_quality_compute_family_weight,
+        compute_fill_quality_score as candidate_quality_compute_fill_quality_score,
+        rank_final_candidates as candidate_quality_rank_final_candidates,
+    )
+except Exception:
+    candidate_quality_build_candidate_quality_summary = None
+    candidate_quality_build_expectancy_score = None
+    candidate_quality_compute_candidate_quality = None
+    candidate_quality_compute_family_weight = None
+    candidate_quality_compute_fill_quality_score = None
+    candidate_quality_rank_final_candidates = None
+
+try:
+    from kalshi_sniper.candidate_sanitizer import (
+        build_candidate_sanitizer_summary as candidate_sanitizer_build_candidate_sanitizer_summary,
+        sanitize_tradeable_candidates as candidate_sanitizer_sanitize_tradeable_candidates,
+    )
+except Exception:
+    candidate_sanitizer_build_candidate_sanitizer_summary = None
+    candidate_sanitizer_sanitize_tradeable_candidates = None
+
+try:
+    from kalshi_sniper.market_sanity import (
+        build_market_sanity_summary as market_sanity_build_market_sanity_summary,
+        is_market_pre_candidate_tradeable as market_sanity_is_market_pre_candidate_tradeable,
+    )
+except Exception:
+    market_sanity_build_market_sanity_summary = None
+    market_sanity_is_market_pre_candidate_tradeable = None
+
+try:
+    from kalshi_sniper.orderbook_health import (
+        compute_pair_spread as orderbook_health_compute_pair_spread,
+        compute_topbook_spread as orderbook_health_compute_topbook_spread,
+        classify_realm_vv_spread_severity as orderbook_health_classify_realm_vv_spread_severity,
+        classify_spread_bucket as orderbook_health_classify_spread_bucket,
+        coerce_mapping as orderbook_health_coerce_mapping,
+        evaluate_orderbook_usability as orderbook_health_evaluate_orderbook_usability,
+        has_executable_pair as orderbook_health_has_executable_pair,
+        is_synthetic_book as orderbook_health_is_synthetic_book,
+        normalize_aggression_profile as orderbook_health_normalize_aggression_profile,
+    )
+except Exception:
+    orderbook_health_classify_realm_vv_spread_severity = None
+    orderbook_health_classify_spread_bucket = None
+    orderbook_health_coerce_mapping = None
+    orderbook_health_evaluate_orderbook_usability = None
+    orderbook_health_compute_pair_spread = None
+    orderbook_health_compute_topbook_spread = None
+    orderbook_health_has_executable_pair = None
+    orderbook_health_is_synthetic_book = None
+    orderbook_health_normalize_aggression_profile = None
+
 
 DEBUG_LIVE = (os.environ.get("DEBUG_LIVE", "false") or "false").strip().lower() == "true"
 DEBUG_LIVE_PREFIXES = (
@@ -868,6 +926,30 @@ def _compute_realm_vv_confidence(self, *, edge_after_cost=0.0, liquidity_depth=0
 
 
 def _classify_realm_vv_spread_severity(self, *, spread_bucket="unknown", edge_after_cost=0.0, profile="safe", market_personality=None, quote_ready=False, orderbook_ready=False, price_bounds_pass=False, liquidity_depth=0.0, fresh_enough=True, topbook_depth_exists=False, selected_side_has_price=False, selected_side_has_liquidity=False, depth_available=False, aggression_settings=None):
+        market_personality = market_personality if isinstance(market_personality, dict) else {}
+        if orderbook_health_classify_realm_vv_spread_severity is not None:
+            aggression_settings = aggression_settings if isinstance(aggression_settings, dict) else _aion_aggression_profile_settings(
+                _normalize_aion_aggression_profile(profile),
+                family=market_personality.get("family"),
+                spread_bucket=str(spread_bucket or "unknown").strip().lower() or "unknown",
+                context="realm_vv_spread",
+            )
+            return orderbook_health_classify_realm_vv_spread_severity(
+                spread_bucket=spread_bucket,
+                edge_after_cost=edge_after_cost,
+                profile=profile,
+                market_personality=market_personality,
+                quote_ready=quote_ready,
+                orderbook_ready=orderbook_ready,
+                price_bounds_pass=price_bounds_pass,
+                liquidity_depth=liquidity_depth,
+                fresh_enough=fresh_enough,
+                topbook_depth_exists=topbook_depth_exists,
+                selected_side_has_price=selected_side_has_price,
+                selected_side_has_liquidity=selected_side_has_liquidity,
+                depth_available=depth_available,
+                aggression_settings=aggression_settings,
+            )
         profile = _normalize_aion_aggression_profile(profile)
         market_personality = market_personality if isinstance(market_personality, dict) else {}
         spread_bucket = str(spread_bucket or "unknown").strip().lower() or "unknown"
@@ -18677,6 +18759,30 @@ class KalshiSniperBot:
         near_miss_count=0,
         phase55_status=None,
     ):
+        if candidate_quality_build_expectancy_score is not None:
+            return candidate_quality_build_expectancy_score(
+                self,
+                market=market,
+                q=q,
+                family=family,
+                spread=spread,
+                candidate_score=candidate_score,
+                score_breakdown=score_breakdown,
+                entry_timing_observation=entry_timing_observation,
+                predictive_regime_summary=predictive_regime_summary,
+                adaptive_confidence_summary=adaptive_confidence_summary,
+                family_rotation_summary=family_rotation_summary,
+                queue_summary=queue_summary,
+                microstructure_summary=microstructure_summary,
+                learning_summary=learning_summary,
+                family_learning_summary=family_learning_summary,
+                persistence_summary=persistence_summary,
+                sports_momentum=sports_momentum,
+                sports_edge=sports_edge,
+                sports_context=sports_context,
+                near_miss_count=near_miss_count,
+                phase55_status=phase55_status,
+            )
         market = market if isinstance(market, dict) else {}
         score_breakdown = score_breakdown if isinstance(score_breakdown, dict) else {}
         entry_timing_observation = entry_timing_observation if isinstance(entry_timing_observation, dict) else {}
@@ -22066,6 +22172,8 @@ class KalshiSniperBot:
         spread_candidate_details = []
 
         def _pair_spread(pair_label, bid_value, ask_value):
+            if orderbook_health_compute_pair_spread is not None:
+                return orderbook_health_compute_pair_spread(pair_label, bid_value, ask_value)
             pair_missing_fields = []
             if bid_value is None:
                 pair_missing_fields.append(f"{pair_label}_bid")
@@ -22085,6 +22193,8 @@ class KalshiSniperBot:
             return round(max(0.0, ask_float - bid_float), 4), [], None
 
         def _topbook_spread(yes_top_price_value, no_top_price_value):
+            if orderbook_health_compute_topbook_spread is not None:
+                return orderbook_health_compute_topbook_spread(yes_top_price_value, no_top_price_value)
             if yes_top_price_value is None or no_top_price_value is None:
                 missing = []
                 if yes_top_price_value is None:
@@ -24289,6 +24399,8 @@ class KalshiSniperBot:
         }
 
     def _get_family_performance_weight(self, family):
+        if candidate_quality_compute_family_weight is not None:
+            return candidate_quality_compute_family_weight(self, family)
         family = str(family or "UNKNOWN").strip() or "UNKNOWN"
         if not KALSHI_FAMILY_PERF_ENABLED:
             print(f"[LIVE-FAMILY-PERF-SKIP] family={family} reason=feature_disabled")
@@ -36240,6 +36352,8 @@ class KalshiSniperBot:
         }
 
     def rank_final_candidates(self, candidates):
+        if candidate_quality_rank_final_candidates is not None:
+            return candidate_quality_rank_final_candidates(candidates)
         def _candidate_rank_key(item):
             if isinstance(item, dict):
                 quality_score = self.to_float(item.get("quality_score"), self.to_float(item.get("candidate_score"), 0.0))
@@ -36276,6 +36390,14 @@ class KalshiSniperBot:
         )
 
     def is_market_pre_candidate_tradeable(self, raw_market=None, orderbook=None, family=None, ticker=None):
+        if market_sanity_is_market_pre_candidate_tradeable is not None:
+            return market_sanity_is_market_pre_candidate_tradeable(
+                raw_market=raw_market,
+                orderbook=orderbook,
+                family=family,
+                ticker=ticker,
+                get_market_family=self.get_market_family,
+            )
         raw_market = raw_market if isinstance(raw_market, dict) else {}
         orderbook = orderbook if isinstance(orderbook, dict) else {}
 
@@ -36554,6 +36676,12 @@ class KalshiSniperBot:
         return skip_reason is None, skip_reason or "ok", details
 
     def _sanitize_tradeable_candidates(self, candidates, markets=None):
+        if candidate_sanitizer_sanitize_tradeable_candidates is not None:
+            return candidate_sanitizer_sanitize_tradeable_candidates(
+                candidates,
+                markets=markets,
+                get_market_family=self.get_market_family,
+            )
         markets = markets if isinstance(markets, list) else []
         market_lookup = {
             str(market.get("ticker", "") or "").strip(): market
@@ -36880,6 +37008,14 @@ class KalshiSniperBot:
         return sanitized, summary
 
     def _evaluate_aion_candidate_quality(self, market=None, q=None, expectancy_summary=None, tradeability=None):
+        if candidate_quality_compute_candidate_quality is not None:
+            return candidate_quality_compute_candidate_quality(
+                self,
+                market=market,
+                q=q,
+                expectancy_summary=expectancy_summary,
+                tradeability=tradeability,
+            )
         market = market if isinstance(market, dict) else {}
         expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
         tradeability = tradeability if isinstance(tradeability, dict) else {}
@@ -40697,29 +40833,41 @@ class KalshiSniperBot:
             f"families_represented={sorted({prescore.get('family') for prescore, _market in strict_pool if prescore.get('family')})} "
             f"all_prefilter_survivors_removed_before_pool={'yes' if prefilter_survivors_total > 0 and strict_pool_after_family_suppression_count == 0 else 'no'}"
         )
-        layer1_sanity_summary = {
-            "total_markets_seen": len(strict_pool),
-            "skipped_non_tradeable": 0,
-            "passed_to_candidate_construction": 0,
-            "skipped_boundary_price": 0,
-            "skipped_catastrophic_spread": 0,
-            "skipped_unusable_orderbook": 0,
-            "skipped_fake_liquidity": 0,
-            "skipped_unexecutable": 0,
-            "top_skip_reasons": [],
-            "sample_passed_ticker": None,
-        }
+        if market_sanity_build_market_sanity_summary is not None:
+            layer1_sanity_summary = market_sanity_build_market_sanity_summary(len(strict_pool))
+        else:
+            layer1_sanity_summary = {
+                "total_markets_seen": len(strict_pool),
+                "skipped_non_tradeable": 0,
+                "passed_to_candidate_construction": 0,
+                "skipped_boundary_price": 0,
+                "skipped_catastrophic_spread": 0,
+                "skipped_unusable_orderbook": 0,
+                "skipped_fake_liquidity": 0,
+                "skipped_unexecutable": 0,
+                "top_skip_reasons": [],
+                "sample_passed_ticker": None,
+            }
         layer1_skip_reason_counts = Counter()
         layer1_filtered_pool = []
         for prescore, market in strict_pool:
             family = prescore.get("family") or self.get_market_family(market)
             ticker = str(market.get("ticker", "") or "").strip()
-            tradeable, skip_reason, sanity_details = self.is_market_pre_candidate_tradeable(
-                raw_market=market,
-                orderbook=market,
-                family=family,
-                ticker=ticker,
-            )
+            if market_sanity_is_market_pre_candidate_tradeable is not None:
+                tradeable, skip_reason, sanity_details = market_sanity_is_market_pre_candidate_tradeable(
+                    raw_market=market,
+                    orderbook=market,
+                    family=family,
+                    ticker=ticker,
+                    get_market_family=self.get_market_family,
+                )
+            else:
+                tradeable, skip_reason, sanity_details = self.is_market_pre_candidate_tradeable(
+                    raw_market=market,
+                    orderbook=market,
+                    family=family,
+                    ticker=ticker,
+                )
             if tradeable:
                 layer1_filtered_pool.append((prescore, market))
                 layer1_sanity_summary["passed_to_candidate_construction"] += 1
@@ -41666,7 +41814,14 @@ class KalshiSniperBot:
         predictive_candidates, predictive_summary = self.profile_predictive_momentum(markets, adaptive_candidates)
         position_candidates, position_summary = self.profile_position_intelligence(markets, predictive_candidates, open_positions=self._get_open_live_positions())
         memory_candidates, memory_summary = self.profile_memory_intelligence(markets, position_candidates)
-        sanitized_candidates, candidate_sanitization_summary = self._sanitize_tradeable_candidates(memory_candidates, markets=markets)
+        if candidate_sanitizer_sanitize_tradeable_candidates is not None:
+            sanitized_candidates, candidate_sanitization_summary = candidate_sanitizer_sanitize_tradeable_candidates(
+                memory_candidates,
+                markets=markets,
+                get_market_family=self.get_market_family,
+            )
+        else:
+            sanitized_candidates, candidate_sanitization_summary = self._sanitize_tradeable_candidates(memory_candidates, markets=markets)
         print("[AION-CANDIDATE-SANITIZED] " + json.dumps(candidate_sanitization_summary, sort_keys=True, default=str))
         multi_agent_candidates, multi_agent_summary = self.profile_multi_agent_network(markets, sanitized_candidates)
         ranked = self.rank_final_candidates(multi_agent_candidates)
@@ -53608,14 +53763,73 @@ class KalshiSniperBot:
             "orderbook_not_usable_reason": orderbook_not_usable_reason,
             "thin_book_override_applied": bool(thin_book_override_applied),
         }
-        try:
-            print("[AION-ORDERBOOK-USABILITY] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
-            if thin_book_override_applied:
-                print("[AION-ORDERBOOK-USABILITY-ALLOW] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
-            elif not orderbook_ready:
-                print("[AION-ORDERBOOK-USABILITY-BLOCKED] " + json.dumps(orderbook_usability_payload, sort_keys=True, default=str))
-        except Exception:
-            pass
+        orderbook_usability_decision = None
+        if orderbook_health_evaluate_orderbook_usability is not None:
+            orderbook_usability_decision = orderbook_health_evaluate_orderbook_usability(
+                ticker=ticker or None,
+                family=family,
+                side=selected_side,
+                yes_bid=yes_bid_dollars,
+                yes_ask=yes_ask_dollars,
+                no_bid=no_bid_dollars,
+                no_ask=no_ask_dollars,
+                spread_cents=spread_cents,
+                spread_classification=spread_classification,
+                spread_severity=spread_severity.get("severity"),
+                quote_ready=bool(quote_ready),
+                payload_ready=bool(quote_diag.get("payload_ready", True)),
+                orderbook_ready=bool(orderbook_ready),
+                orderbook_usable=bool(orderbook_ready),
+                selected_price=selected_price_dollars,
+                selected_price_cents=selected_price_cents,
+                selected_side_has_price=bool(selected_side_has_price),
+                selected_side_has_liquidity=bool(selected_side_has_liquidity),
+                depth_available=bool(depth_available),
+                liquidity=self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
+                liquidity_depth=self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
+                edge_source=edge_source,
+                unsafe_price_status=unsafe_price_status,
+                orderbook_missing_reason=orderbook_not_usable_reason,
+                blocker_reason=orderbook_resolution.get("blocker_reason"),
+                thin_book_override_applied=bool(thin_book_override_applied),
+                relaxed_book_allowed=bool(relaxed_book_allowed),
+                profile=aggress,
+            )
+            if bool(orderbook_usability_decision.get("allowed")):
+                orderbook_ready = True
+                orderbook_not_usable_reason = None
+            else:
+                orderbook_not_usable_reason = str(orderbook_usability_decision.get("rejection_reason") or orderbook_not_usable_reason or "orderbook_not_usable").strip().lower() or "orderbook_not_usable"
+                if orderbook_usability_decision.get("orderbook_ready") is not None:
+                    orderbook_ready = bool(orderbook_usability_decision.get("orderbook_ready"))
+            if bool(orderbook_usability_decision.get("should_log")):
+                try:
+                    print(
+                        "[AION-ORDERBOOK-USABILITY] "
+                        + json.dumps(
+                            {
+                                "ticker": orderbook_usability_decision.get("ticker"),
+                                "family": orderbook_usability_decision.get("family"),
+                                "side": orderbook_usability_decision.get("side"),
+                                "yes_bid": orderbook_usability_decision.get("yes_bid"),
+                                "yes_ask": orderbook_usability_decision.get("yes_ask"),
+                                "no_bid": orderbook_usability_decision.get("no_bid"),
+                                "no_ask": orderbook_usability_decision.get("no_ask"),
+                                "spread_cents": orderbook_usability_decision.get("spread_cents"),
+                                "spread_classification": orderbook_usability_decision.get("spread_classification"),
+                                "spread_severity": orderbook_usability_decision.get("spread_severity"),
+                                "orderbook_usable": bool(orderbook_usability_decision.get("orderbook_usable")),
+                                "rejection_reason": orderbook_usability_decision.get("rejection_reason"),
+                                "reason": orderbook_usability_decision.get("reason"),
+                                "allowed": bool(orderbook_usability_decision.get("allowed")),
+                                "previously_blocked_healthy": bool(orderbook_usability_decision.get("previously_blocked_healthy")),
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                except Exception:
+                    pass
         tradeable = bool(
             quote_ready
             and orderbook_ready
