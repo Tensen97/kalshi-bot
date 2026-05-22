@@ -51,6 +51,11 @@ class LiveMarketCache:
         if not ticker:
             return None
         now = time.time()
+        orderbook = payload.get("orderbook") if isinstance(payload, dict) else None
+        yes_bid = payload.get("yes_bid", payload.get("best_bid"))
+        yes_ask = payload.get("yes_ask", payload.get("best_ask"))
+        no_bid = payload.get("no_bid")
+        no_ask = payload.get("no_ask")
         record = {
             "ticker": ticker,
             "source": source,
@@ -59,6 +64,10 @@ class LiveMarketCache:
             "updated_at": _now_iso(),
             "best_bid": payload.get("best_bid", payload.get("yes_bid")),
             "best_ask": payload.get("best_ask", payload.get("yes_ask")),
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
             "spread": payload.get("spread"),
             "last_trade": payload.get("last_trade", payload.get("last_price")),
             "volume": payload.get("volume"),
@@ -66,6 +75,8 @@ class LiveMarketCache:
             "depth": self._extract_depth(payload),
             "raw": payload,
         }
+        if orderbook is not None:
+            record["orderbook"] = orderbook
         with self._lock:
             self._markets[ticker] = record
             self._recent_updates.append({"ticker": ticker, "source": source, "ts": now})

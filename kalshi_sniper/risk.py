@@ -14,9 +14,9 @@ class GuardThresholds:
     min_entry_liquidity: float = 50.0
     min_entry_volume: float = 25.0
     max_entry_spread: float = 0.06
-    max_yes_ask_to_enter: float = 0.93
-    min_price: float = 0.10
-    max_price: float = 0.90
+    max_yes_ask_to_enter: float = 0.99
+    min_price: float = 0.01
+    max_price: float = 0.99
     max_position_cost: float = 0.85
     max_total_exposure: int = 2
     max_daily_loss: float = 0.10
@@ -40,9 +40,9 @@ class GuardThresholds:
             min_entry_liquidity=env_float("KALSHI_MIN_ENTRY_LIQUIDITY", float(legacy.get("MIN_ENTRY_LIQUIDITY") or 50.0)),
             min_entry_volume=env_float("KALSHI_MIN_ENTRY_VOLUME", float(legacy.get("MIN_ENTRY_VOLUME") or 25.0)),
             max_entry_spread=env_float("KALSHI_MAX_ENTRY_SPREAD", float(legacy.get("MAX_ENTRY_SPREAD") or 0.06)),
-            max_yes_ask_to_enter=env_float("KALSHI_MAX_YES_ASK_TO_ENTER", float(legacy.get("MAX_YES_ASK_TO_ENTER") or 0.93)),
-            min_price=env_float("KALSHI_MIN_ENTRY_PRICE", float(legacy.get("MIN_ENTRY_PRICE") or 0.10)),
-            max_price=env_float("KALSHI_MAX_ENTRY_PRICE", float(legacy.get("MAX_ENTRY_PRICE") or 0.90)),
+            max_yes_ask_to_enter=env_float("KALSHI_MAX_YES_ASK_TO_ENTER", float(legacy.get("MAX_YES_ASK_TO_ENTER") or 0.99)),
+            min_price=env_float("KALSHI_MIN_ENTRY_PRICE", float(legacy.get("MIN_ENTRY_PRICE") or 0.01)),
+            max_price=env_float("KALSHI_MAX_ENTRY_PRICE", float(legacy.get("MAX_ENTRY_PRICE") or 0.99)),
             max_position_cost=env_float("KALSHI_MAX_POSITION_COST", float(legacy.get("MAX_POSITION_COST") or 0.85)),
             max_total_exposure=env_int("KALSHI_MAX_TOTAL_EXPOSURE", int(legacy.get("MAX_TOTAL_EXPOSURE") or 2)),
             max_daily_loss=env_float("KALSHI_MAX_DAILY_LOSS", float(legacy.get("MAX_DAILY_LOSS") or 0.10)),
@@ -65,7 +65,7 @@ class GuardThresholds:
                 min_entry_liquidity=max(1.0, self.min_entry_liquidity * 0.65),
                 min_entry_volume=max(1.0, self.min_entry_volume * 0.60),
                 max_entry_spread=min(0.20, self.max_entry_spread * 1.35),
-                max_yes_ask_to_enter=min(0.97, self.max_yes_ask_to_enter + 0.02),
+                max_yes_ask_to_enter=min(0.99, self.max_yes_ask_to_enter + 0.02),
                 min_price=self.min_price,
                 max_price=self.max_price,
                 max_position_cost=min(0.95, self.max_position_cost + 0.03),

@@ -2630,10 +2630,70 @@ def run_profit_discovery(*, batches: int = 25, sample_size: int = 30, random_rea
     }
 
 
+def _paper30_candidate_prefilter(candidate: Dict[str, Any]) -> Tuple[bool, str]:
+    candidate = candidate if isinstance(candidate, dict) else {}
+    canonical_tradeability = candidate.get("canonical_tradeability") if isinstance(candidate.get("canonical_tradeability"), dict) else {}
+
+    def _num(*keys, default=0.0):
+        for key in keys:
+            value = candidate.get(key)
+            if value not in (None, "", [], {}):
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+            value = canonical_tradeability.get(key)
+            if value not in (None, "", [], {}):
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+        return float(default)
+
+    selected_price_cents = candidate.get("selected_price_cents")
+    try:
+        selected_price_cents = int(round(float(selected_price_cents))) if selected_price_cents not in (None, "", [], {}) else None
+    except Exception:
+        selected_price_cents = None
+    selected_price = _num("selected_price", "selected_price_dollars")
+    if selected_price_cents in {0, 100} or selected_price in {0.0, 1.0}:
+        return False, "boundary_price"
+
+    liquidity = _num("liquidity", "liquidity_score", "liquidity_depth")
+    volume = _num("volume", "recent_volume", "volume_fp")
+    orderbook_depth = _num("orderbook_depth", "yes_top_size", "no_top_size")
+    if max(liquidity, volume, orderbook_depth) <= 0.0:
+        return False, "no_liquidity_or_volume"
+
+    yes_bid = _num("yes_bid", "yes_bid_dollars")
+    yes_ask = _num("yes_ask", "yes_ask_dollars")
+    no_bid = _num("no_bid", "no_bid_dollars")
+    no_ask = _num("no_ask", "no_ask_dollars")
+    if max(yes_bid, yes_ask, no_bid, no_ask) <= 0.0:
+        return False, "no_executable_quote"
+
+    spread_bucket = str(candidate.get("spread_bucket") or canonical_tradeability.get("spread_bucket") or candidate.get("spread_classification") or "unknown").strip().lower() or "unknown"
+    edge_after_cost = _num("edge_after_cost", "final_edge", "sports_edge_after_cost")
+    if spread_bucket in {"unsafe", "extreme_wide"} and edge_after_cost <= 0.0:
+        return False, "wide_spread_no_edge"
+
+    return True, "ok"
+
+
 def _paper30_select_candidates(sample_size: int) -> List[Dict[str, Any]]:
     pool = _collect_recent_candidate_pool(limit=max(200, sample_size * 4))
     if not pool:
         return []
+    filtered_pool: List[Dict[str, Any]] = []
+    rejected_counts: Counter[str] = Counter()
+    for candidate in pool:
+        ok, reason = _paper30_candidate_prefilter(candidate)
+        if ok:
+            filtered_pool.append(candidate)
+        else:
+            rejected_counts[reason] += 1
+    if filtered_pool:
+        pool = filtered_pool
     random.shuffle(pool)
     families: Dict[str, List[Dict[str, Any]]] = {}
     for candidate in pool:
