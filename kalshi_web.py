@@ -25612,6 +25612,10 @@ class KalshiSniperBot:
             memory_profile = dict((getattr(self, "market_memory_profiles", {}) or {}).get(ticker, {}) or {})
         except Exception:
             memory_profile = {}
+        try:
+            family_profit_memory_stats = self._get_family_profit_memory_stats(family, refresh=False)
+        except Exception:
+            family_profit_memory_stats = {}
         selected_side = (
             expectancy_summary.get("selected_side")
             or quality_snapshot.get("selected_side")
@@ -25657,6 +25661,7 @@ class KalshiSniperBot:
             ),
             "probability_confidence": expectancy_summary.get("probability_confidence") or quality_snapshot.get("probability_confidence"),
             "family_profit_memory_adjustment": family_profit_memory_adjustment,
+            "family_profit_memory_stats": family_profit_memory_stats,
             "dynamic_memory_adjustment": dynamic_memory_adjustment,
             "orderbook_imbalance_adjustment": (orderbook_imbalance_context or {}).get("adjustment"),
             "orderbook_imbalance": orderbook_imbalance_context,
@@ -25669,6 +25674,15 @@ class KalshiSniperBot:
         ev_context = candidate_quality_compute_candidate_ev(ev_candidate)
         ev_fields = (
             "market_implied_probability",
+            "raw_probability",
+            "calibrated_probability",
+            "calibration_delta",
+            "calibration_sample_size",
+            "calibration_reason",
+            "calibration_confidence_bucket",
+            "calibration_family_key",
+            "calibration_reliability_weight",
+            "calibration_observed_probability",
             "estimated_win_probability",
             "expected_value",
             "expected_roi",
@@ -25707,6 +25721,37 @@ class KalshiSniperBot:
         if ev_tier == "D":
             return min(-0.50, max(-3.50, ev_score * 0.25))
         return max(-0.25, min(0.25, ev_score * 0.10))
+
+    def _emit_aion_calibration_log(self, *, ticker=None, family=None, ev_context=None):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return
+        already_logged = bool(
+            getattr(self, "last_aion_calibration_log_cycle", None) == self.cycle_count
+            and str(getattr(self, "last_aion_calibration_log_ticker", "") or "").strip() == ticker
+        )
+        if already_logged:
+            return
+        ev_context = ev_context if isinstance(ev_context, dict) else {}
+        print(
+            "[AION-CALIBRATION] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "raw_probability": ev_context.get("raw_probability"),
+                    "calibrated_probability": ev_context.get("calibrated_probability"),
+                    "calibration_delta": ev_context.get("calibration_delta"),
+                    "sample_size": ev_context.get("calibration_sample_size"),
+                    "reliability_weight": ev_context.get("calibration_reliability_weight"),
+                    "reason": ev_context.get("calibration_reason") or "unknown",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        self.last_aion_calibration_log_cycle = self.cycle_count
+        self.last_aion_calibration_log_ticker = ticker
 
     def _get_fractional_kelly_bankroll(self):
         def _normalized_bankroll(value, *, cents=False):
@@ -46860,6 +46905,11 @@ class KalshiSniperBot:
         selected_ev_action = str(selected_ev_context.get("ev_action") or "selected_for_dispatch").strip() or "selected_for_dispatch"
         if str(selected_ev_context.get("ev_tier") or "").strip().upper() == "D":
             selected_ev_action = "deprioritize_micro_after_selection"
+        self._emit_aion_calibration_log(
+            ticker=selected_ticker_for_ev,
+            family=family,
+            ev_context=selected_ev_context,
+        )
         print(
             "[AION-EV] "
             + json.dumps(
@@ -55255,6 +55305,11 @@ class KalshiSniperBot:
             and str(getattr(self, "last_aion_ev_log_ticker", "") or "").strip() == selected_ticker_key
         )
         if selected_ticker_key and selected_context_quote is not None and not ev_already_logged:
+            self._emit_aion_calibration_log(
+                ticker=selected_ticker_key,
+                family=selected_family,
+                ev_context=selected_ev_context,
+            )
             print(
                 "[AION-EV] "
                 + json.dumps(

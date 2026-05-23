@@ -312,6 +312,236 @@ def _ev_price(value: Any, default: Optional[float] = None) -> Optional[float]:
     return max(0.01, min(0.99, float(numeric)))
 
 
+def _probability_confidence_bucket(probability: Any) -> str:
+    probability_value = _ev_probability(probability, 0.50) or 0.50
+    if probability_value < 0.45:
+        return "low"
+    if probability_value < 0.55:
+        return "neutral"
+    if probability_value < 0.65:
+        return "lean"
+    if probability_value < 0.75:
+        return "high"
+    return "very_high"
+
+
+def _calibration_reliability_weight(sample_size: int) -> float:
+    sample_size = max(0, int(sample_size or 0))
+    if sample_size <= 0:
+        return 0.0
+    if sample_size < 10:
+        return min(0.10, sample_size / 100.0)
+    if sample_size < 30:
+        return min(0.20, 0.10 + ((sample_size - 10) / 20.0) * 0.10)
+    if sample_size < 100:
+        return min(0.35, 0.20 + ((sample_size - 30) / 70.0) * 0.15)
+    return min(0.50, 0.35 + (min(sample_size, 300) - 100) / 200.0 * 0.15)
+
+
+def _calibration_max_delta(sample_size: int) -> float:
+    sample_size = max(0, int(sample_size or 0))
+    if sample_size < 10:
+        return 0.035
+    if sample_size < 30:
+        return 0.070
+    if sample_size < 100:
+        return 0.120
+    return 0.180
+
+
+def _outcome_memory_probability(outcome_memory: Any) -> Optional[float]:
+    if not isinstance(outcome_memory, dict):
+        return None
+    positive_keys = {
+        "win",
+        "wins",
+        "profit",
+        "profitable",
+        "positive",
+        "success",
+        "green",
+        "accepted_profitable",
+    }
+    negative_keys = {
+        "loss",
+        "losses",
+        "negative",
+        "red",
+        "failed",
+        "unprofitable",
+        "stopped_loss",
+    }
+    wins = 0
+    losses = 0
+    for key, value in outcome_memory.items():
+        key_text = str(key or "").strip().lower()
+        count = int(to_float(value, 0) or 0)
+        if count <= 0:
+            continue
+        if key_text in positive_keys:
+            wins += count
+        elif key_text in negative_keys:
+            losses += count
+    total = wins + losses
+    if total <= 0:
+        return None
+    return wins / total
+
+
+def calibrate_candidate_probability(candidate: Dict[str, Any], raw_probability: Any) -> Dict[str, Any]:
+    candidate = candidate if isinstance(candidate, dict) else {}
+    raw_probability_value = _ev_probability(raw_probability, None)
+    if raw_probability_value is None:
+        raw_probability_value = _ev_probability(
+            _ev_first(
+                candidate,
+                "raw_probability",
+                "estimated_win_probability",
+                "probability_estimate",
+                "model_confidence",
+                "base_confidence",
+                "confidence_probability",
+                "confidence_score",
+                "confidence",
+            ),
+            0.50,
+        )
+    raw_probability_value = max(0.03, min(0.97, raw_probability_value if raw_probability_value is not None else 0.50))
+    confidence_bucket = _probability_confidence_bucket(raw_probability_value)
+    family_key = str(_ev_first(candidate, "family", "series_ticker") or "").strip().upper() or "UNKNOWN"
+
+    evidence = []
+
+    def _add_evidence(label: str, observed_probability: Any, sample_size: Any, source_weight: float = 1.0):
+        observed_value = _ev_probability(observed_probability, None)
+        sample_value = int(to_float(sample_size, 0) or 0)
+        if observed_value is None or sample_value <= 0:
+            return
+        source_weight_value = max(0.10, min(1.25, float(source_weight or 1.0)))
+        evidence.append(
+            {
+                "label": label,
+                "observed_probability": observed_value,
+                "sample_size": sample_value,
+                "source_weight": source_weight_value,
+            }
+        )
+
+    family_stats = candidate.get("family_profit_memory_stats") if isinstance(candidate.get("family_profit_memory_stats"), dict) else {}
+    _add_evidence(
+        "family_profit_memory",
+        family_stats.get("win_rate"),
+        family_stats.get("trade_count") or family_stats.get("trades") or family_stats.get("sample_size"),
+        1.0,
+    )
+
+    memory_profile = candidate.get("memory_profile") if isinstance(candidate.get("memory_profile"), dict) else {}
+    _add_evidence(
+        "dynamic_memory",
+        memory_profile.get("win_rate"),
+        (to_float(memory_profile.get("sample_count"), 0) or 0) + (to_float(memory_profile.get("outcome_samples"), 0) or 0),
+        0.85,
+    )
+    outcome_probability = _outcome_memory_probability(memory_profile.get("execution_outcome_memory"))
+    outcome_memory = memory_profile.get("execution_outcome_memory") if isinstance(memory_profile.get("execution_outcome_memory"), dict) else {}
+    _add_evidence(
+        "dynamic_outcome_memory",
+        outcome_probability,
+        sum(int(to_float(value, 0) or 0) for value in outcome_memory.values()),
+        0.75,
+    )
+
+    adaptive_summary = candidate.get("adaptive_confidence_summary") if isinstance(candidate.get("adaptive_confidence_summary"), dict) else {}
+    _add_evidence(
+        "adaptive_confidence_history",
+        adaptive_summary.get("win_rate") or adaptive_summary.get("hit_rate") or adaptive_summary.get("observed_probability"),
+        adaptive_summary.get("sample_size") or adaptive_summary.get("samples") or adaptive_summary.get("trade_count"),
+        0.65,
+    )
+
+    confidence_performance = candidate.get("confidence_bucket_performance") if isinstance(candidate.get("confidence_bucket_performance"), dict) else {}
+    bucket_stats = confidence_performance.get(confidence_bucket) or confidence_performance.get(f"bucket:{confidence_bucket}") or {}
+    if not isinstance(bucket_stats, dict):
+        bucket_stats = confidence_performance if confidence_performance else {}
+    _add_evidence(
+        "confidence_bucket_history",
+        bucket_stats.get("win_rate") or bucket_stats.get("hit_rate") or bucket_stats.get("observed_probability"),
+        bucket_stats.get("sample_size") or bucket_stats.get("samples") or bucket_stats.get("trade_count"),
+        0.80,
+    )
+
+    if not evidence:
+        result = {
+            "raw_probability": round(raw_probability_value, 6),
+            "calibrated_probability": round(raw_probability_value, 6),
+            "calibration_delta": 0.0,
+            "sample_size": 0,
+            "confidence_bucket": confidence_bucket,
+            "family_key": family_key,
+            "reliability_weight": 0.0,
+            "reason": "no_history_fallback",
+        }
+        candidate.update(
+            {
+                "raw_probability": result["raw_probability"],
+                "calibrated_probability": result["calibrated_probability"],
+                "calibration_delta": result["calibration_delta"],
+                "calibration_sample_size": result["sample_size"],
+                "calibration_reason": result["reason"],
+                "calibration_confidence_bucket": result["confidence_bucket"],
+                "calibration_family_key": result["family_key"],
+                "calibration_reliability_weight": result["reliability_weight"],
+            }
+        )
+        return result
+
+    weighted_numerator = 0.0
+    weighted_denominator = 0.0
+    total_sample_size = 0
+    source_labels = []
+    for item in evidence:
+        sample_size = int(item.get("sample_size", 0) or 0)
+        source_weight = float(item.get("source_weight", 1.0) or 1.0)
+        weighted_sample = sample_size * source_weight
+        weighted_numerator += float(item.get("observed_probability", raw_probability_value)) * weighted_sample
+        weighted_denominator += weighted_sample
+        total_sample_size += sample_size
+        source_labels.append(str(item.get("label") or "history"))
+
+    observed_probability = raw_probability_value if weighted_denominator <= 0.0 else weighted_numerator / weighted_denominator
+    reliability_weight = _calibration_reliability_weight(total_sample_size)
+    reliability_weight *= min(1.0, weighted_denominator / max(float(total_sample_size), 1.0))
+    reliability_weight = max(0.0, min(0.50, reliability_weight))
+    blended_probability = (raw_probability_value * (1.0 - reliability_weight)) + (observed_probability * reliability_weight)
+    max_delta = _calibration_max_delta(total_sample_size)
+    calibration_delta = max(-max_delta, min(max_delta, blended_probability - raw_probability_value))
+    calibrated_probability = max(0.03, min(0.97, raw_probability_value + calibration_delta))
+    result = {
+        "raw_probability": round(raw_probability_value, 6),
+        "calibrated_probability": round(calibrated_probability, 6),
+        "calibration_delta": round(calibrated_probability - raw_probability_value, 6),
+        "sample_size": int(total_sample_size),
+        "confidence_bucket": confidence_bucket,
+        "family_key": family_key,
+        "reliability_weight": round(reliability_weight, 6),
+        "reason": "history_blend:" + "+".join(dict.fromkeys(source_labels)),
+    }
+    candidate.update(
+        {
+            "raw_probability": result["raw_probability"],
+            "calibrated_probability": result["calibrated_probability"],
+            "calibration_delta": result["calibration_delta"],
+            "calibration_sample_size": result["sample_size"],
+            "calibration_reason": result["reason"],
+            "calibration_confidence_bucket": result["confidence_bucket"],
+            "calibration_family_key": result["family_key"],
+            "calibration_reliability_weight": result["reliability_weight"],
+            "calibration_observed_probability": round(observed_probability, 6),
+        }
+    )
+    return result
+
+
 def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
     candidate = candidate if isinstance(candidate, dict) else {}
     side = str(_ev_first(candidate, "selected_side", "side") or "yes").strip().lower()
@@ -336,6 +566,7 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
     base_probability = _ev_probability(
         _ev_first(
             candidate,
+            "raw_probability",
             "estimated_win_probability",
             "probability_estimate",
             "model_confidence",
@@ -344,7 +575,6 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             "confidence_probability",
             "confidence_score",
             "confidence",
-            "calibrated_probability",
             "fair_probability",
             "no_vig_probability",
         ),
@@ -375,7 +605,7 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         orderbook_adjustment += max(-0.035, min(0.035, side_support * 0.035))
     orderbook_adjustment = max(-0.040, min(0.040, orderbook_adjustment))
 
-    estimated_win_probability = max(
+    raw_estimated_probability = max(
         0.03,
         min(
             0.97,
@@ -384,6 +614,11 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             + dynamic_adjustment
             + orderbook_adjustment,
         ),
+    )
+    calibration_result = calibrate_candidate_probability(candidate, raw_estimated_probability)
+    estimated_win_probability = max(
+        0.03,
+        min(0.97, to_float(calibration_result.get("calibrated_probability"), raw_estimated_probability) or raw_estimated_probability),
     )
     market_implied_probability = max(0.03, min(0.97, market_implied_probability if market_implied_probability is not None else selected_price or 0.50))
     cost = max(0.01, min(0.99, selected_price if selected_price is not None else market_implied_probability))
@@ -425,7 +660,7 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             "ev_reason": (
                 f"base={round(base_probability if base_probability is not None else 0.5, 4)} "
                 f"family={round(family_adjustment, 4)} dynamic={round(dynamic_adjustment, 4)} "
-                f"orderbook={round(orderbook_adjustment, 4)}"
+                f"orderbook={round(orderbook_adjustment, 4)} calibration={calibration_result.get('calibration_delta')}"
             ),
             "ev_sizing_multiplier": round(sizing_multiplier, 4),
             "ev_action": action,
@@ -485,6 +720,7 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
     probability = _ev_probability(
         _ev_first(
             candidate,
+            "calibrated_probability",
             "estimated_win_probability",
             "probability_estimate",
             "model_confidence",
@@ -1917,6 +2153,7 @@ def build_candidate_quality_summary(selected_quality_summary=None, selected_qual
 __all__ = [
     "build_candidate_quality_summary",
     "build_expectancy_score",
+    "calibrate_candidate_probability",
     "calculate_fractional_kelly_size",
     "compute_candidate_ev",
     "compute_candidate_quality",
