@@ -25675,6 +25675,16 @@ class KalshiSniperBot:
         ev_fields = (
             "market_implied_probability",
             "raw_probability",
+            "bayesian_probability",
+            "bayesian_delta",
+            "bayesian_sample_size",
+            "bayesian_posterior_mean",
+            "bayesian_reason",
+            "bayesian_alpha",
+            "bayesian_beta",
+            "bayesian_signal_bucket",
+            "bayesian_family_key",
+            "calibration_input_probability",
             "calibrated_probability",
             "calibration_delta",
             "calibration_sample_size",
@@ -25722,6 +25732,37 @@ class KalshiSniperBot:
             return min(-0.50, max(-3.50, ev_score * 0.25))
         return max(-0.25, min(0.25, ev_score * 0.10))
 
+    def _emit_aion_bayes_log(self, *, ticker=None, family=None, ev_context=None):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return
+        already_logged = bool(
+            getattr(self, "last_aion_bayes_log_cycle", None) == self.cycle_count
+            and str(getattr(self, "last_aion_bayes_log_ticker", "") or "").strip() == ticker
+        )
+        if already_logged:
+            return
+        ev_context = ev_context if isinstance(ev_context, dict) else {}
+        print(
+            "[AION-BAYES] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "raw_probability": ev_context.get("raw_probability"),
+                    "bayesian_probability": ev_context.get("bayesian_probability"),
+                    "bayesian_delta": ev_context.get("bayesian_delta"),
+                    "posterior_mean": ev_context.get("bayesian_posterior_mean"),
+                    "sample_size": ev_context.get("bayesian_sample_size"),
+                    "reason": ev_context.get("bayesian_reason") or "unknown",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        self.last_aion_bayes_log_cycle = self.cycle_count
+        self.last_aion_bayes_log_ticker = ticker
+
     def _emit_aion_calibration_log(self, *, ticker=None, family=None, ev_context=None):
         ticker = str(ticker or "").strip()
         if not ticker:
@@ -25739,7 +25780,7 @@ class KalshiSniperBot:
                 {
                     "ticker": ticker,
                     "family": family,
-                    "raw_probability": ev_context.get("raw_probability"),
+                    "raw_probability": ev_context.get("calibration_input_probability", ev_context.get("bayesian_probability", ev_context.get("raw_probability"))),
                     "calibrated_probability": ev_context.get("calibrated_probability"),
                     "calibration_delta": ev_context.get("calibration_delta"),
                     "sample_size": ev_context.get("calibration_sample_size"),
@@ -46905,6 +46946,11 @@ class KalshiSniperBot:
         selected_ev_action = str(selected_ev_context.get("ev_action") or "selected_for_dispatch").strip() or "selected_for_dispatch"
         if str(selected_ev_context.get("ev_tier") or "").strip().upper() == "D":
             selected_ev_action = "deprioritize_micro_after_selection"
+        self._emit_aion_bayes_log(
+            ticker=selected_ticker_for_ev,
+            family=family,
+            ev_context=selected_ev_context,
+        )
         self._emit_aion_calibration_log(
             ticker=selected_ticker_for_ev,
             family=family,
@@ -55305,6 +55351,11 @@ class KalshiSniperBot:
             and str(getattr(self, "last_aion_ev_log_ticker", "") or "").strip() == selected_ticker_key
         )
         if selected_ticker_key and selected_context_quote is not None and not ev_already_logged:
+            self._emit_aion_bayes_log(
+                ticker=selected_ticker_key,
+                family=selected_family,
+                ev_context=selected_ev_context,
+            )
             self._emit_aion_calibration_log(
                 ticker=selected_ticker_key,
                 family=selected_family,
