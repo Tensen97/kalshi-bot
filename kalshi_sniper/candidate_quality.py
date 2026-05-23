@@ -49,9 +49,462 @@ def _safe_round(value: Any, ndigits: int = 4, default: Any = None) -> Any:
         return default
 
 
+def compute_probability_estimate_signal(
+    self,
+    *,
+    side=None,
+    selected_price=None,
+    selected_price_cents=None,
+    yes_bid=None,
+    yes_ask=None,
+    no_bid=None,
+    no_ask=None,
+    calibrated_probability=None,
+    probability_estimate=None,
+    fair_probability=None,
+    no_vig_probability=None,
+    implied_probability=None,
+    repricing_velocity=None,
+    spread_delta=None,
+    liquidity=None,
+    liquidity_depth=None,
+    yes_top_size=None,
+    no_top_size=None,
+    volume=None,
+    orderbook_age_seconds=None,
+    family_weight=None,
+    edge_source=None,
+    estimated_cost=None,
+):
+    def _bounded_delta(value, cap=0.02):
+        numeric = to_float(value, 0.0) or 0.0
+        return max(-cap, min(cap, numeric))
+
+    side_value = str(side or "").strip().lower() or "yes"
+    selected_price_value = to_float(selected_price, None)
+    if selected_price_value is None and selected_price_cents is not None:
+        selected_price_value = max(0.0, min(1.0, (to_float(selected_price_cents, 0.0) or 0.0) / 100.0))
+    selected_price_value = None if selected_price_value is None else max(0.01, min(0.99, float(selected_price_value)))
+
+    explicit_sources = [
+        ("calibrated_probability", calibrated_probability),
+        ("probability_estimate", probability_estimate),
+        ("fair_probability", fair_probability),
+        ("no_vig_probability", no_vig_probability),
+        ("implied_probability", implied_probability),
+    ]
+    explicit_probability = None
+    explicit_source_name = None
+    for candidate_name, candidate_value in explicit_sources:
+        candidate_probability = to_float(candidate_value, None)
+        if candidate_probability is None:
+            continue
+        explicit_probability = max(0.01, min(0.99, candidate_probability))
+        explicit_source_name = candidate_name
+        break
+
+    yes_mid = None
+    if yes_bid is not None or yes_ask is not None:
+        yes_bid_value = to_float(yes_bid, None)
+        yes_ask_value = to_float(yes_ask, None)
+        if yes_bid_value is not None and yes_ask_value is not None and yes_bid_value > 0.0 and yes_ask_value > 0.0:
+            yes_mid = max(0.01, min(0.99, (yes_bid_value + yes_ask_value) / 2.0))
+        elif yes_ask_value is not None and yes_ask_value > 0.0:
+            yes_mid = max(0.01, min(0.99, yes_ask_value))
+        elif yes_bid_value is not None and yes_bid_value > 0.0:
+            yes_mid = max(0.01, min(0.99, yes_bid_value))
+
+    no_mid = None
+    if no_bid is not None or no_ask is not None:
+        no_bid_value = to_float(no_bid, None)
+        no_ask_value = to_float(no_ask, None)
+        if no_bid_value is not None and no_ask_value is not None and no_bid_value > 0.0 and no_ask_value > 0.0:
+            no_mid = max(0.01, min(0.99, (no_bid_value + no_ask_value) / 2.0))
+        elif no_ask_value is not None and no_ask_value > 0.0:
+            no_mid = max(0.01, min(0.99, no_ask_value))
+        elif no_bid_value is not None and no_bid_value > 0.0:
+            no_mid = max(0.01, min(0.99, no_bid_value))
+
+    selected_side_probability = None
+    implied_probability_value = None
+    market_implied_source_name = None
+    if side_value == "no":
+        if no_mid is not None:
+            selected_side_probability = no_mid
+            implied_probability_value = no_mid
+            market_implied_source_name = "market_implied_probability"
+        elif explicit_probability is not None:
+            selected_side_probability = max(0.01, min(0.99, 1.0 - explicit_probability))
+            implied_probability_value = selected_side_probability
+        elif selected_price_value is not None:
+            selected_side_probability = selected_price_value
+            implied_probability_value = selected_price_value
+    else:
+        if yes_mid is not None:
+            selected_side_probability = yes_mid
+            implied_probability_value = yes_mid
+            market_implied_source_name = "market_implied_probability"
+        elif explicit_probability is not None:
+            selected_side_probability = explicit_probability
+            implied_probability_value = explicit_probability
+        elif selected_price_value is not None:
+            selected_side_probability = selected_price_value
+            implied_probability_value = selected_price_value
+
+    if selected_side_probability is None:
+        selected_side_probability = selected_price_value if selected_price_value is not None else 0.5
+    if implied_probability_value is None:
+        if side_value == "no" and no_mid is not None:
+            implied_probability_value = no_mid
+        elif side_value != "no" and yes_mid is not None:
+            implied_probability_value = yes_mid
+        elif explicit_probability is not None:
+            implied_probability_value = explicit_probability if side_value != "no" else max(0.01, min(0.99, 1.0 - explicit_probability))
+        else:
+            implied_probability_value = selected_side_probability
+
+    selected_side_probability = max(0.01, min(0.99, to_float(selected_side_probability, 0.5) or 0.5))
+    implied_probability_value = max(0.01, min(0.99, to_float(implied_probability_value, selected_side_probability) or selected_side_probability))
+
+    momentum_component = 0.0
+    repricing_velocity_value = to_float(repricing_velocity, 0.0) or 0.0
+    spread_delta_value = to_float(spread_delta, 0.0) or 0.0
+    momentum_component += _bounded_delta(repricing_velocity_value * 18.0, 0.025)
+    momentum_component += _bounded_delta(spread_delta_value * 1.6, 0.020)
+
+    liquidity_component = 0.0
+    best_liquidity = max(
+        to_float(liquidity, 0.0) or 0.0,
+        to_float(liquidity_depth, 0.0) or 0.0,
+    )
+    if best_liquidity > 0.0:
+        liquidity_component += min(0.020, (best_liquidity / 25.0) * 0.020)
+    selected_top_size = to_float(yes_top_size if side_value != "no" else no_top_size, None)
+    opposite_top_size = to_float(no_top_size if side_value != "no" else yes_top_size, None)
+    if selected_top_size is not None and opposite_top_size is not None and (selected_top_size > 0.0 or opposite_top_size > 0.0):
+        imbalance = (selected_top_size - opposite_top_size) / max(selected_top_size + opposite_top_size, 1.0)
+        liquidity_component += _bounded_delta(imbalance * 0.02, 0.015)
+
+    activity_component = 0.0
+    volume_value = to_float(volume, 0.0) or 0.0
+    if volume_value > 0.0:
+        activity_component += min(0.012, (volume_value / max(volume_value + 80.0, 1.0)) * 0.012)
+    orderbook_age_value = to_float(orderbook_age_seconds, None)
+    if orderbook_age_value is not None:
+        if orderbook_age_value <= 30.0:
+            activity_component += 0.010
+        elif orderbook_age_value <= 120.0:
+            activity_component += 0.006
+        elif orderbook_age_value <= 300.0:
+            activity_component += 0.002
+        elif orderbook_age_value > 900.0:
+            activity_component -= 0.010
+
+    family_component = _bounded_delta(to_float(family_weight, 0.0) * 0.010, 0.020)
+
+    estimate_components = {
+        "momentum": momentum_component,
+        "liquidity": liquidity_component,
+        "activity": activity_component,
+        "family": family_component,
+    }
+    probability_base = selected_side_probability
+    if explicit_probability is not None:
+        probability_base = explicit_probability if side_value != "no" else max(0.01, min(0.99, 1.0 - explicit_probability))
+    probability_estimate_value = max(
+        0.01,
+        min(
+            0.99,
+            probability_base + momentum_component + liquidity_component + activity_component + family_component,
+        ),
+    )
+    edge_before_cost_value = probability_estimate_value - selected_price_value if selected_price_value is not None else None
+    estimated_cost_value = to_float(estimated_cost, 0.0) or 0.0
+    edge_after_cost_value = None if edge_before_cost_value is None else round(edge_before_cost_value - estimated_cost_value, 6)
+    if edge_source is not None:
+        edge_source_value = str(edge_source or "").strip().lower() or "unknown"
+    elif explicit_source_name is not None:
+        edge_source_value = str(explicit_source_name or "explicit_probability_model").strip().lower()
+    elif market_implied_source_name is not None:
+        edge_source_value = market_implied_source_name
+    else:
+        edge_source_value = "selected_price_baseline"
+    if explicit_source_name is not None:
+        reason = f"explicit:{explicit_source_name}"
+        fallback_used = False
+    elif any(component != 0.0 for component in (momentum_component, liquidity_component, activity_component, family_component)):
+        reason = "signal_adjusted_probability"
+        fallback_used = False
+    else:
+        reason = "selected_price_baseline"
+        fallback_used = True
+    return {
+        "probability_estimate": round(probability_estimate_value, 6),
+        "implied_probability": round(implied_probability_value, 6),
+        "edge_before_cost": None if edge_before_cost_value is None else round(edge_before_cost_value, 6),
+        "edge_after_cost": edge_after_cost_value,
+        "edge_source": edge_source_value,
+        "fallback_used": bool(fallback_used),
+        "momentum_component": round(momentum_component, 6),
+        "liquidity_component": round(liquidity_component, 6),
+        "activity_component": round(activity_component, 6),
+        "family_component": round(family_component, 6),
+        "reason": reason,
+        "selected_side_probability": round(selected_side_probability, 6),
+        "probability_components": {
+            "momentum": round(momentum_component, 6),
+            "liquidity": round(liquidity_component, 6),
+            "activity": round(activity_component, 6),
+            "family": round(family_component, 6),
+        },
+        "explicit_probability": round(explicit_probability, 6) if explicit_probability is not None else None,
+    }
+
+
+def compute_profitability_signal(
+    self,
+    *,
+    edge_after_cost=None,
+    edge_before_cost=None,
+    edge_source=None,
+    spread=None,
+    spread_classification=None,
+    quote_ready=False,
+    payload_ready=False,
+    orderbook_usable=False,
+    liquidity=None,
+    liquidity_depth=None,
+    fill_quality_score=None,
+    family_weight=None,
+    market_activity_score=None,
+    selected_side_executable=False,
+    executable_side_present=False,
+    selected_price_in_bounds=False,
+    orderbook_age_seconds=None,
+):
+    edge_after_cost_value = to_float(edge_after_cost, None)
+    edge_before_cost_value = to_float(edge_before_cost, None)
+    edge_source_value = str(edge_source or "").strip().lower() or "unknown"
+    spread_value = to_float(spread, None)
+    spread_classification = str(spread_classification or "unknown").strip().upper() or "UNKNOWN"
+    liquidity_value = to_float(liquidity, None)
+    liquidity_depth_value = to_float(liquidity_depth, None)
+    fill_quality_value = to_float(fill_quality_score, None)
+    family_weight_value = to_float(family_weight, None)
+    market_activity_value = to_float(market_activity_score, None)
+    orderbook_age_value = to_float(orderbook_age_seconds, None)
+
+    profitability_score = 50.0
+    edge_quality = 0.5
+    edge_source_quality = 0.5
+    reasons: List[str] = []
+
+    if edge_after_cost_value is None:
+        profitability_score -= 7.0
+        edge_quality = 0.28
+        reasons.append("edge_missing")
+    elif edge_after_cost_value > 0.0:
+        profitability_score += min(30.0, edge_after_cost_value * 1200.0)
+        edge_quality = _clamp(0.58 + min(0.36, edge_after_cost_value * 25.0))
+        reasons.append("positive_edge")
+    elif edge_after_cost_value == 0.0:
+        profitability_score -= 12.0
+        edge_quality = 0.35
+        reasons.append("flat_edge")
+    else:
+        profitability_score -= min(40.0, abs(edge_after_cost_value) * 1500.0 + 10.0)
+        edge_quality = _clamp(0.30 - min(0.18, abs(edge_after_cost_value) * 20.0))
+        reasons.append("negative_edge")
+
+    if edge_before_cost_value is not None:
+        if edge_before_cost_value > 0.0:
+            profitability_score += min(6.0, edge_before_cost_value * 400.0)
+            reasons.append("positive_raw_edge")
+        elif edge_before_cost_value < 0.0:
+            profitability_score -= min(8.0, abs(edge_before_cost_value) * 500.0)
+            reasons.append("negative_raw_edge")
+
+    if edge_source_value == "fallback_zero":
+        profitability_score -= 22.0
+        edge_source_quality = 0.10
+        reasons.append("fallback_zero")
+    elif edge_source_value in {
+        "context.final_edge",
+        "final_edge",
+        "live",
+        "computed",
+        "market_edge",
+        "selected_price_baseline",
+        "signal_adjusted_probability",
+        "quote_diag.edge_after_cost",
+        "explicit_probability_model",
+        "market_implied_probability",
+        "recent_momentum_edge",
+        "spread_adjusted_executable_edge",
+    }:
+        profitability_score += 6.0
+        edge_source_quality = 0.82
+        reasons.append("direct_edge_source")
+    elif edge_source_value not in {"unknown", ""}:
+        profitability_score += 2.0
+        edge_source_quality = 0.62
+        reasons.append("alternate_edge_source")
+    else:
+        profitability_score -= 4.0
+        edge_source_quality = 0.35
+        reasons.append("missing_edge_source")
+
+    if spread_classification in {"SAFE", "AGGRESSIVE_BUT_TRADEABLE"}:
+        profitability_score += 8.0
+        reasons.append("safe_spread")
+    elif spread_classification == "CAUTION_WAIT":
+        profitability_score += 3.0
+        reasons.append("caution_spread")
+    elif spread_classification in {"UNSAFE", "UNSAFE_SPREAD"}:
+        profitability_score -= 14.0
+        reasons.append("unsafe_spread")
+
+    if spread_value is not None:
+        if spread_value <= 0.02:
+            profitability_score += 7.0
+            reasons.append("tight_spread")
+        elif spread_value <= 0.05:
+            profitability_score += 3.5
+            reasons.append("usable_spread")
+        elif spread_value >= 0.15:
+            profitability_score -= 6.0
+            reasons.append("wide_spread")
+
+    if quote_ready:
+        profitability_score += 4.0
+        reasons.append("quote_ready")
+    else:
+        profitability_score -= 4.0
+        reasons.append("quote_not_ready")
+
+    if payload_ready:
+        profitability_score += 4.0
+        reasons.append("payload_ready")
+    else:
+        profitability_score -= 4.0
+        reasons.append("payload_not_ready")
+
+    if orderbook_usable:
+        profitability_score += 6.0
+        reasons.append("orderbook_usable")
+    else:
+        profitability_score -= 8.0
+        reasons.append("orderbook_not_usable")
+
+    if selected_side_executable:
+        profitability_score += 6.0
+        reasons.append("selected_side_executable")
+    else:
+        profitability_score -= 6.0
+        reasons.append("selected_side_not_executable")
+
+    if executable_side_present:
+        profitability_score += 4.0
+        reasons.append("executable_side_present")
+    else:
+        profitability_score -= 10.0
+        reasons.append("no_executable_side")
+
+    if selected_price_in_bounds:
+        profitability_score += 4.0
+        reasons.append("selected_price_in_bounds")
+    else:
+        profitability_score -= 10.0
+        reasons.append("selected_price_out_of_range")
+
+    if liquidity_value is not None or liquidity_depth_value is not None:
+        best_liquidity = max(
+            to_float(liquidity_value, 0.0) or 0.0,
+            to_float(liquidity_depth_value, 0.0) or 0.0,
+        )
+        if best_liquidity <= 0.0:
+            profitability_score -= 6.0
+            reasons.append("no_liquidity")
+        elif best_liquidity >= 10.0:
+            profitability_score += 7.0
+            reasons.append("deep_liquidity")
+        elif best_liquidity >= 5.0:
+            profitability_score += 4.0
+            reasons.append("usable_liquidity")
+        else:
+            profitability_score += 1.5
+            reasons.append("thin_liquidity")
+
+    if fill_quality_value is not None:
+        fill_quality_component = (_clamp(fill_quality_value) - 0.5) * 14.0
+        profitability_score += fill_quality_component
+        reasons.append("fill_quality")
+    else:
+        fill_quality_component = 0.0
+
+    if family_weight_value is not None:
+        family_weight_component = max(-8.0, min(8.0, family_weight_value)) * 0.45
+        profitability_score += family_weight_component
+        reasons.append("family_weight")
+    else:
+        family_weight_component = 0.0
+
+    if market_activity_value is not None:
+        market_activity_component = max(-6.0, min(12.0, market_activity_value)) * 0.35
+        profitability_score += market_activity_component
+        reasons.append("market_activity")
+    else:
+        market_activity_component = 0.0
+
+    if orderbook_age_value is not None:
+        if orderbook_age_value <= 30.0:
+            profitability_score += 4.0
+            reasons.append("fresh_orderbook")
+        elif orderbook_age_value <= 120.0:
+            profitability_score += 2.0
+            reasons.append("recent_orderbook")
+        elif orderbook_age_value > 900.0:
+            profitability_score -= 5.0
+            reasons.append("stale_orderbook")
+
+    profitability_score = round(max(0.0, min(100.0, profitability_score)), 4)
+    if profitability_score >= 75.0:
+        edge_quality_bucket = "strong"
+    elif profitability_score >= 60.0:
+        edge_quality_bucket = "positive"
+    elif profitability_score >= 45.0:
+        edge_quality_bucket = "mixed"
+    elif profitability_score >= 30.0:
+        edge_quality_bucket = "weak"
+    else:
+        edge_quality_bucket = "poor"
+
+    if edge_after_cost_value is None:
+        reason = "edge_missing"
+    elif edge_after_cost_value > 0.0:
+        reason = "positive_edge"
+    elif edge_after_cost_value == 0.0:
+        reason = "flat_or_fallback_edge"
+    else:
+        reason = "negative_edge"
+
+    return {
+        "profitability_score": profitability_score,
+        "edge_quality": round(_clamp(edge_quality), 4),
+        "edge_source_quality": round(_clamp(edge_source_quality), 4),
+        "edge_quality_bucket": edge_quality_bucket,
+        "reason": reason,
+        "reason_tags": reasons[:10],
+        "fill_quality_component": round(fill_quality_component, 4),
+        "family_weight_component": round(family_weight_component, 4),
+        "market_activity_component": round(market_activity_component, 4),
+    }
+
+
 def rank_final_candidates(candidates):
     def _candidate_rank_key(item):
         if isinstance(item, dict):
+            profitability_score = to_float(item.get("profitability_score"), to_float(item.get("quality_score"), to_float(item.get("candidate_score"), 0.0)))
             quality_score = to_float(item.get("quality_score"), to_float(item.get("candidate_score"), 0.0))
             candidate_score = to_float(item.get("candidate_score"), 0.0)
             adjusted_score = to_float(item.get("adjusted_score"), candidate_score)
@@ -59,6 +512,7 @@ def rank_final_candidates(candidates):
             liquidity = to_float(item.get("liquidity"), 0.0)
             volume = to_float(item.get("volume"), 0.0)
             return (
+                profitability_score,
                 quality_score,
                 candidate_score,
                 adjusted_score,
@@ -692,6 +1146,61 @@ def compute_candidate_quality(self, market=None, q=None, expectancy_summary=None
     )
     fill_quality_score = self.to_float(expectancy_summary.get("fill_quality_score"), None)
     family_weight = self.to_float(expectancy_summary.get("family_weight"), None)
+    edge_after_cost = self.to_float(
+        _pick(
+            expectancy_summary.get("edge_after_cost"),
+            expectancy_summary.get("final_edge"),
+            expectancy_summary.get("sports_edge_after_cost"),
+            tradeability.get("edge_after_cost"),
+            tradeability.get("final_edge"),
+            tradeability.get("sports_edge_after_cost"),
+            market.get("edge_after_cost"),
+            market.get("final_edge"),
+        ),
+        None,
+    )
+    edge_before_cost = self.to_float(
+        _pick(
+            expectancy_summary.get("edge_before_cost"),
+            expectancy_summary.get("sports_edge_before_cost"),
+            tradeability.get("edge_before_cost"),
+            market.get("edge_before_cost"),
+        ),
+        None,
+    )
+    probability_estimate = self.to_float(
+        _pick(
+            expectancy_summary.get("probability_estimate"),
+            tradeability.get("probability_estimate"),
+            market.get("probability_estimate"),
+        ),
+        None,
+    )
+    implied_probability = self.to_float(
+        _pick(
+            expectancy_summary.get("implied_probability"),
+            tradeability.get("implied_probability"),
+            market.get("implied_probability"),
+        ),
+        None,
+    )
+    spread_value = self.to_float(_pick(
+        expectancy_summary.get("spread"),
+        tradeability.get("spread"),
+        market.get("spread"),
+    ), None)
+    liquidity_value = self.to_float(_pick(
+        expectancy_summary.get("liquidity"),
+        tradeability.get("liquidity"),
+        market.get("liquidity"),
+        getattr(q, "liquidity", None),
+    ), None)
+    liquidity_depth_value = self.to_float(_pick(
+        expectancy_summary.get("liquidity_depth"),
+        tradeability.get("liquidity_depth"),
+        market.get("liquidity_depth"),
+        getattr(q, "liquidity_depth", None),
+    ), None)
     if family_weight is None:
         try:
             family_weight = compute_family_weight(self, family)
@@ -723,6 +1232,33 @@ def compute_candidate_quality(self, market=None, q=None, expectancy_summary=None
     else:
         market_activity_score -= 2.0
         reasons.append("missing_orderbook_age")
+
+    profitability_signal = compute_profitability_signal(
+        self,
+        edge_after_cost=edge_after_cost,
+        edge_before_cost=edge_before_cost,
+        edge_source=_pick(
+            expectancy_summary.get("edge_source"),
+            tradeability.get("edge_source"),
+            market.get("edge_source"),
+        ),
+        spread=spread_value,
+        spread_classification=spread_classification,
+        quote_ready=quote_ready,
+        payload_ready=payload_ready,
+        orderbook_usable=orderbook_usable,
+        liquidity=liquidity_value,
+        liquidity_depth=liquidity_depth_value,
+        fill_quality_score=fill_quality_score,
+        family_weight=family_weight,
+        market_activity_score=market_activity_score,
+        selected_side_executable=selected_side_executable,
+        executable_side_present=executable_side_present,
+        selected_price_in_bounds=selected_price_in_bounds,
+        orderbook_age_seconds=orderbook_age_seconds,
+    )
+    profitability_score = profitability_signal["profitability_score"]
+    profitability_adjustment = max(-12.0, min(12.0, (profitability_score - 50.0) / 4.0))
     quality_score = market_activity_score
     print(
         "[AION-MARKET-ACTIVITY] "
@@ -841,6 +1377,9 @@ def compute_candidate_quality(self, market=None, q=None, expectancy_summary=None
         quality_score += 3.0
         reasons.append("both_sides_valid")
 
+    quality_score += profitability_adjustment
+    reasons.append("profitability_signal")
+
     if synthetic_yes_book or synthetic_no_book or boundary_price_candidate:
         preferred_reason = "synthetic_or_boundary_book"
     elif not orderbook_usable:
@@ -894,11 +1433,37 @@ def compute_candidate_quality(self, market=None, q=None, expectancy_summary=None
         "synthetic_no_book": bool(synthetic_no_book),
         "spread_classification": spread_classification,
         "orderbook_age_seconds": orderbook_age_seconds,
+        "spread": round(spread_value, 4) if spread_value is not None else None,
+        "spread_cents": int(round(spread_value * 100.0)) if spread_value is not None else None,
+        "liquidity": round(liquidity_value, 4) if liquidity_value is not None else None,
+        "liquidity_depth": round(liquidity_depth_value, 4) if liquidity_depth_value is not None else None,
         "recent_activity": bool(recent_activity),
         "market_activity_score": round(market_activity_score, 4),
         "family_weight": round(family_weight_effect, 4),
         "fill_quality_score": round(fill_quality_score, 4) if fill_quality_score is not None else None,
         "fill_quality_effect": round(fill_quality_effect, 4),
+        "edge_after_cost": round(edge_after_cost, 4) if edge_after_cost is not None else None,
+        "edge_before_cost": round(edge_before_cost, 4) if edge_before_cost is not None else None,
+        "edge_source": str(_pick(
+            expectancy_summary.get("edge_source"),
+            tradeability.get("edge_source"),
+            market.get("edge_source"),
+        ) or "unknown").strip().lower() or "unknown",
+        "probability_estimate": round(probability_estimate, 4) if probability_estimate is not None else None,
+        "implied_probability": round(implied_probability, 4) if implied_probability is not None else None,
+        "probability_signal_reason": str(_pick(
+            expectancy_summary.get("probability_signal_reason"),
+            tradeability.get("probability_signal_reason"),
+            market.get("probability_signal_reason"),
+            "unknown",
+        )).strip().lower() or "unknown",
+        "profitability_score": profitability_score,
+        "profitability_adjustment": round(profitability_adjustment, 4),
+        "edge_quality": profitability_signal.get("edge_quality"),
+        "edge_source_quality": profitability_signal.get("edge_source_quality"),
+        "edge_quality_bucket": profitability_signal.get("edge_quality_bucket"),
+        "profitability_reason": profitability_signal.get("reason"),
+        "profitability_reason_tags": profitability_signal.get("reason_tags"),
         "quality_score": quality_score,
         "quality_adjustment": quality_adjustment,
         "quality_bucket": quality_bucket,
@@ -926,6 +1491,10 @@ def build_candidate_quality_summary(selected_quality_summary=None, selected_qual
         "selected_quality_score": selected_quality_summary.get("selected_quality_score") or selected_quality_snapshot.get("quality_score"),
         "selected_quality_adjustment": selected_quality_summary.get("selected_quality_adjustment") or selected_quality_snapshot.get("quality_adjustment"),
         "selected_quality_reason": selected_quality_summary.get("selected_quality_reason") or selected_quality_snapshot.get("preferred_reason"),
+        "selected_profitability_score": selected_quality_summary.get("selected_profitability_score") or selected_quality_snapshot.get("profitability_score"),
+        "selected_edge_quality": selected_quality_summary.get("selected_edge_quality") or selected_quality_snapshot.get("edge_quality"),
+        "selected_edge_source_quality": selected_quality_summary.get("selected_edge_source_quality") or selected_quality_snapshot.get("edge_source_quality"),
+        "selected_profitability_reason": selected_quality_summary.get("selected_profitability_reason") or selected_quality_snapshot.get("profitability_reason"),
         "quality_ranking_changed": bool(selected_quality_summary.get("quality_ranking_changed")),
     }
 
@@ -934,6 +1503,8 @@ __all__ = [
     "build_candidate_quality_summary",
     "build_expectancy_score",
     "compute_candidate_quality",
+    "compute_profitability_signal",
+    "compute_probability_estimate_signal",
     "compute_family_weight",
     "compute_fill_quality_score",
     "rank_final_candidates",

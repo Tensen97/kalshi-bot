@@ -461,6 +461,87 @@ def evaluate_orderbook_usability(
     }
 
 
+def evaluate_orderbook_recovery(
+    *,
+    ticker=None,
+    family=None,
+    side=None,
+    recoverable=False,
+    quote_ready=False,
+    payload_ready=False,
+    orderbook_ready=False,
+    depth_available=False,
+    spread_classification=None,
+    spread_severity=None,
+    synthetic_book=False,
+    catastrophic_spread=False,
+    fake_liquidity=False,
+    boundary_price=False,
+    executable_side_present=False,
+    orderbook_missing_reason=None,
+    blocker_reason=None,
+):
+    spread_classification = str(spread_classification or "UNKNOWN").strip().upper() or "UNKNOWN"
+    spread_severity = str(spread_severity or "unknown").strip().lower() or "unknown"
+    recoverable = bool(recoverable)
+    quote_ready = bool(quote_ready)
+    payload_ready = bool(payload_ready)
+    orderbook_ready = bool(orderbook_ready)
+    depth_available = bool(depth_available)
+    synthetic_book = bool(synthetic_book)
+    catastrophic_spread = bool(catastrophic_spread)
+    fake_liquidity = bool(fake_liquidity)
+    boundary_price = bool(boundary_price)
+    executable_side_present = bool(executable_side_present)
+    base_retry_attempts = 0
+    recovery_reason = None
+    recovered = bool(orderbook_ready and depth_available)
+    should_retry = False
+    if recoverable and quote_ready and payload_ready and executable_side_present and not boundary_price and not synthetic_book and not catastrophic_spread and not fake_liquidity:
+        base_retry_attempts = 2 if not depth_available else 1
+        if not orderbook_ready:
+            base_retry_attempts = max(base_retry_attempts, 1)
+        if spread_classification in {"UNKNOWN", "UNSAFE", "UNSAFE_SPREAD"} and spread_severity == "unknown" and not catastrophic_spread:
+            recovery_reason = "recoverable_missing_orderbook_data"
+        elif not orderbook_ready or not depth_available:
+            recovery_reason = "recoverable_missing_depth"
+        else:
+            recovery_reason = "recoverable_temporal_gap"
+        should_retry = bool(base_retry_attempts > 0)
+    else:
+        if boundary_price:
+            recovery_reason = "boundary_price"
+        elif synthetic_book:
+            recovery_reason = "synthetic_book"
+        elif catastrophic_spread:
+            recovery_reason = "catastrophic_spread"
+        elif fake_liquidity:
+            recovery_reason = "fake_liquidity"
+        elif not executable_side_present:
+            recovery_reason = "missing_executable_side"
+        elif not quote_ready:
+            recovery_reason = "quote_not_ready"
+        elif not payload_ready:
+            recovery_reason = "payload_not_ready"
+        else:
+            recovery_reason = orderbook_missing_reason or blocker_reason or "orderbook_not_recoverable"
+    return {
+        "ticker": ticker,
+        "family": family,
+        "side": side,
+        "recoverable": bool(should_retry),
+        "retry_attempts": int(base_retry_attempts),
+        "recovered": bool(recovered),
+        "recovery_reason": recovery_reason,
+        "spread_classification": spread_classification,
+        "spread_severity": spread_severity,
+        "quote_ready": bool(quote_ready),
+        "payload_ready": bool(payload_ready),
+        "orderbook_ready": bool(orderbook_ready),
+        "depth_available": bool(depth_available),
+    }
+
+
 __all__ = [
     "compute_pair_spread",
     "compute_topbook_spread",
@@ -468,6 +549,7 @@ __all__ = [
     "classify_spread_bucket",
     "coerce_mapping",
     "evaluate_orderbook_usability",
+    "evaluate_orderbook_recovery",
     "has_executable_pair",
     "is_synthetic_book",
     "normalize_aggression_profile",

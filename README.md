@@ -35,22 +35,13 @@ Runtime state is centralized under:
 
 These paths are for live artifacts only. They are not where source code lives.
 
-## tmux Workflow
-
-Attach to the live session:
-
-```bash
-tmux ls
-tmux attach -t kalshi-bot
-```
-
-## VPS / Service Workflow
+## Service Workflow
 
 Restart the live service:
 
 ```bash
 sudo systemctl restart kalshi-bot
-sudo systemctl status kalshi-bot --no-pager -l
+systemctl status kalshi-bot --no-pager
 ```
 
 ## Run Commands
