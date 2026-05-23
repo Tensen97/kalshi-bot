@@ -298,6 +298,390 @@ def resolve_ev_contract_size(
     return max(1, min(max_size, final_size))
 
 
+def _clamp(value, low, high):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = 0.0
+    return max(float(low), min(float(high), numeric))
+
+
+def _candidate_q(item):
+    if isinstance(item, dict):
+        return item.get("q") or item.get("quote")
+    if isinstance(item, (list, tuple)) and len(item) > 1:
+        return item[1]
+    return None
+
+
+def _candidate_get(bot, item, market, q, *names):
+    containers = []
+    if isinstance(item, dict):
+        containers.append(item)
+        for nested_name in ("expectancy_summary", "quality_snapshot", "ev_context", "momentum_context"):
+            nested = item.get(nested_name)
+            if isinstance(nested, dict):
+                containers.append(nested)
+    if isinstance(market, dict):
+        containers.append(market)
+    for name in names:
+        if q is not None:
+            value = getattr(q, name, None)
+            if value not in (None, ""):
+                return value
+        for container in containers:
+            value = container.get(name)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _coerce_probability(bot, value):
+    numeric = bot.to_float(value, None)
+    if numeric is None:
+        return None
+    if 0.0 <= numeric <= 1.0:
+        return round(float(numeric), 6)
+    if 1.0 < numeric <= 100.0:
+        return round(float(numeric) / 100.0, 6)
+    return None
+
+
+def _coerce_probability_series(bot, value, *, invert=False):
+    if value is None:
+        return []
+    raw_values = value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if "," in text:
+            raw_values = [part.strip() for part in text.split(",")]
+        else:
+            raw_values = [text]
+    elif not isinstance(value, (list, tuple)):
+        raw_values = [value]
+    series = []
+    for raw in raw_values:
+        if isinstance(raw, dict):
+            raw = raw.get("price", raw.get("value", raw.get("mid", raw.get("probability"))))
+        probability = _coerce_probability(bot, raw)
+        if probability is None:
+            continue
+        if invert:
+            probability = round(1.0 - probability, 6)
+        series.append(probability)
+    return series
+
+
+def _current_yes_probability(bot, item, market, q):
+    yes_bid = _coerce_probability(bot, _candidate_get(bot, item, market, q, "yes_bid", "yes_bid_dollars"))
+    yes_ask = _coerce_probability(bot, _candidate_get(bot, item, market, q, "yes_ask", "yes_ask_dollars"))
+    no_bid = _coerce_probability(bot, _candidate_get(bot, item, market, q, "no_bid", "no_bid_dollars"))
+    no_ask = _coerce_probability(bot, _candidate_get(bot, item, market, q, "no_ask", "no_ask_dollars"))
+    if yes_bid is not None and yes_ask is not None and yes_ask >= yes_bid:
+        return round((yes_bid + yes_ask) / 2.0, 6), "yes_mid"
+    mid_price = _coerce_probability(bot, _candidate_get(bot, item, market, q, "mid_price", "mid"))
+    if mid_price is not None:
+        return mid_price, "mid_price"
+    last_price = _coerce_probability(bot, _candidate_get(bot, item, market, q, "last_price", "last_price_dollars", "price"))
+    if last_price is not None:
+        return last_price, "last_price"
+    if no_bid is not None and no_ask is not None and no_ask >= no_bid:
+        return round(1.0 - ((no_bid + no_ask) / 2.0), 6), "no_mid_inverse"
+    selected_side = str(_candidate_get(bot, item, market, q, "selected_side", "side") or "").strip().lower()
+    selected_price = _coerce_probability(
+        bot,
+        _candidate_get(bot, item, market, q, "selected_price", "selected_price_dollars", "ev_selected_price"),
+    )
+    if selected_price is not None and selected_side in {"yes", "no"}:
+        return (selected_price if selected_side == "yes" else round(1.0 - selected_price, 6)), "selected_price"
+    if yes_ask is not None:
+        return yes_ask, "yes_ask"
+    if yes_bid is not None:
+        return yes_bid, "yes_bid"
+    if no_bid is not None:
+        return round(1.0 - no_bid, 6), "no_bid_inverse"
+    if no_ask is not None:
+        return round(1.0 - no_ask, 6), "no_ask_inverse"
+    return None, "missing"
+
+
+def _extract_yes_probability_series(bot, item, market, q):
+    series = []
+    for field in ("yes_price_history", "yes_probability_history", "yes_recent_prices"):
+        series.extend(_coerce_probability_series(bot, _candidate_get(bot, item, market, q, field), invert=False))
+    for field in ("no_price_history", "no_probability_history", "no_recent_prices"):
+        series.extend(_coerce_probability_series(bot, _candidate_get(bot, item, market, q, field), invert=True))
+    if series:
+        return series[-8:], "side_specific_history"
+    for field in ("price_history", "recent_prices", "probability_history", "recent_probability", "prices"):
+        series.extend(_coerce_probability_series(bot, _candidate_get(bot, item, market, q, field), invert=False))
+    if series:
+        return series[-8:], "generic_history"
+    previous = _coerce_probability(
+        bot,
+        _candidate_get(
+            bot,
+            item,
+            market,
+            q,
+            "previous_price",
+            "previous_mid_price",
+            "prior_price",
+            "last_mid_price",
+        ),
+    )
+    current, current_source = _current_yes_probability(bot, item, market, q)
+    if previous is not None and current is not None:
+        return [previous, current], f"previous_plus_{current_source}"
+    return ([current] if current is not None else []), current_source
+
+
+def _selected_side(bot, item, market, q, ev_context=None):
+    ev_context = ev_context if isinstance(ev_context, dict) else {}
+    side = (
+        ev_context.get("selected_side")
+        or ev_context.get("side")
+        or _candidate_get(bot, item, market, q, "selected_side", "side", "chosen_side")
+    )
+    side = str(side or "").strip().lower()
+    if side in {"buy_yes", "yes_bid"}:
+        return "yes"
+    if side in {"buy_no", "no_bid"}:
+        return "no"
+    if side in {"yes", "no"}:
+        return side
+    return "unknown"
+
+
+def _momentum_log(bot, context, *, log=True, log_cooldown_seconds=20.0):
+    if not log:
+        return
+    ticker = str(context.get("ticker") or "").strip()
+    if not ticker:
+        return
+    adjustment = _clamp(context.get("adjustment"), -10.0, 10.0)
+    direction = str(context.get("direction") or "unknown").strip().lower()
+    now_ts = time.time()
+    cycle_count = getattr(bot, "cycle_count", None)
+    if getattr(bot, "last_momentum_engine_log_cycle", None) != cycle_count:
+        bot.last_momentum_engine_log_cycle = cycle_count
+        bot.last_momentum_engine_log_count = 0
+    neutral_sample = abs(adjustment) < 0.05 and direction in {"unknown", "flat"}
+    if neutral_sample and int(getattr(bot, "last_momentum_engine_log_count", 0) or 0) >= 4:
+        return
+    if int(getattr(bot, "last_momentum_engine_log_count", 0) or 0) >= 12:
+        return
+    log_store = getattr(bot, "momentum_engine_log_markers", None)
+    if not isinstance(log_store, dict):
+        bot.momentum_engine_log_markers = {}
+        log_store = bot.momentum_engine_log_markers
+    marker = (
+        direction,
+        str(context.get("side") or "unknown"),
+        round(_clamp(context.get("momentum"), -10.0, 10.0), 3),
+        round(adjustment, 3),
+        str(context.get("reason") or "unknown"),
+    )
+    last = log_store.get(ticker, {}) if isinstance(log_store.get(ticker), dict) else {}
+    last_ts = _clamp(last.get("ts"), 0.0, now_ts)
+    if last.get("marker") == marker and now_ts - last_ts < max(1.0, float(log_cooldown_seconds or 20.0)):
+        return
+    log_store[ticker] = {"ts": now_ts, "marker": marker}
+    bot.last_momentum_engine_log_count = int(getattr(bot, "last_momentum_engine_log_count", 0) or 0) + 1
+    print(
+        "[MOMENTUM-ENGINE] "
+        f"ticker={ticker} "
+        f"family={context.get('family') or 'UNKNOWN'} "
+        f"side={context.get('side') or 'unknown'} "
+        f"momentum={round(_clamp(context.get('momentum'), -10.0, 10.0), 4)} "
+        f"direction={direction} "
+        f"adjustment={round(adjustment, 4)} "
+        f"reason={context.get('reason') or 'unknown'}"
+    )
+
+
+def get_momentum_rank_adjustment(
+    bot,
+    item=None,
+    *,
+    market=None,
+    family=None,
+    imbalance_context=None,
+    btc_volatility_context=None,
+    ev_context=None,
+    source="ranking",
+    log=True,
+):
+    market = market if isinstance(market, dict) else {}
+    q = _candidate_q(item)
+    if isinstance(item, dict):
+        q = q or item.get("q") or item.get("quote")
+        market = market or item.get("market") or {}
+        family = family or item.get("family")
+    elif isinstance(item, (list, tuple)):
+        family = family or (item[3] if len(item) > 3 else None)
+    ticker = str(
+        (item.get("ticker") if isinstance(item, dict) else "")
+        or getattr(q, "ticker", "")
+        or market.get("ticker", "")
+        or ""
+    ).strip()
+    family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
+    ev_context = ev_context if isinstance(ev_context, dict) else {}
+    imbalance_context = imbalance_context if isinstance(imbalance_context, dict) else {}
+    btc_volatility_context = btc_volatility_context if isinstance(btc_volatility_context, dict) else {}
+    side = _selected_side(bot, item, market, q, ev_context=ev_context)
+    series, series_source = _extract_yes_probability_series(bot, item, market, q)
+    current_yes, current_source = _current_yes_probability(bot, item, market, q)
+    if current_yes is not None and (not series or abs(series[-1] - current_yes) > 0.000001):
+        series = list(series or []) + [current_yes]
+    series = [value for value in series if value is not None]
+    reason_parts = []
+    delta = 0.0
+    step_delta = 0.0
+    acceleration = 0.0
+    continuation = 0.0
+    if len(series) >= 2:
+        lookback = series[-min(len(series), 5)]
+        previous = series[-2]
+        current = series[-1]
+        delta = round(current - lookback, 6)
+        step_delta = round(current - previous, 6)
+        direction = "up" if delta > 0.002 else "down" if delta < -0.002 else "flat"
+        if len(series) >= 3:
+            prev_step = round(series[-2] - series[-3], 6)
+            acceleration = round(step_delta - prev_step, 6)
+            if step_delta and prev_step and (step_delta > 0) == (prev_step > 0):
+                continuation = min(1.0, abs(step_delta) / 0.012)
+                reason_parts.append("directional_continuation")
+        reason_parts.append(series_source or current_source)
+    else:
+        direction = "unknown"
+        reason_parts.append("missing_history_neutral")
+
+    if side == "yes":
+        side_aligned_delta = delta
+        side_aligned_step = step_delta
+    elif side == "no":
+        side_aligned_delta = -delta
+        side_aligned_step = -step_delta
+    else:
+        side_aligned_delta = 0.0
+        side_aligned_step = 0.0
+        reason_parts.append("unknown_side_neutral")
+
+    momentum = _clamp((side_aligned_delta / 0.02) * 0.70 + (side_aligned_step / 0.01) * 0.30, -1.0, 1.0)
+    if continuation > 0.0 and momentum > 0.0:
+        momentum = min(1.0, momentum + 0.18 * continuation)
+    elif continuation > 0.0 and momentum < 0.0:
+        momentum = max(-1.0, momentum - 0.08 * continuation)
+
+    spread = bot.to_float(
+        _candidate_get(bot, item, market, q, "spread", "spread_dollars", "bid_ask_spread"),
+        None,
+    )
+    if spread is None:
+        yes_bid = _coerce_probability(bot, _candidate_get(bot, item, market, q, "yes_bid", "yes_bid_dollars"))
+        yes_ask = _coerce_probability(bot, _candidate_get(bot, item, market, q, "yes_ask", "yes_ask_dollars"))
+        spread = (yes_ask - yes_bid) if yes_bid is not None and yes_ask is not None and yes_ask >= yes_bid else None
+    spread_factor = 1.0
+    if spread is not None:
+        spread_factor = _clamp(1.08 - max(0.0, spread) / 0.12, 0.55, 1.08)
+        if spread <= 0.03:
+            reason_parts.append("tight_executable_spread")
+    liquidity = bot.to_float(
+        _candidate_get(bot, item, market, q, "liquidity", "liquidity_dollars", "volume"),
+        0.0,
+    ) or 0.0
+    liquidity_factor = 1.0 + min(0.12, max(0.0, liquidity) / 25000.0)
+
+    imbalance = bot.to_float(imbalance_context.get("imbalance"), 0.0) or 0.0
+    if side == "no":
+        side_imbalance = -imbalance
+    elif side == "yes":
+        side_imbalance = imbalance
+    else:
+        side_imbalance = 0.0
+    if side_imbalance > 0.05:
+        momentum += min(0.18, side_imbalance * 0.20)
+        reason_parts.append("orderbook_pressure_aligned")
+    elif side_imbalance < -0.10:
+        momentum -= min(0.10, abs(side_imbalance) * 0.12)
+        reason_parts.append("orderbook_pressure_opposed")
+    momentum = _clamp(momentum, -1.0, 1.0)
+
+    btc_direction = str(btc_volatility_context.get("direction") or "neutral").strip().lower()
+    btc_preferred_side = str(btc_volatility_context.get("preferred_side") or "").strip().lower()
+    btc_active = bool(btc_volatility_context.get("active"))
+    if btc_active and side in {"yes", "no"}:
+        if btc_preferred_side == side:
+            momentum = min(1.0, momentum + 0.22 * _clamp(btc_volatility_context.get("volatility"), 0.0, 3.0) / 3.0)
+            reason_parts.append(f"btc_{btc_direction}_aligned")
+        elif btc_preferred_side in {"yes", "no"}:
+            momentum = max(-1.0, momentum - 0.10 * _clamp(btc_volatility_context.get("volatility"), 0.0, 3.0) / 3.0)
+            reason_parts.append(f"btc_{btc_direction}_opposed")
+
+    ev_edge = bot.to_float(ev_context.get("ev_edge"), None)
+    if ev_edge is not None and ev_edge > 0.0 and momentum > 0.0:
+        momentum = min(1.0, momentum + min(0.10, ev_edge * 0.40))
+        reason_parts.append("positive_ev_confirms")
+
+    positive_adjustment = 2.20 * max(0.0, momentum) * spread_factor * liquidity_factor
+    negative_adjustment = 0.75 * min(0.0, momentum) * (0.90 if spread_factor >= 0.9 else 1.0)
+    adjustment = round(_clamp(positive_adjustment + negative_adjustment, -0.75, 2.35), 4)
+    if direction == "unknown" or side == "unknown":
+        adjustment = 0.0
+    if abs(adjustment) < 0.03:
+        adjustment = 0.0
+    if adjustment > 0:
+        action = "rank_boost"
+    elif adjustment < 0:
+        action = "rank_soft_penalty"
+    else:
+        action = "neutral"
+    reason = "+".join(dict.fromkeys(reason_parts)) or "neutral"
+    context = {
+        "ticker": ticker or None,
+        "family": family,
+        "side": side,
+        "momentum": round(momentum, 4),
+        "direction": direction,
+        "adjustment": adjustment,
+        "reason": reason,
+        "action": action,
+        "delta": round(delta, 6),
+        "step_delta": round(step_delta, 6),
+        "acceleration": round(acceleration, 6),
+        "series_points": len(series),
+        "series_source": series_source,
+        "current_source": current_source,
+        "spread_factor": round(spread_factor, 4),
+        "liquidity_factor": round(liquidity_factor, 4),
+        "source": source,
+    }
+    for target in (item if isinstance(item, dict) else None,):
+        if isinstance(target, dict):
+            target["momentum_score"] = context["momentum"]
+            target["momentum_direction"] = context["direction"]
+            target["momentum_adjustment"] = context["adjustment"]
+            target["momentum_reason"] = context["reason"]
+    if q is not None:
+        for field, value in (
+            ("momentum_score", context["momentum"]),
+            ("momentum_direction", context["direction"]),
+            ("momentum_adjustment", context["adjustment"]),
+            ("momentum_reason", context["reason"]),
+        ):
+            try:
+                setattr(q, field, value)
+            except Exception:
+                pass
+    _momentum_log(bot, context, log=log)
+    return context
+
+
 def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets=None):
     ranked = list(ranked or [])
     if not ranked:
@@ -333,12 +717,24 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             orderbook_imbalance_context=imbalance_context,
             source=source,
         )
+        momentum_context = get_momentum_rank_adjustment(
+            bot,
+            item,
+            market=market,
+            family=family,
+            imbalance_context=imbalance_context,
+            btc_volatility_context=btc_volatility_context,
+            ev_context=ev_context,
+            source=source,
+            log=True,
+        )
         total_score = (
             bot._rank_score_for_family_profit_memory(item)
             + family_adjustment
             + bot.to_float(imbalance_context.get("adjustment"), 0.0)
             + bot.to_float(btc_volatility_context.get("adjustment"), 0.0)
             + bot._ev_rank_adjustment(ev_context)
+            + bot.to_float(momentum_context.get("adjustment"), 0.0)
         )
         decorated.append((total_score, -index, item))
     decorated.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
