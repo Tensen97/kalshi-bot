@@ -7855,12 +7855,22 @@ class KalshiSniperBot:
                 rows = list(csv.DictReader(csv_file))
         except (OSError, csv.Error):
             return None
+        submitted_events = {"order_submitted", "live_submit_success", "live_exit_submitted", "order_reprice_submitted"}
+        cancel_events = {"order_cancelled", "live_order_cancelled", "auto_reprice_cancelled"}
+        cancelled_order_ids = set()
         for row in reversed(rows):
             if not isinstance(row, dict):
                 continue
             if str(row.get("ticker") or "").strip() != ticker:
                 continue
-            if str(row.get("event_type") or "").strip() not in {"order_submitted", "live_submit_success", "live_exit_submitted"}:
+            event_type = str(row.get("event_type") or "").strip()
+            row_order_id = str(row.get("order_id") or "").strip()
+            if event_type in cancel_events and row_order_id:
+                cancelled_order_ids.add(row_order_id)
+                continue
+            if event_type not in submitted_events:
+                continue
+            if row_order_id and row_order_id in cancelled_order_ids:
                 continue
             timestamp_text = str(row.get("timestamp") or "").strip()
             try:
@@ -7873,6 +7883,10 @@ class KalshiSniperBot:
                     "ticker": ticker,
                     "order_id": row.get("order_id") or None,
                     "event_type": row.get("event_type") or None,
+                    "side": row.get("side") or None,
+                    "action": row.get("action") or None,
+                    "count": row.get("count") or None,
+                    "price": row.get("price") or None,
                     "age_seconds": round(age_seconds, 3),
                     "window_seconds": int(window_seconds),
                     "timestamp": timestamp_text,
@@ -7887,8 +7901,11 @@ class KalshiSniperBot:
         if window_seconds is None or window_seconds <= 0:
             return 0
         now_ts = time.time()
+        submitted_events = {"order_submitted", "live_submit_success", "order_reprice_submitted"}
+        cancel_events = {"order_cancelled", "live_order_cancelled", "auto_reprice_cancelled"}
         count = 0
         seen = set()
+        cancelled_order_ids = set()
         try:
             with open(LIVE_AUDIT_LOG_FILE, newline="") as csv_file:
                 rows = list(csv.DictReader(csv_file))
@@ -7897,10 +7914,17 @@ class KalshiSniperBot:
         for row in reversed(rows):
             if not isinstance(row, dict):
                 continue
-            if str(row.get("event_type") or "").strip() not in {"order_submitted", "live_submit_success"}:
+            event_type = str(row.get("event_type") or "").strip()
+            row_order_id = str(row.get("order_id") or "").strip()
+            if event_type in cancel_events and row_order_id:
+                cancelled_order_ids.add(row_order_id)
+                continue
+            if event_type not in submitted_events:
                 continue
             row_ticker = str(row.get("ticker") or "").strip()
             if not row_ticker or row_ticker.split("-")[0].upper() != family:
+                continue
+            if row_order_id and row_order_id in cancelled_order_ids:
                 continue
             timestamp_text = str(row.get("timestamp") or "").strip()
             try:
@@ -7926,8 +7950,11 @@ class KalshiSniperBot:
         if window_seconds is None or window_seconds <= 0:
             return 0
         now_ts = time.time()
+        submitted_events = {"order_submitted", "live_submit_success", "order_reprice_submitted"}
+        cancel_events = {"order_cancelled", "live_order_cancelled", "auto_reprice_cancelled"}
         count = 0
         seen = set()
+        cancelled_order_ids = set()
         try:
             with open(LIVE_AUDIT_LOG_FILE, newline="") as csv_file:
                 rows = list(csv.DictReader(csv_file))
@@ -7936,7 +7963,14 @@ class KalshiSniperBot:
         for row in reversed(rows):
             if not isinstance(row, dict):
                 continue
-            if str(row.get("event_type") or "").strip() not in {"order_submitted", "live_submit_success"}:
+            event_type = str(row.get("event_type") or "").strip()
+            row_order_id = str(row.get("order_id") or "").strip()
+            if event_type in cancel_events and row_order_id:
+                cancelled_order_ids.add(row_order_id)
+                continue
+            if event_type not in submitted_events:
+                continue
+            if row_order_id and row_order_id in cancelled_order_ids:
                 continue
             timestamp_text = str(row.get("timestamp") or "").strip()
             try:
@@ -32230,6 +32264,12 @@ class KalshiSniperBot:
             q = quotes_by_ticker.get(ticker)
             quote_fixed = False
             quote_fixed_reason = None
+            payload_preflight = {}
+            readiness_sync_payload = {}
+            direct_fields_tradable_override = False
+            positive_edge_override = False
+            tradable_unsafe_override = False
+            canonical_open_market_block_reason = "unknown"
             if q is None:
                 missing_reasons["missing_quote_object"] += 1
                 try:
