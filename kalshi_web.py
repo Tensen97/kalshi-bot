@@ -32245,6 +32245,11 @@ class KalshiSniperBot:
         selected_is_sports = selected_category == "sports"
         selected_is_weak = (not selected_quote_ready) or selected_spread_bucket == "unsafe" or selected_edge <= 0.0
         open_market_payload_override = None
+        market = selected_market or {}
+        family = selected_family
+        final_edge = selected_edge
+        spread_bucket = selected_spread_bucket
+        quote_ready = selected_quote_ready
         scan_counts = Counter()
         missing_reasons = Counter()
         best_candidate = None
