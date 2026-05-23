@@ -132,6 +132,7 @@ try:
     from kalshi_sniper.candidate_quality import (
         build_candidate_quality_summary as candidate_quality_build_candidate_quality_summary,
         build_expectancy_score as candidate_quality_build_expectancy_score,
+        calculate_fractional_kelly_size as candidate_quality_calculate_fractional_kelly_size,
         compute_candidate_ev as candidate_quality_compute_candidate_ev,
         compute_candidate_quality as candidate_quality_compute_candidate_quality,
         compute_family_weight as candidate_quality_compute_family_weight,
@@ -142,6 +143,7 @@ try:
 except Exception:
     candidate_quality_build_candidate_quality_summary = None
     candidate_quality_build_expectancy_score = None
+    candidate_quality_calculate_fractional_kelly_size = None
     candidate_quality_compute_candidate_ev = None
     candidate_quality_compute_candidate_quality = None
     candidate_quality_compute_family_weight = None
@@ -1571,6 +1573,9 @@ AION_SPORTS_MIN_EDGE_AFTER_COST = _env_float("AION_SPORTS_MIN_EDGE_AFTER_COST", 
 AION_AGGRESSIVE_POSITIVE_EDGE_LANE_ENABLED = get_env_bool("AION_AGGRESSIVE_POSITIVE_EDGE_LANE_ENABLED", 1)
 AION_AGGRESSIVE_EDGE_FLOOR = _env_float("AION_AGGRESSIVE_EDGE_FLOOR", 0.002)
 AION_AGGRESSIVE_MAX_CONTRACTS = get_env_int("AION_AGGRESSIVE_MAX_CONTRACTS", 1)
+AION_KELLY_FRACTION = max(0.0, min(1.0, get_env_float("AION_KELLY_FRACTION", 0.25)))
+AION_KELLY_MAX_MULTIPLIER = max(1.0, get_env_float("AION_KELLY_MAX_MULTIPLIER", 1.75))
+AION_KELLY_MIN_EXPLORATION_SIZE = max(0, get_env_int("AION_KELLY_MIN_EXPLORATION_SIZE", 1))
 AION_AGGRESSIVE_MAX_TRADES_PER_DAY = get_env_int("AION_AGGRESSIVE_MAX_TRADES_PER_DAY", 5)
 AION_AGGRESSIVE_COOLDOWN_SECONDS = get_env_int("AION_AGGRESSIVE_COOLDOWN_SECONDS", 300)
 AION_CANDIDATE_TRACE_ENABLED = get_env_bool("AION_CANDIDATE_TRACE_ENABLED", 1)
@@ -25703,6 +25708,102 @@ class KalshiSniperBot:
             return min(-0.50, max(-3.50, ev_score * 0.25))
         return max(-0.25, min(0.25, ev_score * 0.10))
 
+    def _get_fractional_kelly_bankroll(self):
+        def _normalized_bankroll(value, *, cents=False):
+            numeric = self.to_float(value, None)
+            if numeric is None or numeric <= 0.0:
+                return None
+            return round(float(numeric) / 100.0, 4) if cents else round(float(numeric), 4)
+
+        def _from_mapping(mapping):
+            mapping = mapping if isinstance(mapping, dict) else {}
+            for field in (
+                "bankroll",
+                "kelly_bankroll",
+                "available_bankroll",
+                "portfolio_value",
+                "account_value",
+                "account_balance",
+                "cash_balance",
+                "available_cash",
+                "available_balance_dollars",
+                "balance_dollars",
+            ):
+                value = _normalized_bankroll(mapping.get(field), cents=False)
+                if value is not None:
+                    return value
+            for field in ("balance_cents", "available_balance_cents", "cash_balance_cents"):
+                value = _normalized_bankroll(mapping.get(field), cents=True)
+                if value is not None:
+                    return value
+            return None
+
+        for snapshot in (
+            self._get_capital_snapshot() if hasattr(self, "_get_capital_snapshot") else {},
+            getattr(self, "last_realm_xviii_summary", {}) or {},
+        ):
+            bankroll = _from_mapping(snapshot)
+            if bankroll is not None:
+                return bankroll
+
+        now = time.time()
+        cached = getattr(self, "last_fractional_kelly_bankroll_snapshot", {}) or {}
+        if cached and (now - self.to_float(cached.get("ts"), 0.0)) < 60.0:
+            return self.to_float(cached.get("bankroll"), None)
+
+        bankroll = None
+        try:
+            result = self._live_request_json("GET", "/trade-api/v2/portfolio/balance", timeout=5)
+            body = result.get("body") if isinstance(result, dict) else {}
+            if isinstance(body, dict):
+                bankroll = _normalized_bankroll(body.get("balance"), cents=True)
+                if bankroll is None:
+                    bankroll = _normalized_bankroll(body.get("available_balance"), cents=True)
+                if bankroll is None:
+                    bankroll = _from_mapping(body)
+        except Exception:
+            bankroll = None
+        self.last_fractional_kelly_bankroll_snapshot = {
+            "ts": now,
+            "bankroll": bankroll,
+        }
+        return bankroll
+
+    def _emit_aion_kelly_log(self, *, ticker=None, family=None, ev_context=None, price=None, action=None):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return
+        already_logged = bool(
+            getattr(self, "last_aion_kelly_log_cycle", None) == self.cycle_count
+            and str(getattr(self, "last_aion_kelly_log_ticker", "") or "").strip() == ticker
+        )
+        if already_logged:
+            return
+        ev_context = ev_context if isinstance(ev_context, dict) else {}
+        kelly_result = dict(getattr(self, "last_fractional_kelly_result", {}) or {})
+        print(
+            "[AION-KELLY] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "ev_tier": ev_context.get("ev_tier"),
+                    "estimated_win_probability": kelly_result.get("estimated_win_probability", ev_context.get("estimated_win_probability")),
+                    "price": self.to_float(price, kelly_result.get("price")),
+                    "expected_roi": ev_context.get("expected_roi"),
+                    "raw_kelly_fraction": kelly_result.get("raw_kelly_fraction"),
+                    "fractional_kelly_fraction": kelly_result.get("fractional_kelly_fraction"),
+                    "kelly_multiplier": kelly_result.get("kelly_multiplier", ev_context.get("kelly_multiplier")),
+                    "final_contract_size": kelly_result.get("final_contract_size", ev_context.get("kelly_contract_size")),
+                    "action": action or kelly_result.get("reason") or ev_context.get("kelly_reason") or "selected",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        self.last_aion_kelly_log_cycle = self.cycle_count
+        self.last_aion_kelly_log_ticker = ticker
+
     def _resolve_ev_contract_size(self, ev_context=None, q=None):
         ev_context = ev_context if isinstance(ev_context, dict) else {}
         base_size = max(1, int(AION_AGGRESSIVE_MAX_CONTRACTS or 1))
@@ -25719,7 +25820,83 @@ class KalshiSniperBot:
             requested_size = max(requested_size, base_size + 1)
         if requested_size <= 0:
             requested_size = 1
-        return max(1, min(max_size, requested_size))
+        ev_adjusted_size = max(1, min(max_size, requested_size))
+
+        if candidate_quality_calculate_fractional_kelly_size is None:
+            self.last_fractional_kelly_result = {
+                "estimated_win_probability": ev_context.get("estimated_win_probability"),
+                "price": ev_context.get("ev_selected_price"),
+                "payout": None,
+                "raw_kelly_fraction": None,
+                "fractional_kelly_fraction": None,
+                "kelly_multiplier": 1.0,
+                "final_contract_size": int(ev_adjusted_size),
+                "reason": "fallback_kelly_helper_unavailable",
+            }
+            return ev_adjusted_size
+
+        kelly_candidate = dict(ev_context)
+        kelly_candidate.update(
+            {
+                "kelly_fraction_config": AION_KELLY_FRACTION,
+                "kelly_max_multiplier": AION_KELLY_MAX_MULTIPLIER,
+                "kelly_min_exploration_size": AION_KELLY_MIN_EXPLORATION_SIZE,
+                "kelly_selected_for_dispatch": True,
+                "q": q,
+            }
+        )
+        if q is not None:
+            for field in (
+                "ticker",
+                "selected_side",
+                "side",
+                "selected_price",
+                "selected_price_dollars",
+                "yes_bid",
+                "yes_ask",
+                "no_bid",
+                "no_ask",
+                "probability_estimate",
+                "confidence_score",
+            ):
+                if kelly_candidate.get(field) is None:
+                    try:
+                        kelly_candidate[field] = getattr(q, field, None)
+                    except Exception:
+                        pass
+        bankroll = self._get_fractional_kelly_bankroll()
+        kelly_result = candidate_quality_calculate_fractional_kelly_size(
+            kelly_candidate,
+            bankroll,
+            ev_adjusted_size,
+            max_size,
+        )
+        self.last_fractional_kelly_result = dict(kelly_result or {})
+        kelly_fields = {
+            "kelly_fraction": kelly_candidate.get("kelly_fraction"),
+            "kelly_multiplier": kelly_candidate.get("kelly_multiplier"),
+            "kelly_contract_size": kelly_candidate.get("kelly_contract_size"),
+            "kelly_reason": kelly_candidate.get("kelly_reason"),
+        }
+        ev_context.update(kelly_fields)
+        if q is not None:
+            for field, value in kelly_fields.items():
+                try:
+                    setattr(q, field, value)
+                except Exception:
+                    pass
+        final_size = int(self.to_float((kelly_result or {}).get("final_contract_size"), ev_adjusted_size) or ev_adjusted_size)
+        if final_size <= 0:
+            final_size = max(1, min(max_size, AION_KELLY_MIN_EXPLORATION_SIZE or ev_adjusted_size or base_size))
+            self.last_fractional_kelly_result["final_contract_size"] = int(final_size)
+            self.last_fractional_kelly_result["kelly_multiplier"] = round(final_size / max(1, ev_adjusted_size), 4)
+            self.last_fractional_kelly_result["reason"] = str(
+                self.last_fractional_kelly_result.get("reason") or "kelly_zero"
+            ) + "_selected_flow_micro_fallback"
+            ev_context["kelly_contract_size"] = int(final_size)
+            ev_context["kelly_multiplier"] = self.last_fractional_kelly_result["kelly_multiplier"]
+            ev_context["kelly_reason"] = self.last_fractional_kelly_result["reason"]
+        return max(1, min(max_size, final_size))
 
     def _apply_rank_only_memory_adjustments(self, ranked, *, source="ranking", markets=None):
         ranked = list(ranked or [])
@@ -46705,6 +46882,13 @@ class KalshiSniperBot:
         )
         self.last_aion_ev_log_cycle = self.cycle_count
         self.last_aion_ev_log_ticker = selected_ticker_for_ev
+        self._emit_aion_kelly_log(
+            ticker=selected_ticker_for_ev,
+            family=family,
+            ev_context=selected_ev_context,
+            price=selected_ev_price,
+            action=selected_ev_action,
+        )
         psychology_stats = dict(self.market_psychology_cycle_stats or {})
         self.last_live_select_summary = {
             "original_market_count": original_market_count,
@@ -55093,6 +55277,14 @@ class KalshiSniperBot:
             )
             self.last_aion_ev_log_cycle = self.cycle_count
             self.last_aion_ev_log_ticker = selected_ticker_key
+        if selected_ticker_key and selected_context_quote is not None:
+            self._emit_aion_kelly_log(
+                ticker=selected_ticker_key,
+                family=selected_family,
+                ev_context=selected_ev_context,
+                price=selected_price_hint,
+                action=ev_log_action,
+            )
         self._update_aion_persistent_intelligence(
             ticker=getattr(selected_context_quote, "ticker", None) if selected_context_quote is not None else None,
             family=(self.last_live_select_summary or {}).get("selected_family") or (self.last_live_select_summary or {}).get("family"),

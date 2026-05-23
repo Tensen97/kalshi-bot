@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 
@@ -431,6 +432,237 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
     return candidate
+
+
+def _kelly_env_float(name: str, default: float, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
+    numeric = to_float(os.environ.get(name), default)
+    if numeric is None:
+        numeric = default
+    numeric = float(numeric)
+    if minimum is not None:
+        numeric = max(float(minimum), numeric)
+    if maximum is not None:
+        numeric = min(float(maximum), numeric)
+    return numeric
+
+
+def _kelly_env_int(name: str, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    numeric = to_float(os.environ.get(name), default)
+    if numeric is None:
+        numeric = default
+    value = int(float(numeric))
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return value
+
+
+def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, base_size: Any, max_size: Any) -> Dict[str, Any]:
+    candidate = candidate if isinstance(candidate, dict) else {}
+    base_contracts = max(0, int(to_float(base_size, 0) or 0))
+    hard_max_contracts = max(base_contracts, int(to_float(max_size, base_contracts or 1) or (base_contracts or 1)))
+    fallback_size = max(0, min(hard_max_contracts, base_contracts))
+
+    kelly_fraction_config = to_float(candidate.get("kelly_fraction_config"), None)
+    if kelly_fraction_config is None:
+        kelly_fraction_config = _kelly_env_float("AION_KELLY_FRACTION", 0.25, 0.0, 1.0)
+    else:
+        kelly_fraction_config = max(0.0, min(1.0, float(kelly_fraction_config)))
+
+    max_multiplier = to_float(candidate.get("kelly_max_multiplier"), None)
+    if max_multiplier is None:
+        max_multiplier = _kelly_env_float("AION_KELLY_MAX_MULTIPLIER", 1.75, 1.0, 10.0)
+    else:
+        max_multiplier = max(1.0, min(10.0, float(max_multiplier)))
+
+    min_exploration_size = to_float(candidate.get("kelly_min_exploration_size"), None)
+    if min_exploration_size is None:
+        min_exploration_size = _kelly_env_int("AION_KELLY_MIN_EXPLORATION_SIZE", 1, 0, hard_max_contracts)
+    else:
+        min_exploration_size = max(0, min(hard_max_contracts, int(float(min_exploration_size))))
+
+    probability = _ev_probability(
+        _ev_first(
+            candidate,
+            "estimated_win_probability",
+            "probability_estimate",
+            "model_confidence",
+            "base_confidence",
+            "confidence_probability",
+            "confidence_score",
+            "confidence",
+        ),
+        None,
+    )
+    side = str(_ev_first(candidate, "selected_side", "side") or "yes").strip().lower()
+    price = _ev_price(
+        _ev_first(candidate, "ev_selected_price", "selected_price", "selected_price_dollars", "price", "cost"),
+        None,
+    )
+    if price is None:
+        if side == "no":
+            price = _ev_price(_ev_first(candidate, "no_ask", "no_price", "no_price_dollars"), None)
+        else:
+            price = _ev_price(_ev_first(candidate, "yes_ask", "yes_price", "yes_price_dollars"), None)
+    if price is None:
+        price = _ev_price(_ev_first(candidate, "selected_price_cents", "price_cents"), None)
+
+    raw_payout = to_float(_ev_first(candidate, "payout", "profit_payout", "profit_per_contract", "ev_payout"), None)
+    if raw_payout is None or raw_payout >= 1.0:
+        payout = None if price is None else max(0.01, 1.0 - price)
+    else:
+        payout = _ev_price(raw_payout, None)
+    bankroll_value = to_float(bankroll, None)
+
+    result = {
+        "estimated_win_probability": None if probability is None else round(probability, 6),
+        "price": None if price is None else round(price, 6),
+        "payout": None if payout is None else round(payout, 6),
+        "raw_kelly_fraction": None,
+        "fractional_kelly_fraction": None,
+        "kelly_multiplier": 1.0,
+        "final_contract_size": int(fallback_size),
+        "reason": "fallback_existing_size",
+    }
+
+    if base_contracts <= 0 or hard_max_contracts <= 0:
+        result["reason"] = "fallback_invalid_size_bounds"
+        candidate.update(
+            {
+                "kelly_fraction": result["fractional_kelly_fraction"],
+                "kelly_multiplier": result["kelly_multiplier"],
+                "kelly_contract_size": result["final_contract_size"],
+                "kelly_reason": result["reason"],
+            }
+        )
+        return result
+
+    if probability is None or price is None or payout is None or price <= 0.0 or payout <= 0.0:
+        missing = []
+        if probability is None:
+            missing.append("probability")
+        if price is None or price <= 0.0:
+            missing.append("price")
+        if payout is None or payout <= 0.0:
+            missing.append("payout")
+        result["reason"] = "fallback_missing_" + "_".join(missing or ["kelly_input"])
+        candidate.update(
+            {
+                "kelly_fraction": result["fractional_kelly_fraction"],
+                "kelly_multiplier": result["kelly_multiplier"],
+                "kelly_contract_size": result["final_contract_size"],
+                "kelly_reason": result["reason"],
+            }
+        )
+        return result
+
+    b = payout / price
+    if b <= 0.0:
+        result["reason"] = "fallback_invalid_profit_per_dollar"
+        candidate.update(
+            {
+                "kelly_fraction": result["fractional_kelly_fraction"],
+                "kelly_multiplier": result["kelly_multiplier"],
+                "kelly_contract_size": result["final_contract_size"],
+                "kelly_reason": result["reason"],
+            }
+        )
+        return result
+
+    q_probability = 1.0 - probability
+    raw_kelly_fraction = ((b * probability) - q_probability) / b
+    positive_kelly_fraction = max(0.0, raw_kelly_fraction)
+    fractional_kelly_fraction = positive_kelly_fraction * kelly_fraction_config
+    result["raw_kelly_fraction"] = round(raw_kelly_fraction, 6)
+    result["fractional_kelly_fraction"] = round(fractional_kelly_fraction, 6)
+
+    ev_tier = str(_ev_first(candidate, "ev_tier") or "C").strip().upper() or "C"
+    selected_for_dispatch = bool(candidate.get("selected_for_dispatch") or candidate.get("kelly_selected_for_dispatch"))
+    if raw_kelly_fraction <= 0.0:
+        if ev_tier in {"B", "C"}:
+            final_size = max(min_exploration_size, 1)
+            reason = "exploration_micro_nonpositive_kelly"
+        elif selected_for_dispatch and min_exploration_size > 0:
+            final_size = min_exploration_size
+            reason = "selected_micro_nonpositive_kelly"
+        else:
+            final_size = 0
+            reason = "zero_nonpositive_kelly"
+        final_size = max(0, min(hard_max_contracts, int(final_size)))
+        result["kelly_multiplier"] = round((final_size / base_contracts) if base_contracts > 0 else 0.0, 4)
+        result["final_contract_size"] = int(final_size)
+        result["reason"] = reason
+        candidate.update(
+            {
+                "kelly_fraction": result["fractional_kelly_fraction"],
+                "kelly_multiplier": result["kelly_multiplier"],
+                "kelly_contract_size": result["final_contract_size"],
+                "kelly_reason": result["reason"],
+            }
+        )
+        return result
+
+    if bankroll_value is None or bankroll_value <= 0.0:
+        result["reason"] = "fallback_missing_bankroll"
+        candidate.update(
+            {
+                "kelly_fraction": result["fractional_kelly_fraction"],
+                "kelly_multiplier": result["kelly_multiplier"],
+                "kelly_contract_size": result["final_contract_size"],
+                "kelly_reason": result["reason"],
+            }
+        )
+        return result
+
+    kelly_contracts = int((bankroll_value * fractional_kelly_fraction) / price)
+    raw_multiplier = (kelly_contracts / base_contracts) if base_contracts > 0 else 0.0
+    if ev_tier == "S":
+        tier_cap = max_multiplier
+        bounded_multiplier = max(1.0, min(tier_cap, raw_multiplier))
+        min_size = max(1, min_exploration_size)
+    elif ev_tier == "A":
+        tier_cap = max_multiplier
+        bounded_multiplier = max(0.50, min(tier_cap, raw_multiplier))
+        min_size = max(1, min_exploration_size)
+    elif ev_tier == "B":
+        tier_cap = min(max_multiplier, 0.75)
+        bounded_multiplier = max(0.10, min(tier_cap, raw_multiplier))
+        min_size = max(1, min_exploration_size)
+    elif ev_tier == "C":
+        tier_cap = min(max_multiplier, 0.35)
+        bounded_multiplier = max(0.05, min(tier_cap, raw_multiplier))
+        min_size = max(1, min_exploration_size)
+    else:
+        tier_cap = min(max_multiplier, 0.20)
+        if not selected_for_dispatch:
+            bounded_multiplier = 0.0
+            min_size = 0
+        else:
+            bounded_multiplier = max(0.0, min(tier_cap, raw_multiplier))
+            min_size = min_exploration_size
+
+    requested_size = int(base_contracts * bounded_multiplier)
+    if bounded_multiplier > 0.0 and requested_size <= 0:
+        requested_size = min_size
+    if ev_tier in {"B", "C"} and requested_size <= 0:
+        requested_size = min_size
+    final_size = max(0, min(hard_max_contracts, requested_size))
+    if final_size <= 0 and selected_for_dispatch and min_exploration_size > 0 and ev_tier != "D":
+        final_size = min(hard_max_contracts, min_exploration_size)
+
+    result["kelly_multiplier"] = round((final_size / base_contracts) if base_contracts > 0 else 0.0, 4)
+    result["final_contract_size"] = int(final_size)
+    result["reason"] = f"fractional_kelly_{ev_tier.lower()}"
+    candidate.update(
+        {
+            "kelly_fraction": result["fractional_kelly_fraction"],
+            "kelly_multiplier": result["kelly_multiplier"],
+            "kelly_contract_size": result["final_contract_size"],
+            "kelly_reason": result["reason"],
+        }
+    )
+    return result
 
 
 def compute_profitability_signal(
@@ -1685,6 +1917,7 @@ def build_candidate_quality_summary(selected_quality_summary=None, selected_qual
 __all__ = [
     "build_candidate_quality_summary",
     "build_expectancy_score",
+    "calculate_fractional_kelly_size",
     "compute_candidate_ev",
     "compute_candidate_quality",
     "compute_profitability_signal",
