@@ -194,6 +194,41 @@ except Exception:
     orderbook_health_is_synthetic_book = None
     orderbook_health_normalize_aggression_profile = None
 
+try:
+    from kalshi_memory import normalize_memory_family_value as kalshi_memory_normalize_family_value
+except Exception:
+    kalshi_memory_normalize_family_value = None
+
+try:
+    from kalshi_orderbook import calculate_topbook_imbalance as kalshi_orderbook_calculate_topbook_imbalance
+except Exception:
+    kalshi_orderbook_calculate_topbook_imbalance = None
+
+try:
+    from kalshi_exits import coerce_live_exit_price as kalshi_exits_coerce_live_exit_price
+except Exception:
+    kalshi_exits_coerce_live_exit_price = None
+
+try:
+    from kalshi_crypto_mode import is_btc_volatility_family as kalshi_crypto_mode_is_btc_volatility_family
+except Exception:
+    kalshi_crypto_mode_is_btc_volatility_family = None
+
+try:
+    from kalshi_ranking import ev_rank_adjustment as kalshi_ranking_ev_rank_adjustment
+except Exception:
+    kalshi_ranking_ev_rank_adjustment = None
+
+try:
+    from kalshi_execution import ensure_live_client_order_id as kalshi_execution_ensure_live_client_order_id
+except Exception:
+    kalshi_execution_ensure_live_client_order_id = None
+
+try:
+    from kalshi_risk import compute_effective_live_dry_run as kalshi_risk_compute_effective_live_dry_run
+except Exception:
+    kalshi_risk_compute_effective_live_dry_run = None
+
 
 DEBUG_LIVE = (os.environ.get("DEBUG_LIVE", "false") or "false").strip().lower() == "true"
 DEBUG_LIVE_PREFIXES = (
@@ -1715,6 +1750,14 @@ def compute_effective_live_dry_run(live_mode=None, live_armed=None, live_env_con
         live_env_confirmed = bool(globals().get("LIVE_ENV_CONFIRMED", False))
     if configured_dry_run is None:
         configured_dry_run = bool(globals().get("DRY_RUN_LIVE_ORDERS", False))
+    if kalshi_risk_compute_effective_live_dry_run is not None:
+        return kalshi_risk_compute_effective_live_dry_run(
+            live_mode=live_mode,
+            live_armed=live_armed,
+            live_env_confirmed=live_env_confirmed,
+            configured_dry_run=configured_dry_run,
+            allow_live_raw=os.environ.get("KALSHI_ALLOW_LIVE", ""),
+        )
     allow_live_raw = (os.environ.get("KALSHI_ALLOW_LIVE", "") or "").strip().lower()
     allow_live_enabled = allow_live_raw in {"1", "true", "yes", "on"}
     if live_armed and allow_live_enabled:
@@ -24789,9 +24832,12 @@ class KalshiSniperBot:
         )
 
     def _normalize_family_for_profit_memory(self, family=None, ticker=None, market=None, q=None):
-        family_value = str(family or "").strip().upper()
-        if family_value in {"NONE", "NULL", "UNKNOWN"}:
-            family_value = ""
+        if kalshi_memory_normalize_family_value is not None:
+            family_value = kalshi_memory_normalize_family_value(family, default="")
+        else:
+            family_value = str(family or "").strip().upper()
+            if family_value in {"NONE", "NULL", "UNKNOWN"}:
+                family_value = ""
         if not family_value and isinstance(market, dict):
             family_value = str(market.get("family") or market.get("series_ticker") or "").strip().upper()
             if family_value in {"NONE", "NULL", "UNKNOWN"}:
@@ -24805,7 +24851,10 @@ class KalshiSniperBot:
             except Exception:
                 family_value = ""
         if not family_value and ticker_value:
-            family_value = ticker_value.split("-")[0].strip().upper()
+            if kalshi_memory_normalize_family_value is not None:
+                family_value = kalshi_memory_normalize_family_value(None, ticker_value, default="")
+            else:
+                family_value = ticker_value.split("-")[0].strip().upper()
         return family_value or "UNKNOWN"
 
     def _family_profit_memory_rows_from_sqlite(self, limit=None):
@@ -25137,9 +25186,15 @@ class KalshiSniperBot:
                 _market_get("selected_side", "side"),
             )
         )
-        total_size = max(0.0, yes_top_size) + max(0.0, no_top_size)
-        imbalance = ((yes_top_size - no_top_size) / total_size) if total_size > 0.0 else 0.0
-        pressure_side = "yes" if imbalance > 0.0 else "no" if imbalance < 0.0 else None
+        if kalshi_orderbook_calculate_topbook_imbalance is not None:
+            imbalance_summary = kalshi_orderbook_calculate_topbook_imbalance(yes_top_size, no_top_size)
+            total_size = imbalance_summary.get("total_size")
+            imbalance = imbalance_summary.get("imbalance")
+            pressure_side = imbalance_summary.get("pressure_side")
+        else:
+            total_size = max(0.0, yes_top_size) + max(0.0, no_top_size)
+            imbalance = ((yes_top_size - no_top_size) / total_size) if total_size > 0.0 else 0.0
+            pressure_side = "yes" if imbalance > 0.0 else "no" if imbalance < 0.0 else None
         if selected_side is None and abs(imbalance) >= max(0.0, KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND):
             selected_side = pressure_side
 
@@ -25255,6 +25310,8 @@ class KalshiSniperBot:
             market=market if isinstance(market, dict) else None,
             q=q,
         )
+        if kalshi_crypto_mode_is_btc_volatility_family is not None:
+            return kalshi_crypto_mode_is_btc_volatility_family(family_key, ticker_key)
         combined = f"{family_key} {ticker_key}"
         return bool(
             "KXBTC" in combined
@@ -25717,6 +25774,8 @@ class KalshiSniperBot:
         return ev_context
 
     def _ev_rank_adjustment(self, ev_context):
+        if kalshi_ranking_ev_rank_adjustment is not None:
+            return kalshi_ranking_ev_rank_adjustment(ev_context, self.to_float)
         ev_context = ev_context if isinstance(ev_context, dict) else {}
         ev_score = self.to_float(ev_context.get("ev_score"), 0.0) or 0.0
         ev_tier = str(ev_context.get("ev_tier") or "").strip().upper()
@@ -51946,6 +52005,8 @@ class KalshiSniperBot:
         return side in {"", "yes", "no", "buy_yes", "buy_no"}
 
     def _coerce_live_exit_price(self, value):
+        if kalshi_exits_coerce_live_exit_price is not None:
+            return kalshi_exits_coerce_live_exit_price(value, self.to_float)
         price = self.to_float(value, None)
         if price is None:
             return None
@@ -52415,6 +52476,8 @@ class KalshiSniperBot:
         return row
 
     def _ensure_live_client_order_id(self, payload):
+        if kalshi_execution_ensure_live_client_order_id is not None:
+            return kalshi_execution_ensure_live_client_order_id(payload)
         payload = dict(payload or {})
         if not payload.get("client_order_id"):
             seed = f"{payload.get('ticker')}:{time.time_ns()}:{os.getpid()}"
