@@ -261,6 +261,178 @@ def compute_probability_estimate_signal(
     }
 
 
+def _ev_first(mapping: Dict[str, Any], *keys: str) -> Any:
+    mapping = mapping if isinstance(mapping, dict) else {}
+    nested = (
+        mapping,
+        mapping.get("expectancy_summary") if isinstance(mapping.get("expectancy_summary"), dict) else {},
+        mapping.get("quality_snapshot") if isinstance(mapping.get("quality_snapshot"), dict) else {},
+        mapping.get("tradeability") if isinstance(mapping.get("tradeability"), dict) else {},
+        mapping.get("canonical_tradeability") if isinstance(mapping.get("canonical_tradeability"), dict) else {},
+        mapping.get("quote_diag") if isinstance(mapping.get("quote_diag"), dict) else {},
+        mapping.get("memory_profile") if isinstance(mapping.get("memory_profile"), dict) else {},
+        mapping.get("adaptive_confidence_summary") if isinstance(mapping.get("adaptive_confidence_summary"), dict) else {},
+    )
+    for source in nested:
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+    q = mapping.get("q") or mapping.get("quote")
+    if q is not None:
+        for key in keys:
+            value = getattr(q, key, None)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+    return None
+
+
+def _ev_probability(value: Any, default: Optional[float] = None) -> Optional[float]:
+    numeric = to_float(value, None)
+    if numeric is None:
+        return default
+    if numeric > 1.0 and numeric <= 100.0:
+        numeric = numeric / 100.0
+    return max(0.01, min(0.99, float(numeric)))
+
+
+def _ev_price(value: Any, default: Optional[float] = None) -> Optional[float]:
+    numeric = to_float(value, None)
+    if numeric is None:
+        return default
+    if numeric > 1.0 and numeric <= 100.0:
+        numeric = numeric / 100.0
+    return max(0.01, min(0.99, float(numeric)))
+
+
+def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    candidate = candidate if isinstance(candidate, dict) else {}
+    side = str(_ev_first(candidate, "selected_side", "side") or "yes").strip().lower()
+    if side not in {"yes", "no"}:
+        side = "yes"
+    selected_price = _ev_price(
+        _ev_first(candidate, "selected_price", "selected_price_dollars", "price"),
+        None,
+    )
+    if selected_price is None:
+        if side == "no":
+            selected_price = _ev_price(_ev_first(candidate, "no_ask", "no_price", "no_price_dollars"), None)
+        else:
+            selected_price = _ev_price(_ev_first(candidate, "yes_ask", "yes_price", "yes_price_dollars"), None)
+    if selected_price is None:
+        selected_price = _ev_price(_ev_first(candidate, "selected_price_cents", "price_cents"), 0.50)
+
+    market_implied_probability = _ev_probability(
+        _ev_first(candidate, "market_implied_probability", "implied_probability"),
+        selected_price,
+    )
+    base_probability = _ev_probability(
+        _ev_first(
+            candidate,
+            "estimated_win_probability",
+            "probability_estimate",
+            "model_confidence",
+            "base_confidence",
+            "probability_confidence",
+            "confidence_probability",
+            "confidence_score",
+            "confidence",
+            "calibrated_probability",
+            "fair_probability",
+            "no_vig_probability",
+        ),
+        market_implied_probability,
+    )
+
+    family_adjustment = max(
+        -0.035,
+        min(0.035, (to_float(candidate.get("family_profit_memory_adjustment"), 0.0) or 0.0) * 0.018),
+    )
+    memory_profile = candidate.get("memory_profile") if isinstance(candidate.get("memory_profile"), dict) else {}
+    memory_score = to_float(memory_profile.get("memory_score"), None)
+    sample_quality = str(memory_profile.get("sample_size_quality") or "none").strip().lower()
+    sample_scale = {"none": 0.0, "tiny": 0.20, "small": 0.45, "medium": 0.75, "strong": 1.0}.get(sample_quality, 0.50)
+    dynamic_adjustment = (to_float(candidate.get("dynamic_memory_adjustment"), 0.0) or 0.0) * 0.018
+    if memory_score is not None:
+        dynamic_adjustment += (max(0.0, min(1.0, memory_score)) - 0.5) * 0.10 * sample_scale
+    adaptive_summary = candidate.get("adaptive_confidence_summary") if isinstance(candidate.get("adaptive_confidence_summary"), dict) else {}
+    dynamic_adjustment += (to_float(adaptive_summary.get("adaptive_confidence_modifier"), to_float(adaptive_summary.get("avg_confidence_modifier"), 0.0)) or 0.0) * 0.75
+    dynamic_adjustment = max(-0.045, min(0.045, dynamic_adjustment))
+
+    imbalance_context = candidate.get("orderbook_imbalance") if isinstance(candidate.get("orderbook_imbalance"), dict) else {}
+    orderbook_adjustment = (to_float(candidate.get("orderbook_imbalance_adjustment"), 0.0) or 0.0) * 0.018
+    imbalance = to_float(imbalance_context.get("imbalance"), None)
+    imbalance_side = str(imbalance_context.get("side") or side).strip().lower()
+    if imbalance is not None:
+        side_support = imbalance if imbalance_side == "yes" else -imbalance if imbalance_side == "no" else 0.0
+        orderbook_adjustment += max(-0.035, min(0.035, side_support * 0.035))
+    orderbook_adjustment = max(-0.040, min(0.040, orderbook_adjustment))
+
+    estimated_win_probability = max(
+        0.03,
+        min(
+            0.97,
+            (base_probability if base_probability is not None else market_implied_probability or 0.50)
+            + family_adjustment
+            + dynamic_adjustment
+            + orderbook_adjustment,
+        ),
+    )
+    market_implied_probability = max(0.03, min(0.97, market_implied_probability if market_implied_probability is not None else selected_price or 0.50))
+    cost = max(0.01, min(0.99, selected_price if selected_price is not None else market_implied_probability))
+    payout = max(0.01, 1.0 - cost)
+    expected_value = (estimated_win_probability * payout) - ((1.0 - estimated_win_probability) * cost)
+    expected_roi = expected_value / cost if cost > 0.0 else 0.0
+    ev_edge = estimated_win_probability - market_implied_probability
+    if ev_edge >= 0.08 or expected_roi >= 0.18:
+        ev_tier = "S"
+        sizing_multiplier = 1.40
+        action = "prioritize_size_up"
+    elif ev_edge >= 0.035 or expected_roi >= 0.08:
+        ev_tier = "A"
+        sizing_multiplier = 1.00
+        action = "prioritize_normal"
+    elif ev_edge >= 0.005 or expected_value > 0.0:
+        ev_tier = "B"
+        sizing_multiplier = 0.65
+        action = "trade_small"
+    elif ev_edge >= -0.020 or expected_roi >= -0.05:
+        ev_tier = "C"
+        sizing_multiplier = 0.35
+        action = "explore_micro"
+    else:
+        ev_tier = "D"
+        sizing_multiplier = 0.0
+        action = "deprioritize"
+
+    candidate.update(
+        {
+            "market_implied_probability": round(market_implied_probability, 6),
+            "estimated_win_probability": round(estimated_win_probability, 6),
+            "expected_value": round(expected_value, 6),
+            "expected_roi": round(expected_roi, 6),
+            "ev_edge": round(ev_edge, 6),
+            "ev_score": round((ev_edge * 100.0) + (expected_roi * 2.0), 4),
+            "ev_selected_price": round(cost, 6),
+            "ev_tier": ev_tier,
+            "ev_reason": (
+                f"base={round(base_probability if base_probability is not None else 0.5, 4)} "
+                f"family={round(family_adjustment, 4)} dynamic={round(dynamic_adjustment, 4)} "
+                f"orderbook={round(orderbook_adjustment, 4)}"
+            ),
+            "ev_sizing_multiplier": round(sizing_multiplier, 4),
+            "ev_action": action,
+        }
+    )
+    return candidate
+
+
 def compute_profitability_signal(
     self,
     *,
@@ -502,8 +674,12 @@ def compute_profitability_signal(
 
 
 def rank_final_candidates(candidates):
+    tier_rank = {"S": 4, "A": 3, "B": 2, "C": 1, "D": 0}
+
     def _candidate_rank_key(item):
         if isinstance(item, dict):
+            ev_tier_rank = tier_rank.get(str(item.get("ev_tier") or "").strip().upper(), 1)
+            ev_score = to_float(item.get("ev_score"), 0.0)
             profitability_score = to_float(item.get("profitability_score"), to_float(item.get("quality_score"), to_float(item.get("candidate_score"), 0.0)))
             quality_score = to_float(item.get("quality_score"), to_float(item.get("candidate_score"), 0.0))
             candidate_score = to_float(item.get("candidate_score"), 0.0)
@@ -512,6 +688,8 @@ def rank_final_candidates(candidates):
             liquidity = to_float(item.get("liquidity"), 0.0)
             volume = to_float(item.get("volume"), 0.0)
             return (
+                ev_tier_rank,
+                ev_score,
                 profitability_score,
                 quality_score,
                 candidate_score,
@@ -521,11 +699,16 @@ def rank_final_candidates(candidates):
                 volume,
             )
         if isinstance(item, (list, tuple)) and item:
+            q = item[1] if len(item) > 1 else None
+            ev_tier_rank = tier_rank.get(str(getattr(q, "ev_tier", "") or "").strip().upper(), 1)
+            ev_score = to_float(getattr(q, "ev_score", 0.0), 0.0)
             candidate_score = to_float(item[0], 0.0)
             spread = to_float(item[2], 0.0) if len(item) > 2 else 0.0
-            liquidity = to_float(getattr(item[1], "liquidity", 0.0), 0.0) if len(item) > 1 else 0.0
-            volume = to_float(getattr(item[1], "volume", 0.0), 0.0) if len(item) > 1 else 0.0
+            liquidity = to_float(getattr(q, "liquidity", 0.0), 0.0) if q is not None else 0.0
+            volume = to_float(getattr(q, "volume", 0.0), 0.0) if q is not None else 0.0
             return (
+                ev_tier_rank,
+                ev_score,
                 candidate_score,
                 -spread,
                 liquidity,
@@ -1502,6 +1685,7 @@ def build_candidate_quality_summary(selected_quality_summary=None, selected_qual
 __all__ = [
     "build_candidate_quality_summary",
     "build_expectancy_score",
+    "compute_candidate_ev",
     "compute_candidate_quality",
     "compute_profitability_signal",
     "compute_probability_estimate_signal",

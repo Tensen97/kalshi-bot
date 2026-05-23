@@ -132,6 +132,7 @@ try:
     from kalshi_sniper.candidate_quality import (
         build_candidate_quality_summary as candidate_quality_build_candidate_quality_summary,
         build_expectancy_score as candidate_quality_build_expectancy_score,
+        compute_candidate_ev as candidate_quality_compute_candidate_ev,
         compute_candidate_quality as candidate_quality_compute_candidate_quality,
         compute_family_weight as candidate_quality_compute_family_weight,
         compute_fill_quality_score as candidate_quality_compute_fill_quality_score,
@@ -141,6 +142,7 @@ try:
 except Exception:
     candidate_quality_build_candidate_quality_summary = None
     candidate_quality_build_expectancy_score = None
+    candidate_quality_compute_candidate_ev = None
     candidate_quality_compute_candidate_quality = None
     candidate_quality_compute_family_weight = None
     candidate_quality_compute_fill_quality_score = None
@@ -25557,6 +25559,168 @@ class KalshiSniperBot:
         mode["adjustment"] = round(float(adjustment or 0.0), 4)
         return mode
 
+    def _attach_ev_score_to_candidate(
+        self,
+        item=None,
+        *,
+        market=None,
+        q=None,
+        spread=None,
+        family=None,
+        expectancy_summary=None,
+        quality_snapshot=None,
+        family_profit_memory_adjustment=0.0,
+        orderbook_imbalance_context=None,
+        dynamic_memory_adjustment=0.0,
+        adaptive_confidence_summary=None,
+        source="ranking",
+    ):
+        if candidate_quality_compute_candidate_ev is None:
+            return {}
+        item = item if item is not None else {}
+        market = market if isinstance(market, dict) else {}
+        expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+        quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+        orderbook_imbalance_context = orderbook_imbalance_context if isinstance(orderbook_imbalance_context, dict) else {}
+        adaptive_confidence_summary = adaptive_confidence_summary if isinstance(adaptive_confidence_summary, dict) else {}
+        if isinstance(item, dict):
+            q = q or item.get("q") or item.get("quote")
+            spread = spread if spread is not None else item.get("spread")
+            family = family or item.get("family")
+            if not expectancy_summary and isinstance(item.get("expectancy_summary"), dict):
+                expectancy_summary = item.get("expectancy_summary") or {}
+            if not quality_snapshot and isinstance(item.get("quality_snapshot"), dict):
+                quality_snapshot = item.get("quality_snapshot") or {}
+        elif isinstance(item, (list, tuple)):
+            q = q or (item[1] if len(item) > 1 else None)
+            spread = spread if spread is not None else (item[2] if len(item) > 2 else None)
+            family = family or (item[3] if len(item) > 3 else None)
+        ticker = str(
+            (item.get("ticker") if isinstance(item, dict) else "")
+            or getattr(q, "ticker", "")
+            or market.get("ticker", "")
+            or ""
+        ).strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        memory_profile = {}
+        try:
+            memory_profile = dict((getattr(self, "market_memory_profiles", {}) or {}).get(ticker, {}) or {})
+        except Exception:
+            memory_profile = {}
+        selected_side = (
+            expectancy_summary.get("selected_side")
+            or quality_snapshot.get("selected_side")
+            or (item.get("selected_side") if isinstance(item, dict) else None)
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        selected_price = (
+            expectancy_summary.get("selected_price")
+            or expectancy_summary.get("selected_price_dollars")
+            or quality_snapshot.get("selected_price")
+            or quality_snapshot.get("selected_price_dollars")
+            or (item.get("selected_price") if isinstance(item, dict) else None)
+            or getattr(q, "selected_price", None)
+        )
+        ev_candidate = {
+            "ticker": ticker or None,
+            "family": family,
+            "q": q,
+            "side": selected_side,
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "spread": spread,
+            "yes_bid": getattr(q, "yes_bid", None) if q is not None else market.get("yes_bid"),
+            "yes_ask": getattr(q, "yes_ask", None) if q is not None else market.get("yes_ask"),
+            "no_bid": getattr(q, "no_bid", None) if q is not None else market.get("no_bid"),
+            "no_ask": getattr(q, "no_ask", None) if q is not None else market.get("no_ask"),
+            "probability_estimate": (
+                expectancy_summary.get("probability_estimate")
+                or quality_snapshot.get("probability_estimate")
+                or (item.get("probability_estimate") if isinstance(item, dict) else None)
+            ),
+            "implied_probability": (
+                expectancy_summary.get("implied_probability")
+                or quality_snapshot.get("implied_probability")
+                or (item.get("implied_probability") if isinstance(item, dict) else None)
+            ),
+            "confidence_score": (
+                expectancy_summary.get("confidence_score")
+                or quality_snapshot.get("confidence_score")
+                or quality_snapshot.get("profitability_score")
+                or (item.get("confidence_score") if isinstance(item, dict) else None)
+            ),
+            "probability_confidence": expectancy_summary.get("probability_confidence") or quality_snapshot.get("probability_confidence"),
+            "family_profit_memory_adjustment": family_profit_memory_adjustment,
+            "dynamic_memory_adjustment": dynamic_memory_adjustment,
+            "orderbook_imbalance_adjustment": (orderbook_imbalance_context or {}).get("adjustment"),
+            "orderbook_imbalance": orderbook_imbalance_context,
+            "memory_profile": memory_profile,
+            "adaptive_confidence_summary": adaptive_confidence_summary,
+            "expectancy_summary": expectancy_summary,
+            "quality_snapshot": quality_snapshot,
+            "source": source,
+        }
+        ev_context = candidate_quality_compute_candidate_ev(ev_candidate)
+        ev_fields = (
+            "market_implied_probability",
+            "estimated_win_probability",
+            "expected_value",
+            "expected_roi",
+            "ev_edge",
+            "ev_score",
+            "ev_selected_price",
+            "ev_tier",
+            "ev_reason",
+            "ev_sizing_multiplier",
+            "ev_action",
+        )
+        for target in (item if isinstance(item, dict) else None, expectancy_summary, quality_snapshot):
+            if isinstance(target, dict):
+                for field in ev_fields:
+                    target[field] = ev_context.get(field)
+        if q is not None:
+            for field in ev_fields:
+                try:
+                    setattr(q, field, ev_context.get(field))
+                except Exception:
+                    pass
+        return ev_context
+
+    def _ev_rank_adjustment(self, ev_context):
+        ev_context = ev_context if isinstance(ev_context, dict) else {}
+        ev_score = self.to_float(ev_context.get("ev_score"), 0.0) or 0.0
+        ev_tier = str(ev_context.get("ev_tier") or "").strip().upper()
+        if ev_tier == "S":
+            return max(1.50, min(4.00, ev_score * 0.35))
+        if ev_tier == "A":
+            return max(0.75, min(2.50, ev_score * 0.30))
+        if ev_tier == "B":
+            return max(0.10, min(1.25, ev_score * 0.20))
+        if ev_tier == "C":
+            return max(-0.25, min(0.25, ev_score * 0.10))
+        if ev_tier == "D":
+            return min(-0.50, max(-3.50, ev_score * 0.25))
+        return max(-0.25, min(0.25, ev_score * 0.10))
+
+    def _resolve_ev_contract_size(self, ev_context=None, q=None):
+        ev_context = ev_context if isinstance(ev_context, dict) else {}
+        base_size = max(1, int(AION_AGGRESSIVE_MAX_CONTRACTS or 1))
+        max_size = max(1, int(MAX_LIVE_ORDER_SIZE or base_size))
+        multiplier = self.to_float(ev_context.get("ev_sizing_multiplier"), None)
+        if multiplier is None and q is not None:
+            multiplier = self.to_float(getattr(q, "ev_sizing_multiplier", None), None)
+        if multiplier is None:
+            multiplier = 1.0
+        multiplier = max(0.0, min(1.60, float(multiplier)))
+        ev_tier = str(ev_context.get("ev_tier") or getattr(q, "ev_tier", None) or "C").strip().upper() or "C"
+        requested_size = int(round(base_size * multiplier))
+        if ev_tier == "S" and multiplier > 1.0 and max_size > base_size:
+            requested_size = max(requested_size, base_size + 1)
+        if requested_size <= 0:
+            requested_size = 1
+        return max(1, min(max_size, requested_size))
+
     def _apply_rank_only_memory_adjustments(self, ranked, *, source="ranking", markets=None):
         ranked = list(ranked or [])
         if not ranked:
@@ -25584,11 +25748,20 @@ class KalshiSniperBot:
                 log=True,
                 source=source,
             )
+            ev_context = self._attach_ev_score_to_candidate(
+                item,
+                market=market,
+                family=family,
+                family_profit_memory_adjustment=family_adjustment,
+                orderbook_imbalance_context=imbalance_context,
+                source=source,
+            )
             total_score = (
                 self._rank_score_for_family_profit_memory(item)
                 + family_adjustment
                 + self.to_float(imbalance_context.get("adjustment"), 0.0)
                 + self.to_float(btc_volatility_context.get("adjustment"), 0.0)
+                + self._ev_rank_adjustment(ev_context)
             )
             decorated.append((total_score, -index, item))
         decorated.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
@@ -44412,6 +44585,29 @@ class KalshiSniperBot:
                     0.0,
                 )
                 adjusted_score += btc_volatility_adjustment
+                ev_context = self._attach_ev_score_to_candidate(
+                    {
+                        "raw_score": score,
+                        "adjusted_score": adjusted_score,
+                        "q": q,
+                        "spread": spread,
+                        "family": family,
+                        "expectancy_summary": expectancy_summary,
+                        "quality_snapshot": quality_snapshot,
+                    },
+                    market=market,
+                    q=q,
+                    spread=spread,
+                    family=family,
+                    expectancy_summary=expectancy_summary,
+                    quality_snapshot=quality_snapshot,
+                    family_profit_memory_adjustment=family_profit_memory_adjustment,
+                    orderbook_imbalance_context=orderbook_imbalance_context,
+                    adaptive_confidence_summary=adaptive_confidence_summary,
+                    source="expectancy_rerank",
+                )
+                ev_rank_adjustment = self._ev_rank_adjustment(ev_context)
+                adjusted_score += ev_rank_adjustment
                 candidate_final_edge = self.to_float(expectancy_summary.get("final_edge"), self.to_float(expectancy_summary.get("sports_edge_after_cost"), 0.0))
                 aggressive_candidate_search = self._evaluate_aggressive_candidate_search(
                     ticker=ticker,
@@ -44503,11 +44699,18 @@ class KalshiSniperBot:
                     "orderbook_imbalance_adjustment": orderbook_imbalance_adjustment,
                     "btc_volatility_adjustment": btc_volatility_adjustment,
                     "btc_volatility_context": btc_volatility_context,
+                    "ev_context": ev_context,
+                    "ev_score": ev_context.get("ev_score"),
+                    "ev_tier": ev_context.get("ev_tier"),
+                    "ev_edge": ev_context.get("ev_edge"),
+                    "expected_roi": ev_context.get("expected_roi"),
+                    "ev_rank_adjustment": ev_rank_adjustment,
                 })
             expectancy_ranked_items.sort(
                 key=lambda item: (
                     int(bool(item.get("aggressive_priority"))),
                     self.to_float(item.get("adjusted_score"), self.to_float(item.get("raw_score"), 0.0)),
+                    self.to_float(item.get("ev_score"), 0.0),
                     self.to_float(item.get("raw_score"), 0.0),
                 ),
                 reverse=True,
@@ -44517,6 +44720,7 @@ class KalshiSniperBot:
                 key=lambda item: (
                     int(bool(item.get("aggressive_priority"))),
                     self.to_float(item.get("adjusted_score"), self.to_float(item.get("raw_score"), 0.0)),
+                    self.to_float(item.get("ev_score"), 0.0),
                     self.to_float(item.get("quality_adjustment"), 0.0),
                     self.to_float(item.get("quality_score"), 0.0),
                     self.to_float(item.get("raw_score"), 0.0),
@@ -46428,6 +46632,79 @@ class KalshiSniperBot:
             )
         except Exception:
             pass
+        selected_ticker_for_ev = str(getattr(q, "ticker", "") or "").strip()
+        selected_ev_item = expectancy_summary_by_ticker.get(selected_ticker_for_ev, {}) if selected_ticker_for_ev else {}
+        selected_expectancy_for_ev = (
+            selected_ev_item.get("expectancy_summary")
+            if isinstance(selected_ev_item, dict) and isinstance(selected_ev_item.get("expectancy_summary"), dict)
+            else {}
+        )
+        selected_ev_context = dict(selected_ev_item.get("ev_context") or {}) if isinstance(selected_ev_item, dict) else {}
+        if not selected_ev_context:
+            selected_orderbook_ev_context = self._get_orderbook_imbalance_adjustment(
+                (score, q, spread, family),
+                market=selected_market,
+                log=False,
+                source="live_select_ev",
+            )
+            selected_ev_context = self._attach_ev_score_to_candidate(
+                {
+                    "raw_score": score,
+                    "q": q,
+                    "ticker": selected_ticker_for_ev,
+                    "family": family,
+                    "spread": spread,
+                    "expectancy_summary": selected_expectancy_for_ev,
+                    "quality_snapshot": selected_quality_snapshot,
+                },
+                market=selected_market,
+                q=q,
+                spread=spread,
+                family=family,
+                expectancy_summary=selected_expectancy_for_ev,
+                quality_snapshot=selected_quality_snapshot,
+                family_profit_memory_adjustment=(
+                    selected_ev_item.get("family_profit_memory_adjustment")
+                    if isinstance(selected_ev_item, dict)
+                    else 0.0
+                ),
+                orderbook_imbalance_context=selected_orderbook_ev_context,
+                source="live_select_selected",
+            )
+        selected_ev_contract_size = self._resolve_ev_contract_size(selected_ev_context, q=q)
+        selected_ev_price = (
+            selected_quality_snapshot.get("selected_price")
+            or selected_expectancy_for_ev.get("selected_price")
+            or selected_expectancy_for_ev.get("selected_price_dollars")
+            or selected_ev_context.get("ev_selected_price")
+            or getattr(q, "selected_price", None)
+            or getattr(q, "yes_ask", None)
+        )
+        selected_ev_action = str(selected_ev_context.get("ev_action") or "selected_for_dispatch").strip() or "selected_for_dispatch"
+        if str(selected_ev_context.get("ev_tier") or "").strip().upper() == "D":
+            selected_ev_action = "deprioritize_micro_after_selection"
+        print(
+            "[AION-EV] "
+            + json.dumps(
+                {
+                    "ticker": selected_ticker_for_ev,
+                    "family": family,
+                    "price": self.to_float(selected_ev_price, None),
+                    "estimated_win_probability": selected_ev_context.get("estimated_win_probability"),
+                    "market_implied_probability": selected_ev_context.get("market_implied_probability"),
+                    "ev_edge": selected_ev_context.get("ev_edge"),
+                    "expected_roi": selected_ev_context.get("expected_roi"),
+                    "ev_tier": selected_ev_context.get("ev_tier"),
+                    "sizing_multiplier": selected_ev_context.get("ev_sizing_multiplier"),
+                    "contracts": int(selected_ev_contract_size),
+                    "action": selected_ev_action,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        self.last_aion_ev_log_cycle = self.cycle_count
+        self.last_aion_ev_log_ticker = selected_ticker_for_ev
         psychology_stats = dict(self.market_psychology_cycle_stats or {})
         self.last_live_select_summary = {
             "original_market_count": original_market_count,
@@ -46510,6 +46787,10 @@ class KalshiSniperBot:
         emit_phase5_observation_logs(len(ranked), "selected_candidate")
         self._emit_market_psychology_summary(source="live_select_selected", force=True)
         emit_full_select_cycle_timing()
+        self.last_auto_live_selected_quote = q
+        self.last_auto_live_selected_market = selected_market
+        self.last_auto_live_expectancy_summary_by_ticker = expectancy_summary_by_ticker
+        self.last_auto_live_trade_readiness_records = trade_readiness_records
         return q.ticker, reason
 
     def find_best_live_ticker_with_retries(self, markets=None):
@@ -47615,6 +47896,21 @@ class KalshiSniperBot:
             _note_source(f"phase55_result.{phase55_shape}")
 
         quote_object = quote.get("quote_object") if "quote_object" in quote else quote.get("q") if "q" in quote else quote
+        resolver_ev_context = {
+            "ev_sizing_multiplier": _first_defined(
+                payload.get("ev_sizing_multiplier"),
+                safety_context.get("ev_sizing_multiplier"),
+                canonical_execution_state.get("ev_sizing_multiplier"),
+                quote.get("ev_sizing_multiplier") if isinstance(quote, dict) else None,
+            ),
+            "ev_tier": _first_defined(
+                payload.get("ev_tier"),
+                safety_context.get("ev_tier"),
+                canonical_execution_state.get("ev_tier"),
+                quote.get("ev_tier") if isinstance(quote, dict) else None,
+            ),
+        }
+        ev_contract_size = self._resolve_ev_contract_size(resolver_ev_context, q=quote_object)
         quote_present_hint, quote_present_hint_found = _extract(quote, ("quote_present", "quote_ready", "quote_available"), "quote")
         if quote_present_hint_found:
             quote_object_present = bool(quote_present_hint)
@@ -49740,7 +50036,7 @@ class KalshiSniperBot:
                             "stage": "canonical_final_handoff",
                             "trace_id": trace_id,
                             "selected_price": canonical_submit_payload.get("yes_price") if isinstance(canonical_submit_payload, dict) else None,
-                            "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                            "count": int(ev_contract_size),
                         },
                         sort_keys=True,
                         default=str,
@@ -49748,7 +50044,7 @@ class KalshiSniperBot:
                 )
                 result = self.submit_live_order(
                     submit_quote,
-                    size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                    size=ev_contract_size,
                     lane="canonical_final",
                     payload_override=canonical_submit_payload,
                 )
@@ -49816,7 +50112,7 @@ class KalshiSniperBot:
             if final_decision_allowed and not trade_readiness_trade_submitted and submit_quote is not None and not bool(canonical_final.get("hard_block")):
                 canonical_submit_payload = aggressive_fastpath_payload_override or payload_preview or self.build_live_order_payload(
                     submit_quote,
-                    size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                    size=ev_contract_size,
                     price_source="bid",
                     post_only=False,
                     rest_remainder=True,
@@ -49863,7 +50159,7 @@ class KalshiSniperBot:
                                 "stage": "canonical_final_fallback",
                                 "trace_id": trace_id,
                                 "selected_price": canonical_submit_payload.get("yes_price") if isinstance(canonical_submit_payload, dict) else None,
-                                "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                                "count": int(ev_contract_size),
                             },
                             sort_keys=True,
                             default=str,
@@ -49871,7 +50167,7 @@ class KalshiSniperBot:
                     )
                     fallback_result = self.submit_live_order(
                         submit_quote,
-                        size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                        size=ev_contract_size,
                         lane="canonical_final",
                         payload_override=canonical_submit_payload,
                     )
@@ -49880,7 +50176,7 @@ class KalshiSniperBot:
                         payload = fallback_result.get("payload") or canonical_submit_payload
                         self.record_live_position(
                             submit_quote,
-                            size=payload.get("count") if isinstance(payload, dict) else AION_AGGRESSIVE_MAX_CONTRACTS,
+                            size=payload.get("count") if isinstance(payload, dict) else ev_contract_size,
                             entry_price=payload.get("price") if isinstance(payload, dict) else None,
                             side=payload.get("side") if isinstance(payload, dict) else None,
                         )
@@ -49980,7 +50276,7 @@ class KalshiSniperBot:
                     or quote_readiness_diagnostic.get("selected_side_has_liquidity")
                     or (payload_preview or {}).get("depth_available")
                 ),
-                contracts=AION_AGGRESSIVE_MAX_CONTRACTS,
+                contracts=ev_contract_size,
                 trades_today=self.aggressive_trades_today,
                 canonical_execution_state=canonical_execution_state,
                 source="final_gate",
@@ -53365,6 +53661,8 @@ class KalshiSniperBot:
         selected_market = {}
         selected_family = "UNKNOWN"
         selected_price_cents = None
+        selected_ev_context = {}
+        ev_contract_size = max(1, int(AION_AGGRESSIVE_MAX_CONTRACTS or 1))
         final_gate_edge = 0.0
         aggressive_spread_bucket = "unknown"
         controlled_spread_bucket = "unknown"
@@ -54717,6 +55015,84 @@ class KalshiSniperBot:
             selected_price_cents = int(round(float(selected_price_hint) * 100.0)) if selected_price_hint not in (None, "", 0, 0.0) else None
         except (TypeError, ValueError):
             selected_price_cents = None
+        selected_ev_context = dict(expectancy_item.get("ev_context") or {}) if isinstance(expectancy_item, dict) else {}
+        if selected_context_quote is not None and not selected_ev_context:
+            selected_score_for_ev = self.to_float(
+                expectancy_item.get("raw_score") if isinstance(expectancy_item, dict) else None,
+                self.to_float(candidates[0][0], 0.0) if candidates else 0.0,
+            )
+            selected_spread_for_ev = (
+                expectancy_summary.get("spread")
+                if isinstance(expectancy_summary, dict)
+                else None
+            )
+            selected_quality_for_ev = (
+                expectancy_item.get("quality_snapshot")
+                if isinstance(expectancy_item, dict) and isinstance(expectancy_item.get("quality_snapshot"), dict)
+                else {}
+            )
+            selected_orderbook_ev_context = self._get_orderbook_imbalance_adjustment(
+                (selected_score_for_ev, selected_context_quote, selected_spread_for_ev, selected_family),
+                market=selected_market,
+                log=False,
+                source="final_gate_ev",
+            )
+            selected_ev_context = self._attach_ev_score_to_candidate(
+                {
+                    "raw_score": selected_score_for_ev,
+                    "q": selected_context_quote,
+                    "ticker": selected_ticker_key,
+                    "family": selected_family,
+                    "spread": selected_spread_for_ev,
+                    "selected_price": selected_price_hint,
+                    "expectancy_summary": expectancy_summary,
+                    "quality_snapshot": selected_quality_for_ev,
+                },
+                market=selected_market,
+                q=selected_context_quote,
+                spread=selected_spread_for_ev,
+                family=selected_family,
+                expectancy_summary=expectancy_summary,
+                quality_snapshot=selected_quality_for_ev,
+                family_profit_memory_adjustment=(
+                    expectancy_item.get("family_profit_memory_adjustment")
+                    if isinstance(expectancy_item, dict)
+                    else 0.0
+                ),
+                orderbook_imbalance_context=selected_orderbook_ev_context,
+                source="final_gate_selected",
+            )
+        ev_contract_size = self._resolve_ev_contract_size(selected_ev_context, q=selected_context_quote)
+        ev_log_action = str(selected_ev_context.get("ev_action") or "ranked").strip() or "ranked"
+        if str(selected_ev_context.get("ev_tier") or "").strip().upper() == "D":
+            ev_log_action = "deprioritize_micro_after_selection"
+        ev_already_logged = bool(
+            getattr(self, "last_aion_ev_log_cycle", None) == self.cycle_count
+            and str(getattr(self, "last_aion_ev_log_ticker", "") or "").strip() == selected_ticker_key
+        )
+        if selected_ticker_key and selected_context_quote is not None and not ev_already_logged:
+            print(
+                "[AION-EV] "
+                + json.dumps(
+                    {
+                        "ticker": selected_ticker_key,
+                        "family": selected_family,
+                        "price": self.to_float(selected_price_hint, selected_ev_context.get("ev_selected_price")),
+                        "estimated_win_probability": selected_ev_context.get("estimated_win_probability"),
+                        "market_implied_probability": selected_ev_context.get("market_implied_probability"),
+                        "ev_edge": selected_ev_context.get("ev_edge"),
+                        "expected_roi": selected_ev_context.get("expected_roi"),
+                        "ev_tier": selected_ev_context.get("ev_tier"),
+                        "sizing_multiplier": selected_ev_context.get("ev_sizing_multiplier"),
+                        "contracts": int(ev_contract_size),
+                        "action": ev_log_action,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            self.last_aion_ev_log_cycle = self.cycle_count
+            self.last_aion_ev_log_ticker = selected_ticker_key
         self._update_aion_persistent_intelligence(
             ticker=getattr(selected_context_quote, "ticker", None) if selected_context_quote is not None else None,
             family=(self.last_live_select_summary or {}).get("selected_family") or (self.last_live_select_summary or {}).get("family"),
@@ -55149,7 +55525,7 @@ class KalshiSniperBot:
             )
             payload_preflight = self._diagnose_live_order_payload_context(
                 selected_quote,
-                size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                size=ev_contract_size,
                 price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                 selected_ticker=locals().get("auto_live_ticker"),
                 selection_stage="final_gate_preflight",
@@ -55829,7 +56205,7 @@ class KalshiSniperBot:
                     f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={str(expectancy_summary.get('spread_bucket') or 'unknown').strip().lower() if isinstance(expectancy_summary, dict) else 'unknown'} "
                     f"quote_ready={'yes' if bool(quote_readiness_diagnostic.get('quote_ready')) else 'no'} "
-                    f"price=none contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason=duplicate_position"
+                    f"price=none contracts={ev_contract_size} block_reason=duplicate_position"
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=duplicate_position_guard")
                 print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
@@ -55913,7 +56289,7 @@ class KalshiSniperBot:
                     f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={str(expectancy_summary.get('spread_bucket') or 'unknown').strip().lower() if isinstance(expectancy_summary, dict) else 'unknown'} "
                     f"quote_ready={'yes' if bool(quote_readiness_diagnostic.get('quote_ready')) else 'no'} "
-                    f"price=none contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason={block_reason}"
+                    f"price=none contracts={ev_contract_size} block_reason={block_reason}"
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={reason}")
                 print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
@@ -56005,7 +56381,7 @@ class KalshiSniperBot:
                     f"family={selected_family} edge_after_cost={self.to_float(arm_gate_edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={str(quote_readiness_diagnostic.get('spread_bucket') or 'unknown').strip().lower()} "
                     f"quote_ready={'yes' if bool(quote_readiness_diagnostic.get('quote_ready')) else 'no'} "
-                    f"price=none contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason=live_arm_block"
+                    f"price=none contracts={ev_contract_size} block_reason=live_arm_block"
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=live_trading_not_armed")
                 print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
@@ -56075,7 +56451,7 @@ class KalshiSniperBot:
                 print(
                     f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
                     f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
-                    f"spread_bucket={aggressive_spread_bucket} quote_ready=no price=none contracts={AION_AGGRESSIVE_MAX_CONTRACTS} "
+                    f"spread_bucket={aggressive_spread_bucket} quote_ready=no price=none contracts={ev_contract_size} "
                     f"block_reason={payload_block_reason}"
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={payload_block_reason}")
@@ -56350,7 +56726,7 @@ class KalshiSniperBot:
                     f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
                     f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={aggressive_spread_bucket} quote_ready={'yes' if bool(quote_readiness_diagnostic.get('quote_ready')) else 'no'} "
-                    f"price=none contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason=phase55_block"
+                    f"price=none contracts={ev_contract_size} block_reason=phase55_block"
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={phase55_reason}")
                 self._log_live_execution_final_blocked(auto_live_ticker, phase55_reason)
@@ -56963,7 +57339,7 @@ class KalshiSniperBot:
                 if aggressive_fastpath_quote is not None:
                     aggressive_fastpath_payload_override = self.build_live_order_payload(
                         aggressive_fastpath_quote,
-                        size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                        size=ev_contract_size,
                         price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                         post_only=False,
                         rest_remainder=True,
@@ -56985,7 +57361,7 @@ class KalshiSniperBot:
             if aggressive_positive_edge_override and aggressive_fastpath_quote is not None:
                 aggressive_fastpath_payload_override = self.build_live_order_payload(
                     aggressive_fastpath_quote,
-                    size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                    size=ev_contract_size,
                     price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                     post_only=False,
                     rest_remainder=True,
@@ -56998,7 +57374,7 @@ class KalshiSniperBot:
                 if aggressive_fastpath_payload_override is None:
                     aggressive_fastpath_payload_override = self.build_live_order_payload(
                         aggressive_fastpath_quote,
-                        size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                        size=ev_contract_size,
                         price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                         post_only=False,
                         rest_remainder=True,
@@ -57029,7 +57405,7 @@ class KalshiSniperBot:
                 try:
                     open_market_payload_override = self.build_live_order_payload(
                         selected_quote,
-                        size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                        size=ev_contract_size,
                         price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                         post_only=False,
                         rest_remainder=True,
@@ -57150,7 +57526,7 @@ class KalshiSniperBot:
                     or quote_readiness_diagnostic.get("selected_side_has_liquidity")
                     or (payload_preview or {}).get("depth_available")
                 ),
-                contracts=AION_AGGRESSIVE_MAX_CONTRACTS,
+                contracts=ev_contract_size,
                 trades_today=self.aggressive_trades_today,
                 canonical_execution_state=canonical_execution_state,
                 source="final_gate",
@@ -57189,7 +57565,7 @@ class KalshiSniperBot:
                 if aggressive_fastpath_quote is not None:
                     aggressive_fastpath_payload_override = self.build_live_order_payload(
                         aggressive_fastpath_quote,
-                        size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                        size=ev_contract_size,
                         price_source="ask" if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy" else "bid",
                         post_only=False,
                         rest_remainder=True,
@@ -57308,7 +57684,7 @@ class KalshiSniperBot:
                     f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={controlled_spread_bucket} quote_ready={'yes' if controlled_quote_ready else 'no'} "
                     f"price={'none' if payload_preview is None else payload_preview.get('yes_price', payload_preview.get('no_price'))} "
-                    f"contracts={AION_AGGRESSIVE_MAX_CONTRACTS} block_reason={block_reason}"
+                    f"contracts={ev_contract_size} block_reason={block_reason}"
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={aggressive_lane_execution.get('block_reason') or 'aggressive_lane_blocked'}")
                 print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
@@ -57333,7 +57709,7 @@ class KalshiSniperBot:
                 "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
                 "spread_bucket": controlled_spread_bucket if bool(near_safe_spread_context and near_safe_spread_context.get("eligible")) else aggressive_spread_bucket,
                 "lifecycle_state": aggressive_lifecycle_state,
-                "contracts": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                "contracts": int(ev_contract_size),
                 "trades_today": int(self.aggressive_trades_today or 0),
                 "near_safe_spread_relief": bool(near_safe_spread_context and near_safe_spread_context.get("eligible")),
                 "adaptive_relief_limit": near_safe_spread_context.get("adaptive_relief_limit") if isinstance(near_safe_spread_context, dict) else None,
@@ -57430,7 +57806,7 @@ class KalshiSniperBot:
                 f"spread_bucket={controlled_spread_bucket} "
                 f"quote_ready={'yes' if bool(quote_readiness_diagnostic.get('quote_ready')) else 'no'} "
                 f"price={submission_price} "
-                f"contracts={int(AION_AGGRESSIVE_MAX_CONTRACTS)} "
+                f"contracts={int(ev_contract_size)} "
                 f"decision=EXECUTED"
             )
             print(
@@ -57441,7 +57817,7 @@ class KalshiSniperBot:
                         "side": submission_side,
                         "action": DEFAULT_LIVE_ORDER_ACTION,
                         "price": submission_price,
-                        "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                        "count": int(ev_contract_size),
                         "live_mode": bool(globals().get("LIVE_MODE", False)),
                         "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
                         "dry_run": bool(compute_effective_live_dry_run()),
@@ -57469,7 +57845,7 @@ class KalshiSniperBot:
                         "side": submission_side,
                         "action": DEFAULT_LIVE_ORDER_ACTION,
                         "price": submission_price,
-                        "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                        "count": int(ev_contract_size),
                         "live_mode": bool(globals().get("LIVE_MODE", False)),
                         "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
                         "dry_run": bool(compute_effective_live_dry_run()),
@@ -57491,7 +57867,7 @@ class KalshiSniperBot:
             )
             result = self.submit_live_order(
                 selected_quote_for_submission,
-                size=AION_AGGRESSIVE_MAX_CONTRACTS,
+                size=ev_contract_size,
                 lane="aggressive_positive_edge",
                 payload_override=aggressive_fastpath_payload_override,
             )
@@ -57533,7 +57909,7 @@ class KalshiSniperBot:
                             "family": selected_family,
                             "side": (result.get("payload") or payload_preview or {}).get("side"),
                             "price": (result.get("payload") or payload_preview or {}).get("price"),
-                            "count": (result.get("payload") or payload_preview or {}).get("count", int(AION_AGGRESSIVE_MAX_CONTRACTS)),
+                            "count": (result.get("payload") or payload_preview or {}).get("count", int(ev_contract_size)),
                             "reason": submit_reason,
                             "subsystem": "kalshi_web.submit_live_order",
                         },
@@ -57596,7 +57972,7 @@ class KalshiSniperBot:
                             "side": selected_quote_for_submission and getattr(selected_quote_for_submission, "selected_side", None) or getattr(selected_quote_for_submission, "side", None) or getattr(selected_quote_for_submission, "selected_side", None) or None,
                             "action": DEFAULT_LIVE_ORDER_ACTION,
                             "price": submission_price,
-                            "count": int(AION_AGGRESSIVE_MAX_CONTRACTS),
+                            "count": int(ev_contract_size),
                             "live_mode": bool(globals().get("LIVE_MODE", False)),
                             "arm_live": bool(globals().get("LIVE_ARMED", False) and globals().get("LIVE_ENV_CONFIRMED", False)),
                             "dry_run": bool(compute_effective_live_dry_run()),
@@ -57646,7 +58022,7 @@ class KalshiSniperBot:
                     f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
                     f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
                     f"spread_bucket={controlled_spread_bucket} quote_ready={'yes' if controlled_quote_ready else 'no'} "
-                    f"price={submission_price} contracts={int(AION_AGGRESSIVE_MAX_CONTRACTS)} block_reason={submit_reason}"
+                    f"price={submission_price} contracts={int(ev_contract_size)} block_reason={submit_reason}"
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={result.get('reason')}")
                 self._log_live_execution_final_blocked(auto_live_ticker, result.get("reason"))
