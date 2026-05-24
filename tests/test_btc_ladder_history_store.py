@@ -68,6 +68,50 @@ class BTCLadderHistoryStoreTests(unittest.TestCase):
             self.assertGreater(signal["historical_edge_boost"], 0.0)
             self.assertGreater(signal["sizing_confidence_multiplier"], 1.0)
 
+    def test_upsert_records_updates_settlement_outcome_for_existing_ticker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = BTCLadderHistoryStore(db_path=Path(tmpdir) / "btc_ladder.sqlite")
+            opened = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
+            closed = opened + timedelta(hours=1)
+            open_record = {
+                "ticker": "KXBTC1H-UPSERT-70500",
+                "event_ticker": "KXBTC1H-UPSERT-HOUR",
+                "family": "KXBTC1H",
+                "title": "Bitcoin above $70,500 at 3pm",
+                "open_time": opened.isoformat().replace("+00:00", "Z"),
+                "close_time": closed.isoformat().replace("+00:00", "Z"),
+                "source_time": opened.isoformat().replace("+00:00", "Z"),
+                "strike": 70500,
+                "outcome": "unknown",
+                "yes_bid": 0.39,
+                "yes_ask": 0.41,
+                "liquidity": 300,
+            }
+            settled_record = {
+                **open_record,
+                "status": "settled",
+                "source_time": closed.isoformat().replace("+00:00", "Z"),
+                "settlement_time": closed.isoformat().replace("+00:00", "Z"),
+                "settlement_value": 71000,
+                "outcome": "yes",
+            }
+
+            first = store.upsert_records([open_record])
+            second = store.upsert_records([settled_record])
+            audit = store.audit(recompute=True)
+            with store.connect() as conn:
+                row = conn.execute(
+                    "SELECT status, outcome, settlement_value FROM btc_ladder_markets WHERE ticker = ?",
+                    ("KXBTC1H-UPSERT-70500",),
+                ).fetchone()
+
+            self.assertEqual(first["stored"], 1)
+            self.assertEqual(second["updated"], 1)
+            self.assertEqual(audit["total_records"], 1)
+            self.assertEqual(row["status"], "settled")
+            self.assertEqual(row["outcome"], "yes")
+            self.assertEqual(row["settlement_value"], 71000)
+
 
 if __name__ == "__main__":
     unittest.main()

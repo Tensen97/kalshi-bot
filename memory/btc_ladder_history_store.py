@@ -289,10 +289,18 @@ def summary_bias(payload: dict[str, Any], *, min_count: int) -> float:
 
 
 class BTCLadderHistoryStore:
-    def __init__(self, db_path: str | Path | None = None, log_fn=None, initialize: bool = True, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        log_fn=None,
+        initialize: bool = True,
+        read_only: bool = False,
+        use_wal: bool = True,
+    ):
         self.db_path = str(Path(db_path or os.environ.get("AION_BTC_1H_HISTORY_DB_PATH") or DEFAULT_DB_PATH))
         self.log_fn = log_fn
         self.read_only = bool(read_only)
+        self.use_wal = bool(use_wal)
         if initialize:
             self.initialize()
 
@@ -314,7 +322,10 @@ class BTCLadderHistoryStore:
             conn.execute("PRAGMA foreign_keys=ON")
             if not self.read_only:
                 conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA journal_mode=WAL")
+                if self.use_wal:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                else:
+                    conn.execute("PRAGMA journal_mode=MEMORY")
             yield conn
         finally:
             conn.close()
@@ -323,7 +334,7 @@ class BTCLadderHistoryStore:
         if self.read_only:
             return {"ok": True, "db_path": self.db_path, "read_only": True}
         with self.connect() as conn:
-            journal_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS btc_ladder_markets (
@@ -535,6 +546,63 @@ class BTCLadderHistoryStore:
                 errors += len(normalized)
         duplicates = max(0, len(normalized) - stored - errors)
         return {"stored": stored, "duplicates": duplicates, "malformed": malformed, "errors": errors}
+
+    def upsert_records(self, records: list[dict[str, Any]], *, batch_size: int = 250) -> dict[str, int]:
+        normalized = []
+        malformed = 0
+        for record in records or []:
+            item = self.normalize_record(record)
+            if item is None:
+                malformed += 1
+                continue
+            normalized.append(item)
+        if not normalized:
+            return {"stored": 0, "updated": 0, "duplicates": 0, "malformed": malformed, "errors": 0}
+        columns = (
+            "ticker", "event_ticker", "family", "ladder_group", "title", "subtitle", "rules_primary", "rules_secondary",
+            "status", "open_time", "close_time", "expiration_time", "settlement_time", "source_time", "strike",
+            "settlement_value", "outcome", "yes_bid", "yes_ask", "no_bid", "no_ask", "last_price", "previous_price",
+            "implied_probability", "spread", "liquidity", "volume", "open_interest", "implied_probability_bucket",
+            "spread_bucket", "liquidity_bucket", "time_to_expiry_bucket", "session_bucket", "strike_distance_bucket",
+            "neighbor_gap_bucket", "data_source", "backfill_run_id", "raw_hash", "raw_json", "ingested_at", "updated_at",
+        )
+        update_columns = [column for column in columns if column not in {"ticker", "ingested_at"}]
+        set_clause = ", ".join(
+            f"{column}=excluded.{column}" for column in update_columns
+        ) + ", ingested_at=COALESCE(btc_ladder_markets.ingested_at, excluded.ingested_at)"
+        difference_checks = " OR ".join(
+            f"COALESCE(btc_ladder_markets.{column}, '') != COALESCE(excluded.{column}, '')"
+            for column in update_columns
+            if column != "updated_at"
+        )
+        sql = f"""
+            INSERT INTO btc_ladder_markets ({', '.join(columns)})
+            VALUES ({', '.join(['?'] * len(columns))})
+            ON CONFLICT(ticker) DO UPDATE SET {set_clause}
+            WHERE {difference_checks}
+        """
+        stored = 0
+        updated = 0
+        errors = 0
+        existing = self.seen_tickers()
+        with self.connect() as conn:
+            try:
+                for offset in range(0, len(normalized), max(1, int(batch_size or 250))):
+                    chunk = normalized[offset:offset + max(1, int(batch_size or 250))]
+                    before = conn.total_changes
+                    conn.executemany(sql, [tuple(item.get(column) for column in columns) for item in chunk])
+                    conn.commit()
+                    changed = max(0, conn.total_changes - before)
+                    chunk_new = sum(1 for item in chunk if item.get("ticker") not in existing)
+                    chunk_stored = min(changed, chunk_new)
+                    stored += chunk_stored
+                    updated += max(0, changed - chunk_stored)
+                    existing.update(str(item.get("ticker")) for item in chunk if item.get("ticker"))
+            except sqlite3.Error:
+                conn.rollback()
+                errors += len(normalized)
+        duplicates = max(0, len(normalized) - stored - updated - errors)
+        return {"stored": stored, "updated": updated, "duplicates": duplicates, "malformed": malformed, "errors": errors}
 
     def _rows_for_summary(self) -> list[dict[str, Any]]:
         with self.connect() as conn:

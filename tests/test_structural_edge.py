@@ -21,6 +21,11 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.btc_1h_history_store = None
         bot.btc_1h_history_audit = {}
         bot.btc_1h_history_no_data_logged = True
+        bot.btc1h_cycle_last_run_ts = 0.0
+        bot.btc1h_cycle_priority_by_ticker = {}
+        bot.btc1h_cycle_last_summary = {}
+        bot.btc1h_cycle_write_store = None
+        bot.btc1h_cycle_storage_warning_logged = True
         return bot
 
     def test_ladder_dislocation_gets_structural_score_and_boost(self):
@@ -350,6 +355,81 @@ class StructuralEdgeTests(unittest.TestCase):
             self.assertGreater(btc_context["history_sample_size"], 20)
             self.assertIn("BTC_1H_HISTORY_PROFITABLE_BUCKET", context["tags"])
             self.assertGreater(context["size_multiplier"], 1.0)
+
+    def test_btc1h_adaptive_cycle_promotes_best_ladder_candidate_without_storage_dependency(self):
+        bot = self._make_bot()
+        bot._fetch_btc1h_cycle_markets = lambda status="open", limit=None: ([], [])
+        bot._refresh_btc1h_settlement_learning = lambda source="unit": {
+            "stored": 0,
+            "updated": 0,
+            "duplicates": 0,
+            "malformed": 0,
+            "errors": 0,
+            "records_seen": 0,
+        }
+        markets = [
+            {
+                "ticker": "KXBTC1H-CYCLE-70000",
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-CYCLE-HOUR",
+                "title": "Bitcoin above $70,000 at 4pm",
+                "yes_bid": 67,
+                "yes_ask": 69,
+                "no_bid": 31,
+                "no_ask": 33,
+                "yes_top_size": 35,
+                "no_top_size": 30,
+                "price_delta": 0.04,
+            },
+            {
+                "ticker": "KXBTC1H-CYCLE-70500",
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-CYCLE-HOUR",
+                "title": "Bitcoin above $70,500 at 4pm",
+                "yes_bid": 60,
+                "yes_ask": 62,
+                "no_bid": 38,
+                "no_ask": 40,
+                "yes_top_size": 35,
+                "no_top_size": 30,
+                "price_delta": 0.035,
+            },
+            {
+                "ticker": "KXBTC1H-CYCLE-71000",
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-CYCLE-HOUR",
+                "title": "Bitcoin above $71,000 at 4pm",
+                "yes_bid": 35,
+                "yes_ask": 37,
+                "no_bid": 63,
+                "no_ask": 65,
+                "yes_top_size": 35,
+                "no_top_size": 30,
+                "price_delta": 0.00,
+            },
+            {
+                "ticker": "KXBTC1H-CYCLE-71500",
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-CYCLE-HOUR",
+                "title": "Bitcoin above $71,500 at 4pm",
+                "yes_bid": 48,
+                "yes_ask": 50,
+                "no_bid": 50,
+                "no_ask": 52,
+                "yes_top_size": 35,
+                "no_top_size": 30,
+                "price_delta": 0.03,
+            },
+        ]
+
+        summary = bot._run_btc1h_adaptive_cycle(markets=markets, source="unit_cycle", force=True)
+
+        self.assertTrue(summary["enabled"])
+        self.assertEqual(summary["ladder_groups"], 1)
+        self.assertGreaterEqual(summary["scored"], 1)
+        self.assertGreaterEqual(summary["promoted"], 1)
+        self.assertTrue(bot.btc1h_cycle_priority_by_ticker)
+        self.assertIn("markets_to_merge", summary)
 
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {

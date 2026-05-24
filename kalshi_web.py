@@ -1384,7 +1384,7 @@ MAX_DISCOVERY_RETRY_DELAY_SECONDS = 15
 TELEGRAM_HEARTBEAT_INTERVAL_SECONDS = 3600
 PHASE5_BUY_SCORE_THRESHOLD = 70.0
 ENABLE_TARGETED_SERIES_MODE = True
-TARGETED_SERIES_TICKERS = ["KXBTC15M"]
+TARGETED_SERIES_TICKERS = ["KXBTC15M", "KXBTC"]
 TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS = [
     "KXMLBSPREAD",
     "KXMLBTOTAL",
@@ -1420,6 +1420,7 @@ TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS = [
 ]
 HIGH_LIQUIDITY_PRIORITY_FAMILIES = (
     "KXBTC15M",
+    "KXBTC",
     "KXNBA1HTOTAL",
     "KXNBA1HSPREAD",
     "KXNBASPREAD",
@@ -1443,6 +1444,7 @@ OPTIONAL_TARGETED_SERIES_TICKERS = [
 ] + TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS
 TARGETED_SERIES_PRIORITY_WINDOWS = {
     "KXBTC15M": {"hours_utc": (), "reason": "always_on_crypto_window"},
+    "KXBTC": {"hours_utc": (), "reason": "always_on_btc_hourly_ladder_window"},
     "KXNBA1HTOTAL": {"hours_utc": (16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4), "reason": "us_basketball_game_window"},
     "KXNBA1HSPREAD": {"hours_utc": (16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4), "reason": "us_basketball_game_window"},
     "KXNBASPREAD": {"hours_utc": (16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4), "reason": "us_basketball_game_window"},
@@ -1504,6 +1506,7 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
             "KXMLBTB",
             "KXMLBHIT",
             "KXBTC15M",
+            "KXBTC",
             "KXTEMP",
             "KXRAIN",
         ],
@@ -1514,6 +1517,7 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
         "hours_utc": (),
         "ordered": [
             "KXBTC15M",
+            "KXBTC",
             "KXNBA1HTOTAL",
             "KXNBA1HSPREAD",
             "KXNBASPREAD",
@@ -1556,9 +1560,11 @@ TARGETED_SERIES_EXCLUDE_KEYWORDS = (
 TARGETED_ORDERBOOK_MIN_SIZE = 5.0
 TARGETED_SERIES_MIN_LIQUIDITY = {
     "KXBTC15M": 8.0,
+    "KXBTC": 8.0,
 }
 TARGETED_SERIES_MIN_TOP_OF_BOOK_SIZE = {
     "KXBTC15M": 5.0,
+    "KXBTC": 5.0,
 }
 BTC15M_DEAD_BOOK_MIN_CYCLES = 3
 BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES = int(_env_float("KALSHI_BTC15M_ROTATION_MIN_PERSISTENCE_CYCLES", 2))
@@ -1587,6 +1593,17 @@ AION_BTC_1H_HISTORY_DB_PATH = (
     os.environ.get("AION_BTC_1H_HISTORY_DB_PATH")
     or (str(BTC_LADDER_HISTORY_DEFAULT_DB_PATH) if BTC_LADDER_HISTORY_DEFAULT_DB_PATH is not None else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "btc_ladder_history.sqlite"))
 )
+AION_BTC1H_CYCLE_ENABLED = get_env_bool("AION_BTC1H_CYCLE_ENABLED", 1)
+AION_BTC1H_CYCLE_INTERVAL_SECONDS = get_env_float("AION_BTC1H_CYCLE_INTERVAL_SECONDS", 60.0)
+AION_BTC1H_CYCLE_SERIES_TICKERS = tuple(
+    item.strip().upper()
+    for item in (os.environ.get("AION_BTC1H_CYCLE_SERIES_TICKERS") or "KXBTC,KXBTC1H,KXBTCPRICE,KXBTCUSD").split(",")
+    if item.strip()
+)
+AION_BTC1H_CYCLE_PAGE_LIMIT = get_env_int("AION_BTC1H_CYCLE_PAGE_LIMIT", 120)
+AION_BTC1H_CYCLE_MAX_SETTLEMENT_REFRESH = get_env_int("AION_BTC1H_CYCLE_MAX_SETTLEMENT_REFRESH", 120)
+AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE = get_env_float("AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE", 30.0)
+AION_BTC1H_CYCLE_LOG_TOP_N = get_env_int("AION_BTC1H_CYCLE_LOG_TOP_N", 5)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS = int(_env_float("SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS", 45))
@@ -1994,6 +2011,11 @@ class KalshiSniperBot:
         self.btc_1h_history_store = None
         self.btc_1h_history_audit = {}
         self.btc_1h_history_no_data_logged = False
+        self.btc1h_cycle_last_run_ts = 0.0
+        self.btc1h_cycle_priority_by_ticker = {}
+        self.btc1h_cycle_last_summary = {}
+        self.btc1h_cycle_write_store = None
+        self.btc1h_cycle_storage_warning_logged = False
         self.sports_quote_continuity_cache = {}
         self.sports_momentum_state = {}
         self.sports_edge_ranking_log_markers = {}
@@ -27047,7 +27069,560 @@ class KalshiSniperBot:
                 },
                 marker=("btc_1h_history_boost", source, ticker),
             )
+            self._emit_structural_edge_log(
+                "[BTC1H-HISTORY-BOOST]",
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "selected_side": selected_side,
+                    "historical_boost": signal.get("historical_edge_boost"),
+                    "historical_penalty": signal.get("historical_risk_penalty"),
+                    "learned_winrate": signal.get("learned_winrate"),
+                    "learned_avg_pnl": signal.get("learned_avg_pnl"),
+                    "sample_size": signal.get("sample_size"),
+                    "reason": "matched_historical_btc_ladder_buckets",
+                },
+                marker=("btc1h_history_boost", source, ticker),
+            )
         return signal
+
+    def _btc1h_cycle_series_tickers(self):
+        seen = set()
+        series = []
+        for item in list(AION_BTC1H_CYCLE_SERIES_TICKERS or ()) + ["KXBTC"]:
+            value = str(item or "").strip().upper()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            series.append(value)
+        return series
+
+    def _get_btc1h_cycle_write_store(self):
+        if not AION_BTC_1H_HISTORY_ENABLED or BTCLadderHistoryStore is None:
+            return None
+        if getattr(self, "btc1h_cycle_write_store", None) is not None:
+            return self.btc1h_cycle_write_store
+        db_path = str(AION_BTC_1H_HISTORY_DB_PATH or "").strip()
+        if not db_path:
+            return None
+        try:
+            store = BTCLadderHistoryStore(
+                db_path=db_path,
+                log_fn=None,
+                initialize=True,
+                read_only=False,
+                use_wal=False,
+            )
+            self.btc1h_cycle_write_store = store
+            return store
+        except Exception as exc:
+            if not getattr(self, "btc1h_cycle_storage_warning_logged", False):
+                self.btc1h_cycle_storage_warning_logged = True
+                print(
+                    "[BTC1H-CYCLE-SUMMARY] "
+                    + json.dumps(
+                        {
+                            "reason": "history_storage_unavailable",
+                            "db_path": db_path,
+                            "error": exc.__class__.__name__,
+                            "final_effect": "continue_live_without_history_write",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            return None
+
+    def _btc1h_market_to_history_record(self, market=None, *, data_source="kalshi_api:live_cycle", backfill_run_id=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str(market.get("ticker") or "").strip()
+        family = str(self.get_market_family(market) or "").strip().upper()
+        if not ticker or not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market):
+            return None
+        strike = self._parse_btc_1h_ladder_strike(
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("rules_primary"),
+            market.get("rules_secondary"),
+            market.get("event_title"),
+            ticker,
+        )
+        if strike is None:
+            return None
+        yes_bid = self._sports_edge_price_value(market.get("yes_bid_dollars") or market.get("yes_bid"))
+        yes_ask = self._sports_edge_price_value(market.get("yes_ask_dollars") or market.get("yes_ask"))
+        no_bid = self._sports_edge_price_value(market.get("no_bid_dollars") or market.get("no_bid"))
+        no_ask = self._sports_edge_price_value(market.get("no_ask_dollars") or market.get("no_ask"))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+        implied_probability = self._structural_yes_mid(
+            {
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "last_price": market.get("last_price") or market.get("last_price_dollars"),
+            }
+        )
+        spread = None
+        if yes_bid is not None and yes_ask is not None and yes_ask >= yes_bid:
+            spread = round(yes_ask - yes_bid, 6)
+        elif no_bid is not None and no_ask is not None and no_ask >= no_bid:
+            spread = round(no_ask - no_bid, 6)
+        return {
+            "ticker": ticker,
+            "event_ticker": market.get("event_ticker") or market.get("eventTicker"),
+            "family": family,
+            "ladder_group": self._btc_1h_ladder_group_key(market, ticker=ticker, family=family),
+            "title": market.get("title") or market.get("market_title") or "",
+            "subtitle": market.get("subtitle") or "",
+            "rules_primary": market.get("rules_primary") or "",
+            "rules_secondary": market.get("rules_secondary") or "",
+            "status": market.get("status") or "",
+            "open_time": market.get("open_time"),
+            "close_time": market.get("close_time"),
+            "expiration_time": market.get("expiration_time") or market.get("latest_expiration_time"),
+            "settlement_time": market.get("settlement_time") or market.get("settled_time"),
+            "source_time": market.get("settlement_time") or market.get("close_time") or market.get("expiration_time") or datetime.now(timezone.utc).isoformat(),
+            "strike": strike,
+            "settlement_value": market.get("settlement_value") or market.get("expiration_value") or market.get("final_settlement"),
+            "outcome": market.get("settlement_result") or market.get("result") or market.get("winning_outcome") or market.get("outcome"),
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "last_price": market.get("last_price") or market.get("last_price_dollars") or market.get("last_trade_price"),
+            "previous_price": market.get("previous_price") or market.get("previous_price_dollars"),
+            "implied_probability": implied_probability,
+            "spread": spread,
+            "liquidity": market.get("liquidity") or market.get("liquidity_dollars"),
+            "volume": market.get("volume") or market.get("volume_dollars") or market.get("volume_24h") or market.get("volume_24h_dollars"),
+            "open_interest": market.get("open_interest") or market.get("open_interest_dollars") or market.get("open_interest_fp"),
+            "data_source": data_source,
+            "backfill_run_id": backfill_run_id or f"btc1h_cycle_{datetime.now(timezone.utc).strftime('%Y%m%dT%H')}",
+        }
+
+    def _fetch_btc1h_cycle_markets(self, *, status="open", limit=None):
+        collected = []
+        errors = []
+        for series in self._btc1h_cycle_series_tickers():
+            try:
+                batch = self.get_markets(
+                    limit=int(limit or AION_BTC1H_CYCLE_PAGE_LIMIT or 120),
+                    status=status,
+                    extra_params={"series_ticker": series},
+                )
+            except Exception as exc:
+                errors.append({"series": series, "status": status, "error": exc.__class__.__name__})
+                continue
+            for market in batch or []:
+                if not isinstance(market, dict):
+                    continue
+                collected.append(market)
+        return collected, errors
+
+    def _score_btc1h_cycle_markets(self, markets=None, *, source="btc1h_cycle"):
+        by_ticker = {}
+        for market in markets or []:
+            if not isinstance(market, dict):
+                continue
+            ticker = str(market.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            family = str(self.get_market_family(market) or "").strip().upper()
+            if not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market):
+                continue
+            if self._parse_btc_1h_ladder_strike(
+                market.get("title"),
+                market.get("subtitle"),
+                market.get("rules_primary"),
+                market.get("rules_secondary"),
+                market.get("event_title"),
+                ticker,
+            ) is None:
+                continue
+            by_ticker[ticker] = market
+        groups = {}
+        for ticker, market in by_ticker.items():
+            family = str(self.get_market_family(market) or "").strip().upper()
+            group_key = self._btc_1h_ladder_group_key(market, ticker=ticker, family=family)
+            groups.setdefault(group_key, []).append(market)
+        promoted = {}
+        score_rows = []
+        for group_key, group_markets in groups.items():
+            snapshots = [self._btc_1h_ladder_contract_snapshot(market) for market in group_markets]
+            snapshots = [snapshot for snapshot in snapshots if snapshot]
+            if len(snapshots) >= int(AION_BTC_1H_LADDER_MIN_GROUP_SIZE or 3):
+                ordered = sorted(snapshots, key=lambda item: self.to_float(item.get("strike"), 0.0) or 0.0)
+                print(
+                    "[BTC1H-LADDER-DETECTED] "
+                    + json.dumps(
+                        {
+                            "settlement_hour": group_key,
+                            "ladder_group": group_key,
+                            "group_size": len(ordered),
+                            "min_strike": ordered[0].get("strike") if ordered else None,
+                            "max_strike": ordered[-1].get("strike") if ordered else None,
+                            "reason": "continuous_cycle_grouped",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            best_for_group = None
+            group_score_rows = []
+            for market in group_markets:
+                ticker = str(market.get("ticker") or "").strip()
+                family = str(self.get_market_family(market) or "").strip().upper()
+                snapshot = self._btc_1h_ladder_contract_snapshot(market)
+                if not snapshot:
+                    continue
+                side_contexts = []
+                for side in ("yes", "no"):
+                    selected_price = snapshot.get("yes_ask") if side == "yes" else snapshot.get("no_ask")
+                    selected_bid = snapshot.get("yes_bid") if side == "yes" else snapshot.get("no_bid")
+                    selected_top_size = snapshot.get("yes_top_size") if side == "yes" else snapshot.get("no_top_size")
+                    opposite_top_size = snapshot.get("no_top_size") if side == "yes" else snapshot.get("yes_top_size")
+                    selected_price_value = self.to_float(selected_price, None)
+                    if selected_price_value is None or selected_price_value <= 0.0 or selected_price_value >= 1.0:
+                        continue
+                    side_spread = snapshot.get("spread")
+                    selected_bid_value = self.to_float(selected_bid, None)
+                    if selected_bid_value is not None and selected_price_value >= selected_bid_value:
+                        side_spread = selected_price_value - selected_bid_value
+                    context = self._get_btc_1h_ladder_rank_adjustment(
+                        market=market,
+                        q=None,
+                        family=family,
+                        ticker=ticker,
+                        markets=group_markets,
+                        selected_side=side,
+                        selected_price=selected_price_value,
+                        spread_value=side_spread,
+                        selected_top_size=self.to_float(selected_top_size, 0.0) or 0.0,
+                        opposite_top_size=self.to_float(opposite_top_size, 0.0) or 0.0,
+                        source=source,
+                        log=False,
+                    )
+                    if not context.get("enabled"):
+                        continue
+                    ladder_score = self.to_float(context.get("score"), 0.0) or 0.0
+                    ladder_boost = self.to_float(context.get("boost"), 0.0) or 0.0
+                    history_boost = self.to_float(context.get("historical_edge_boost"), 0.0) or 0.0
+                    history_penalty = self.to_float(context.get("historical_risk_penalty"), 0.0) or 0.0
+                    cycle_rank_boost = round(
+                        max(
+                            0.0,
+                            min(
+                                10.0,
+                                ladder_boost
+                                + max(0.0, ladder_score - AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE) * 0.055
+                                + history_boost * 0.75
+                                - history_penalty * 0.45,
+                            ),
+                        ),
+                        4,
+                    )
+                    context = dict(context)
+                    context["cycle_rank_boost"] = cycle_rank_boost
+                    context["final_score"] = round(ladder_score + cycle_rank_boost, 4)
+                    context["source"] = source
+                    side_contexts.append(context)
+                if not side_contexts:
+                    print(
+                        "[BTC1H-LADDER-SKIP] "
+                        + json.dumps(
+                            {
+                                "ticker": ticker,
+                                "settlement_hour": group_key,
+                                "ladder_group": group_key,
+                                "strike": snapshot.get("strike"),
+                                "reason": "no_executable_side_price",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    continue
+                context = max(side_contexts, key=lambda item: self.to_float(item.get("final_score"), 0.0))
+                score_rows.append(context)
+                group_score_rows.append(context)
+                if best_for_group is None or self.to_float(context.get("final_score"), 0.0) > self.to_float(best_for_group.get("final_score"), 0.0):
+                    best_for_group = context
+            for context in sorted(
+                group_score_rows,
+                key=lambda item: self.to_float(item.get("final_score"), 0.0),
+                reverse=True,
+            )[: max(1, int(AION_BTC1H_CYCLE_LOG_TOP_N or 5))]:
+                print(
+                    "[BTC1H-LADDER-SCORE] "
+                    + json.dumps(
+                        {
+                            "ticker": context.get("ticker"),
+                            "strike": context.get("strike"),
+                            "settlement_hour": group_key,
+                            "ladder_group": group_key,
+                            "selected_side": context.get("selected_side"),
+                            "price": context.get("selected_price"),
+                            "bid": context.get("bid"),
+                            "ask": context.get("ask"),
+                            "spread": context.get("spread"),
+                            "liquidity": context.get("liquidity"),
+                            "top_size": context.get("top_size"),
+                            "momentum_alignment": (context.get("components") or {}).get("nearby_confirmation"),
+                            "historical_boost": context.get("historical_edge_boost"),
+                            "ladder_boost": context.get("cycle_rank_boost"),
+                            "final_score": context.get("final_score"),
+                            "reason": context.get("reason"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            if best_for_group and (
+                self.to_float(best_for_group.get("score"), 0.0) >= AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE
+                or self.to_float(best_for_group.get("cycle_rank_boost"), 0.0) > 0.0
+            ):
+                promoted[best_for_group.get("ticker")] = best_for_group
+                print(
+                    "[BTC1H-LADDER-PROMOTE] "
+                    + json.dumps(
+                        {
+                            "ticker": best_for_group.get("ticker"),
+                            "strike": best_for_group.get("strike"),
+                            "settlement_hour": group_key,
+                            "ladder_group": group_key,
+                            "selected_side": best_for_group.get("selected_side"),
+                            "price": best_for_group.get("selected_price"),
+                            "spread": best_for_group.get("spread"),
+                            "liquidity": best_for_group.get("liquidity"),
+                            "momentum_alignment": (best_for_group.get("components") or {}).get("nearby_confirmation"),
+                            "historical_boost": best_for_group.get("historical_edge_boost"),
+                            "ladder_boost": best_for_group.get("cycle_rank_boost"),
+                            "final_score": best_for_group.get("final_score"),
+                            "reason": "best_candidate_for_settlement_hour",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        return {"groups": groups, "promoted": promoted, "score_rows": score_rows, "markets": list(by_ticker.values())}
+
+    def _refresh_btc1h_settlement_learning(self, *, source="btc1h_cycle"):
+        store = self._get_btc1h_cycle_write_store()
+        if store is None:
+            return {"stored": 0, "updated": 0, "duplicates": 0, "malformed": 0, "errors": 0, "records_seen": 0, "reason": "store_unavailable"}
+        records = []
+        fetch_errors = []
+        for status in ("settled", "closed"):
+            markets, errors = self._fetch_btc1h_cycle_markets(status=status, limit=AION_BTC1H_CYCLE_MAX_SETTLEMENT_REFRESH)
+            fetch_errors.extend(errors)
+            for market in markets:
+                record = self._btc1h_market_to_history_record(
+                    market,
+                    data_source=f"kalshi_api:{source}:{status}",
+                    backfill_run_id=f"btc1h_cycle_{datetime.now(timezone.utc).strftime('%Y%m%dT%H')}",
+                )
+                if record is not None:
+                    records.append(record)
+        if not records:
+            return {"stored": 0, "updated": 0, "duplicates": 0, "malformed": 0, "errors": len(fetch_errors), "records_seen": 0, "fetch_errors": fetch_errors}
+        try:
+            result = store.upsert_records(records, batch_size=100)
+            if (result.get("stored", 0) + result.get("updated", 0)) > 0:
+                store.recompute_summaries()
+                try:
+                    if getattr(self, "btc_1h_history_store", None) is not None:
+                        self.btc_1h_history_audit = self.btc_1h_history_store.audit(recompute=False)
+                except Exception:
+                    pass
+            payload = {
+                **result,
+                "records_seen": len(records),
+                "fetch_errors": fetch_errors[:4],
+                "reason": "settlement_refresh",
+            }
+            print("[BTC1H-SETTLEMENT-LEARN] " + json.dumps(payload, sort_keys=True, default=str))
+            return payload
+        except Exception as exc:
+            payload = {
+                "stored": 0,
+                "updated": 0,
+                "duplicates": 0,
+                "malformed": 0,
+                "errors": len(records),
+                "records_seen": len(records),
+                "reason": "settlement_upsert_failed",
+                "error": exc.__class__.__name__,
+            }
+            print("[BTC1H-SETTLEMENT-LEARN] " + json.dumps(payload, sort_keys=True, default=str))
+            return payload
+
+    def _run_btc1h_adaptive_cycle(self, *, markets=None, quotes_by_ticker=None, source="live_cycle", force=False):
+        if not AION_BTC1H_CYCLE_ENABLED:
+            return {"enabled": False, "markets_to_merge": [], "reason": "disabled"}
+        now_ts = time.time()
+        if not force and (now_ts - float(getattr(self, "btc1h_cycle_last_run_ts", 0.0) or 0.0)) < float(AION_BTC1H_CYCLE_INTERVAL_SECONDS or 60.0):
+            return {
+                "enabled": True,
+                "markets_to_merge": [],
+                "promoted": dict(getattr(self, "btc1h_cycle_priority_by_ticker", {}) or {}),
+                "reason": "cycle_throttled",
+            }
+        self.btc1h_cycle_last_run_ts = now_ts
+        cycle_started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        print(
+            "[BTC1H-CYCLE-START] "
+            + json.dumps(
+                {
+                    "cycle_count": int(getattr(self, "cycle_count", 0) or 0),
+                    "started_at": cycle_started,
+                    "series": self._btc1h_cycle_series_tickers(),
+                    "source": source,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        combined_by_ticker = {}
+        for market in markets or []:
+            if not isinstance(market, dict):
+                continue
+            ticker = str(market.get("ticker") or "").strip()
+            if ticker:
+                combined_by_ticker[ticker] = market
+        fetched_open, open_errors = self._fetch_btc1h_cycle_markets(status="open", limit=AION_BTC1H_CYCLE_PAGE_LIMIT)
+        for market in fetched_open:
+            ticker = str(market.get("ticker") or "").strip()
+            if ticker:
+                combined_by_ticker[ticker] = market
+        score_result = self._score_btc1h_cycle_markets(
+            list(combined_by_ticker.values()),
+            source=source,
+        )
+        promoted = score_result.get("promoted") or {}
+        self.btc1h_cycle_priority_by_ticker = dict(promoted)
+        settlement_result = self._refresh_btc1h_settlement_learning(source=source)
+        merge_by_ticker = {}
+        groups = score_result.get("groups") or {}
+        for promoted_context in promoted.values():
+            if not isinstance(promoted_context, dict):
+                continue
+            promoted_ticker = str(promoted_context.get("ticker") or "").strip()
+            group_key = str(promoted_context.get("settlement_group") or "").strip()
+            group_markets = groups.get(group_key) or []
+            snapshots = []
+            for market in group_markets:
+                snapshot = self._btc_1h_ladder_contract_snapshot(market)
+                if not snapshot:
+                    continue
+                snapshots.append((snapshot, market))
+            snapshots.sort(key=lambda item: self.to_float(item[0].get("strike"), 0.0) or 0.0)
+            promoted_index = next(
+                (idx for idx, (_snapshot, market) in enumerate(snapshots) if str(market.get("ticker") or "").strip() == promoted_ticker),
+                None,
+            )
+            if promoted_index is None:
+                market = combined_by_ticker.get(promoted_ticker)
+                if isinstance(market, dict):
+                    merge_by_ticker[promoted_ticker] = market
+                continue
+            for _snapshot, market in snapshots[max(0, promoted_index - 2): promoted_index + 3]:
+                ticker = str(market.get("ticker") or "").strip()
+                if ticker:
+                    merge_by_ticker[ticker] = market
+        markets_to_merge = list(merge_by_ticker.values())
+        summary = {
+            "enabled": True,
+            "cycle_count": int(getattr(self, "cycle_count", 0) or 0),
+            "active_markets_seen": len(combined_by_ticker),
+            "btc1h_markets": len(score_result.get("markets") or []),
+            "btc1h_markets_merged": len(markets_to_merge),
+            "ladder_groups": len(score_result.get("groups") or {}),
+            "scored": len(score_result.get("score_rows") or []),
+            "promoted": len(promoted),
+            "promoted_tickers": list(promoted.keys())[:8],
+            "history_records_seen": settlement_result.get("records_seen"),
+            "history_stored": settlement_result.get("stored"),
+            "history_updated": settlement_result.get("updated"),
+            "history_duplicates": settlement_result.get("duplicates"),
+            "open_fetch_errors": open_errors[:4],
+            "settlement_errors": settlement_result.get("errors"),
+            "final_effect": "continue_live_execution",
+            "markets_to_merge": markets_to_merge,
+            "promoted_context": promoted,
+        }
+        self.btc1h_cycle_last_summary = dict(summary)
+        print(
+            "[BTC1H-CYCLE-SUMMARY] "
+            + json.dumps(
+                {key: value for key, value in summary.items() if key not in {"markets_to_merge", "promoted_context"}},
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return summary
+
+    def _get_btc1h_cycle_rank_adjustment(self, ticker=None, *, source="ranking"):
+        ticker = str(ticker or "").strip()
+        context = (getattr(self, "btc1h_cycle_priority_by_ticker", {}) or {}).get(ticker)
+        if not isinstance(context, dict):
+            return {"available": False, "boost": 0.0}
+        boost = self.to_float(context.get("cycle_rank_boost"), 0.0) or 0.0
+        if boost > 0.0:
+            self._emit_structural_edge_log(
+                "[BTC1H-LADDER-PROMOTE]",
+                {
+                    "ticker": ticker,
+                    "strike": context.get("strike"),
+                    "settlement_hour": context.get("settlement_group"),
+                    "ladder_group": context.get("settlement_group"),
+                    "selected_side": context.get("selected_side"),
+                    "price": context.get("selected_price"),
+                    "spread": context.get("spread"),
+                    "liquidity": context.get("liquidity"),
+                    "momentum_alignment": (context.get("components") or {}).get("nearby_confirmation"),
+                    "historical_boost": context.get("historical_edge_boost"),
+                    "ladder_boost": boost,
+                    "final_score": context.get("final_score"),
+                    "reason": f"cycle_rank_boost_{source}",
+                },
+                marker=("btc1h_cycle_rank_boost", source, ticker),
+            )
+        return {"available": True, "boost": boost, "context": context}
+
+    def _emit_btc1h_live_execute_log(self, ticker=None, *, result=None, payload=None, family=None):
+        ticker = str(ticker or "").strip()
+        context = (getattr(self, "btc1h_cycle_priority_by_ticker", {}) or {}).get(ticker)
+        if not isinstance(context, dict):
+            return
+        result = result if isinstance(result, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        print(
+            "[BTC1H-LIVE-EXECUTE] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "settlement_hour": context.get("settlement_group"),
+                    "ladder_group": context.get("settlement_group"),
+                    "strike": context.get("strike"),
+                    "side": payload.get("side") or context.get("selected_side"),
+                    "price": payload.get("price") or context.get("selected_price"),
+                    "contracts": payload.get("count"),
+                    "spread": context.get("spread"),
+                    "liquidity": context.get("liquidity"),
+                    "momentum_alignment": (context.get("components") or {}).get("nearby_confirmation"),
+                    "historical_boost": context.get("historical_edge_boost"),
+                    "ladder_boost": context.get("cycle_rank_boost"),
+                    "final_score": context.get("final_score"),
+                    "execution_result": "submitted" if result.get("submitted") else str(result.get("reason") or "not_submitted"),
+                    "reason": context.get("reason"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
 
     def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
         market = market if isinstance(market, dict) else {}
@@ -35283,7 +35858,7 @@ class KalshiSniperBot:
         hour_utc = time.gmtime().tm_hour if utc_hour is None else int(utc_hour)
         mode = self._get_live_time_routing_mode(hour_utc)
         def is_btc_family(family):
-            return str(family or "") == "KXBTC15M"
+            return str(family or "").strip().upper().startswith("KXBTC")
         def is_sports_family(family):
             return self.get_market_discovery_category(str(family or "")) == "sports"
         sports_families = [family for family in families if is_sports_family(family)]
@@ -36045,7 +36620,7 @@ class KalshiSniperBot:
         }
 
     def _should_trace_priority_topbook_family(self, family):
-        return family in {"KXBTC15M", "KXNBA1HTOTAL", "KXNBA1HSPREAD", "KXNBASPREAD"}
+        return family in {"KXBTC15M", "KXBTC", "KXNBA1HTOTAL", "KXNBA1HSPREAD", "KXNBASPREAD"}
 
     def _is_balanced_sports_family(self, family):
         return bool(family) and family != "KXBTC15M" and self.get_market_discovery_category(family) == "sports"
@@ -49193,6 +49768,15 @@ class KalshiSniperBot:
                     0.0,
                 )
                 adjusted_score += structural_edge_adjustment
+                btc1h_cycle_context = self._get_btc1h_cycle_rank_adjustment(
+                    ticker,
+                    source="expectancy_rerank",
+                )
+                btc1h_cycle_adjustment = self.to_float(
+                    btc1h_cycle_context.get("boost"),
+                    0.0,
+                )
+                adjusted_score += btc1h_cycle_adjustment
                 sports_edge_context = self._get_sports_edge_rank_adjustment(
                     (score, q, spread, family),
                     market=market,
@@ -49323,6 +49907,7 @@ class KalshiSniperBot:
                     "family_profit_memory_adjustment": family_profit_memory_adjustment,
                     "orderbook_imbalance_adjustment": orderbook_imbalance_adjustment,
                     "btc_volatility_adjustment": btc_volatility_adjustment,
+                    "btc1h_cycle_adjustment": btc1h_cycle_adjustment,
                     "btc_volatility_context": btc_volatility_context,
                     "elite_public_signal_adjustment": elite_signal_adjustment,
                     "elite_public_signal_context": elite_signal_context,
@@ -58070,6 +58655,34 @@ class KalshiSniperBot:
         self._emit_aggressive_candidate_search_heartbeat()
         self.maybe_send_telegram_heartbeat()
         markets = self.get_markets(limit=self.max_markets, status="open")
+        try:
+            btc1h_cycle = self._run_btc1h_adaptive_cycle(markets=markets, source="run_once_pre_quote")
+            if isinstance(btc1h_cycle, dict):
+                existing_tickers = {
+                    str(market.get("ticker") or "").strip()
+                    for market in markets
+                    if isinstance(market, dict) and str(market.get("ticker") or "").strip()
+                }
+                for market in btc1h_cycle.get("markets_to_merge") or []:
+                    if not isinstance(market, dict):
+                        continue
+                    ticker = str(market.get("ticker") or "").strip()
+                    if ticker and ticker not in existing_tickers:
+                        markets.append(market)
+                        existing_tickers.add(ticker)
+        except Exception as exc:
+            print(
+                "[BTC1H-CYCLE-SUMMARY] "
+                + json.dumps(
+                    {
+                        "reason": "cycle_failed_nonblocking",
+                        "error": exc.__class__.__name__,
+                        "final_effect": "continue_live_execution",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         self._refresh_aion_data_coverage_cache(source="live_cycle")
         self._maybe_emit_aion_distilled_memory_audit(source="live_cycle")
         self._start_execution_failure_audit_cycle(source="live_cycle")
@@ -58079,7 +58692,7 @@ class KalshiSniperBot:
         discovery_disabled_count = sum(1 for market in markets if isinstance(market, dict) and (bool(market.get("disabled")) or bool(market.get("is_disabled")) or str(market.get("status") or "").strip().lower() in {"disabled", "inactive", "suspended"}))
         discovery_refresh_stale_count = sum(1 for market in markets if isinstance(market, dict) and (bool(market.get("refresh")) or bool(market.get("stale")) or bool(market.get("is_stale"))))
         discovery_time_window_eligible_count = sum(1 for market in markets if isinstance(market, dict) and self.get_minutes_to_event(market) is not None and self.get_minutes_to_event(market) >= 0.0)
-        discovery_family_allowed_count = sum(1 for market in markets if isinstance(market, dict) and (self.get_market_discovery_category(market or self.get_market_family(market)) in {"sports", "crypto"} or self.get_market_family(market) == "KXBTC15M"))
+        discovery_family_allowed_count = sum(1 for market in markets if isinstance(market, dict) and (self.get_market_discovery_category(market or self.get_market_family(market)) in {"sports", "crypto"} or str(self.get_market_family(market) or "").strip().upper().startswith("KXBTC")))
         discovery_high_liquidity_allowed_count = sum(1 for market in markets if isinstance(market, dict) and int((self.get_market_liquidity_priority(market) or {}).get("tier", 3) or 3) in {1, 2})
         print(
             "[AION-MARKET-DISCOVERY-ROOT] "
@@ -62486,6 +63099,12 @@ class KalshiSniperBot:
                         sort_keys=True,
                         default=str,
                     )
+                )
+                self._emit_btc1h_live_execute_log(
+                    auto_live_ticker,
+                    result=result,
+                    payload=payload,
+                    family=selected_family,
                 )
             else:
                 execution_funnel["execution_blocked"] = 1
