@@ -544,6 +544,22 @@ def maybe_auto_reprice_recent_order(
             reason="auto_reprice",
             status_code=result.get("status_code"),
         )
+        archive_writer = getattr(bot, "append_aion_learning_archive_event", None)
+        if callable(archive_writer):
+            archive_writer(
+                "trade_opened",
+                q=q,
+                payload=reprice_payload,
+                order=result.get("response") or {},
+                result=result,
+                extra={
+                    "ticker": ticker,
+                    "order_id": new_order_id,
+                    "entry_reason": "auto_reprice",
+                    "entry_mode": "auto_reprice",
+                    "phase_or_realm_source": "kalshi_execution.maybe_auto_reprice_recent_order",
+                },
+            )
         print(
             "[ORDER-SUBMITTED] "
             + json.dumps(
@@ -685,6 +701,22 @@ def submit_live_order(
             price=payload.get("price"),
             status_code=result.get("status_code"),
         )
+        archive_writer = getattr(bot, "append_aion_learning_archive_event", None)
+        if callable(archive_writer):
+            archive_writer(
+                "trade_opened",
+                q=q,
+                payload=payload,
+                order=result.get("response") or {},
+                result=result,
+                extra={
+                    "ticker": legacy_payload.get("ticker"),
+                    "order_id": order_id,
+                    "entry_reason": result.get("reason") or lane or "live_order_submitted",
+                    "entry_mode": lane or "live_order",
+                    "phase_or_realm_source": "kalshi_execution.submit_live_order",
+                },
+            )
         print(
             "[ORDER-SUBMITTED] "
             + json.dumps(

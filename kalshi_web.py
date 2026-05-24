@@ -1614,6 +1614,8 @@ MAX_LIVE_ORDER_SIZE = 1
 MAX_LIVE_TRADES_PER_DAY = 60
 LIVE_TEST_TICKER = None
 LIVE_AUDIT_LOG_FILE = runtime_state_file("live_audit_log.csv")
+AION_LEARNING_ARCHIVE_FILE = _Path("data") / "aion_learning_archive.jsonl"
+AION_LEARNING_ARCHIVE_CANDIDATE_MIN_SECONDS = 60.0
 DEFAULT_LIVE_PRIVATE_KEY_PATH = "/Users/Kevin/Downloads/kalshi.key.txt"
 SERAPH_MEMORY_SQLITE_PATH = runtime_memory_file("seraph_memory.sqlite3")
 SERAPH_MEMORY_READ_LIMIT = 300
@@ -7841,6 +7843,175 @@ class KalshiSniperBot:
                 writer.writerow(row)
         except OSError:
             return
+
+    def _learning_archive_value(self, sources, *names):
+        for source in sources or []:
+            if source is None:
+                continue
+            for name in names:
+                if isinstance(source, dict):
+                    value = source.get(name)
+                else:
+                    value = getattr(source, name, None)
+                if value not in (None, ""):
+                    return value
+        return None
+
+    def _learning_archive_float(self, value):
+        value = self.to_float(value, None)
+        return round(value, 6) if value is not None else None
+
+    def _learning_archive_int(self, value):
+        value = self.to_float(value, None)
+        return int(value) if value is not None else None
+
+    def append_aion_learning_archive_event(self, event_type, q=None, payload=None, order=None, result=None, decision=None, position=None, extra=None):
+        try:
+            event_type = str(event_type or "").strip().lower()
+            if event_type not in {"candidate_seen", "trade_opened", "trade_closed"}:
+                return {"ok": False, "reason": "unsupported_event_type"}
+            payload = payload if isinstance(payload, dict) else {}
+            order = order if isinstance(order, dict) else {}
+            result = result if isinstance(result, dict) else {}
+            decision = decision if isinstance(decision, dict) else {}
+            position = position if isinstance(position, dict) else {}
+            extra = extra if isinstance(extra, dict) else {}
+            order_summary = self.extract_order_execution_summary(order) if order else {}
+            entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+            if not entry_context and isinstance(position.get("entry_context"), dict):
+                entry_context = position.get("entry_context")
+            sources = [extra, payload, order_summary, position, decision, entry_context, q]
+            ticker = str(self._learning_archive_value(sources, "ticker", "market_ticker") or "").strip()
+            family = str(self._learning_archive_value(sources, "family") or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")).strip().upper()
+            side = str(self._learning_archive_value(sources, "selected_side", "side", "outcome_side") or "").strip().lower() or None
+            price = self._learning_archive_float(
+                self._learning_archive_value(
+                    sources,
+                    "price",
+                    "selected_price",
+                    "selected_price_dollars",
+                    "entry_price",
+                    "avg_price",
+                    "exit_price",
+                    "current_price",
+                )
+            )
+            contracts = self._learning_archive_int(
+                self._learning_archive_value(sources, "contracts", "count", "filled_count", "size")
+            )
+            notional_dollars = None
+            if price is not None and contracts is not None:
+                notional_dollars = round(price * contracts, 6)
+            if event_type == "candidate_seen":
+                now_ts = time.time()
+                candidate_seen_recent = getattr(self, "_aion_learning_candidate_seen_recent", {})
+                if not isinstance(candidate_seen_recent, dict):
+                    candidate_seen_recent = {}
+                candidate_key = f"{ticker}|{side}|{price}"
+                previous_seen_ts = self.to_float(candidate_seen_recent.get(candidate_key), None)
+                if previous_seen_ts is not None and now_ts - previous_seen_ts < AION_LEARNING_ARCHIVE_CANDIDATE_MIN_SECONDS:
+                    return {"ok": True, "skipped": True, "reason": "candidate_seen_recent"}
+                candidate_seen_recent[candidate_key] = now_ts
+                self._aion_learning_candidate_seen_recent = {
+                    key: ts
+                    for key, ts in candidate_seen_recent.items()
+                    if self.to_float(ts, 0.0) and now_ts - self.to_float(ts, 0.0) <= AION_LEARNING_ARCHIVE_CANDIDATE_MIN_SECONDS
+                }
+            now_utc = datetime.now(timezone.utc).isoformat()
+            event = {
+                "event_type": event_type,
+                "timestamp_utc": now_utc,
+                "ticker": ticker or None,
+                "market_title": self._learning_archive_value(sources, "market_title", "title"),
+                "family": family or "UNKNOWN",
+            }
+            if event_type in {"candidate_seen", "trade_opened"}:
+                event.update(
+                    {
+                        "side": side,
+                        "price": price,
+                        "contracts": contracts,
+                        "notional_dollars": notional_dollars,
+                        "confidence": self._learning_archive_float(self._learning_archive_value(sources, "confidence", "confidence_score", "candidate_score", "probability_estimate")),
+                        "ev_score": self._learning_archive_float(self._learning_archive_value(sources, "ev_score", "edge_after_cost", "final_edge", "final_edge_value", "sports_edge_after_cost", "expectancy_score")),
+                        "kelly_fraction": self._learning_archive_float(self._learning_archive_value(sources, "kelly_fraction", "kelly_size_fraction")),
+                        "liquidity_dollars": self._learning_archive_float(self._learning_archive_value(sources, "liquidity_dollars", "liquidity")),
+                        "spread": self._learning_archive_float(self._learning_archive_value(sources, "spread", "spread_cents")),
+                        "yes_bid": self._learning_archive_float(self._learning_archive_value(sources, "yes_bid", "yes_bid_dollars")),
+                        "yes_ask": self._learning_archive_float(self._learning_archive_value(sources, "yes_ask", "yes_ask_dollars")),
+                        "no_bid": self._learning_archive_float(self._learning_archive_value(sources, "no_bid", "no_bid_dollars")),
+                        "no_ask": self._learning_archive_float(self._learning_archive_value(sources, "no_ask", "no_ask_dollars")),
+                        "orderbook_imbalance": self._learning_archive_float(self._learning_archive_value(sources, "orderbook_imbalance", "imbalance")),
+                        "entry_reason": self._learning_archive_value(sources, "entry_reason", "reason", "selector_reason", "final_block_reason"),
+                        "entry_mode": self._learning_archive_value(sources, "entry_mode", "lane", "mode", "trade_mode"),
+                        "phase_or_realm_source": self._learning_archive_value(sources, "phase_or_realm_source", "source", "subsystem", "selection_stage"),
+                        "daily_trade_count": int(getattr(self, "live_trade_count_today", 0) or 0),
+                        "max_daily_trade_cap": int(MAX_LIVE_TRADES_PER_DAY),
+                        "position_id": self._learning_archive_value(sources, "position_id"),
+                        "order_id": self._learning_archive_value(sources, "order_id", "id"),
+                    }
+                )
+            else:
+                close_timestamp = self._learning_archive_value(sources, "close_timestamp_utc", "closed_at", "exit_timestamp_utc") or now_utc
+                pnl_dollars = self._learning_archive_float(
+                    self._learning_archive_value(sources, "pnl_dollars", "realized_pnl", "realized_pnl_delta", "unrealized_pnl", "pnl")
+                )
+                pnl_percent = self._learning_archive_float(self._learning_archive_value(sources, "pnl_percent", "return_percent", "roi"))
+                hold_seconds = self._learning_archive_float(self._learning_archive_value(sources, "hold_seconds"))
+                entry_ts = self.to_float(self._learning_archive_value(sources, "entry_ts"), None)
+                if hold_seconds is None and entry_ts is not None:
+                    hold_seconds = round(max(0.0, time.time() - entry_ts), 3)
+                if pnl_dollars is None and price is not None:
+                    entry_price = self._learning_archive_float(self._learning_archive_value(sources, "entry_price", "avg_price"))
+                    if entry_price is not None and contracts is not None:
+                        pnl_dollars = round((price - entry_price) * contracts, 6)
+                outcome = str(self._learning_archive_value(sources, "result", "outcome") or "").strip().lower()
+                if not outcome and pnl_dollars is not None:
+                    outcome = "win" if pnl_dollars > 0 else "loss" if pnl_dollars < 0 else "breakeven"
+                won = None
+                if pnl_dollars is not None:
+                    won = bool(pnl_dollars > 0)
+                event.update(
+                    {
+                        "close_timestamp_utc": close_timestamp,
+                        "result": outcome or "unknown",
+                        "pnl_dollars": pnl_dollars,
+                        "pnl_percent": pnl_percent,
+                        "exit_reason": self._learning_archive_value(sources, "exit_reason", "reason") or "unknown",
+                        "hold_seconds": hold_seconds,
+                        "won": won,
+                        "original_confidence": self._learning_archive_float(self._learning_archive_value(sources, "original_confidence", "confidence", "confidence_score")),
+                        "original_ev_score": self._learning_archive_float(self._learning_archive_value(sources, "original_ev_score", "ev_score", "edge_after_cost", "final_edge")),
+                        "position_id": self._learning_archive_value(sources, "position_id"),
+                        "order_id": self._learning_archive_value(sources, "order_id", "exit_order_id", "id"),
+                    }
+                )
+            archive_path = _Path(AION_LEARNING_ARCHIVE_FILE)
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            with archive_path.open("a", encoding="utf-8") as archive_file:
+                archive_file.write(json.dumps(event, sort_keys=True, separators=(",", ":"), default=str) + "\n")
+            print(
+                "[AION-LEARNING-ARCHIVE-WRITE] "
+                + json.dumps(
+                    {"event_type": event_type, "ticker": ticker or None, "path": str(archive_path)},
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            return {"ok": True, "path": str(archive_path), "event_type": event_type}
+        except Exception as exc:
+            try:
+                print(
+                    "[AION-LEARNING-ARCHIVE-WARN] "
+                    + json.dumps(
+                        {"event_type": str(event_type or "unknown"), "reason": exc.__class__.__name__, "path": str(AION_LEARNING_ARCHIVE_FILE)},
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+            return {"ok": False, "reason": exc.__class__.__name__}
 
     def recent_submitted_order_for_ticker(self, ticker, window_seconds=None):
         ticker = str(ticker or "").strip()
@@ -48745,6 +48916,21 @@ class KalshiSniperBot:
                     default=str,
                 )
             )
+            self.append_aion_learning_archive_event(
+                "candidate_seen",
+                q=q,
+                payload=payload,
+                extra={
+                    "trace_id": trace_id,
+                    "ticker": ticker,
+                    "edge_after_cost": edge_value,
+                    "final_block_reason": "all_guards_passed",
+                    "entry_reason": "final_readiness_reconcile",
+                    "entry_mode": "final_readiness",
+                    "phase_or_realm_source": "realm_vv_final_readiness",
+                    "spread": canonical_readiness.get("canonical_spread") if isinstance(canonical_readiness, dict) else None,
+                },
+            )
             if stale_unsafe_price_status_value in {"unsafe_spread", "unsafe", "unsafe_price"} and unsafe_price_status_value != stale_unsafe_price_status_value:
                 print(
                     "[AION-STALE-BLOCKER-OVERRIDE] "
@@ -51026,6 +51212,33 @@ class KalshiSniperBot:
             for row in (raw_positions or [])
             if isinstance(row, dict)
         ]
+        previous_state = self.load_live_position_state()
+        normalized_by_ticker = {
+            str(row.get("ticker") or "").strip(): row
+            for row in normalized
+            if isinstance(row, dict) and str(row.get("ticker") or "").strip()
+        }
+        active_tickers = {
+            ticker
+            for ticker, row in normalized_by_ticker.items()
+            if str(row.get("status", "open") or "open").strip().lower() == "open"
+        }
+        for ticker, entry in (previous_state or {}).items():
+            ticker = str(ticker or "").strip()
+            if not ticker or ticker in active_tickers or not isinstance(entry, dict):
+                continue
+            closed_summary = normalized_by_ticker.get(ticker, {})
+            self.append_aion_learning_archive_event(
+                "trade_closed",
+                position={**entry, **closed_summary, "ticker": ticker},
+                extra={
+                    "ticker": ticker,
+                    "family": entry.get("family") or self.get_market_family({"ticker": ticker}),
+                    "exit_reason": "position_reconcile_closed",
+                    "result": closed_summary.get("status") or "closed",
+                    "close_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            )
         self.live_positions = [
             row for row in normalized
             if str(row.get("ticker") or "").strip()
@@ -54820,6 +55033,22 @@ class KalshiSniperBot:
                     sort_keys=True,
                     default=str,
                 )
+            )
+            self.append_aion_learning_archive_event(
+                "candidate_seen",
+                q=selected_quote,
+                payload=payload_preview,
+                extra={
+                    "trace_id": trace_id,
+                    "ticker": auto_live_ticker,
+                    "family": selected_family,
+                    "edge_after_cost": preflight_edge,
+                    "final_block_reason": "all_guards_passed" if canonical_allow_lane else preflight_unsafe_resolution_reason,
+                    "entry_reason": "final_readiness_reconcile",
+                    "entry_mode": "final_readiness",
+                    "phase_or_realm_source": "realm_vv_final_readiness",
+                    "spread": quote_readiness_diagnostic.get("spread"),
+                },
             )
             if stale_unsafe_price_status in {"unsafe_spread", "unsafe", "unsafe_price"} and final_gate_unsafe_price_status != stale_unsafe_price_status:
                 print(
