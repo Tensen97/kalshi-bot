@@ -134,6 +134,96 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertIn("CROSS_MARKET_DISTRIBUTION_INCONSISTENCY", context["tags"])
         self.assertGreater(context["size_multiplier"], 1.0)
 
+    def test_btc_1h_ladder_underpriced_strike_gets_promoted(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXBTC1H-TEST-71000",
+            family="KXBTC1H",
+            selected_side="yes",
+            selected_price=0.37,
+            yes_bid=0.35,
+            yes_ask=0.37,
+            no_bid=0.63,
+            no_ask=0.65,
+            yes_top_size=32,
+            no_top_size=40,
+            price_delta=0.00,
+            repricing_velocity=0.00,
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": "KXBTC1H",
+            "event_ticker": "KXBTC1H-TEST-HOUR",
+            "title": "Bitcoin above $71,000 at 4pm",
+            "yes_bid": 35,
+            "yes_ask": 37,
+            "no_bid": 63,
+            "no_ask": 65,
+            "yes_top_size": 32,
+            "no_top_size": 40,
+            "price_delta": 0.00,
+        }
+        markets = [
+            {
+                "ticker": "KXBTC1H-TEST-70000",
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-TEST-HOUR",
+                "title": "Bitcoin above $70,000 at 4pm",
+                "yes_bid": 67,
+                "yes_ask": 69,
+                "no_bid": 31,
+                "no_ask": 33,
+                "yes_top_size": 22,
+                "no_top_size": 30,
+                "price_delta": 0.04,
+            },
+            {
+                "ticker": "KXBTC1H-TEST-70500",
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-TEST-HOUR",
+                "title": "Bitcoin above $70,500 at 4pm",
+                "yes_bid": 60,
+                "yes_ask": 62,
+                "no_bid": 38,
+                "no_ask": 40,
+                "yes_top_size": 22,
+                "no_top_size": 30,
+                "price_delta": 0.035,
+            },
+            market,
+            {
+                "ticker": "KXBTC1H-TEST-71500",
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-TEST-HOUR",
+                "title": "Bitcoin above $71,500 at 4pm",
+                "yes_bid": 48,
+                "yes_ask": 50,
+                "no_bid": 50,
+                "no_ask": 52,
+                "yes_top_size": 20,
+                "no_top_size": 25,
+                "price_delta": 0.03,
+            },
+        ]
+
+        context = bot._get_structural_edge_rank_adjustment(
+            market=market,
+            q=q,
+            spread=0.02,
+            family="KXBTC1H",
+            markets=markets,
+            source="unit_test_btc_ladder",
+            log=False,
+        )
+
+        btc_context = context["btc_1h_ladder_context"]
+        self.assertGreater(btc_context["BTC_1H_LADDER_SCORE"], 45.0)
+        self.assertGreater(btc_context["boost"], 0.0)
+        self.assertGreater(context["boost"], 0.0)
+        self.assertGreater(context["size_multiplier"], 1.0)
+        self.assertIn("BTC_1H_LADDER_RELATIVE_MISPRICING", context["tags"])
+        self.assertEqual(getattr(q, "BTC_1H_LADDER_SCORE"), btc_context["BTC_1H_LADDER_SCORE"])
+
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {
             "ticker": "KXMLBSTRIKEOUT-TEST-65",

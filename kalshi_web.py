@@ -1567,6 +1567,12 @@ BTC_VOLATILITY_THRESHOLD_RELAXATION = _env_float("KALSHI_BTC_VOLATILITY_THRESHOL
 BTC_VOLATILITY_SPREAD_RELAXATION = _env_float("KALSHI_BTC_VOLATILITY_SPREAD_RELAXATION", 0.012)
 BTC_VOLATILITY_MAX_EFFECTIVE_SPREAD = _env_float("KALSHI_BTC_VOLATILITY_MAX_EFFECTIVE_SPREAD", 0.075)
 BTC_VOLATILITY_LOG_COOLDOWN_SECONDS = _env_float("KALSHI_BTC_VOLATILITY_LOG_COOLDOWN_SECONDS", 20.0)
+AION_BTC_1H_LADDER_ENABLED = get_env_bool("AION_BTC_1H_LADDER_ENABLED", 1)
+AION_BTC_1H_LADDER_MIN_GROUP_SIZE = get_env_int("AION_BTC_1H_LADDER_MIN_GROUP_SIZE", 3)
+AION_BTC_1H_LADDER_MAX_RANK_BOOST = get_env_float("AION_BTC_1H_LADDER_MAX_RANK_BOOST", 8.0)
+AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT", 0.055)
+AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER = get_env_float("AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER", 2.25)
+AION_BTC_1H_LADDER_ABSURD_SPREAD = get_env_float("AION_BTC_1H_LADDER_ABSURD_SPREAD", 0.24)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS = int(_env_float("SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS", 45))
@@ -26742,6 +26748,9 @@ class KalshiSniperBot:
             item["cross_market_edge_context"] = context.get("cross_market_edge_context") or {}
             item["cross_market_edge_score"] = context.get("cross_market_edge_score", context.get("CROSS_MARKET_EDGE_SCORE", 0.0))
             item["CROSS_MARKET_EDGE_SCORE"] = context.get("CROSS_MARKET_EDGE_SCORE", context.get("cross_market_edge_score", 0.0))
+            item["btc_1h_ladder_context"] = context.get("btc_1h_ladder_context") or {}
+            item["btc_1h_ladder_score"] = context.get("btc_1h_ladder_score", context.get("BTC_1H_LADDER_SCORE", 0.0))
+            item["BTC_1H_LADDER_SCORE"] = context.get("BTC_1H_LADDER_SCORE", context.get("btc_1h_ladder_score", 0.0))
             item["elite_edge_context"] = context.get("elite_edge_context") or {}
             item["elite_edge_confidence"] = context.get("elite_edge_confidence", context.get("ELITE_EDGE_CONFIDENCE", 0.0))
             item["ELITE_EDGE_CONFIDENCE"] = context.get("ELITE_EDGE_CONFIDENCE", context.get("elite_edge_confidence", 0.0))
@@ -26762,6 +26771,9 @@ class KalshiSniperBot:
                 ("cross_market_edge_context", context.get("cross_market_edge_context") or {}),
                 ("cross_market_edge_score", context.get("cross_market_edge_score", context.get("CROSS_MARKET_EDGE_SCORE", 0.0))),
                 ("CROSS_MARKET_EDGE_SCORE", context.get("CROSS_MARKET_EDGE_SCORE", context.get("cross_market_edge_score", 0.0))),
+                ("btc_1h_ladder_context", context.get("btc_1h_ladder_context") or {}),
+                ("btc_1h_ladder_score", context.get("btc_1h_ladder_score", context.get("BTC_1H_LADDER_SCORE", 0.0))),
+                ("BTC_1H_LADDER_SCORE", context.get("BTC_1H_LADDER_SCORE", context.get("btc_1h_ladder_score", 0.0))),
                 ("elite_edge_context", context.get("elite_edge_context") or {}),
                 ("elite_edge_confidence", context.get("elite_edge_confidence", context.get("ELITE_EDGE_CONFIDENCE", 0.0))),
                 ("ELITE_EDGE_CONFIDENCE", context.get("ELITE_EDGE_CONFIDENCE", context.get("elite_edge_confidence", 0.0))),
@@ -26825,6 +26837,503 @@ class KalshiSniperBot:
             return round(max(0.01, min(0.99, last_price)), 6)
         return None
 
+    def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
+        market = market if isinstance(market, dict) else {}
+        text = " ".join(
+            str(value or "")
+            for value in (
+                family,
+                ticker,
+                market.get("ticker"),
+                market.get("series_ticker"),
+                market.get("event_ticker"),
+                market.get("title"),
+                market.get("subtitle"),
+                market.get("event_title"),
+                getattr(q, "ticker", None),
+                getattr(q, "title", None),
+                getattr(q, "market_title", None),
+            )
+            if str(value or "").strip()
+        ).upper()
+        if "BTC" not in text and "BITCOIN" not in text:
+            return False
+        return bool(
+            "KXBTC" in text
+            or "BITCOIN" in text
+            or any(term in text for term in ("BTC PRICE", "BTC ABOVE", "BTC BELOW", "BTC AT"))
+        )
+
+    def _parse_btc_1h_ladder_strike(self, *values):
+        fallback = None
+        for source in values:
+            text = str(source or "")
+            if not text.strip():
+                continue
+            candidates = []
+            preferred = []
+            for raw in re.findall(r"\$?\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\$?\b\d{4,7}(?:\.\d+)?\b", text):
+                try:
+                    value = float(str(raw).replace("$", "").replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+                if 1000.0 <= value <= 1000000.0:
+                    candidates.append(value)
+                    if "$" in raw or "," in raw or any(term in text.lower() for term in ("bitcoin", "btc", "price", "above", "below")):
+                        preferred.append(value)
+            if preferred:
+                return float(preferred[-1])
+            if candidates and fallback is None:
+                fallback = float(candidates[-1])
+        return fallback
+
+    def _btc_1h_ladder_group_key(self, market=None, *, ticker=None, family=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str(ticker or market.get("ticker") or "").strip()
+        for key in ("event_ticker", "eventTicker"):
+            value = str(market.get(key) or "").strip().upper()
+            if value:
+                return value
+        close_or_expiration = str(
+            market.get("close_time")
+            or market.get("expiration_time")
+            or market.get("settlement_time")
+            or market.get("expected_expiration_time")
+            or ""
+        ).strip()
+        if close_or_expiration:
+            return f"{str(family or self.get_market_family(market) or 'KXBTC').upper()}|{close_or_expiration[:13]}"
+        parts = ticker.split("-")
+        if len(parts) >= 2:
+            return "-".join(parts[:2]).upper()
+        return ticker.upper()
+
+    def _btc_1h_ladder_contract_snapshot(self, market=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str(market.get("ticker") or "").strip()
+        family = self.get_market_family(market) if ticker else ""
+        if not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market):
+            return None
+        strike = self._parse_btc_1h_ladder_strike(
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("rules_primary"),
+            market.get("rules_secondary"),
+            market.get("event_title"),
+            ticker,
+        )
+        if strike is None:
+            return None
+        yes_bid = self._sports_edge_price_value(market.get("yes_bid") or market.get("yes_bid_dollars"))
+        yes_ask = self._sports_edge_price_value(market.get("yes_ask") or market.get("yes_ask_dollars"))
+        no_bid = self._sports_edge_price_value(market.get("no_bid") or market.get("no_bid_dollars"))
+        no_ask = self._sports_edge_price_value(market.get("no_ask") or market.get("no_ask_dollars"))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+        yes_mid = self._structural_yes_mid(
+            {
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "last_price": market.get("last_price"),
+            }
+        )
+        if yes_mid is None:
+            return None
+        yes_top_size = self.to_float(
+            market.get("yes_top_size")
+            or market.get("yes_ask_size")
+            or market.get("yes_ask_size_fp")
+            or market.get("yes_bid_size_fp")
+            or market.get("yes_size"),
+            0.0,
+        ) or 0.0
+        no_top_size = self.to_float(
+            market.get("no_top_size")
+            or market.get("no_ask_size")
+            or market.get("no_ask_size_fp")
+            or market.get("no_bid_size_fp")
+            or market.get("no_size"),
+            0.0,
+        ) or 0.0
+        spread = None
+        if yes_bid is not None and yes_ask is not None and yes_ask >= yes_bid:
+            spread = max(0.0, yes_ask - yes_bid)
+        elif no_bid is not None and no_ask is not None and no_ask >= no_bid:
+            spread = max(0.0, no_ask - no_bid)
+        return {
+            "ticker": ticker,
+            "family": family,
+            "group_key": self._btc_1h_ladder_group_key(market, ticker=ticker, family=family),
+            "strike": strike,
+            "yes_mid": yes_mid,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "yes_top_size": yes_top_size,
+            "no_top_size": no_top_size,
+            "spread": spread,
+            "price_delta": self.to_float(
+                market.get("price_delta")
+                or market.get("recent_price_movement")
+                or market.get("movement")
+                or market.get("repricing_delta"),
+                0.0,
+            ) or 0.0,
+            "repricing_velocity": self.to_float(market.get("repricing_velocity") or market.get("velocity"), 0.0) or 0.0,
+            "close_time": market.get("close_time") or market.get("expiration_time"),
+        }
+
+    def _get_btc_1h_ladder_rank_adjustment(
+        self,
+        *,
+        market=None,
+        q=None,
+        family=None,
+        ticker=None,
+        markets=None,
+        selected_side="yes",
+        selected_price=None,
+        spread_value=None,
+        selected_top_size=0.0,
+        opposite_top_size=0.0,
+        source="ranking",
+        log=True,
+    ):
+        if not AION_BTC_1H_LADDER_ENABLED:
+            return {"enabled": False, "score": 0.0, "boost": 0.0, "reason": "disabled", "tags": []}
+        market = market if isinstance(market, dict) else {}
+        ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        if not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market, q=q):
+            return {"enabled": False, "score": 0.0, "boost": 0.0, "reason": "not_btc_ladder", "tags": []}
+        current_strike = self._parse_btc_1h_ladder_strike(
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("rules_primary"),
+            market.get("rules_secondary"),
+            market.get("event_title"),
+            getattr(q, "title", None),
+            getattr(q, "market_title", None),
+            ticker,
+        )
+        if current_strike is None:
+            if log:
+                self._emit_structural_edge_log(
+                    "[BTC-1H-LADDER-SKIP]",
+                    {
+                        "ticker": ticker,
+                        "settlement_group": self._btc_1h_ladder_group_key(market, ticker=ticker, family=family),
+                        "reason": "strike_parse_failed",
+                    },
+                    marker=("btc_1h_ladder_skip", source, ticker, "strike"),
+                )
+            return {"enabled": True, "score": 0.0, "boost": 0.0, "reason": "strike_parse_failed", "tags": []}
+
+        group_key = self._btc_1h_ladder_group_key(market, ticker=ticker, family=family)
+        ladder = []
+        for candidate_market in markets or []:
+            snapshot = self._btc_1h_ladder_contract_snapshot(candidate_market)
+            if not snapshot or snapshot.get("group_key") != group_key:
+                continue
+            ladder.append(snapshot)
+        if not any(item.get("ticker") == ticker for item in ladder):
+            current_yes_mid = self._structural_yes_mid(
+                {
+                    "yes_bid": self._sports_edge_read_value([market, q], "yes_bid", "yes_bid_dollars"),
+                    "yes_ask": self._sports_edge_read_value([market, q], "yes_ask", "yes_ask_dollars"),
+                    "last_price": selected_price,
+                }
+            )
+            if current_yes_mid is not None:
+                ladder.append(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "group_key": group_key,
+                        "strike": current_strike,
+                        "yes_mid": current_yes_mid,
+                        "yes_top_size": selected_top_size if selected_side == "yes" else opposite_top_size,
+                        "no_top_size": selected_top_size if selected_side == "no" else opposite_top_size,
+                        "spread": spread_value,
+                        "price_delta": self.to_float(self._sports_edge_read_value([market, q], "price_delta", "repricing_delta"), 0.0) or 0.0,
+                        "repricing_velocity": self.to_float(self._sports_edge_read_value([market, q], "repricing_velocity", "velocity"), 0.0) or 0.0,
+                    }
+                )
+        ladder = list({item["ticker"]: item for item in ladder if item.get("ticker")}.values())
+        ladder.sort(key=lambda item: self.to_float(item.get("strike"), 0.0) or 0.0)
+        current_index = next((idx for idx, item in enumerate(ladder) if item.get("ticker") == ticker), None)
+        group_size = len(ladder)
+        if log and group_size >= int(AION_BTC_1H_LADDER_MIN_GROUP_SIZE or 3):
+            self._emit_structural_edge_log(
+                "[BTC-1H-LADDER-DETECTED]",
+                {
+                    "ticker": ticker,
+                    "strike": current_strike,
+                    "settlement_group": group_key,
+                    "group_size": group_size,
+                    "min_strike": ladder[0].get("strike") if ladder else None,
+                    "max_strike": ladder[-1].get("strike") if ladder else None,
+                    "reason": "btc_ladder_grouped",
+                },
+                marker=("btc_1h_ladder_detected", source, group_key),
+            )
+        if current_index is None or group_size < int(AION_BTC_1H_LADDER_MIN_GROUP_SIZE or 3):
+            if log:
+                self._emit_structural_edge_log(
+                    "[BTC-1H-LADDER-SKIP]",
+                    {
+                        "ticker": ticker,
+                        "strike": current_strike,
+                        "settlement_group": group_key,
+                        "group_size": group_size,
+                        "reason": "insufficient_ladder_neighbors",
+                    },
+                    marker=("btc_1h_ladder_skip", source, ticker, "neighbors"),
+                )
+            return {"enabled": True, "score": 0.0, "boost": 0.0, "reason": "insufficient_ladder_neighbors", "tags": []}
+
+        selected_side = str(selected_side or "yes").strip().lower()
+        if selected_side not in {"yes", "no"}:
+            selected_side = "yes"
+        current = ladder[current_index]
+        current_yes_mid = self.to_float(current.get("yes_mid"), None)
+        selected_price_value = self.to_float(selected_price, None)
+        if selected_price_value is None:
+            selected_price_value = current_yes_mid if selected_side == "yes" else None if current_yes_mid is None else 1.0 - current_yes_mid
+        side_spread = self.to_float(spread_value, None)
+        if side_spread is None:
+            side_spread = self.to_float(current.get("spread"), None)
+        selected_depth = self.to_float(selected_top_size, 0.0) or 0.0
+        if selected_depth <= 0.0:
+            selected_depth = self.to_float(current.get("yes_top_size") if selected_side == "yes" else current.get("no_top_size"), 0.0) or 0.0
+        if (
+            selected_price_value is None
+            or not (0.0 < selected_price_value < 1.0)
+            or current_yes_mid is None
+            or side_spread is None
+            or side_spread > float(AION_BTC_1H_LADDER_ABSURD_SPREAD or 0.24)
+            or selected_depth <= 0.0
+        ):
+            reason = (
+                "malformed_price" if selected_price_value is None or not (0.0 < (selected_price_value or 0.0) < 1.0)
+                else "missing_mid" if current_yes_mid is None
+                else "absurd_spread" if side_spread is None or side_spread > float(AION_BTC_1H_LADDER_ABSURD_SPREAD or 0.24)
+                else "dead_book"
+            )
+            if log:
+                self._emit_structural_edge_log(
+                    "[BTC-1H-LADDER-SKIP]",
+                    {
+                        "ticker": ticker,
+                        "strike": current_strike,
+                        "settlement_group": group_key,
+                        "price": selected_price_value,
+                        "spread": side_spread,
+                        "liquidity": selected_depth,
+                        "top_size": selected_depth,
+                        "ladder_boost": 0.0,
+                        "final_score": 0.0,
+                        "reason": reason,
+                    },
+                    marker=("btc_1h_ladder_skip", source, ticker, reason),
+                )
+            return {"enabled": True, "score": 0.0, "boost": 0.0, "reason": reason, "tags": []}
+
+        lower = ladder[current_index - 1] if current_index > 0 else None
+        higher = ladder[current_index + 1] if current_index + 1 < group_size else None
+        curve_expected_yes = None
+        if lower and higher:
+            low_strike = self.to_float(lower.get("strike"), None)
+            high_strike = self.to_float(higher.get("strike"), None)
+            low_mid = self.to_float(lower.get("yes_mid"), None)
+            high_mid = self.to_float(higher.get("yes_mid"), None)
+            if low_strike is not None and high_strike is not None and high_strike != low_strike and low_mid is not None and high_mid is not None:
+                ratio = max(0.0, min(1.0, (current_strike - low_strike) / (high_strike - low_strike)))
+                curve_expected_yes = low_mid + ((high_mid - low_mid) * ratio)
+        elif lower:
+            curve_expected_yes = self.to_float(lower.get("yes_mid"), None)
+        elif higher:
+            curve_expected_yes = self.to_float(higher.get("yes_mid"), None)
+
+        side_curve_gap = 0.0
+        if curve_expected_yes is not None and current_yes_mid is not None:
+            side_curve_gap = (curve_expected_yes - current_yes_mid) if selected_side == "yes" else (current_yes_mid - curve_expected_yes)
+        curve_component = self._clamp(max(0.0, side_curve_gap) / 0.070)
+
+        monotonic_breaks = 0.0
+        for prev, nxt in zip(ladder, ladder[1:]):
+            prev_mid = self.to_float(prev.get("yes_mid"), None)
+            next_mid = self.to_float(nxt.get("yes_mid"), None)
+            if prev_mid is None or next_mid is None:
+                continue
+            violation = max(0.0, next_mid - prev_mid)
+            distance = abs((self.to_float(prev.get("strike"), 0.0) or 0.0) - current_strike) + abs((self.to_float(nxt.get("strike"), 0.0) or 0.0) - current_strike)
+            weight = 1.0 if distance <= 2500.0 else 0.45
+            monotonic_breaks = max(monotonic_breaks, violation * weight)
+        monotonic_component = self._clamp(monotonic_breaks / 0.080)
+
+        neighbor_slice = ladder[max(0, current_index - 2): min(group_size, current_index + 3)]
+        peer_deltas = [self.to_float(item.get("price_delta"), 0.0) or 0.0 for item in neighbor_slice if item.get("ticker") != ticker]
+        peer_velocities = [self.to_float(item.get("repricing_velocity"), 0.0) or 0.0 for item in neighbor_slice if item.get("ticker") != ticker]
+        peer_delta = sum(peer_deltas) / len(peer_deltas) if peer_deltas else 0.0
+        peer_velocity = sum(peer_velocities) / len(peer_velocities) if peer_velocities else 0.0
+        current_delta = self.to_float(current.get("price_delta"), 0.0) or 0.0
+        side_peer_delta = peer_delta if selected_side == "yes" else -peer_delta
+        side_current_delta = current_delta if selected_side == "yes" else -current_delta
+        repricing_lag_component = self._clamp(max(0.0, side_peer_delta - side_current_delta) * 10.0 + max(0.0, peer_velocity if selected_side == "yes" else -peer_velocity) * 35.0)
+        nearby_confirmation = self._clamp(
+            (
+                sum(
+                    1
+                    for item in neighbor_slice
+                    if item.get("ticker") != ticker
+                    and (
+                        (selected_side == "yes" and self.to_float(item.get("yes_mid"), 0.0) >= current_yes_mid)
+                        or (selected_side == "no" and self.to_float(item.get("yes_mid"), 1.0) <= current_yes_mid)
+                    )
+                )
+                / max(1, len(neighbor_slice) - 1)
+            )
+            + max(0.0, side_peer_delta) * 3.0
+        )
+        spread_component = 1.0 if side_spread <= 0.025 else 0.72 if side_spread <= 0.055 else 0.42 if side_spread <= 0.10 else 0.16
+        liquidity_component = self._clamp((selected_depth / 20.0) * 0.78 + (max(0.0, self.to_float(opposite_top_size, 0.0) or 0.0) / 35.0) * 0.22)
+        fast_expiry_component = 0.50
+        close_time = str(current.get("close_time") or market.get("close_time") or market.get("expiration_time") or "").strip()
+        if close_time:
+            try:
+                close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                minutes_left = (close_dt - datetime.now(timezone.utc)).total_seconds() / 60.0
+                if 0.0 <= minutes_left <= 75.0:
+                    fast_expiry_component = 1.0
+                elif 75.0 < minutes_left <= 150.0:
+                    fast_expiry_component = 0.72
+                elif minutes_left < 0.0:
+                    fast_expiry_component = 0.18
+            except Exception:
+                fast_expiry_component = 0.50
+        components = {
+            "curve_mispricing": round(curve_component, 4),
+            "monotonic_inconsistency": round(monotonic_component, 4),
+            "repricing_lag": round(repricing_lag_component, 4),
+            "nearby_confirmation": round(nearby_confirmation, 4),
+            "spread_efficiency": round(spread_component, 4),
+            "liquidity_depth": round(liquidity_component, 4),
+            "fast_expiry": round(fast_expiry_component, 4),
+        }
+        score = round(
+            max(
+                0.0,
+                min(
+                    100.0,
+                    curve_component * 23.0
+                    + monotonic_component * 18.0
+                    + repricing_lag_component * 17.0
+                    + nearby_confirmation * 15.0
+                    + spread_component * 9.0
+                    + liquidity_component * 10.0
+                    + fast_expiry_component * 8.0,
+                ),
+            ),
+            4,
+        )
+        tags = []
+        if curve_component >= 0.32:
+            tags.append("BTC_1H_LADDER_RELATIVE_MISPRICING")
+        if monotonic_component >= 0.25:
+            tags.append("BTC_1H_LADDER_MONOTONIC_BREAK")
+        if repricing_lag_component >= 0.28:
+            tags.append("BTC_1H_LADDER_REPRICING_LAG")
+        if nearby_confirmation >= 0.45:
+            tags.append("BTC_1H_LADDER_NEARBY_CONFIRMATION")
+        if fast_expiry_component >= 0.72:
+            tags.append("BTC_1H_FAST_EXPIRY")
+        boost = 0.0
+        if score >= 24.0:
+            boost = min(AION_BTC_1H_LADDER_MAX_RANK_BOOST, ((score - 20.0) / 80.0) * AION_BTC_1H_LADDER_MAX_RANK_BOOST)
+        probability_adjustment = 0.0
+        if score >= 45.0:
+            probability_adjustment = min(
+                AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT,
+                0.012 + ((score - 45.0) / 55.0) * (AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT - 0.012),
+            )
+        size_multiplier = 1.0
+        if score >= 82.0:
+            size_multiplier = AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER
+        elif score >= 65.0:
+            size_multiplier = min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, 1.72)
+        elif score >= 45.0:
+            size_multiplier = min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, 1.32)
+        context = {
+            "enabled": True,
+            "ticker": ticker,
+            "family": family,
+            "strike": current_strike,
+            "settlement_group": group_key,
+            "group_size": group_size,
+            "selected_side": selected_side,
+            "selected_price": round(selected_price_value, 6) if selected_price_value is not None else None,
+            "bid": current.get("yes_bid") if selected_side == "yes" else current.get("no_bid"),
+            "ask": current.get("yes_ask") if selected_side == "yes" else current.get("no_ask"),
+            "yes_mid": round(current_yes_mid, 6) if current_yes_mid is not None else None,
+            "curve_expected_yes": round(curve_expected_yes, 6) if curve_expected_yes is not None else None,
+            "side_curve_gap": round(side_curve_gap, 6),
+            "spread": round(side_spread, 6) if side_spread is not None else None,
+            "liquidity": selected_depth,
+            "top_size": selected_depth,
+            "score": score,
+            "BTC_1H_LADDER_SCORE": score,
+            "boost": round(max(0.0, boost), 4),
+            "probability_adjustment": round(max(0.0, probability_adjustment), 6),
+            "size_multiplier": round(max(1.0, min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
+            "components": components,
+            "tags": tags,
+            "pattern_keys": [f"{family}|{tag}" for tag in tags[:8]] + [f"BTC_1H_LADDER|{tag}" for tag in tags[:8]],
+            "reason": "+".join(tags) if tags else "btc_ladder_baseline",
+        }
+        if log and (score > 0.0 or tags):
+            self._emit_structural_edge_log(
+                "[BTC-1H-LADDER-SCORE]",
+                {
+                    "ticker": ticker,
+                    "strike": current_strike,
+                    "settlement_group": group_key,
+                    "price": context["selected_price"],
+                    "bid": current.get("yes_bid") if selected_side == "yes" else current.get("no_bid"),
+                    "ask": current.get("yes_ask") if selected_side == "yes" else current.get("no_ask"),
+                    "spread": context["spread"],
+                    "liquidity": selected_depth,
+                    "top_size": selected_depth,
+                    "ladder_boost": context["boost"],
+                    "final_score": score,
+                    "reason": context["reason"],
+                },
+                marker=("btc_1h_ladder_score", source, ticker),
+            )
+        if log and boost > 0.0:
+            self._emit_structural_edge_log(
+                "[BTC-1H-LADDER-PROMOTE]",
+                {
+                    "ticker": ticker,
+                    "strike": current_strike,
+                    "settlement_group": group_key,
+                    "price": context["selected_price"],
+                    "bid": current.get("yes_bid") if selected_side == "yes" else current.get("no_bid"),
+                    "ask": current.get("yes_ask") if selected_side == "yes" else current.get("no_ask"),
+                    "spread": context["spread"],
+                    "liquidity": selected_depth,
+                    "top_size": selected_depth,
+                    "ladder_boost": context["boost"],
+                    "final_score": score,
+                    "reason": context["reason"],
+                },
+                marker=("btc_1h_ladder_promote", source, ticker),
+            )
+        return context
+
     def _build_structural_family_profile(self, family=None, category=None, market_type=None):
         family_text = str(family or "").strip().upper() or "UNKNOWN"
         category_text = str(category or "").strip().lower() or "unknown"
@@ -26881,7 +27390,17 @@ class KalshiSniperBot:
                         "profile_reason": "sports_tennis",
                     }
                 )
-        elif family_text.startswith(("KXBTC", "KXETH")) or "CRYPTO" in family_text:
+        elif family_text.startswith("KXBTC"):
+            profile.update(
+                {
+                    "structural_edge_weight": 1.18,
+                    "timing_sensitivity": 0.94,
+                    "volatility_tolerance": 0.94,
+                    "sizing_bias": 1.10,
+                    "profile_reason": "btc_ladder_fast_repricing",
+                }
+            )
+        elif family_text.startswith("KXETH") or "CRYPTO" in family_text:
             profile.update(
                 {
                     "structural_edge_weight": 0.88,
@@ -27700,6 +28219,27 @@ class KalshiSniperBot:
         ) or 0.0
         cross_market_component = self._clamp(cross_market_score / 100.0)
         components["cross_market"] = round(cross_market_component, 4)
+        btc_1h_ladder_context = self._get_btc_1h_ladder_rank_adjustment(
+            market=market,
+            q=q,
+            family=family,
+            ticker=ticker,
+            markets=markets,
+            selected_side=selected_side,
+            selected_price=selected_price_value,
+            spread_value=spread_value,
+            selected_top_size=selected_top_size,
+            opposite_top_size=opposite_top_size,
+            source=source,
+            log=log,
+        )
+        btc_1h_ladder_score = self.to_float(
+            btc_1h_ladder_context.get("BTC_1H_LADDER_SCORE", btc_1h_ladder_context.get("score")),
+            0.0,
+        ) or 0.0
+        btc_1h_ladder_component = self._clamp(btc_1h_ladder_score / 100.0)
+        if btc_1h_ladder_context.get("enabled"):
+            components["btc_1h_ladder"] = round(btc_1h_ladder_component, 4)
         family_weight = self.to_float(family_profile.get("structural_edge_weight"), 1.0) or 1.0
         weighted_score = (
             curve_component * 24.0
@@ -27712,6 +28252,7 @@ class KalshiSniperBot:
             + stale_ladder_component * 8.0
         ) * family_weight
         weighted_score += cross_market_component * 30.0 * max(0.90, min(1.35, family_weight))
+        weighted_score += btc_1h_ladder_component * 34.0 * max(1.0, min(1.40, family_weight))
         structural_edge_score = round(max(0.0, min(100.0, weighted_score)), 4)
         tags = []
         if curve_component >= 0.35:
@@ -27735,6 +28276,9 @@ class KalshiSniperBot:
         for cross_tag in cross_market_context.get("tags") or []:
             if cross_tag not in tags:
                 tags.append(cross_tag)
+        for btc_ladder_tag in btc_1h_ladder_context.get("tags") or []:
+            if btc_ladder_tag not in tags:
+                tags.append(btc_ladder_tag)
         structural_pattern_keys = []
         market_kind = cross_market_context.get("market_kind") or self._structural_market_kind(
             family=family,
@@ -27746,6 +28290,8 @@ class KalshiSniperBot:
             structural_pattern_keys.append(f"{family}|{tag}")
             structural_pattern_keys.append(f"{market_kind}|{tag}")
         for key in cross_market_context.get("pattern_keys") or []:
+            structural_pattern_keys.append(str(key))
+        for key in btc_1h_ladder_context.get("pattern_keys") or []:
             structural_pattern_keys.append(str(key))
         if odds_bucket:
             structural_pattern_keys.append(f"{family}|{market_kind}|{odds_bucket}")
@@ -27802,6 +28348,7 @@ class KalshiSniperBot:
                 AION_STRUCTURAL_EDGE_MAX_RANK_BOOST + AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST,
                 boost
                 + (self.to_float(cross_market_context.get("boost"), 0.0) or 0.0)
+                + (self.to_float(btc_1h_ladder_context.get("boost"), 0.0) or 0.0)
                 + (self.to_float(elite_edge_context.get("rank_boost"), 0.0) or 0.0)
                 + max(-0.65, min(1.65, memory_rank_adjustment * 0.85)),
             ),
@@ -27820,6 +28367,7 @@ class KalshiSniperBot:
                 0.095,
                 probability_adjustment
                 + (self.to_float(cross_market_context.get("probability_adjustment"), 0.0) or 0.0)
+                + (self.to_float(btc_1h_ladder_context.get("probability_adjustment"), 0.0) or 0.0)
                 + (0.020 if elite_edge_confidence >= 85.0 else 0.012 if elite_edge_confidence >= 72.0 else 0.0)
                 + max(-0.012, min(0.018, memory_rank_adjustment * 0.014)),
             ),
@@ -27836,6 +28384,9 @@ class KalshiSniperBot:
         cross_size_multiplier = self.to_float(cross_market_context.get("size_multiplier"), 1.0) or 1.0
         if cross_market_score >= 42.0:
             size_multiplier = max(size_multiplier, cross_size_multiplier)
+        btc_ladder_size_multiplier = self.to_float(btc_1h_ladder_context.get("size_multiplier"), 1.0) or 1.0
+        if btc_1h_ladder_score >= 42.0:
+            size_multiplier = max(size_multiplier, btc_ladder_size_multiplier)
         elite_size_multiplier = self.to_float(elite_edge_context.get("size_multiplier"), 1.0) or 1.0
         if elite_edge_confidence >= 42.0:
             size_multiplier = max(size_multiplier, elite_size_multiplier)
@@ -27869,6 +28420,12 @@ class KalshiSniperBot:
             "cross_market_edge_rank_boost": cross_market_context.get("boost", 0.0),
             "cross_market_probability_adjustment": cross_market_context.get("probability_adjustment", 0.0),
             "cross_market_size_multiplier": cross_market_context.get("size_multiplier", 1.0),
+            "btc_1h_ladder_context": btc_1h_ladder_context,
+            "btc_1h_ladder_score": btc_1h_ladder_score,
+            "BTC_1H_LADDER_SCORE": btc_1h_ladder_score,
+            "btc_1h_ladder_rank_boost": btc_1h_ladder_context.get("boost", 0.0),
+            "btc_1h_ladder_probability_adjustment": btc_1h_ladder_context.get("probability_adjustment", 0.0),
+            "btc_1h_ladder_size_multiplier": btc_1h_ladder_context.get("size_multiplier", 1.0),
             "structural_memory_signal": memory_signal,
             "structural_memory_rank_adjustment": round(memory_rank_adjustment, 4),
             "structural_memory_size_multiplier": round(memory_size_multiplier, 4),
@@ -27913,6 +28470,14 @@ class KalshiSniperBot:
                         "peer_count": cross_market_context.get("peer_count"),
                         "peer_kinds": cross_market_context.get("peer_kinds"),
                         "reason": cross_market_context.get("reason"),
+                    },
+                    "btc_1h_ladder": {
+                        "score": btc_1h_ladder_score,
+                        "boost": btc_1h_ladder_context.get("boost"),
+                        "strike": btc_1h_ladder_context.get("strike"),
+                        "settlement_group": btc_1h_ladder_context.get("settlement_group"),
+                        "group_size": btc_1h_ladder_context.get("group_size"),
+                        "reason": btc_1h_ladder_context.get("reason"),
                     },
                     "structural_memory": {
                         "rank_adjustment": context.get("structural_memory_rank_adjustment"),

@@ -566,6 +566,8 @@ def maybe_auto_reprice_recent_order(
                     "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),
                     "STRUCTURAL_EDGE_SCORE": getattr(q, "STRUCTURAL_EDGE_SCORE", None),
                     "CROSS_MARKET_EDGE_SCORE": getattr(q, "CROSS_MARKET_EDGE_SCORE", None),
+                    "BTC_1H_LADDER_SCORE": getattr(q, "BTC_1H_LADDER_SCORE", None),
+                    "btc_1h_ladder_context": getattr(q, "btc_1h_ladder_context", None),
                     "ELITE_EDGE_CONFIDENCE": getattr(q, "ELITE_EDGE_CONFIDENCE", None),
                     "elite_edge_context": getattr(q, "elite_edge_context", None),
                     "cross_market_edge_context": getattr(q, "cross_market_edge_context", None),
@@ -712,6 +714,9 @@ def submit_live_order(
         "structural_pattern_keys",
         "STRUCTURAL_EDGE_SCORE",
         "CROSS_MARKET_EDGE_SCORE",
+        "btc_1h_ladder_context",
+        "btc_1h_ladder_score",
+        "BTC_1H_LADDER_SCORE",
         "ELITE_EDGE_CONFIDENCE",
         "elite_edge_context",
         "elite_edge_size_multiplier",
@@ -727,6 +732,90 @@ def submit_live_order(
                 value = None
             if value is not None:
                 payload[field] = value
+    structural_context = payload.get("structural_edge_context") if isinstance(payload.get("structural_edge_context"), dict) else {}
+    btc_ladder_context = payload.get("btc_1h_ladder_context") if isinstance(payload.get("btc_1h_ladder_context"), dict) else {}
+    if not btc_ladder_context and isinstance(structural_context.get("btc_1h_ladder_context"), dict):
+        btc_ladder_context = structural_context.get("btc_1h_ladder_context") or {}
+        payload["btc_1h_ladder_context"] = btc_ladder_context
+    if btc_ladder_context:
+        entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+        entry_context.setdefault("btc_1h_ladder_context", btc_ladder_context)
+        entry_context.setdefault("btc_1h_ladder_score", btc_ladder_context.get("score") or btc_ladder_context.get("BTC_1H_LADDER_SCORE"))
+        if structural_context:
+            entry_context.setdefault("structural_edge_context", structural_context)
+        payload["entry_context"] = entry_context
+    btc_ladder_group = str(btc_ladder_context.get("settlement_group") or "").strip()
+    if btc_ladder_group and str(family or "").upper().startswith("KXBTC"):
+        try:
+            for position in bot._get_open_live_positions() or []:
+                if not isinstance(position, dict):
+                    continue
+                position_ticker = str(position.get("ticker") or "").strip()
+                if not position_ticker or position_ticker == str(payload.get("ticker") or "").strip():
+                    continue
+                position_context = position.get("entry_context") if isinstance(position.get("entry_context"), dict) else {}
+                position_structural = position_context.get("structural_edge_context") if isinstance(position_context.get("structural_edge_context"), dict) else {}
+                position_btc_ladder = (
+                    position_context.get("btc_1h_ladder_context")
+                    if isinstance(position_context.get("btc_1h_ladder_context"), dict)
+                    else position_structural.get("btc_1h_ladder_context")
+                    if isinstance(position_structural.get("btc_1h_ladder_context"), dict)
+                    else {}
+                )
+                position_group = str(position_btc_ladder.get("settlement_group") or "").strip()
+                if position_group and position_group == btc_ladder_group:
+                    print(
+                        "[BTC-1H-LADDER-SKIP] "
+                        + json.dumps(
+                            {
+                                "ticker": payload.get("ticker"),
+                                "strike": btc_ladder_context.get("strike"),
+                                "settlement_group": btc_ladder_group,
+                                "price": payload.get("price") or payload.get("selected_price"),
+                                "bid": btc_ladder_context.get("bid"),
+                                "ask": btc_ladder_context.get("ask"),
+                                "spread": btc_ladder_context.get("spread"),
+                                "liquidity": btc_ladder_context.get("liquidity"),
+                                "top_size": btc_ladder_context.get("top_size"),
+                                "ladder_boost": btc_ladder_context.get("boost"),
+                                "final_score": btc_ladder_context.get("score"),
+                                "reason": "same_settlement_window_position_open",
+                                "open_ticker": position_ticker,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    return {
+                        "submitted": False,
+                        "reason": "btc_1h_ladder_same_window_guard",
+                        "payload": payload,
+                        "open_ticker": position_ticker,
+                    }
+        except Exception:
+            pass
+    if btc_ladder_context.get("enabled") and bot.to_float(btc_ladder_context.get("boost"), 0.0) > 0.0:
+        print(
+            "[BTC-1H-LADDER-EXECUTE] "
+            + json.dumps(
+                {
+                    "ticker": payload.get("ticker"),
+                    "strike": btc_ladder_context.get("strike"),
+                    "settlement_group": btc_ladder_context.get("settlement_group"),
+                    "price": payload.get("price") or payload.get("selected_price"),
+                    "bid": btc_ladder_context.get("bid"),
+                    "ask": btc_ladder_context.get("ask"),
+                    "spread": btc_ladder_context.get("spread"),
+                    "liquidity": btc_ladder_context.get("liquidity"),
+                    "top_size": btc_ladder_context.get("top_size"),
+                    "ladder_boost": btc_ladder_context.get("boost"),
+                    "final_score": btc_ladder_context.get("score"),
+                    "reason": btc_ladder_context.get("reason"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
     result = bot.place_live_order({**payload, **legacy_payload})
     if result.get("submitted"):
         bot._live_order_timestamps.append(time.time())
@@ -766,6 +855,8 @@ def submit_live_order(
                     "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),
                     "STRUCTURAL_EDGE_SCORE": getattr(q, "STRUCTURAL_EDGE_SCORE", None),
                     "CROSS_MARKET_EDGE_SCORE": getattr(q, "CROSS_MARKET_EDGE_SCORE", None),
+                    "BTC_1H_LADDER_SCORE": getattr(q, "BTC_1H_LADDER_SCORE", None),
+                    "btc_1h_ladder_context": getattr(q, "btc_1h_ladder_context", None),
                     "ELITE_EDGE_CONFIDENCE": getattr(q, "ELITE_EDGE_CONFIDENCE", None),
                     "elite_edge_context": getattr(q, "elite_edge_context", None),
                     "cross_market_edge_context": getattr(q, "cross_market_edge_context", None),
