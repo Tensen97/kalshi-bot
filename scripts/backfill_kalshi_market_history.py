@@ -58,6 +58,36 @@ PRIORITY_FAMILIES: tuple[dict[str, Any], ...] = (
         "tokens": ("MLB",),
     },
     {
+        "name": "nfl_spreads_totals",
+        "series_tickers": ("KXNFLSPREAD", "KXNFLTOTAL", "KXNFLMONEYLINE"),
+        "tokens": ("NFL",),
+    },
+    {
+        "name": "nhl_markets",
+        "series_tickers": ("KXNHL", "KXNHLGOAL", "KXNHLSPREAD", "KXNHLTOTAL"),
+        "tokens": ("NHL",),
+    },
+    {
+        "name": "ncaa_markets",
+        "series_tickers": ("KXNCAAB", "KXNCAAF", "KXCFB", "KXCBB"),
+        "tokens": ("NCAA",),
+    },
+    {
+        "name": "tennis_matches",
+        "series_tickers": ("KXATPCHALLENGERMATCH", "KXTENNISMATCH", "KXATP", "KXWTA", "KXITF"),
+        "tokens": ("TENNIS",),
+    },
+    {
+        "name": "golf_soccer_combat",
+        "series_tickers": ("KXGOLF", "KXEPL", "KXSOCCER", "KXUFC", "KXMMA", "KXBOX"),
+        "tokens": ("SPORT",),
+    },
+    {
+        "name": "sports_combo_player_props",
+        "series_tickers": ("KXPLAYERPROP", "KXSPORTSCOMBO", "KXSPORTSPARLAY"),
+        "tokens": ("PROP",),
+    },
+    {
         "name": "btc_crypto_short_duration",
         "series_tickers": ("KXBTC15M", "KXETH15M", "KXCRYPTO"),
         "tokens": ("BTC", "CRYPTO"),
@@ -335,7 +365,16 @@ def category_for_market(market: dict[str, Any], family: str | None) -> str | Non
     text = f"{family_upper} {ticker_upper}"
     if any(prefix in text for prefix in ("KXBTC", "KXETH", "KXXRP", "CRYPTO", "BTC", "ETH")):
         return "crypto"
-    if any(prefix in text for prefix in ("KXNBA", "KXMLB", "KXNFL", "KXNHL", "NBA", "MLB")):
+    if any(
+        prefix in text
+        for prefix in (
+            "KXNBA", "KXWNBA", "KXMLB", "KXNFL", "KXNHL", "KXNCAA", "KXCFB", "KXCBB",
+            "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXGOLF", "KXEPL", "KXSOCCER",
+            "KXUFC", "KXMMA", "KXBOX", "NBA", "MLB", "NFL", "NHL", "NCAA",
+            "TENNIS", "GOLF", "SOCCER", "SPREAD", "TOTAL", "PLAYER PROP", "STRIKEOUT",
+            "COMBO", "PARLAY",
+        )
+    ):
         return "sports"
     return None
 

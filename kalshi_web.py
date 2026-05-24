@@ -112,6 +112,15 @@ except Exception:
     safe_atomic_json_write = None
 
 try:
+    from aion_data_coverage import (
+        audit_kalshi_data_coverage,
+        build_sports_data_signal,
+    )
+except Exception:
+    audit_kalshi_data_coverage = None
+    build_sports_data_signal = None
+
+try:
     from sports import calibration as sports_calibration
     from sports import harvest as sports_harvest
 except Exception:
@@ -1371,8 +1380,32 @@ TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS = [
     "KXMLBSPREAD",
     "KXMLBTOTAL",
     "KXMLBMONEYLINE",
+    "KXNFLSPREAD",
+    "KXNFLTOTAL",
+    "KXNFLMONEYLINE",
+    "KXNHL",
+    "KXNHLGOAL",
+    "KXNHLSPREAD",
+    "KXNHLTOTAL",
+    "KXNCAAB",
+    "KXNCAAF",
+    "KXCFB",
+    "KXCBB",
     "KXATPCHALLENGERMATCH",
     "KXTENNISMATCH",
+    "KXATP",
+    "KXWTA",
+    "KXITF",
+    "KXGOLF",
+    "KXEPL",
+    "KXSOCCER",
+    "KXUFC",
+    "KXMMA",
+    "KXBOX",
+    "KXMLBHRR",
+    "KXMLBHR",
+    "KXMLBTB",
+    "KXMLBHIT",
     "KXTEMP",
     "KXRAIN",
 ]
@@ -1384,7 +1417,11 @@ HIGH_LIQUIDITY_PRIORITY_FAMILIES = (
 )
 AION_HIGH_LIQUIDITY_ALLOWED_FAMILIES = HIGH_LIQUIDITY_PRIORITY_FAMILIES
 LIQUIDITY_PRIORITY_TIER_1_PREFIXES = ("BTC", "ETH", "XRP", "KXBTC", "KXETH", "KXXRP")
-LIQUIDITY_PRIORITY_TIER_2_PREFIXES = ("KXNBA", "KXMLB", "NBA", "MLB")
+LIQUIDITY_PRIORITY_TIER_2_PREFIXES = (
+    "KXNBA", "KXWNBA", "KXMLB", "KXNFL", "KXNHL", "KXNCAA", "KXCFB", "KXCBB",
+    "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXGOLF", "KXEPL", "KXSOCCER",
+    "NBA", "MLB", "NFL", "NHL", "NCAA", "TENNIS", "GOLF", "SOCCER",
+)
 DISCOVERY_DEPRIORITIZED_FAMILIES = (
     "KXTEMP",
     "KXRAIN",
@@ -1403,8 +1440,32 @@ TARGETED_SERIES_PRIORITY_WINDOWS = {
     "KXMLBSPREAD": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXMLBTOTAL": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXMLBMONEYLINE": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNFLSPREAD": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNFLTOTAL": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNFLMONEYLINE": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNHL": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNHLGOAL": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNHLSPREAD": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNHLTOTAL": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNCAAB": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNCAAF": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXCFB": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXCBB": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXATPCHALLENGERMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXTENNISMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXATP": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXWTA": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXITF": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXGOLF": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXEPL": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXSOCCER": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXUFC": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXMMA": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXBOX": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXMLBHRR": {"hours_utc": (), "reason": "sports_player_prop_window"},
+    "KXMLBHR": {"hours_utc": (), "reason": "sports_player_prop_window"},
+    "KXMLBTB": {"hours_utc": (), "reason": "sports_player_prop_window"},
+    "KXMLBHIT": {"hours_utc": (), "reason": "sports_player_prop_window"},
     "KXTEMP": {"hours_utc": (), "reason": "weather_active_short_horizon_window"},
     "KXRAIN": {"hours_utc": (), "reason": "weather_active_short_horizon_window"},
 }
@@ -1419,8 +1480,20 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
             "KXMLBSPREAD",
             "KXMLBTOTAL",
             "KXMLBMONEYLINE",
+            "KXNFLSPREAD",
+            "KXNFLTOTAL",
+            "KXNHL",
+            "KXNHLGOAL",
+            "KXNCAAB",
+            "KXNCAAF",
             "KXATPCHALLENGERMATCH",
             "KXTENNISMATCH",
+            "KXGOLF",
+            "KXEPL",
+            "KXSOCCER",
+            "KXMLBHRR",
+            "KXMLBTB",
+            "KXMLBHIT",
             "KXBTC15M",
             "KXTEMP",
             "KXRAIN",
@@ -1438,8 +1511,20 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
             "KXMLBSPREAD",
             "KXMLBTOTAL",
             "KXMLBMONEYLINE",
+            "KXNFLSPREAD",
+            "KXNFLTOTAL",
+            "KXNHL",
+            "KXNHLGOAL",
+            "KXNCAAB",
+            "KXNCAAF",
             "KXATPCHALLENGERMATCH",
             "KXTENNISMATCH",
+            "KXGOLF",
+            "KXEPL",
+            "KXSOCCER",
+            "KXMLBHRR",
+            "KXMLBTB",
+            "KXMLBHIT",
             "KXTEMP",
             "KXRAIN",
         ],
@@ -1614,6 +1699,9 @@ AION_SPORTS_EDGE_USABLE_SPREAD = get_env_float("AION_SPORTS_EDGE_USABLE_SPREAD",
 AION_SPORTS_EDGE_MIN_TOP_DEPTH = get_env_float("AION_SPORTS_EDGE_MIN_TOP_DEPTH", 3.0)
 AION_SPORTS_EDGE_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_SIZE_MULTIPLIER", 1.15)
 AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER", 1.35)
+AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
+AION_DATA_COVERAGE_REFRESH_SECONDS = get_env_int("AION_DATA_COVERAGE_REFRESH_SECONDS", 900)
+AION_DATA_COVERAGE_INCLUDE_TELEMETRY = get_env_bool("AION_DATA_COVERAGE_INCLUDE_TELEMETRY", 0)
 AION_CONTROLLED_LOOSENING_ENABLED = get_env_bool("AION_CONTROLLED_LOOSENING_ENABLED", 1)
 AION_PHASE55_FASTPATH_ENABLED = get_env_bool("AION_PHASE55_FASTPATH_ENABLED", 1)
 AION_MICRO_PULLBACK_RELAX_ENABLED = get_env_bool("AION_MICRO_PULLBACK_RELAX_ENABLED", 1)
@@ -2013,6 +2101,8 @@ class KalshiSniperBot:
         self.last_sports_harvest_summary = {}
         self.last_sports_harvest_family_summary = {}
         self.last_sports_harvest_overall_summary = {}
+        self.aion_data_coverage_cache = {}
+        self.aion_data_coverage_last_ts = 0.0
         self.realm_ix_startup_alert_sent = False
         self.market_memory_profiles = {}
         self.last_market_memory_summary = {}
@@ -2555,13 +2645,19 @@ class KalshiSniperBot:
         family = str(family or "").strip().upper()
         if not family and ticker:
             family = str(self.get_market_family({"ticker": str(ticker).strip()}) or "").strip().upper()
-        sports_prefixes = ("KXNBA", "KXMLB", "KXNFL", "KXNHL", "KXNCAAB", "KXNCAAF")
+        sports_prefixes = (
+            "KXNBA", "KXWNBA", "KXMLB", "KXNFL", "KXNHL", "KXNCAA", "KXNCAAB", "KXNCAAF",
+            "KXCFB", "KXCBB", "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXGOLF", "KXEPL",
+            "KXSOCCER", "KXUFC", "KXMMA", "KXBOX",
+        )
         explicit_sports_families = {
             "KXNBA", "KXNBA1H", "KXNBA1HTOTAL", "KXNBA1HSPREAD", "KXNBASPREAD", "KXNBATOTAL",
             "KXMLB", "KXMLBSPREAD", "KXMLBTOTAL", "KXMLBHRR", "KXMLBMONEYLINE", "KXMLBHR", "KXMLBTB", "KXMLBHIT",
             "KXNFL", "KXNFLSPREAD", "KXNFLTOTAL",
             "KXNHL", "KXNHLGOAL",
             "KXNCAAB", "KXNCAAF",
+            "KXCFB", "KXCBB", "KXATP", "KXWTA", "KXITF", "KXTENNISMATCH", "KXATPCHALLENGERMATCH",
+            "KXGOLF", "KXEPL", "KXSOCCER", "KXUFC", "KXMMA", "KXBOX",
         }
         if family in explicit_sports_families or any(family.startswith(prefix) for prefix in sports_prefixes):
             return True
@@ -25396,6 +25492,136 @@ class KalshiSniperBot:
             self._attach_elite_signal_context(item=item, q=q, context=context)
         return context
 
+    def _emit_aion_data_coverage_logs(self, audit, *, source="live_cycle"):
+        audit = audit if isinstance(audit, dict) else {}
+        totals = audit.get("totals") if isinstance(audit.get("totals"), dict) else {}
+        sports = audit.get("sports") if isinstance(audit.get("sports"), dict) else {}
+        family_coverage = audit.get("sports_family_coverage") if isinstance(audit.get("sports_family_coverage"), list) else []
+        try:
+            print(
+                "[AION-DATA-AUDIT] "
+                + json.dumps(
+                    {
+                        "source": source,
+                        "include_telemetry": bool(audit.get("include_telemetry")),
+                        "total_records": totals.get("records"),
+                        "oldest_timestamp": totals.get("oldest_timestamp"),
+                        "newest_timestamp": totals.get("newest_timestamp"),
+                        "unique_markets_tickers": totals.get("unique_markets_tickers"),
+                        "total_categories_families": totals.get("total_categories_families"),
+                        "source_count": len(audit.get("sources") or []),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[AION-SPORTS-DATA] "
+                + json.dumps(
+                    {
+                        "source": source,
+                        "sports_record_count": sports.get("record_count"),
+                        "sports_unique_markets_tickers": sports.get("unique_markets_tickers"),
+                        "sports_oldest_timestamp": sports.get("oldest_timestamp"),
+                        "sports_newest_timestamp": sports.get("newest_timestamp"),
+                        "top_sports_families": sports.get("top_families"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            for family in family_coverage[:8]:
+                print(
+                    "[AION-SPORTS-FAMILY-COVERAGE] "
+                    + json.dumps(
+                        {
+                            "source": source,
+                            "family": family.get("family"),
+                            "records": family.get("records"),
+                            "unique_markets_tickers": family.get("unique_markets_tickers"),
+                            "liquidity_samples": family.get("liquidity_samples"),
+                            "price_observations": family.get("price_observations"),
+                            "oldest_timestamp": family.get("oldest_timestamp"),
+                            "newest_timestamp": family.get("newest_timestamp"),
+                            "avg_spread": family.get("avg_spread"),
+                            "avg_liquidity": family.get("avg_liquidity"),
+                            "win_rate": family.get("win_rate"),
+                            "pnl_dollars": family.get("pnl_dollars"),
+                            "tags": family.get("tags"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            print(
+                "[AION-SPORTS-DATA-READY] "
+                + json.dumps(
+                    {
+                        "source": source,
+                        "ready_families": sports.get("ready_families"),
+                        "active_families": sports.get("active_families"),
+                        "thin_families": sports.get("thin_families"),
+                        "stale_families": sports.get("stale_families"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception as exc:
+            print(
+                "[AION-DATA-AUDIT] "
+                + json.dumps({"source": source, "error": exc.__class__.__name__}, sort_keys=True, default=str)
+            )
+
+    def _refresh_aion_data_coverage_cache(self, *, force=False, source="live_cycle"):
+        if not AION_DATA_COVERAGE_AUDIT_ENABLED or audit_kalshi_data_coverage is None:
+            return getattr(self, "aion_data_coverage_cache", {}) if isinstance(getattr(self, "aion_data_coverage_cache", {}), dict) else {}
+        now_ts = time.time()
+        last_ts = self.to_float(getattr(self, "aion_data_coverage_last_ts", 0.0), 0.0) or 0.0
+        cache = getattr(self, "aion_data_coverage_cache", {})
+        if (
+            not force
+            and isinstance(cache, dict)
+            and cache
+            and now_ts - last_ts < max(60, int(AION_DATA_COVERAGE_REFRESH_SECONDS or 900))
+        ):
+            return cache
+        try:
+            repo_root = _Path(__file__).resolve().parent
+            audit = audit_kalshi_data_coverage(
+                repo_root,
+                include_telemetry=bool(AION_DATA_COVERAGE_INCLUDE_TELEMETRY),
+            )
+            self.aion_data_coverage_cache = audit
+            self.aion_data_coverage_last_ts = now_ts
+            self._emit_aion_data_coverage_logs(audit, source=source)
+            return audit
+        except Exception as exc:
+            print(
+                "[AION-DATA-AUDIT] "
+                + json.dumps(
+                    {
+                        "source": source,
+                        "error": exc.__class__.__name__,
+                        "action": "continue_trading",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            return cache if isinstance(cache, dict) else {}
+
+    def _get_sports_data_signal(self, family):
+        if build_sports_data_signal is None:
+            return {}
+        audit = getattr(self, "aion_data_coverage_cache", {})
+        if not isinstance(audit, dict) or not audit:
+            audit = self._refresh_aion_data_coverage_cache(force=False, source="sports_edge_lazy")
+        try:
+            return build_sports_data_signal(audit, family)
+        except Exception:
+            return {}
+
     def _sports_edge_read_value(self, sources, *names):
         for source in sources or []:
             if source is None:
@@ -25661,6 +25887,14 @@ class KalshiSniperBot:
                 self.to_float(self._sports_edge_read_value(sources, "ev_edge"), 0.0) or 0.0,
             ) > 0.0
         )
+        sports_data_signal = self._get_sports_data_signal(family)
+        sports_data_signal = sports_data_signal if isinstance(sports_data_signal, dict) else {}
+        data_readiness_tags = [
+            str(tag).strip()
+            for tag in (sports_data_signal.get("tags") or [])
+            if str(tag or "").strip()
+        ]
+        data_rank_boost = self.to_float(sports_data_signal.get("rank_boost"), 0.0) or 0.0
         tags = []
         if underdog_value:
             tags.append("SPORTS_UNDERDOG_VALUE")
@@ -25672,6 +25906,9 @@ class KalshiSniperBot:
             tags.append("SPORTS_THIN_BOOK_RISK")
         if momentum_risk:
             tags.append("SPORTS_MOMENTUM_RISK")
+        for data_tag in data_readiness_tags:
+            if data_tag not in tags:
+                tags.append(data_tag)
 
         boost = 0.0
         base_boost = max(0.0, self.to_float(AION_SPORTS_EDGE_BASE_BOOST, 0.0) or 0.0)
@@ -25683,6 +25920,8 @@ class KalshiSniperBot:
             boost += base_boost * 0.45
         if positive_edge:
             boost += base_boost * 0.25
+        if data_rank_boost > 0.0:
+            boost += data_rank_boost
         if underdog_value and asymmetric_payout and good_book and not momentum_risk:
             boost = max(boost, self.to_float(AION_SPORTS_EDGE_STRONG_BOOST, boost) or boost)
         if not depth_usable:
@@ -25723,6 +25962,17 @@ class KalshiSniperBot:
             "directional_bias": selected_directional_bias,
             "momentum_risk": momentum_risk,
             "positive_edge": positive_edge,
+            "sports_family_activity_level": sports_data_signal.get("activity_level"),
+            "data_readiness_tags": data_readiness_tags,
+            "sports_data_rank_boost": round(data_rank_boost, 4),
+            "sports_family_records": sports_data_signal.get("records"),
+            "sports_family_unique_markets_tickers": sports_data_signal.get("unique_markets_tickers"),
+            "sports_family_avg_spread": sports_data_signal.get("avg_spread"),
+            "sports_family_avg_liquidity": sports_data_signal.get("avg_liquidity"),
+            "sports_family_price_observations": sports_data_signal.get("price_observations"),
+            "sports_family_liquidity_samples": sports_data_signal.get("liquidity_samples"),
+            "sports_family_win_rate": sports_data_signal.get("win_rate"),
+            "sports_family_pnl_dollars": sports_data_signal.get("pnl_dollars"),
             "tags": tags,
             "boost": boost,
             "score_at_entry": round(score_at_entry, 4) if score_at_entry is not None else None,
@@ -25744,6 +25994,8 @@ class KalshiSniperBot:
                     "spread": context["spread"],
                     "book_depth": context["book_depth"],
                     "momentum_risk": momentum_risk,
+                    "data_readiness_tags": data_readiness_tags,
+                    "sports_data_rank_boost": round(data_rank_boost, 4),
                 },
                 marker=("score", source, ticker, tuple(tags), boost),
             )
@@ -25759,6 +26011,25 @@ class KalshiSniperBot:
                     "reason": "sports_underdog_asymmetry_book_boost",
                 },
                 marker=("boost", source, ticker, boost, tuple(tags)),
+            )
+        if log and data_readiness_tags:
+            self._emit_sports_edge_log(
+                "[AION-SPORTS-DATA]",
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "source": source,
+                    "records": sports_data_signal.get("records"),
+                    "unique_markets_tickers": sports_data_signal.get("unique_markets_tickers"),
+                    "activity_level": sports_data_signal.get("activity_level"),
+                    "tags": data_readiness_tags,
+                    "rank_boost": round(data_rank_boost, 4),
+                    "avg_spread": sports_data_signal.get("avg_spread"),
+                    "avg_liquidity": sports_data_signal.get("avg_liquidity"),
+                    "win_rate": sports_data_signal.get("win_rate"),
+                    "pnl_dollars": sports_data_signal.get("pnl_dollars"),
+                },
+                marker=("data", source, family, tuple(data_readiness_tags), round(data_rank_boost, 4)),
             )
         return context
 
@@ -27885,7 +28156,9 @@ class KalshiSniperBot:
         if "weather" in explicit_category or family.startswith(("KXTEMP", "KXRAIN", "KXSNOW", "KXWEATHER")):
             return "weather"
         if "sport" in explicit_category or family.startswith((
-            "KXNBA", "KXWNBA", "KXNHL", "KXMLB", "KXNFL", "KXNFL", "KXNCAA", "KXATP", "KXITF", "KXEPL", "KXSOCCER", "KXUFC", "KXBOX", "KXMMA", "KXGOLF", "KXCFB", "KXCBB"
+            "KXNBA", "KXWNBA", "KXNHL", "KXMLB", "KXNFL", "KXNCAA", "KXNCAAB", "KXNCAAF",
+            "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXEPL", "KXSOCCER", "KXUFC",
+            "KXBOX", "KXMMA", "KXGOLF", "KXCFB", "KXCBB"
         )):
             return "sports"
         return "general"
@@ -53835,6 +54108,7 @@ class KalshiSniperBot:
         self._emit_aggressive_candidate_search_heartbeat()
         self.maybe_send_telegram_heartbeat()
         markets = self.get_markets(limit=self.max_markets, status="open")
+        self._refresh_aion_data_coverage_cache(source="live_cycle")
         self._start_execution_failure_audit_cycle(source="live_cycle")
         self._start_live_edge_quality_cycle(source="live_cycle")
         markets_by_ticker = {str(market.get("ticker", "") or "").strip(): market for market in markets if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()}

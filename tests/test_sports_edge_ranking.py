@@ -13,6 +13,21 @@ class SportsEdgeRankingTests(unittest.TestCase):
         bot.trading_halted = False
         bot.realized_pnl = 0.0
         bot.live_realized_pnl_today = 0.0
+        bot.aion_data_coverage_cache = {
+            "sports_family_coverage": [
+                {
+                    "family": "KXNBA1HTOTAL",
+                    "records": 25,
+                    "unique_markets_tickers": 8,
+                    "liquidity_samples": 12,
+                    "price_observations": 12,
+                    "avg_spread": 0.03,
+                    "tags": ["SPORTS_DATA_READY", "SPORTS_DATA_ACTIVE"],
+                    "activity_level": "ready",
+                }
+            ]
+        }
+        bot.aion_data_coverage_last_ts = 0.0
         bot.check_live_duplicate_position_api = lambda ticker: {"blocked": False}
         return bot
 
@@ -47,6 +62,7 @@ class SportsEdgeRankingTests(unittest.TestCase):
         self.assertIn("SPORTS_UNDERDOG_VALUE", context["tags"])
         self.assertIn("SPORTS_ASYMMETRIC_PAYOUT", context["tags"])
         self.assertIn("SPORTS_GOOD_BOOK", context["tags"])
+        self.assertIn("SPORTS_DATA_READY", context["data_readiness_tags"])
 
     def test_sports_edge_can_nudge_ev_sizing_without_exceeding_cap_hint(self):
         bot = self._make_bot()
