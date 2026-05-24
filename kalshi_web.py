@@ -19994,13 +19994,17 @@ class KalshiSniperBot:
         }
         if text.startswith("payload_missing:"):
             return "hard_safety"
+        if text.startswith("edge_after_cost="):
+            return "profit_quality"
+        if text.startswith("group_"):
+            return "duplicate_cadence"
         if text.startswith("realm_vv_status_"):
             return "obsolete_legacy"
         if text in hard_labels:
             return "hard_safety"
         if text in obsolete_labels:
             return "obsolete_legacy"
-        if text in {"unsafe_price", "unsafe_spread", "spread_extreme", "spread_wait", "edge_below_threshold", "edge_below_aggressive_floor", "sports_context_unavailable", "sports_context_required_for_weak_signal"}:
+        if text in {"unsafe_price", "unsafe_spread", "unsafe_spread_bucket", "spread_extreme", "spread_wait", "spread_above_threshold", "edge_below_threshold", "edge_below_aggressive_floor", "near_safe_relief_denied", "sports_context_unavailable", "sports_context_required_for_weak_signal"}:
             return "profit_quality"
         if text in {"execution_attempt_cooldown", "entry_attempt_cooldown", "cooldown_active", "cooldown"}:
             return "duplicate_cadence"
@@ -20071,6 +20075,9 @@ class KalshiSniperBot:
                 "dispatch_decision",
                 "payload_build",
                 "payload_size_check",
+                "position_risk_gate",
+                "group_filter_gate",
+                "cooldown_gate",
                 "duplicate_guard",
                 "duplicate_api_gate",
                 "execution_cooldown",
@@ -51256,21 +51263,6 @@ class KalshiSniperBot:
                 default=str,
             )
         )
-        self._emit_aion_final_execution_truth(
-            ticker=ticker,
-            family=family,
-            decision="EXECUTE" if bool(payload.get("canonical_ready")) else "SKIP",
-            reason=payload.get("final_block_reason") or ("all_guards_passed" if bool(payload.get("canonical_ready")) else "final_not_ready_unknown"),
-            stage="final_readiness_sync",
-            canonical_state=payload.get("phase55_status") if payload.get("canonical_ready") else payload.get("final_block_reason"),
-            hard_block=bool(
-                (not payload.get("canonical_ready"))
-                and self._classify_aion_execution_blocker(payload.get("final_block_reason")) == "hard_safety"
-            ),
-            final_submit_allowed=bool(payload.get("canonical_ready")),
-            selected_price=quote_readiness_diagnostic.get("selected_price_dollars") or quote_readiness_diagnostic.get("selected_price") or payload.get("selected_price") or payload.get("selected_price_dollars"),
-            selected_side=quote_readiness_diagnostic.get("selected_side") or payload.get("selected_side"),
-        )
         print(
             "[AION-POST-CANONICAL] "
             + json.dumps(
@@ -51673,6 +51665,18 @@ class KalshiSniperBot:
                     lane="canonical_final",
                     payload_override=canonical_submit_payload,
                 )
+                submit_reason = str(result.get("reason") or "unknown")
+                self._emit_aion_final_execution_truth(
+                    ticker=auto_live_ticker,
+                    family=selected_family,
+                    decision="EXECUTE" if result.get("submitted") else "SKIP",
+                    reason="submitted" if result.get("submitted") else submit_reason,
+                    stage="submit_live_order",
+                    hard_block=(not result.get("submitted") and self._classify_aion_execution_blocker(submit_reason) == "hard_safety"),
+                    final_submit_allowed=True,
+                    selected_price=canonical_submit_payload.get("selected_price") or canonical_submit_payload.get("yes_price") or canonical_submit_payload.get("no_price") if isinstance(canonical_submit_payload, dict) else None,
+                    selected_side=canonical_submit_payload.get("selected_side") or canonical_submit_payload.get("side") if isinstance(canonical_submit_payload, dict) else None,
+                )
                 if not result.get("submitted"):
                     print(
                         "[AION-LIVE-SUBMIT-FAIL] "
@@ -51795,6 +51799,18 @@ class KalshiSniperBot:
                         size=ev_contract_size,
                         lane="canonical_final",
                         payload_override=canonical_submit_payload,
+                    )
+                    fallback_reason = str(fallback_result.get("reason") or "unknown")
+                    self._emit_aion_final_execution_truth(
+                        ticker=getattr(submit_quote, "ticker", None) if submit_quote is not None else auto_live_ticker,
+                        family=selected_family,
+                        decision="EXECUTE" if fallback_result.get("submitted") else "SKIP",
+                        reason="submitted" if fallback_result.get("submitted") else fallback_reason,
+                        stage="submit_live_order",
+                        hard_block=(not fallback_result.get("submitted") and self._classify_aion_execution_blocker(fallback_reason) == "hard_safety"),
+                        final_submit_allowed=True,
+                        selected_price=canonical_submit_payload.get("selected_price") or canonical_submit_payload.get("yes_price") or canonical_submit_payload.get("no_price") if isinstance(canonical_submit_payload, dict) else None,
+                        selected_side=canonical_submit_payload.get("selected_side") or canonical_submit_payload.get("side") if isinstance(canonical_submit_payload, dict) else None,
                     )
                     if fallback_result.get("submitted"):
                         trade_readiness_trade_submitted = True
@@ -52525,6 +52541,18 @@ class KalshiSniperBot:
                     lane="aggressive_positive_edge",
                     payload_override=canonical_submit_payload,
                 )
+                canonical_submit_reason = str(canonical_submit_result.get("reason") or "unknown")
+                self._emit_aion_final_execution_truth(
+                    ticker=auto_live_ticker,
+                    family=selected_family,
+                    decision="EXECUTE" if canonical_submit_result.get("submitted") else "SKIP",
+                    reason="submitted" if canonical_submit_result.get("submitted") else canonical_submit_reason,
+                    stage="submit_live_order",
+                    hard_block=(not canonical_submit_result.get("submitted") and self._classify_aion_execution_blocker(canonical_submit_reason) == "hard_safety"),
+                    final_submit_allowed=True,
+                    selected_price=canonical_submit_payload.get("selected_price") or canonical_submit_payload.get("yes_price") or canonical_submit_payload.get("no_price") if isinstance(canonical_submit_payload, dict) else None,
+                    selected_side=canonical_submit_payload.get("selected_side") or canonical_submit_payload.get("side") if isinstance(canonical_submit_payload, dict) else None,
+                )
                 if canonical_submit_result.get("submitted"):
                     trade_readiness_trade_submitted = True
                 else:
@@ -52610,6 +52638,18 @@ class KalshiSniperBot:
                 )
             )
             result = self.submit_live_order(q)
+            fallback_loop_reason = str(result.get("reason") or "unknown")
+            self._emit_aion_final_execution_truth(
+                ticker=getattr(q, "ticker", None),
+                family=self.get_market_family({"ticker": getattr(q, "ticker", None)}) if getattr(q, "ticker", None) else None,
+                decision="EXECUTE" if result.get("submitted") else "SKIP",
+                reason="submitted" if result.get("submitted") else fallback_loop_reason,
+                stage="submit_live_order",
+                hard_block=(not result.get("submitted") and self._classify_aion_execution_blocker(fallback_loop_reason) == "hard_safety"),
+                final_submit_allowed=True,
+                selected_price=getattr(q, "selected_price", None) or getattr(q, "yes_ask", None) or getattr(q, "no_ask", None),
+                selected_side=getattr(q, "selected_side", None) or getattr(q, "side", None),
+            )
             if result.get("submitted"):
                 payload = result.get("payload") or {}
                 self.record_live_position(
@@ -52750,6 +52790,18 @@ class KalshiSniperBot:
                     size=AION_AGGRESSIVE_MAX_CONTRACTS,
                     lane='canonical_final',
                     payload_override=canonical_submit_payload,
+                )
+                dispatch_submit_reason = str(result.get('reason') or 'unknown')
+                self._emit_aion_final_execution_truth(
+                    ticker=locals().get('auto_live_ticker') or getattr(dispatch_quote_candidate, 'ticker', None),
+                    family=locals().get('selected_family') or family,
+                    decision='EXECUTE' if result.get('submitted') else 'SKIP',
+                    reason='submitted' if result.get('submitted') else dispatch_submit_reason,
+                    stage='submit_live_order',
+                    hard_block=(not result.get('submitted') and self._classify_aion_execution_blocker(dispatch_submit_reason) == 'hard_safety'),
+                    final_submit_allowed=True,
+                    selected_price=canonical_submit_payload.get('selected_price') or canonical_submit_payload.get('yes_price') or canonical_submit_payload.get('no_price') if isinstance(canonical_submit_payload, dict) else None,
+                    selected_side=canonical_submit_payload.get('selected_side') or canonical_submit_payload.get('side') if isinstance(canonical_submit_payload, dict) else None,
                 )
                 if result.get('submitted'):
                     trade_readiness_trade_submitted = True
