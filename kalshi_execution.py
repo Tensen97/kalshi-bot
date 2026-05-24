@@ -566,6 +566,8 @@ def maybe_auto_reprice_recent_order(
                     "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),
                     "STRUCTURAL_EDGE_SCORE": getattr(q, "STRUCTURAL_EDGE_SCORE", None),
                     "CROSS_MARKET_EDGE_SCORE": getattr(q, "CROSS_MARKET_EDGE_SCORE", None),
+                    "ELITE_EDGE_CONFIDENCE": getattr(q, "ELITE_EDGE_CONFIDENCE", None),
+                    "elite_edge_context": getattr(q, "elite_edge_context", None),
                     "cross_market_edge_context": getattr(q, "cross_market_edge_context", None),
                 },
             )
@@ -699,6 +701,10 @@ def submit_live_order(
         "structural_pattern_keys",
         "STRUCTURAL_EDGE_SCORE",
         "CROSS_MARKET_EDGE_SCORE",
+        "ELITE_EDGE_CONFIDENCE",
+        "elite_edge_context",
+        "elite_edge_size_multiplier",
+        "elite_edge_kelly_max_multiplier",
         "cross_market_edge_context",
         "sports_edge_context",
         "sports_edge_tags",
@@ -749,6 +755,8 @@ def submit_live_order(
                     "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),
                     "STRUCTURAL_EDGE_SCORE": getattr(q, "STRUCTURAL_EDGE_SCORE", None),
                     "CROSS_MARKET_EDGE_SCORE": getattr(q, "CROSS_MARKET_EDGE_SCORE", None),
+                    "ELITE_EDGE_CONFIDENCE": getattr(q, "ELITE_EDGE_CONFIDENCE", None),
+                    "elite_edge_context": getattr(q, "elite_edge_context", None),
                     "cross_market_edge_context": getattr(q, "cross_market_edge_context", None),
                 },
             )

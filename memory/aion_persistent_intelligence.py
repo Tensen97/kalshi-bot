@@ -1136,6 +1136,7 @@ class AIONPersistentIntelligence:
         price = record.get("entry_price") if record.get("entry_price") is not None else record.get("price")
         structural_edge_score = safe_float(record.get("structural_edge_score", record.get("STRUCTURAL_EDGE_SCORE")), None)
         cross_market_edge_score = safe_float(record.get("cross_market_edge_score", record.get("CROSS_MARKET_EDGE_SCORE")), None)
+        elite_edge_confidence = safe_float(record.get("elite_edge_confidence", record.get("ELITE_EDGE_CONFIDENCE")), None)
         normalized = {
             "timestamp": timestamp,
             "timestamp_ts": round(timestamp_ts, 6),
@@ -1162,8 +1163,11 @@ class AIONPersistentIntelligence:
             "structural_pattern_keys": structural_pattern_keys,
             "structural_edge_score": structural_edge_score,
             "cross_market_edge_score": cross_market_edge_score,
+            "elite_edge_confidence": elite_edge_confidence,
             "structural_edge_bucket": record.get("structural_edge_bucket") or _distilled_score_bucket(structural_edge_score, prefix="structural"),
             "cross_market_bucket": record.get("cross_market_bucket") or _distilled_score_bucket(cross_market_edge_score, prefix="cross"),
+            "elite_edge_bucket": record.get("elite_edge_bucket") or _distilled_score_bucket(elite_edge_confidence, prefix="elite_edge"),
+            "elite_edge_tier": record.get("elite_edge_tier"),
             "sports_edge_score": safe_float(record.get("sports_edge_score", record.get("sports_score_at_entry")), None),
             "asymmetry_score": safe_float(record.get("asymmetry_score", record.get("sports_payout_multiple")), None),
             "odds_bucket": record.get("odds_bucket") or _distilled_price_bucket(price),
@@ -1269,6 +1273,7 @@ class AIONPersistentIntelligence:
                 update_bucket("structural_patterns", pattern_key)
             update_bucket("structural_edge_buckets", normalized.get("structural_edge_bucket") or "structural_unknown")
             update_bucket("cross_market_buckets", normalized.get("cross_market_bucket") or "cross_unknown")
+            update_bucket("elite_edge_buckets", normalized.get("elite_edge_bucket") or "elite_edge_unknown")
             if normalized.get("elite_signal_used") and normalized.get("elite_trader_handle"):
                 handle = str(normalized.get("elite_trader_handle") or "").strip()
                 update_bucket("elite_traders", handle)
@@ -1336,6 +1341,7 @@ class AIONPersistentIntelligence:
         structural_tags=None,
         structural_pattern_keys=None,
         cross_market_bucket=None,
+        elite_edge_bucket=None,
     ):
         memory = _ensure_distilled_learning_defaults(self.distilled_learning)
         summaries = memory.get("summaries") if isinstance(memory.get("summaries"), dict) else {}
@@ -1380,6 +1386,7 @@ class AIONPersistentIntelligence:
         for pattern_key in structural_pattern_keys[:12]:
             add_component("structural_pattern", "structural_patterns", pattern_key, 0.30, min_count=2)
         add_component("cross_market_bucket", "cross_market_buckets", cross_market_bucket, 0.16, min_count=2)
+        add_component("elite_edge_bucket", "elite_edge_buckets", elite_edge_bucket, 0.20, min_count=2)
         add_component("odds_bucket", "odds_buckets", odds_bucket, 0.18, min_count=4)
         add_component("book_quality", "book_quality", book_quality_tag, 0.12, min_count=4)
         add_component("side", "side_buckets", side_key, 0.08, min_count=4)

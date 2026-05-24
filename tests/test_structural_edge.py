@@ -129,6 +129,7 @@ class StructuralEdgeTests(unittest.TestCase):
         )
 
         self.assertGreater(context["CROSS_MARKET_EDGE_SCORE"], 35.0)
+        self.assertGreater(context["ELITE_EDGE_CONFIDENCE"], 40.0)
         self.assertGreater(context["cross_market_edge_context"]["peer_count"], 0)
         self.assertIn("CROSS_MARKET_DISTRIBUTION_INCONSISTENCY", context["tags"])
         self.assertGreater(context["size_multiplier"], 1.0)
@@ -146,6 +147,8 @@ class StructuralEdgeTests(unittest.TestCase):
             "STRUCTURAL_EDGE_SCORE": 84.0,
             "CROSS_MARKET_EDGE_SCORE": 76.0,
             "cross_market_edge_context": {"size_multiplier": 1.52, "probability_adjustment": 0.04},
+            "ELITE_EDGE_CONFIDENCE": 82.0,
+            "elite_edge_context": {"size_multiplier": 4.75, "kelly_max_multiplier": 12.0, "tier": "strong"},
             "structural_edge_probability_adjustment": 0.052,
             "structural_edge_size_multiplier": 1.34,
             "family_profile": {"sizing_bias": 1.10, "structural_edge_weight": 1.25},
@@ -156,8 +159,9 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertGreater(ev["estimated_win_probability"], ev["market_implied_probability"])
         self.assertIn(ev["ev_tier"], {"A", "S"})
-        self.assertGreater(ev["ev_sizing_multiplier"], 1.0)
-        self.assertGreater(ev["conviction_size_multiplier"], 1.0)
+        self.assertGreater(ev["ev_sizing_multiplier"], 2.0)
+        self.assertGreater(ev["conviction_size_multiplier"], 4.0)
+        self.assertEqual(ev["elite_edge_concentration_tier"], "strong")
 
 
 if __name__ == "__main__":

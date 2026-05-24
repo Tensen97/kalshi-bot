@@ -834,6 +834,19 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         ),
         0.0,
     ) or 0.0
+    elite_edge_context = candidate.get("elite_edge_context") if isinstance(candidate.get("elite_edge_context"), dict) else {}
+    if not elite_edge_context and isinstance(structural_context.get("elite_edge_context"), dict):
+        elite_edge_context = structural_context.get("elite_edge_context") or {}
+    elite_edge_confidence = to_float(
+        _pick(
+            candidate.get("ELITE_EDGE_CONFIDENCE"),
+            candidate.get("elite_edge_confidence"),
+            structural_context.get("ELITE_EDGE_CONFIDENCE"),
+            structural_context.get("elite_edge_confidence"),
+            elite_edge_context.get("ELITE_EDGE_CONFIDENCE"),
+        ),
+        0.0,
+    ) or 0.0
     structural_adjustment = to_float(
         _pick(
             candidate.get("structural_edge_probability_adjustment"),
@@ -871,7 +884,11 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         if cross_probability_adjustment is None:
             cross_probability_adjustment = 0.010 + ((min(100.0, cross_market_score) - 45.0) / 55.0) * 0.045
         structural_adjustment += max(0.0, min(0.060, cross_probability_adjustment))
-    structural_adjustment = max(-0.035, min(0.095, structural_adjustment))
+    if elite_edge_confidence >= 75.0:
+        structural_adjustment += 0.010 + ((min(100.0, elite_edge_confidence) - 75.0) / 25.0) * 0.018
+    elif elite_edge_confidence >= 60.0:
+        structural_adjustment += 0.006
+    structural_adjustment = max(-0.035, min(0.125, structural_adjustment))
 
     raw_estimated_probability = max(
         0.03,
@@ -900,12 +917,12 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
     expected_value = (estimated_win_probability * payout) - ((1.0 - estimated_win_probability) * cost)
     expected_roi = expected_value / cost if cost > 0.0 else 0.0
     ev_edge = estimated_win_probability - market_implied_probability
-    structural_elite = bool((structural_score >= 82.0 or cross_market_score >= 78.0) and ev_edge > 0.0)
-    structural_strong = bool((structural_score >= 60.0 or cross_market_score >= 58.0) and (ev_edge > 0.0 or expected_value > 0.0))
-    if ev_edge >= 0.08 or expected_roi >= 0.18 or (structural_elite and expected_roi >= 0.045):
+    structural_elite = bool((structural_score >= 82.0 or cross_market_score >= 78.0 or elite_edge_confidence >= 82.0) and ev_edge > 0.0)
+    structural_strong = bool((structural_score >= 60.0 or cross_market_score >= 58.0 or elite_edge_confidence >= 62.0) and (ev_edge > 0.0 or expected_value > 0.0))
+    if ev_edge >= 0.08 or expected_roi >= 0.18 or (structural_elite and expected_roi >= 0.020):
         ev_tier = "S"
-        sizing_multiplier = 1.62
-        action = "prioritize_conviction_size_up"
+        sizing_multiplier = 2.15 if elite_edge_confidence >= 75.0 else 1.62
+        action = "prioritize_elite_concentration" if elite_edge_confidence >= 75.0 else "prioritize_conviction_size_up"
     elif ev_edge >= 0.035 or expected_roi >= 0.08 or structural_strong:
         ev_tier = "A"
         sizing_multiplier = 1.00
@@ -937,7 +954,17 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
     ) or 1.0
     if cross_market_score >= 42.0:
         structural_size_multiplier = max(structural_size_multiplier, cross_market_size_multiplier)
-    structural_size_multiplier = max(0.55, min(1.90, structural_size_multiplier))
+    elite_edge_size_multiplier = to_float(
+        _pick(
+            candidate.get("elite_edge_size_multiplier"),
+            structural_context.get("elite_edge_size_multiplier"),
+            elite_edge_context.get("size_multiplier"),
+        ),
+        1.0,
+    ) or 1.0
+    if elite_edge_confidence >= 42.0:
+        structural_size_multiplier = max(structural_size_multiplier, elite_edge_size_multiplier)
+    structural_size_multiplier = max(0.55, min(8.0, structural_size_multiplier))
     family_size_bias = max(0.85, min(1.22, to_float(family_profile.get("sizing_bias"), 1.0) or 1.0))
     memory_size_multiplier = max(
         0.86,
@@ -953,17 +980,26 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             or 1.0,
         ),
     )
-    conviction_size_multiplier = max(0.20, min(2.35, structural_size_multiplier * family_size_bias * memory_size_multiplier))
+    conviction_cap = 2.35
+    if elite_edge_confidence >= 88.0:
+        conviction_cap = 12.0
+    elif elite_edge_confidence >= 75.0:
+        conviction_cap = 8.0
+    elif elite_edge_confidence >= 60.0:
+        conviction_cap = 4.0
+    conviction_size_multiplier = max(0.20, min(conviction_cap, structural_size_multiplier * family_size_bias * memory_size_multiplier))
     if ev_tier in {"S", "A"}:
-        sizing_multiplier = min(2.35, max(sizing_multiplier, sizing_multiplier * conviction_size_multiplier))
+        sizing_multiplier = min(conviction_cap, max(sizing_multiplier, sizing_multiplier * conviction_size_multiplier))
     elif ev_tier in {"B", "C"}:
         sizing_multiplier = max(0.10, min(1.05, sizing_multiplier * conviction_size_multiplier))
     else:
         sizing_multiplier = max(0.0, min(0.25, sizing_multiplier * min(1.0, conviction_size_multiplier)))
     if structural_score < 24.0 and ev_tier in {"B", "C"}:
         action = "probe_structural_weak"
-    elif (structural_score >= 78.0 or cross_market_score >= 70.0) and ev_tier in {"S", "A"}:
+    elif (structural_score >= 78.0 or cross_market_score >= 70.0 or elite_edge_confidence >= 70.0) and ev_tier in {"S", "A"}:
         action = "conviction_structural_cross_market_size_up"
+    if elite_edge_confidence >= 75.0 and ev_tier in {"S", "A"}:
+        action = "elite_edge_concentration"
 
     candidate.update(
         {
@@ -980,6 +1016,7 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
                 f"family={round(family_adjustment, 4)} dynamic={round(dynamic_adjustment, 4)} "
                 f"orderbook={round(orderbook_adjustment, 4)} structural={round(structural_adjustment, 4)} "
                 f"cross_market={round(cross_market_score, 4)} "
+                f"elite_edge={round(elite_edge_confidence, 4)} "
                 f"bayes={bayes_result.get('bayesian_delta')} "
                 f"calibration={calibration_result.get('calibration_delta')}"
             ),
@@ -989,6 +1026,12 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             "STRUCTURAL_EDGE_SCORE": round(structural_score, 4),
             "cross_market_edge_score": round(cross_market_score, 4),
             "CROSS_MARKET_EDGE_SCORE": round(cross_market_score, 4),
+            "elite_edge_confidence": round(elite_edge_confidence, 4),
+            "ELITE_EDGE_CONFIDENCE": round(elite_edge_confidence, 4),
+            "elite_edge_context": elite_edge_context,
+            "elite_edge_size_multiplier": round(elite_edge_size_multiplier, 4),
+            "elite_edge_kelly_max_multiplier": elite_edge_context.get("kelly_max_multiplier"),
+            "elite_edge_concentration_tier": elite_edge_context.get("tier"),
             "structural_edge_probability_adjustment": round(structural_adjustment, 6),
             "structural_edge_size_multiplier": round(structural_size_multiplier, 4),
             "cross_market_edge_context": cross_market_context,
@@ -1040,7 +1083,23 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
     if max_multiplier is None:
         max_multiplier = _kelly_env_float("AION_KELLY_MAX_MULTIPLIER", 1.75, 1.0, 10.0)
     else:
-        max_multiplier = max(1.0, min(10.0, float(max_multiplier)))
+        max_multiplier = max(1.0, min(20.0, float(max_multiplier)))
+    elite_edge_confidence = to_float(
+        _ev_first(candidate, "ELITE_EDGE_CONFIDENCE", "elite_edge_confidence"),
+        0.0,
+    ) or 0.0
+    elite_kelly_max_multiplier = to_float(candidate.get("elite_edge_kelly_max_multiplier"), None)
+    if elite_kelly_max_multiplier is not None and elite_edge_confidence >= 60.0:
+        max_multiplier = max(max_multiplier, min(20.0, max(1.0, elite_kelly_max_multiplier)))
+    if elite_edge_confidence >= 88.0:
+        max_multiplier = max(max_multiplier, 15.0)
+        kelly_fraction_config = min(0.70, kelly_fraction_config * 1.65)
+    elif elite_edge_confidence >= 75.0:
+        max_multiplier = max(max_multiplier, 12.0)
+        kelly_fraction_config = min(0.60, kelly_fraction_config * 1.45)
+    elif elite_edge_confidence >= 60.0:
+        max_multiplier = max(max_multiplier, 7.0)
+        kelly_fraction_config = min(0.50, kelly_fraction_config * 1.22)
 
     min_exploration_size = to_float(candidate.get("kelly_min_exploration_size"), None)
     if min_exploration_size is None:
@@ -1091,6 +1150,8 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
         "kelly_multiplier": 1.0,
         "final_contract_size": int(fallback_size),
         "reason": "fallback_existing_size",
+        "ELITE_EDGE_CONFIDENCE": round(elite_edge_confidence, 4),
+        "elite_kelly_max_multiplier": round(max_multiplier, 4),
     }
 
     if base_contracts <= 0 or hard_max_contracts <= 0:
@@ -1189,7 +1250,7 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
         bounded_multiplier = max(1.0, min(tier_cap, raw_multiplier))
         min_size = max(1, min_exploration_size)
     elif ev_tier == "A":
-        tier_cap = max_multiplier
+        tier_cap = max_multiplier if elite_edge_confidence >= 60.0 else min(max_multiplier, 4.0)
         bounded_multiplier = max(0.50, min(tier_cap, raw_multiplier))
         min_size = max(1, min_exploration_size)
     elif ev_tier == "B":
@@ -1227,6 +1288,8 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
             "kelly_multiplier": result["kelly_multiplier"],
             "kelly_contract_size": result["final_contract_size"],
             "kelly_reason": result["reason"],
+            "ELITE_EDGE_CONFIDENCE": result["ELITE_EDGE_CONFIDENCE"],
+            "elite_kelly_max_multiplier": result["elite_kelly_max_multiplier"],
         }
     )
     return result

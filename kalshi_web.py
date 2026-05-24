@@ -1707,6 +1707,10 @@ AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER = get_env_float("AION_STRUCTURAL_EDGE_M
 AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST = get_env_float("AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST", 4.75)
 AION_CROSS_MARKET_EDGE_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_CROSS_MARKET_EDGE_MAX_PROBABILITY_ADJUSTMENT", 0.060)
 AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER", 1.85)
+AION_ELITE_EDGE_ENABLED = get_env_bool("AION_ELITE_EDGE_ENABLED", 1)
+AION_ELITE_EDGE_MAX_RANK_BOOST = get_env_float("AION_ELITE_EDGE_MAX_RANK_BOOST", 4.25)
+AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER", 8.0)
+AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER = get_env_float("AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER", 15.0)
 AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
 AION_DATA_COVERAGE_REFRESH_SECONDS = get_env_int("AION_DATA_COVERAGE_REFRESH_SECONDS", 900)
 AION_DATA_COVERAGE_INCLUDE_TELEMETRY = get_env_bool("AION_DATA_COVERAGE_INCLUDE_TELEMETRY", 0)
@@ -1728,7 +1732,7 @@ AION_PROFIT_EXPANSION_ENABLED = get_env_bool("AION_PROFIT_EXPANSION_ENABLED", 1)
 SPORTS_CONTEXT_GATE_ENABLED = (os.environ.get("SPORTS_CONTEXT_GATE_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS = (os.environ.get("SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_CONTEXT_ALLOW_STRONG_SIGNAL_WITHOUT_DATA = (os.environ.get("SPORTS_CONTEXT_ALLOW_STRONG_SIGNAL_WITHOUT_DATA", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
-MAX_LIVE_ORDER_SIZE = 1
+MAX_LIVE_ORDER_SIZE = max(1, get_env_int("MAX_LIVE_ORDER_SIZE", get_env_int("AION_MAX_LIVE_ORDER_SIZE", 15)))
 MAX_LIVE_TRADES_PER_DAY = 60
 LIVE_TEST_TICKER = None
 LIVE_AUDIT_LOG_FILE = runtime_state_file("live_audit_log.csv")
@@ -8345,6 +8349,16 @@ class KalshiSniperBot:
                 or cross_market_context.get("CROSS_MARKET_EDGE_SCORE")
                 or cross_market_context.get("score")
             )
+            elite_edge_context = (
+                self._learning_archive_value(sources, "elite_edge_context")
+                or structural_context.get("elite_edge_context")
+            )
+            elite_edge_context = elite_edge_context if isinstance(elite_edge_context, dict) else {}
+            elite_edge_confidence = self._learning_archive_float(
+                self._learning_archive_value(sources, "ELITE_EDGE_CONFIDENCE", "elite_edge_confidence")
+                or structural_context.get("ELITE_EDGE_CONFIDENCE")
+                or elite_edge_context.get("ELITE_EDGE_CONFIDENCE")
+            )
             sports_score_at_entry = self._learning_archive_float(
                 self._learning_archive_value(sources, "sports_score_at_entry", "sports_edge_score_at_entry", "score_at_entry")
                 or sports_context.get("score_at_entry")
@@ -8449,6 +8463,10 @@ class KalshiSniperBot:
                         "cross_market_bucket": cross_market_context.get("cross_market_bucket"),
                         "cross_market_peer_count": cross_market_context.get("peer_count"),
                         "cross_market_reason": cross_market_context.get("reason"),
+                        "elite_edge_confidence": elite_edge_confidence,
+                        "ELITE_EDGE_CONFIDENCE": elite_edge_confidence,
+                        "elite_edge_tier": elite_edge_context.get("tier"),
+                        "elite_edge_size_multiplier": elite_edge_context.get("size_multiplier"),
                     }
                 )
             else:
@@ -8494,6 +8512,10 @@ class KalshiSniperBot:
                         "structural_tags": structural_tags,
                         "structural_pattern_keys": structural_pattern_keys,
                         "cross_market_bucket": cross_market_context.get("cross_market_bucket"),
+                        "elite_edge_confidence": elite_edge_confidence,
+                        "ELITE_EDGE_CONFIDENCE": elite_edge_confidence,
+                        "elite_edge_tier": elite_edge_context.get("tier"),
+                        "elite_edge_size_multiplier": elite_edge_context.get("size_multiplier"),
                         "entry_price": self._learning_archive_float(self._learning_archive_value(sources, "entry_price", "avg_price")),
                         "exit_price": price,
                         "contracts": contracts,
@@ -8540,6 +8562,7 @@ class KalshiSniperBot:
                             "family": family or "UNKNOWN",
                             "STRUCTURAL_EDGE_SCORE": structural_edge_score,
                             "CROSS_MARKET_EDGE_SCORE": cross_market_edge_score,
+                            "ELITE_EDGE_CONFIDENCE": elite_edge_confidence,
                             "tags": structural_tags[:8],
                             "pnl_dollars": event.get("pnl_dollars"),
                             "result": event.get("result"),
@@ -25906,6 +25929,7 @@ class KalshiSniperBot:
         structural_tags=None,
         structural_pattern_keys=None,
         cross_market_bucket=None,
+        elite_edge_bucket=None,
     ):
         engine = getattr(self, "aion_persistent_intelligence", None)
         if not AION_DISTILLED_MEMORY_ENABLED or engine is None or not hasattr(engine, "get_distilled_learning_signal"):
@@ -25932,6 +25956,7 @@ class KalshiSniperBot:
                 structural_tags=structural_tags if isinstance(structural_tags, list) else [],
                 structural_pattern_keys=structural_pattern_keys if isinstance(structural_pattern_keys, list) else [],
                 cross_market_bucket=cross_market_bucket,
+                elite_edge_bucket=elite_edge_bucket,
             )
             return signal if isinstance(signal, dict) else {}
         except Exception as exc:
@@ -25958,6 +25983,15 @@ class KalshiSniperBot:
             structural_tags = event.get("structural_tags") if isinstance(event.get("structural_tags"), list) else []
             structural_pattern_keys = event.get("structural_pattern_keys") if isinstance(event.get("structural_pattern_keys"), list) else []
             selected_price = event.get("entry_price") if event.get("entry_price") is not None else event.get("price")
+            elite_confidence_value = self.to_float(event.get("ELITE_EDGE_CONFIDENCE") or event.get("elite_edge_confidence"), None)
+            elite_edge_bucket = (
+                "elite_edge_elite" if elite_confidence_value is not None and elite_confidence_value >= 88.0 else
+                "elite_edge_strong" if elite_confidence_value is not None and elite_confidence_value >= 75.0 else
+                "elite_edge_promising" if elite_confidence_value is not None and elite_confidence_value >= 60.0 else
+                "elite_edge_standard" if elite_confidence_value is not None and elite_confidence_value >= 42.0 else
+                "elite_edge_weak" if elite_confidence_value is not None else
+                None
+            )
             record = {
                 **event,
                 "timestamp": event.get("timestamp_utc") or event.get("close_timestamp_utc"),
@@ -25977,6 +26011,9 @@ class KalshiSniperBot:
                 "structural_edge_score": event.get("STRUCTURAL_EDGE_SCORE") or event.get("structural_edge_score"),
                 "cross_market_edge_score": event.get("CROSS_MARKET_EDGE_SCORE") or event.get("cross_market_edge_score"),
                 "cross_market_bucket": event.get("cross_market_bucket"),
+                "elite_edge_confidence": event.get("ELITE_EDGE_CONFIDENCE") or event.get("elite_edge_confidence"),
+                "elite_edge_tier": event.get("elite_edge_tier"),
+                "elite_edge_bucket": event.get("elite_edge_bucket") or elite_edge_bucket,
                 "asymmetry_score": event.get("sports_payout_multiple"),
                 "odds_bucket": event.get("odds_bucket") or sports_context.get("odds_bucket") or self._aion_distilled_odds_bucket(selected_price),
                 "asymmetry_bucket": event.get("asymmetry_bucket") or sports_context.get("asymmetry_bucket") or self._aion_distilled_asymmetry_bucket(
@@ -26052,6 +26089,7 @@ class KalshiSniperBot:
                         structural_tags=structural_tags,
                         structural_pattern_keys=structural_pattern_keys,
                         cross_market_bucket=record.get("cross_market_bucket"),
+                        elite_edge_bucket=record.get("elite_edge_bucket"),
                     )
                     self._emit_aion_memory_log(
                         "[AION-MEMORY-LEARN]",
@@ -26075,6 +26113,7 @@ class KalshiSniperBot:
                                 "family": family,
                                 "STRUCTURAL_EDGE_SCORE": record.get("structural_edge_score"),
                                 "CROSS_MARKET_EDGE_SCORE": record.get("cross_market_edge_score"),
+                                "ELITE_EDGE_CONFIDENCE": record.get("elite_edge_confidence"),
                                 "tags": structural_tags[:8],
                                 "rank_adjustment": signal.get("rank_adjustment"),
                                 "sizing_confidence_multiplier": signal.get("sizing_confidence_multiplier"),
@@ -26697,6 +26736,11 @@ class KalshiSniperBot:
             item["cross_market_edge_context"] = context.get("cross_market_edge_context") or {}
             item["cross_market_edge_score"] = context.get("cross_market_edge_score", context.get("CROSS_MARKET_EDGE_SCORE", 0.0))
             item["CROSS_MARKET_EDGE_SCORE"] = context.get("CROSS_MARKET_EDGE_SCORE", context.get("cross_market_edge_score", 0.0))
+            item["elite_edge_context"] = context.get("elite_edge_context") or {}
+            item["elite_edge_confidence"] = context.get("elite_edge_confidence", context.get("ELITE_EDGE_CONFIDENCE", 0.0))
+            item["ELITE_EDGE_CONFIDENCE"] = context.get("ELITE_EDGE_CONFIDENCE", context.get("elite_edge_confidence", 0.0))
+            item["elite_edge_size_multiplier"] = context.get("elite_edge_size_multiplier", 1.0)
+            item["elite_edge_kelly_max_multiplier"] = context.get("elite_edge_kelly_max_multiplier")
             item["structural_edge_rank_boost"] = context.get("boost", 0.0)
             item["structural_edge_size_multiplier"] = context.get("size_multiplier", 1.0)
             item["structural_edge_probability_adjustment"] = context.get("probability_adjustment", 0.0)
@@ -26712,6 +26756,11 @@ class KalshiSniperBot:
                 ("cross_market_edge_context", context.get("cross_market_edge_context") or {}),
                 ("cross_market_edge_score", context.get("cross_market_edge_score", context.get("CROSS_MARKET_EDGE_SCORE", 0.0))),
                 ("CROSS_MARKET_EDGE_SCORE", context.get("CROSS_MARKET_EDGE_SCORE", context.get("cross_market_edge_score", 0.0))),
+                ("elite_edge_context", context.get("elite_edge_context") or {}),
+                ("elite_edge_confidence", context.get("elite_edge_confidence", context.get("ELITE_EDGE_CONFIDENCE", 0.0))),
+                ("ELITE_EDGE_CONFIDENCE", context.get("ELITE_EDGE_CONFIDENCE", context.get("elite_edge_confidence", 0.0))),
+                ("elite_edge_size_multiplier", context.get("elite_edge_size_multiplier", 1.0)),
+                ("elite_edge_kelly_max_multiplier", context.get("elite_edge_kelly_max_multiplier")),
                 ("structural_edge_rank_boost", context.get("boost", 0.0)),
                 ("structural_edge_size_multiplier", context.get("size_multiplier", 1.0)),
                 ("structural_edge_probability_adjustment", context.get("probability_adjustment", 0.0)),
@@ -27257,6 +27306,163 @@ class KalshiSniperBot:
             "reason": "+".join(tags) if tags else "cross_market_baseline",
         }
 
+    def _build_elite_edge_confidence_context(
+        self,
+        *,
+        structural_edge_score=0.0,
+        cross_market_score=0.0,
+        structural_tags=None,
+        cross_market_context=None,
+        memory_signal=None,
+        family_profile=None,
+        spread_component=0.0,
+        liquidity_component=0.0,
+        repricing_component=0.0,
+        live_state_score=0.0,
+        quality_snapshot=None,
+        selected_top_size=0.0,
+        opposite_top_size=0.0,
+    ):
+        if not AION_ELITE_EDGE_ENABLED:
+            return {
+                "enabled": False,
+                "ELITE_EDGE_CONFIDENCE": 0.0,
+                "rank_boost": 0.0,
+                "size_multiplier": 1.0,
+                "kelly_max_multiplier": None,
+                "tier": "disabled",
+                "tags": [],
+            }
+        structural_tags = structural_tags if isinstance(structural_tags, list) else []
+        cross_market_context = cross_market_context if isinstance(cross_market_context, dict) else {}
+        memory_signal = memory_signal if isinstance(memory_signal, dict) else {}
+        family_profile = family_profile if isinstance(family_profile, dict) else {}
+        quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+        structural_component = self._clamp((self.to_float(structural_edge_score, 0.0) or 0.0) / 100.0)
+        cross_component = self._clamp((self.to_float(cross_market_score, 0.0) or 0.0) / 100.0)
+        memory_components = [
+            component for component in (memory_signal.get("components") or [])
+            if isinstance(component, dict)
+            and str(component.get("label") or "") in {"structural_tag", "structural_pattern", "cross_market_bucket"}
+        ]
+        weighted_bias = 0.0
+        weighted_count = 0.0
+        for component in memory_components:
+            bias = self.to_float(component.get("bias"), 0.0) or 0.0
+            weight = self.to_float(component.get("weight"), 1.0) or 1.0
+            weighted_bias += bias * weight
+            weighted_count += abs(weight)
+        memory_bias = (weighted_bias / weighted_count) if weighted_count > 0.0 else 0.0
+        structural_memory_component = self._clamp(0.48 + max(-0.32, min(0.42, memory_bias)))
+        signal_size_multiplier = self.to_float(memory_signal.get("sizing_confidence_multiplier"), 1.0) or 1.0
+        if signal_size_multiplier > 1.02:
+            structural_memory_component = min(1.0, structural_memory_component + (signal_size_multiplier - 1.0) * 1.35)
+        elif signal_size_multiplier < 0.98:
+            structural_memory_component = max(0.0, structural_memory_component - (1.0 - signal_size_multiplier) * 1.10)
+        family_bias = self.to_float(family_profile.get("sizing_bias"), 1.0) or 1.0
+        family_weight = self.to_float(family_profile.get("structural_edge_weight"), 1.0) or 1.0
+        family_component = self._clamp(0.50 + ((family_bias - 1.0) * 1.25) + ((family_weight - 1.0) * 0.70))
+        fill_quality_raw = self.to_float(
+            self._sports_edge_read_value([quality_snapshot], "fill_quality_score", "execution_quality_score", "market_quality_score"),
+            None,
+        )
+        fill_quality_component = self._clamp(fill_quality_raw / 100.0) if fill_quality_raw is not None and fill_quality_raw > 1.0 else self._clamp(fill_quality_raw if fill_quality_raw is not None else 0.50)
+        liquidity_quality_component = self._clamp(
+            (self.to_float(spread_component, 0.0) or 0.0) * 0.50
+            + (self.to_float(liquidity_component, 0.0) or 0.0) * 0.30
+            + (0.20 if (self.to_float(selected_top_size, 0.0) or 0.0) > 0.0 and (self.to_float(opposite_top_size, 0.0) or 0.0) > 0.0 else 0.0)
+        )
+        repricing_reliability_component = self._clamp(
+            (self.to_float(repricing_component, 0.0) or 0.0) * 0.62
+            + (self.to_float(cross_market_context.get("peer_velocity"), 0.0) or 0.0) * 0.18
+            + (self.to_float(cross_market_context.get("peer_pressure"), 0.0) or 0.0) * 0.20
+        )
+        live_state_component = self._clamp(self.to_float(live_state_score, 0.0) or 0.0)
+        cross_cluster_component = self._clamp(
+            cross_component * 0.74
+            + min(1.0, (self.to_float(cross_market_context.get("peer_count"), 0.0) or 0.0) / 8.0) * 0.16
+            + (0.10 if len(cross_market_context.get("tags") or []) >= 2 else 0.0)
+        )
+        confidence = (
+            structural_component * 19.0
+            + cross_cluster_component * 18.0
+            + structural_memory_component * 19.0
+            + family_component * 10.0
+            + fill_quality_component * 8.0
+            + liquidity_quality_component * 8.0
+            + repricing_reliability_component * 9.0
+            + live_state_component * 9.0
+        )
+        if structural_component < 0.45 and cross_component < 0.42:
+            confidence *= 0.62
+        if memory_bias < -0.18:
+            confidence *= 0.82
+        confidence = round(max(0.0, min(100.0, confidence)), 4)
+        tags = []
+        if structural_component >= 0.78:
+            tags.append("ELITE_STRUCTURAL_PERSISTENCE")
+        if cross_cluster_component >= 0.62:
+            tags.append("ELITE_CROSS_MARKET_CLUSTER")
+        if structural_memory_component >= 0.62 and memory_components:
+            tags.append("ELITE_STRUCTURAL_MEMORY_CONFIRMED")
+        if family_component >= 0.60:
+            tags.append("ELITE_FAMILY_SPECIALIZATION")
+        if fill_quality_component >= 0.70:
+            tags.append("ELITE_FILL_QUALITY")
+        if liquidity_quality_component >= 0.62:
+            tags.append("ELITE_LIQUIDITY_QUALITY")
+        if repricing_reliability_component >= 0.55:
+            tags.append("ELITE_REPRICING_RELIABLE")
+        if live_state_component >= 0.65:
+            tags.append("ELITE_LIVE_STATE_ALIGNMENT")
+        tier = "weak"
+        size_multiplier = 0.72
+        rank_boost = 0.0
+        kelly_max_multiplier = None
+        if confidence >= 88.0:
+            tier = "elite"
+            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 7.5)
+            rank_boost = AION_ELITE_EDGE_MAX_RANK_BOOST
+            kelly_max_multiplier = min(18.0, AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER)
+            tags.append("ELITE_CONCENTRATION_READY")
+        elif confidence >= 75.0:
+            tier = "strong"
+            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 4.75)
+            rank_boost = AION_ELITE_EDGE_MAX_RANK_BOOST * 0.74
+            kelly_max_multiplier = min(14.0, AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER)
+            tags.append("ELITE_CONCENTRATION_READY")
+        elif confidence >= 60.0:
+            tier = "promising"
+            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 2.35)
+            rank_boost = AION_ELITE_EDGE_MAX_RANK_BOOST * 0.38
+            kelly_max_multiplier = min(8.0, AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER)
+        elif confidence >= 42.0:
+            tier = "standard"
+            size_multiplier = 1.18
+            rank_boost = AION_ELITE_EDGE_MAX_RANK_BOOST * 0.14
+        return {
+            "enabled": True,
+            "ELITE_EDGE_CONFIDENCE": confidence,
+            "elite_edge_confidence": confidence,
+            "tier": tier,
+            "rank_boost": round(max(0.0, rank_boost), 4),
+            "size_multiplier": round(max(0.55, min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
+            "kelly_max_multiplier": None if kelly_max_multiplier is None else round(max(1.0, kelly_max_multiplier), 4),
+            "components": {
+                "structural_persistence": round(structural_component, 4),
+                "cross_market_agreement": round(cross_cluster_component, 4),
+                "structural_memory_success": round(structural_memory_component, 4),
+                "family_profitability": round(family_component, 4),
+                "fill_quality": round(fill_quality_component, 4),
+                "liquidity_quality": round(liquidity_quality_component, 4),
+                "repricing_reliability": round(repricing_reliability_component, 4),
+                "live_state_alignment": round(live_state_component, 4),
+            },
+            "structural_memory_bias": round(memory_bias, 4),
+            "structural_memory_component_count": len(memory_components),
+            "tags": list(dict.fromkeys(tags)),
+        }
+
     def _get_structural_edge_rank_adjustment(
         self,
         item=None,
@@ -27556,6 +27762,28 @@ class KalshiSniperBot:
         )
         memory_rank_adjustment = self.to_float(memory_signal.get("rank_adjustment"), 0.0) or 0.0
         memory_size_multiplier = max(0.86, min(1.16, self.to_float(memory_signal.get("sizing_confidence_multiplier"), 1.0) or 1.0))
+        elite_edge_context = self._build_elite_edge_confidence_context(
+            structural_edge_score=structural_edge_score,
+            cross_market_score=cross_market_score,
+            structural_tags=tags,
+            cross_market_context=cross_market_context,
+            memory_signal=memory_signal,
+            family_profile=family_profile,
+            spread_component=spread_component,
+            liquidity_component=liquidity_component,
+            repricing_component=repricing_component,
+            live_state_score=live_state_score,
+            quality_snapshot=quality_snapshot,
+            selected_top_size=selected_top_size,
+            opposite_top_size=opposite_top_size,
+        )
+        elite_edge_confidence = self.to_float(elite_edge_context.get("ELITE_EDGE_CONFIDENCE"), 0.0) or 0.0
+        for elite_tag in elite_edge_context.get("tags") or []:
+            if elite_tag not in tags:
+                tags.append(elite_tag)
+                structural_pattern_keys.append(f"{family}|{elite_tag}")
+                structural_pattern_keys.append(f"{market_kind}|{elite_tag}")
+        structural_pattern_keys = list(dict.fromkeys(key for key in structural_pattern_keys if key))[:28]
         boost = 0.0
         if structural_edge_score >= 25.0:
             boost = min(
@@ -27568,6 +27796,7 @@ class KalshiSniperBot:
                 AION_STRUCTURAL_EDGE_MAX_RANK_BOOST + AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST,
                 boost
                 + (self.to_float(cross_market_context.get("boost"), 0.0) or 0.0)
+                + (self.to_float(elite_edge_context.get("rank_boost"), 0.0) or 0.0)
                 + max(-0.65, min(1.65, memory_rank_adjustment * 0.85)),
             ),
         )
@@ -27585,6 +27814,7 @@ class KalshiSniperBot:
                 0.095,
                 probability_adjustment
                 + (self.to_float(cross_market_context.get("probability_adjustment"), 0.0) or 0.0)
+                + (0.020 if elite_edge_confidence >= 85.0 else 0.012 if elite_edge_confidence >= 72.0 else 0.0)
                 + max(-0.012, min(0.018, memory_rank_adjustment * 0.014)),
             ),
         )
@@ -27600,9 +27830,12 @@ class KalshiSniperBot:
         cross_size_multiplier = self.to_float(cross_market_context.get("size_multiplier"), 1.0) or 1.0
         if cross_market_score >= 42.0:
             size_multiplier = max(size_multiplier, cross_size_multiplier)
+        elite_size_multiplier = self.to_float(elite_edge_context.get("size_multiplier"), 1.0) or 1.0
+        if elite_edge_confidence >= 42.0:
+            size_multiplier = max(size_multiplier, elite_size_multiplier)
         size_multiplier = max(
             AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER,
-            min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, size_multiplier * memory_size_multiplier),
+            min(max(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER), size_multiplier * memory_size_multiplier),
         )
         context = {
             "enabled": True,
@@ -27633,9 +27866,16 @@ class KalshiSniperBot:
             "structural_memory_signal": memory_signal,
             "structural_memory_rank_adjustment": round(memory_rank_adjustment, 4),
             "structural_memory_size_multiplier": round(memory_size_multiplier, 4),
+            "elite_edge_context": elite_edge_context,
+            "elite_edge_confidence": elite_edge_confidence,
+            "ELITE_EDGE_CONFIDENCE": elite_edge_confidence,
+            "elite_edge_rank_boost": elite_edge_context.get("rank_boost", 0.0),
+            "elite_edge_size_multiplier": elite_edge_context.get("size_multiplier", 1.0),
+            "elite_edge_kelly_max_multiplier": elite_edge_context.get("kelly_max_multiplier"),
+            "elite_edge_concentration_tier": elite_edge_context.get("tier"),
             "boost": round(boost, 4),
             "probability_adjustment": round(probability_adjustment, 6),
-            "size_multiplier": round(max(AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER, min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
+            "size_multiplier": round(max(AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER, min(max(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER), size_multiplier)), 4),
             "family_profile": family_profile,
             "live_state": {
                 "lifecycle_state": lifecycle_text,
@@ -27656,6 +27896,7 @@ class KalshiSniperBot:
                     "source": source,
                     "STRUCTURAL_EDGE_SCORE": structural_edge_score,
                     "CROSS_MARKET_EDGE_SCORE": cross_market_score,
+                    "ELITE_EDGE_CONFIDENCE": elite_edge_confidence,
                     "boost": context["boost"],
                     "probability_adjustment": context["probability_adjustment"],
                     "size_multiplier": context["size_multiplier"],
@@ -27671,6 +27912,13 @@ class KalshiSniperBot:
                         "rank_adjustment": context.get("structural_memory_rank_adjustment"),
                         "size_multiplier": context.get("structural_memory_size_multiplier"),
                         "component_count": len((memory_signal or {}).get("components") or []),
+                    },
+                    "elite_edge": {
+                        "tier": elite_edge_context.get("tier"),
+                        "rank_boost": elite_edge_context.get("rank_boost"),
+                        "size_multiplier": elite_edge_context.get("size_multiplier"),
+                        "kelly_max_multiplier": elite_edge_context.get("kelly_max_multiplier"),
+                        "components": elite_edge_context.get("components"),
                     },
                     "related_count": len(related),
                     "live_state": context["live_state"],
@@ -28444,6 +28692,12 @@ class KalshiSniperBot:
             "cross_market_edge_score": structural_edge_context.get("cross_market_edge_score"),
             "CROSS_MARKET_EDGE_SCORE": structural_edge_context.get("CROSS_MARKET_EDGE_SCORE"),
             "cross_market_size_multiplier": structural_edge_context.get("cross_market_size_multiplier"),
+            "elite_edge_context": structural_edge_context.get("elite_edge_context") or {},
+            "elite_edge_confidence": structural_edge_context.get("elite_edge_confidence"),
+            "ELITE_EDGE_CONFIDENCE": structural_edge_context.get("ELITE_EDGE_CONFIDENCE"),
+            "elite_edge_size_multiplier": structural_edge_context.get("elite_edge_size_multiplier"),
+            "elite_edge_kelly_max_multiplier": structural_edge_context.get("elite_edge_kelly_max_multiplier"),
+            "elite_edge_concentration_tier": structural_edge_context.get("elite_edge_concentration_tier"),
             "structural_edge_probability_adjustment": structural_edge_context.get("probability_adjustment"),
             "structural_edge_size_multiplier": structural_edge_context.get("size_multiplier"),
             "structural_edge_rank_boost": structural_edge_context.get("boost"),
@@ -28527,6 +28781,12 @@ class KalshiSniperBot:
             "cross_market_edge_score",
             "CROSS_MARKET_EDGE_SCORE",
             "cross_market_size_multiplier",
+            "elite_edge_context",
+            "elite_edge_confidence",
+            "ELITE_EDGE_CONFIDENCE",
+            "elite_edge_size_multiplier",
+            "elite_edge_kelly_max_multiplier",
+            "elite_edge_concentration_tier",
             "structural_edge_probability_adjustment",
             "structural_edge_size_multiplier",
             "structural_edge_rank_boost",

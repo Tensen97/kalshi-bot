@@ -183,8 +183,11 @@ def emit_aion_kelly_log(bot, *, ticker=None, family=None, ev_context=None, price
                     ev_context.get("kelly_contract_size"),
                 ),
                 "STRUCTURAL_EDGE_SCORE": ev_context.get("STRUCTURAL_EDGE_SCORE", ev_context.get("structural_edge_score")),
+                "CROSS_MARKET_EDGE_SCORE": ev_context.get("CROSS_MARKET_EDGE_SCORE", ev_context.get("cross_market_edge_score")),
+                "ELITE_EDGE_CONFIDENCE": ev_context.get("ELITE_EDGE_CONFIDENCE", ev_context.get("elite_edge_confidence")),
                 "conviction_size_multiplier": ev_context.get("conviction_size_multiplier"),
                 "structural_edge_size_multiplier": ev_context.get("structural_edge_size_multiplier"),
+                "elite_edge_size_multiplier": ev_context.get("elite_edge_size_multiplier"),
                 "action": action or kelly_result.get("reason") or ev_context.get("kelly_reason") or "selected",
             },
             sort_keys=True,
@@ -227,11 +230,29 @@ def resolve_ev_contract_size(
         ev_context.get("conviction_size_multiplier"),
         bot.to_float(getattr(q, "conviction_size_multiplier", None), None) if q is not None else None,
     )
-    multiplier_cap = max(1.60, min(2.75, bot.to_float(kelly_max_multiplier, 1.75) or 1.75))
+    elite_edge_confidence = bot.to_float(
+        ev_context.get("ELITE_EDGE_CONFIDENCE", ev_context.get("elite_edge_confidence")),
+        bot.to_float(getattr(q, "ELITE_EDGE_CONFIDENCE", None), 0.0) if q is not None else 0.0,
+    ) or 0.0
+    elite_size_multiplier = bot.to_float(
+        ev_context.get("elite_edge_size_multiplier"),
+        bot.to_float(getattr(q, "elite_edge_size_multiplier", None), 1.0) if q is not None else 1.0,
+    ) or 1.0
+    elite_kelly_max_multiplier = bot.to_float(
+        ev_context.get("elite_edge_kelly_max_multiplier"),
+        bot.to_float(getattr(q, "elite_edge_kelly_max_multiplier", None), None) if q is not None else None,
+    )
+    multiplier_cap = max(1.60, min(3.0, bot.to_float(kelly_max_multiplier, 1.75) or 1.75))
     if structural_score >= 78.0 or cross_market_score >= 70.0:
-        multiplier_cap = max(multiplier_cap, min(2.75, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 0.35))
+        multiplier_cap = max(multiplier_cap, min(4.0, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 0.75))
     if structural_score >= 88.0 and cross_market_score >= 78.0:
-        multiplier_cap = max(multiplier_cap, min(2.75, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 0.55))
+        multiplier_cap = max(multiplier_cap, min(6.0, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 1.50))
+    if elite_edge_confidence >= 88.0:
+        multiplier_cap = max(multiplier_cap, min(15.0, elite_kelly_max_multiplier or 15.0, max(7.5, elite_size_multiplier)))
+    elif elite_edge_confidence >= 75.0:
+        multiplier_cap = max(multiplier_cap, min(12.0, elite_kelly_max_multiplier or 12.0, max(4.75, elite_size_multiplier)))
+    elif elite_edge_confidence >= 60.0:
+        multiplier_cap = max(multiplier_cap, min(7.0, elite_kelly_max_multiplier or 7.0, max(2.35, elite_size_multiplier)))
     if conviction_size_multiplier is not None and conviction_size_multiplier < 0.90:
         multiplier_cap = min(multiplier_cap, 1.15)
     multiplier = max(0.0, min(multiplier_cap, float(multiplier)))
@@ -253,6 +274,9 @@ def resolve_ev_contract_size(
                         "ev_tier": ev_tier,
                         "STRUCTURAL_EDGE_SCORE": round(structural_score, 4),
                         "CROSS_MARKET_EDGE_SCORE": round(cross_market_score, 4),
+                        "ELITE_EDGE_CONFIDENCE": round(elite_edge_confidence, 4),
+                        "elite_edge_size_multiplier": round(elite_size_multiplier, 4),
+                        "elite_edge_kelly_max_multiplier": elite_kelly_max_multiplier,
                         "conviction_size_multiplier": None if conviction_size_multiplier is None else round(conviction_size_multiplier, 4),
                         "ev_sizing_multiplier": round(multiplier, 4),
                         "base_size": int(base_size),
@@ -285,6 +309,7 @@ def resolve_ev_contract_size(
         {
             "kelly_fraction_config": kelly_fraction,
             "kelly_max_multiplier": kelly_max_multiplier,
+            "elite_edge_kelly_max_multiplier": elite_kelly_max_multiplier,
             "kelly_min_exploration_size": kelly_min_exploration_size,
             "kelly_selected_for_dispatch": True,
             "q": q,
