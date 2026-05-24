@@ -6,10 +6,16 @@ import math
 import os
 import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from runtime.paths import ensure_runtime_layout, record_persist_event, runtime_memory_file, safe_atomic_json_write
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-Linux fallback
+    fcntl = None
 
 from risk.helpers import bounded_delta, clamp, safe_float, safe_ratio
 from runtime.paths import ensure_runtime_layout, legacy_runtime_artifact_paths, runtime_memory_file
@@ -35,6 +41,25 @@ def _load_json_file(path):
             return json.load(handle)
     except Exception:
         return None
+
+
+@contextmanager
+def _state_file_lock(path):
+    lock_handle = None
+    try:
+        lock_path = Path(str(path) + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = open(lock_path, "a")
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if lock_handle is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_handle.close()
 
 
 def _load_legacy_payload():
@@ -1445,15 +1470,16 @@ class AIONPersistentIntelligence:
             return self.snapshot()
         with self._lock:
             try:
-                payload = self.snapshot()
-                disk_payload = _load_json_file(self.state_file)
-                if isinstance(disk_payload, dict):
-                    payload["distilled_learning"] = _merge_distilled_learning_for_persist(
-                        disk_payload.get("distilled_learning"),
-                        payload.get("distilled_learning"),
-                    )
-                    self.distilled_learning = _ensure_distilled_learning_defaults(payload.get("distilled_learning"))
-                ok = safe_atomic_json_write(self.state_file, payload, indent=2, sort_keys=True, default=str)
+                with _state_file_lock(self.state_file):
+                    payload = self.snapshot()
+                    disk_payload = _load_json_file(self.state_file)
+                    if isinstance(disk_payload, dict):
+                        payload["distilled_learning"] = _merge_distilled_learning_for_persist(
+                            disk_payload.get("distilled_learning"),
+                            payload.get("distilled_learning"),
+                        )
+                        self.distilled_learning = _ensure_distilled_learning_defaults(payload.get("distilled_learning"))
+                    ok = safe_atomic_json_write(self.state_file, payload, indent=2, sort_keys=True, default=str)
                 record_persist_event(subsystem="AION-PERSIST", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
             except Exception as exc:
                 record_persist_event(subsystem="AION-PERSIST", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
