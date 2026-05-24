@@ -1711,6 +1711,12 @@ AION_ELITE_EDGE_ENABLED = get_env_bool("AION_ELITE_EDGE_ENABLED", 1)
 AION_ELITE_EDGE_MAX_RANK_BOOST = get_env_float("AION_ELITE_EDGE_MAX_RANK_BOOST", 4.25)
 AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER", 12.0)
 AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER = get_env_float("AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER", 15.0)
+AION_WEAK_MAX_DOLLAR_EXPOSURE = get_env_float("AION_WEAK_MAX_DOLLAR_EXPOSURE", 3.0)
+AION_PROMISING_MAX_DOLLAR_EXPOSURE = get_env_float("AION_PROMISING_MAX_DOLLAR_EXPOSURE", 10.0)
+AION_STRONG_MAX_DOLLAR_EXPOSURE = get_env_float("AION_STRONG_MAX_DOLLAR_EXPOSURE", 20.0)
+AION_ELITE_MAX_DOLLAR_EXPOSURE = get_env_float("AION_ELITE_MAX_DOLLAR_EXPOSURE", 30.0)
+AION_ORDINARY_MAX_LIVE_ORDER_SIZE = get_env_int("AION_ORDINARY_MAX_LIVE_ORDER_SIZE", 15)
+AION_ELITE_MAX_LIVE_ORDER_SIZE = get_env_int("AION_ELITE_MAX_LIVE_ORDER_SIZE", 150)
 AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
 AION_DATA_COVERAGE_REFRESH_SECONDS = get_env_int("AION_DATA_COVERAGE_REFRESH_SECONDS", 900)
 AION_DATA_COVERAGE_INCLUDE_TELEMETRY = get_env_bool("AION_DATA_COVERAGE_INCLUDE_TELEMETRY", 0)
@@ -1732,7 +1738,7 @@ AION_PROFIT_EXPANSION_ENABLED = get_env_bool("AION_PROFIT_EXPANSION_ENABLED", 1)
 SPORTS_CONTEXT_GATE_ENABLED = (os.environ.get("SPORTS_CONTEXT_GATE_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS = (os.environ.get("SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_CONTEXT_ALLOW_STRONG_SIGNAL_WITHOUT_DATA = (os.environ.get("SPORTS_CONTEXT_ALLOW_STRONG_SIGNAL_WITHOUT_DATA", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
-MAX_LIVE_ORDER_SIZE = max(1, get_env_int("MAX_LIVE_ORDER_SIZE", get_env_int("AION_MAX_LIVE_ORDER_SIZE", 15)))
+MAX_LIVE_ORDER_SIZE = max(1, get_env_int("MAX_LIVE_ORDER_SIZE", get_env_int("AION_MAX_LIVE_ORDER_SIZE", AION_ELITE_MAX_LIVE_ORDER_SIZE)))
 MAX_LIVE_TRADES_PER_DAY = 60
 LIVE_TEST_TICKER = None
 LIVE_AUDIT_LOG_FILE = runtime_state_file("live_audit_log.csv")
@@ -28951,6 +28957,140 @@ class KalshiSniperBot:
         if multiplier > 1.0:
             _candidate("context.multiplier", base_size * multiplier)
 
+        def _contract_price(value):
+            numeric = self.to_float(value, None)
+            if numeric is None:
+                return None
+            if 1.0 < numeric <= 100.0:
+                numeric = numeric / 100.0
+            return numeric if 0.0 < numeric < 1.0 else None
+
+        def _clamped_ratio(value, low, high):
+            numeric = self.to_float(value, 0.0) or 0.0
+            if high <= low:
+                return 0.0
+            return max(0.0, min(1.0, (float(numeric) - float(low)) / (float(high) - float(low))))
+
+        def _blend_dollars(low, high, quality):
+            low = max(0.0, self.to_float(low, 0.0) or 0.0)
+            high = max(low, self.to_float(high, low) or low)
+            quality = max(0.0, min(1.0, self.to_float(quality, 0.0) or 0.0))
+            return low + ((high - low) * quality)
+
+        side = str(context.get("selected_side") or context.get("side") or payload.get("side") or DEFAULT_LIVE_ORDER_SIDE).strip().lower()
+        if side not in {"yes", "no"}:
+            side = DEFAULT_LIVE_ORDER_SIDE
+        selected_price = _contract_price(
+            context.get("selected_price_dollars")
+            or context.get("selected_price")
+            or context.get("price")
+            or payload.get("selected_price_dollars")
+            or payload.get("selected_price")
+            or payload.get("price")
+        )
+        if selected_price is None:
+            selected_price = _contract_price(context.get("yes_ask") if side == "yes" else context.get("no_ask"))
+        if selected_price is None:
+            selected_price = _contract_price(payload.get("yes_price") if side == "yes" else payload.get("no_price"))
+
+        ev_tier = str(context.get("ev_tier") or "").strip().upper()
+        structural_score = self.to_float(
+            context.get("STRUCTURAL_EDGE_SCORE", context.get("structural_edge_score")),
+            0.0,
+        ) or 0.0
+        cross_score = self.to_float(
+            context.get("CROSS_MARKET_EDGE_SCORE", context.get("cross_market_edge_score")),
+            0.0,
+        ) or 0.0
+        expected_value = self.to_float(context.get("expected_value"), None)
+        expected_roi = self.to_float(context.get("expected_roi"), None)
+        ev_edge = self.to_float(context.get("ev_edge"), None)
+        estimated_probability = self.to_float(context.get("estimated_win_probability"), None)
+        market_probability = self.to_float(context.get("market_implied_probability"), None)
+        ev_positive = any(value is not None and value > 0.0 for value in (expected_value, expected_roi, ev_edge))
+        if not ev_positive and estimated_probability is not None and market_probability is not None:
+            ev_positive = bool(estimated_probability > market_probability + 0.003)
+        structural_support = bool(
+            elite_confidence >= 75.0
+            and (
+                structural_score >= 70.0
+                or cross_score >= 60.0
+                or (structural_score >= 58.0 and cross_score >= 42.0)
+            )
+        )
+        true_elite_support = bool(
+            elite_confidence >= 88.0
+            and ev_tier == "S"
+            and (
+                structural_score >= 82.0
+                or cross_score >= 75.0
+                or (structural_score >= 72.0 and cross_score >= 62.0)
+            )
+            and (
+                (expected_roi is not None and expected_roi >= 0.02)
+                or (ev_edge is not None and ev_edge >= 0.02)
+                or (expected_value is not None and expected_value > 0.0)
+            )
+        )
+        dollar_tier = None
+        target_dollar_exposure = None
+        if selected_price is not None and ev_positive:
+            if true_elite_support:
+                dollar_tier = "elite"
+                quality = (
+                    _clamped_ratio(elite_confidence, 88.0, 100.0)
+                    + _clamped_ratio(structural_score, 72.0, 100.0)
+                    + _clamped_ratio(cross_score, 62.0, 100.0)
+                ) / 3.0
+                target_dollar_exposure = _blend_dollars(
+                    AION_STRONG_MAX_DOLLAR_EXPOSURE,
+                    AION_ELITE_MAX_DOLLAR_EXPOSURE,
+                    quality,
+                )
+            elif structural_support and ev_tier in {"S", "A"}:
+                dollar_tier = "strong"
+                quality = (
+                    _clamped_ratio(elite_confidence, 75.0, 92.0)
+                    + _clamped_ratio(structural_score, 58.0, 88.0)
+                    + _clamped_ratio(cross_score, 42.0, 78.0)
+                ) / 3.0
+                target_dollar_exposure = _blend_dollars(
+                    AION_PROMISING_MAX_DOLLAR_EXPOSURE,
+                    AION_STRONG_MAX_DOLLAR_EXPOSURE,
+                    quality,
+                )
+            elif ev_tier in {"S", "A", "B"} or elite_confidence >= 50.0 or structural_score >= 50.0 or cross_score >= 40.0:
+                dollar_tier = "promising"
+                quality = max(
+                    _clamped_ratio(elite_confidence, 35.0, 75.0),
+                    _clamped_ratio(structural_score, 35.0, 70.0),
+                    _clamped_ratio(cross_score, 30.0, 60.0),
+                    0.35 if ev_tier in {"S", "A", "B"} else 0.0,
+                )
+                target_dollar_exposure = _blend_dollars(
+                    AION_WEAK_MAX_DOLLAR_EXPOSURE,
+                    AION_PROMISING_MAX_DOLLAR_EXPOSURE,
+                    quality,
+                )
+            else:
+                dollar_tier = "weak"
+                quality = max(
+                    _clamped_ratio(elite_confidence, 0.0, 50.0),
+                    _clamped_ratio(structural_score, 0.0, 50.0),
+                    _clamped_ratio(cross_score, 0.0, 40.0),
+                    0.20,
+                )
+                target_dollar_exposure = _blend_dollars(1.0, AION_WEAK_MAX_DOLLAR_EXPOSURE, quality)
+
+        if selected_price is not None and target_dollar_exposure is not None and target_dollar_exposure > 0.0:
+            dollar_contracts = max(1, min(hard_max, int(target_dollar_exposure / selected_price)))
+            if dollar_contracts > 0:
+                context["dollar_exposure_tier"] = dollar_tier
+                context["target_dollar_exposure"] = round(float(target_dollar_exposure), 4)
+                context["target_dollar_contracts"] = int(dollar_contracts)
+                context["selected_price_for_dollar_sizing"] = round(float(selected_price), 6)
+                _candidate(f"dollar_exposure.{dollar_tier}", dollar_contracts)
+
         chosen_label, chosen_raw = max(candidates, key=lambda item: item[1]) if candidates else ("base", base_size)
         chosen = max(1, min(hard_max, int(round(chosen_raw))))
         chosen, quality_context = self._validate_elite_live_entry_size(
@@ -28974,6 +29114,9 @@ class KalshiSniperBot:
                             "resolved_count": int(chosen),
                             "hard_max": int(hard_max),
                             "reason": chosen_label,
+                            "dollar_exposure_tier": context.get("dollar_exposure_tier"),
+                            "target_dollar_exposure": context.get("target_dollar_exposure"),
+                            "selected_price_for_dollar_sizing": context.get("selected_price_for_dollar_sizing"),
                             "ev_tier": context.get("ev_tier"),
                             "STRUCTURAL_EDGE_SCORE": context.get("STRUCTURAL_EDGE_SCORE"),
                             "CROSS_MARKET_EDGE_SCORE": context.get("CROSS_MARKET_EDGE_SCORE"),
@@ -29054,6 +29197,15 @@ class KalshiSniperBot:
         structural_score = self.to_float(_get("STRUCTURAL_EDGE_SCORE", "structural_edge_score"), 0.0) or 0.0
         cross_score = self.to_float(_get("CROSS_MARKET_EDGE_SCORE", "cross_market_edge_score"), 0.0) or 0.0
         elite_confidence = self.to_float(_get("ELITE_EDGE_CONFIDENCE", "elite_edge_confidence"), 0.0) or 0.0
+        dollar_exposure_tier = str(_get("dollar_exposure_tier") or "").strip().lower()
+        target_dollar_exposure = self.to_float(_get("target_dollar_exposure"), None)
+        requested_notional = (float(requested) * float(selected_price)) if selected_price is not None else None
+
+        def _contracts_for_dollars(dollars, fallback):
+            dollars = self.to_float(dollars, None)
+            if dollars is None or dollars <= 0.0 or selected_price is None:
+                return max(1, int(fallback or 1))
+            return max(1, min(int(MAX_LIVE_ORDER_SIZE or requested), int(float(dollars) / float(selected_price))))
 
         ev_positive = any(value is not None and value > 0.0 for value in (expected_value, expected_roi, ev_edge))
         if not ev_positive and estimated_probability is not None and market_probability is not None:
@@ -29093,6 +29245,23 @@ class KalshiSniperBot:
         selected_side_depth = side_top_size if side_top_size is not None and side_top_size > 0.0 else None
         liquidity_supports_size = bool(selected_side_depth is not None and selected_side_depth >= requested)
         weak_depth_hint = bool(selected_side_depth is None and liquidity_depth is not None and liquidity_depth > 0.0)
+        small_dollar_probe = bool(
+            requested_notional is not None
+            and requested_notional <= (float(AION_WEAK_MAX_DOLLAR_EXPOSURE or 3.0) + 0.01)
+        )
+        promising_dollar_supported = bool(
+            requested_notional is not None
+            and requested_notional <= (float(AION_PROMISING_MAX_DOLLAR_EXPOSURE or 10.0) + 0.01)
+            and ev_positive
+            and ev_tier in {"S", "A", "B"}
+        )
+        strong_dollar_supported = bool(
+            requested_notional is not None
+            and requested_notional <= (float(AION_STRONG_MAX_DOLLAR_EXPOSURE or 20.0) + 0.01)
+            and ev_positive
+            and ev_tier in {"S", "A"}
+            and structural_support
+        )
         correlated_same_game = False
         if self.get_market_discovery_category(family) == "sports" and ticker:
             try:
@@ -29103,15 +29272,30 @@ class KalshiSniperBot:
 
         cap = int(MAX_LIVE_ORDER_SIZE or requested)
         reasons = []
-        if not ev_positive or ev_tier not in {"S", "A"}:
+        if requested_notional is not None and requested_notional > float(AION_ELITE_MAX_DOLLAR_EXPOSURE or 30.0) + 0.01:
+            cap = min(cap, _contracts_for_dollars(AION_ELITE_MAX_DOLLAR_EXPOSURE, requested))
+            reasons.append("above_elite_dollar_exposure_ceiling")
+        if not ev_positive:
             cap = min(cap, 1)
             reasons.append("ev_not_positive_enough")
-        if not structural_support:
-            cap = min(cap, 5)
+        elif ev_tier not in {"S", "A"} and not (small_dollar_probe or promising_dollar_supported):
+            cap = min(cap, _contracts_for_dollars(AION_WEAK_MAX_DOLLAR_EXPOSURE, 1))
+            reasons.append("ev_tier_not_large_size")
+        if not structural_support and not (small_dollar_probe or promising_dollar_supported):
+            cap = min(cap, _contracts_for_dollars(AION_PROMISING_MAX_DOLLAR_EXPOSURE, 5))
             reasons.append("structural_proof_insufficient")
-        if requested > 10 and not true_elite_support:
-            cap = min(cap, 8)
+        if (
+            requested_notional is not None
+            and requested_notional > float(AION_STRONG_MAX_DOLLAR_EXPOSURE or 20.0) + 0.01
+            and not true_elite_support
+        ):
+            cap = min(cap, _contracts_for_dollars(AION_STRONG_MAX_DOLLAR_EXPOSURE, 8))
             reasons.append("true_elite_proof_insufficient")
+        elif requested > int(AION_ORDINARY_MAX_LIVE_ORDER_SIZE or 15) and not (
+            true_elite_support or strong_dollar_supported or promising_dollar_supported
+        ):
+            cap = min(cap, int(AION_ORDINARY_MAX_LIVE_ORDER_SIZE or 15))
+            reasons.append("ordinary_contract_ceiling_without_strong_proof")
         if not book_executable:
             cap = min(cap, 5 if selected_price is not None else 1)
             reasons.append("book_not_fully_executable")
@@ -29141,10 +29325,16 @@ class KalshiSniperBot:
             "requested_size": requested,
             "final_size": final_size,
             "reasons": reasons,
+            "dollar_exposure_tier": dollar_exposure_tier or None,
+            "target_dollar_exposure": target_dollar_exposure,
+            "requested_notional": requested_notional,
             "ev_tier": ev_tier,
             "ev_positive": bool(ev_positive),
             "structural_support": bool(structural_support),
             "true_elite_support": bool(true_elite_support),
+            "small_dollar_probe": bool(small_dollar_probe),
+            "promising_dollar_supported": bool(promising_dollar_supported),
+            "strong_dollar_supported": bool(strong_dollar_supported),
             "book_executable": bool(book_executable),
             "liquidity_supports_size": bool(liquidity_supports_size),
             "selected_side_depth": selected_side_depth,
@@ -29163,6 +29353,9 @@ class KalshiSniperBot:
                             "requested_size": requested,
                             "final_size": final_size,
                             "reasons": reasons,
+                            "dollar_exposure_tier": dollar_exposure_tier or None,
+                            "target_dollar_exposure": target_dollar_exposure,
+                            "requested_notional": requested_notional,
                             "ev_tier": ev_tier,
                             "expected_roi": expected_roi,
                             "ev_edge": ev_edge,

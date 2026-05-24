@@ -179,14 +179,14 @@ class StructuralEdgeTests(unittest.TestCase):
             expected_value=0.038,
             ev_edge=0.055,
             selected_side="yes",
-            selected_price=0.34,
-            yes_bid=0.31,
-            yes_ask=0.35,
-            no_bid=0.64,
-            no_ask=0.69,
-            yes_top_size=18,
-            no_top_size=20,
-            spread=0.04,
+            selected_price=0.20,
+            yes_bid=0.19,
+            yes_ask=0.21,
+            no_bid=0.79,
+            no_ask=0.81,
+            yes_top_size=180,
+            no_top_size=200,
+            spread=0.02,
             orderbook_ready=True,
             quote_ready=True,
         )
@@ -194,7 +194,7 @@ class StructuralEdgeTests(unittest.TestCase):
         resolved = bot._resolve_dynamic_live_entry_size(
             q,
             explicit_size=1,
-            payload={"ticker": q.ticker, "count": 1, "selected_side": "yes", "selected_price": 0.34},
+            payload={"ticker": q.ticker, "count": 1, "selected_side": "yes", "selected_price": 0.20},
             ev_context={
                 "ticker": q.ticker,
                 "family": q.family,
@@ -209,7 +209,10 @@ class StructuralEdgeTests(unittest.TestCase):
             },
         )
 
-        self.assertGreaterEqual(resolved, 10)
+        self.assertGreaterEqual(resolved, 100)
+        self.assertLessEqual(resolved, 150)
+        self.assertGreaterEqual(resolved * q.selected_price, 20.0)
+        self.assertLessEqual(resolved * q.selected_price, kw.AION_ELITE_MAX_DOLLAR_EXPOSURE)
         self.assertLessEqual(resolved, kw.MAX_LIVE_ORDER_SIZE)
 
     def test_dynamic_entry_size_downgrades_fake_elite_without_positive_ev_or_book_depth(self):
@@ -271,6 +274,50 @@ class StructuralEdgeTests(unittest.TestCase):
         )
 
         self.assertEqual(resolved, 1)
+
+    def test_dynamic_entry_size_keeps_weak_cheap_contract_to_small_dollar_probe(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBPROP-TEST",
+            family="KXMLBPROP",
+            ev_tier="C",
+            ELITE_EDGE_CONFIDENCE=18.0,
+            STRUCTURAL_EDGE_SCORE=12.0,
+            CROSS_MARKET_EDGE_SCORE=8.0,
+            expected_roi=0.004,
+            expected_value=0.001,
+            selected_side="yes",
+            selected_price=0.20,
+            yes_bid=0.19,
+            yes_ask=0.21,
+            no_bid=0.79,
+            no_ask=0.81,
+            yes_top_size=100,
+            no_top_size=100,
+            spread=0.02,
+            orderbook_ready=True,
+            quote_ready=True,
+        )
+
+        resolved = bot._resolve_dynamic_live_entry_size(
+            q,
+            explicit_size=1,
+            payload={"ticker": q.ticker, "count": 1, "selected_side": "yes", "selected_price": 0.20},
+            ev_context={
+                "ticker": q.ticker,
+                "family": q.family,
+                "ev_tier": "C",
+                "ELITE_EDGE_CONFIDENCE": 18.0,
+                "STRUCTURAL_EDGE_SCORE": 12.0,
+                "CROSS_MARKET_EDGE_SCORE": 8.0,
+                "expected_roi": 0.004,
+                "expected_value": 0.001,
+            },
+        )
+
+        self.assertGreaterEqual(resolved, 1)
+        self.assertGreaterEqual(resolved * q.selected_price, 1.0)
+        self.assertLessEqual(resolved * q.selected_price, kw.AION_WEAK_MAX_DOLLAR_EXPOSURE)
 
 
 if __name__ == "__main__":
