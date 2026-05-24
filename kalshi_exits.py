@@ -244,6 +244,29 @@ def evaluate_dynamic_live_exit(
     if adverse_movement:
         dynamic_stop_loss = -max(0.01, base_stop_loss * max(0.1, adverse_stop_multiplier))
     severe_stop_loss = -base_stop_loss * max(1.0, severe_stop_multiplier)
+    is_sports_position = False
+    try:
+        is_sports_position = bool(bot.is_sports_family(family, ticker=ticker))
+    except Exception:
+        is_sports_position = False
+    sports_lifecycle_state = "unknown"
+    if is_sports_position:
+        try:
+            sports_lifecycle_state = str(bot._get_sports_market_lifecycle_state(market=market, family=family) or "unknown").strip().lower()
+        except Exception:
+            sports_lifecycle_state = "unknown"
+    probability_collapse = bool(
+        recent_delta <= -max(0.015, momentum_eps * 4.0)
+        or last_step_delta <= -max(0.012, momentum_eps * 3.0)
+        or side_support < -(neutral_band + 0.18)
+    )
+    late_or_stale_sports = bool(
+        is_sports_position
+        and (
+            sports_lifecycle_state in {"live_late"}
+            or hold_seconds >= max(min_hold_seconds * 3.0, 900.0)
+        )
+    )
 
     action = "hold"
     reason = "existing_hold_logic"
@@ -252,8 +275,11 @@ def evaluate_dynamic_live_exit(
         reason = "dynamic_exit_disabled"
     elif exit_price is None or exit_price <= 0.0:
         reason = "missing_executable_exit_bid"
-    elif spread is not None and spread > max_exit_spread and pnl_per_contract > severe_stop_loss:
+    elif spread is not None and spread > max_exit_spread and pnl_per_contract > severe_stop_loss and not (is_sports_position and pnl_per_contract >= min_profit):
         reason = "exit_spread_too_wide"
+    elif is_sports_position and pnl_per_contract >= min_profit and (weak_momentum or not strong_momentum or spread is not None and spread > max_exit_spread):
+        action = "exit"
+        reason = "harvest_profit"
     elif pnl_per_contract >= runner_take_profit:
         action = "exit"
         reason = "runner_profit_target"
@@ -273,6 +299,13 @@ def evaluate_dynamic_live_exit(
         action = "exit"
         reason = "adverse_fast_cut"
         required_loss_confirmations = 1
+    elif is_sports_position and probability_collapse and hold_seconds >= fast_cut_min_hold_seconds and pnl_per_contract <= -max(0.01, base_stop_loss * 0.45):
+        action = "exit"
+        reason = "defensive_exit"
+        required_loss_confirmations = 1
+    elif late_or_stale_sports and weak_momentum and pnl_per_contract < 0.0:
+        action = "exit"
+        reason = "stale_sports_exit"
     elif pnl_per_contract <= -base_stop_loss and hold_seconds >= min_hold_seconds:
         action = "exit"
         reason = "stop_loss"
@@ -317,6 +350,9 @@ def evaluate_dynamic_live_exit(
         "dynamic_take_profit": round(dynamic_take_profit, 4),
         "dynamic_stop_loss": round(dynamic_stop_loss, 4),
         "quote_source": quote_source,
+        "is_sports_position": bool(is_sports_position),
+        "sports_lifecycle_state": sports_lifecycle_state,
+        "probability_collapse": bool(probability_collapse),
     }
     log_dynamic_exit_decision(bot, decision, log_cooldown_seconds=log_cooldown_seconds)
     return decision

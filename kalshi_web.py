@@ -2672,6 +2672,207 @@ class KalshiSniperBot:
                 return True
         return self.get_market_discovery_category(family or ticker or "") == "sports"
 
+    def _classify_sports_liquidity_market_type(self, family=None, ticker=None, title=None):
+        family = str(family or "").strip().upper()
+        ticker = str(ticker or "").strip().upper()
+        code = family if family and family != "UNKNOWN" else ticker
+        text = " ".join(str(value or "").strip().upper() for value in (family, ticker, title) if value)
+        if code.startswith("KXMLBHR") or "HOME RUN" in text or " HR" in text:
+            return "mlb_hr_longshot"
+        if (
+            code.startswith(("KXMLBTB", "KXMLBHIT"))
+            or "HIT" in text
+            or "TOTAL BASE" in text
+            or "RBI" in text
+            or "STRIKEOUT" in text
+            or "PLAYER PROP" in text
+        ):
+            return "mlb_player_prop"
+        if code.startswith(("KXMLBSPREAD", "KXMLBTOTAL", "KXMLBMONEYLINE", "KXMLB")):
+            return "mlb_core"
+        if code.startswith(("KXATP", "KXTENNIS", "KXWTA", "KXITF")) or "ATP" in text or "TENNIS" in text:
+            return "tennis_atp"
+        if code.startswith(("KXNBA", "KXNFL", "KXNHL", "KXNCAA", "KXCFB", "KXCBB")):
+            return "sports_core"
+        return "sports_default"
+
+    def _sports_liquidity_relaxation_thresholds(self, market_type):
+        market_type = str(market_type or "sports_default").strip().lower()
+        defaults = {
+            "spread_cap": max(AION_SPORTS_MAX_SPREAD_SOFT, 0.35),
+            "edge_floor": max(0.0025, AION_SPORTS_MIN_EDGE_AFTER_COST * 0.30),
+            "stale_seconds": 240.0,
+        }
+        by_type = {
+            "mlb_core": {"spread_cap": max(AION_SPORTS_MAX_SPREAD_SOFT, 0.32), "edge_floor": max(0.002, AION_SPORTS_MIN_EDGE_AFTER_COST * 0.25), "stale_seconds": 240.0},
+            "mlb_player_prop": {"spread_cap": max(AION_SPORTS_MAX_SPREAD_SOFT, 0.48), "edge_floor": max(0.004, AION_SPORTS_MIN_EDGE_AFTER_COST * 0.35), "stale_seconds": 240.0},
+            "mlb_hr_longshot": {"spread_cap": max(AION_SPORTS_MAX_SPREAD_HARD, 0.65), "edge_floor": max(0.008, AION_SPORTS_MIN_EDGE_AFTER_COST * 0.55), "stale_seconds": 240.0},
+            "tennis_atp": {"spread_cap": max(AION_SPORTS_MAX_SPREAD_SOFT, 0.42), "edge_floor": max(0.0035, AION_SPORTS_MIN_EDGE_AFTER_COST * 0.35), "stale_seconds": 180.0},
+            "sports_core": {"spread_cap": max(AION_SPORTS_MAX_SPREAD_SOFT, 0.28), "edge_floor": max(0.0025, AION_SPORTS_MIN_EDGE_AFTER_COST * 0.30), "stale_seconds": 240.0},
+        }
+        return {**defaults, **by_type.get(market_type, {})}
+
+    def _sports_liquidity_relaxation_decision(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        market_title=None,
+        market=None,
+        selected_side=None,
+        selected_price=None,
+        spread=None,
+        yes_top_size=None,
+        no_top_size=None,
+        liquidity=None,
+        edge_after_cost=None,
+        profitability_score=None,
+        blocker_reason=None,
+        unsafe_price_status=None,
+        unsafe_resolution_reason=None,
+        orderbook_age_seconds=None,
+        market_lifecycle_state=None,
+        final_submit_allowed=False,
+        quote_ready=False,
+        orderbook_ready=False,
+    ):
+        family = str(family or self.get_market_family(market or {}) or "").strip().upper()
+        ticker = str(ticker or (market or {}).get("ticker") or "").strip()
+        market_title = str(market_title or (market or {}).get("title") or (market or {}).get("market_title") or "").strip()
+        selected_side = str(selected_side or "").strip().lower()
+        market_type = self._classify_sports_liquidity_market_type(family=family, ticker=ticker, title=market_title)
+        thresholds = self._sports_liquidity_relaxation_thresholds(market_type)
+        selected_price_value = self.to_float(selected_price, None)
+        spread_value = self.to_float(spread, None)
+        yes_top = self.to_float(yes_top_size, 0.0) or 0.0
+        no_top = self.to_float(no_top_size, 0.0) or 0.0
+        liquidity_value = self.to_float(liquidity, 0.0) or 0.0
+        edge_value = self.to_float(edge_after_cost, None)
+        profitability_value = self.to_float(profitability_score, None)
+        orderbook_age = self.to_float(orderbook_age_seconds, None)
+        blocker = str(blocker_reason or "").strip().lower()
+        unsafe_status = str(unsafe_price_status or "").strip().lower()
+        unsafe_reason = str(unsafe_resolution_reason or "").strip().lower()
+        lifecycle = str(market_lifecycle_state or "").strip().lower()
+        weak_liquidity_blockers = {
+            "insufficient_liquidity",
+            "orderbook_not_usable",
+            "quote_not_usable",
+            "unsafe_spread",
+            "spread_wait",
+            "spread_above_threshold",
+            "thin_book_without_depth",
+            "thin_top_book",
+            "low_liquidity",
+            "selected_side_liquidity_missing",
+            "missing_selected_side_liquidity",
+            "topbook_size_too_small",
+        }
+        hard_unsafe_statuses = {
+            "unexecutable_price",
+            "both_sides_unexecutable",
+            "invalid_price",
+            "malformed_price",
+            "inverted_book",
+            "crossed_book",
+            "corrupt_orderbook",
+            "fake_orderbook",
+            "dead_market",
+            "empty_book",
+        }
+        executable_price = bool(selected_side in {"yes", "no"} and selected_price_value is not None and KALSHI_CONTRACT_MIN_PRICE <= selected_price_value <= KALSHI_CONTRACT_MAX_PRICE)
+        explicit_fake_or_corrupt = bool(
+            unsafe_status in hard_unsafe_statuses
+            or unsafe_reason in hard_unsafe_statuses
+            or blocker in {"selected_price_missing", "selected_price_below_0_01", "selected_price_above_0_99", "selected_price_unit_mismatch", "missing_selected_side_price"}
+        )
+        stale_timing = bool(
+            lifecycle in {"closed", "settled", "expired", "halted", "cancelled"}
+            or (orderbook_age is not None and orderbook_age > float(thresholds.get("stale_seconds", 240.0)))
+        )
+        spread_absurd = bool(spread_value is not None and (spread_value < 0.0 or spread_value > float(thresholds.get("spread_cap", AION_SPORTS_MAX_SPREAD_HARD))))
+        edge_ok = bool(
+            final_submit_allowed
+            or (edge_value is not None and edge_value >= float(thresholds.get("edge_floor", 0.004)))
+            or (
+                edge_value is not None
+                and edge_value > 0.0
+                and profitability_value is not None
+                and (
+                    profitability_value >= 65.0
+                    or (0.0 < profitability_value <= 1.0 and profitability_value >= 0.55)
+                )
+            )
+        )
+        reason = "sports_thin_liquidity_warning"
+        allowed = bool(
+            self.is_sports_family(family, ticker=ticker)
+            and family != "KXBTC15M"
+            and (blocker in weak_liquidity_blockers or not quote_ready or not orderbook_ready)
+            and executable_price
+            and not explicit_fake_or_corrupt
+            and not stale_timing
+            and not spread_absurd
+            and edge_ok
+        )
+        if not self.is_sports_family(family, ticker=ticker) or family == "KXBTC15M":
+            reason = "not_relaxable_sports_family"
+        elif blocker not in weak_liquidity_blockers and quote_ready and orderbook_ready:
+            reason = "no_liquidity_relaxation_needed"
+        elif not executable_price:
+            reason = "missing_executable_selected_price"
+        elif explicit_fake_or_corrupt:
+            reason = "hard_book_or_price_integrity_block"
+        elif stale_timing:
+            reason = "stale_or_closed_sports_market"
+        elif spread_absurd:
+            reason = "sports_spread_absurd_for_family"
+        elif not edge_ok:
+            reason = "edge_or_profitability_not_strong_enough"
+        return {
+            "allowed": bool(allowed),
+            "reason": reason,
+            "market_type": market_type,
+            "spread_cap": round(float(thresholds.get("spread_cap", AION_SPORTS_MAX_SPREAD_HARD)), 4),
+            "edge_floor": round(float(thresholds.get("edge_floor", 0.004)), 4),
+            "selected_price_executable": bool(executable_price),
+            "selected_price": selected_price_value,
+            "spread": spread_value,
+            "yes_top_size": yes_top,
+            "no_top_size": no_top,
+            "liquidity": liquidity_value,
+            "edge_after_cost": edge_value,
+            "profitability_score": profitability_value,
+            "blocker_reason": blocker or None,
+            "unsafe_price_status": unsafe_status or None,
+            "unsafe_resolution_reason": unsafe_reason or None,
+            "orderbook_age_seconds": orderbook_age,
+            "market_lifecycle_state": lifecycle or None,
+            "final_effect": "sports_thin_liquidity_warning" if allowed else "hard_block",
+        }
+
+    def _emit_sports_liquidity_decision_log(self, tag, *, ticker=None, family=None, selected_side=None, decision=None, reason=None):
+        decision = decision if isinstance(decision, dict) else {}
+        payload = {
+            "ticker": ticker or None,
+            "family": family or None,
+            "market_type": decision.get("market_type"),
+            "selected_side": selected_side or None,
+            "selected_price": decision.get("selected_price"),
+            "spread": decision.get("spread"),
+            "yes_top_size": decision.get("yes_top_size"),
+            "no_top_size": decision.get("no_top_size"),
+            "liquidity": decision.get("liquidity"),
+            "edge_after_cost": decision.get("edge_after_cost"),
+            "profitability_score": decision.get("profitability_score"),
+            "reason": reason or decision.get("reason"),
+            "final_effect": decision.get("final_effect"),
+        }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+
     def _get_sports_market_lifecycle_state(self, market=None, q=None, family=None, event_urgency=None):
         if sports_calibration is not None and hasattr(sports_calibration, "get_sports_market_lifecycle_state"):
             try:
@@ -7294,6 +7495,63 @@ class KalshiSniperBot:
             final_blocker_source = "derived_aggressive_tradeable_override"
         if (canonical_aggressive_tradeable or beast_spread_override_applied) and block_reason == "all_guards_passed":
             final_blocker_source = "canonical_tradeability"
+        sports_liquidity_relaxation = None
+        if family != "KXBTC15M" and self.is_sports_family(family, ticker=ticker):
+            sports_liquidity_relaxation = self._sports_liquidity_relaxation_decision(
+                ticker=ticker,
+                family=family,
+                market_title=market.get("title") or market.get("market_title"),
+                market=market,
+                selected_side=resolved_side,
+                selected_price=selected_price_for_threshold,
+                spread=spread,
+                yes_top_size=yes_top_size,
+                no_top_size=no_top_size,
+                liquidity=liquidity_value,
+                edge_after_cost=canonical_final_edge,
+                profitability_score=quote_diag.get("profitability_score") or quote_diag.get("quality_score"),
+                blocker_reason=block_reason,
+                unsafe_price_status=unsafe_price_status,
+                unsafe_resolution_reason=quote_diag.get("unsafe_resolution_reason"),
+                orderbook_age_seconds=quote_diag.get("orderbook_age_seconds") or quote_diag.get("cache_age_seconds"),
+                market_lifecycle_state=self._get_sports_market_lifecycle_state(market=market, family=family),
+                final_submit_allowed=bool(canonical_final_submit_allowed or canonical_beast_submit_override),
+                quote_ready=effective_quote_ready,
+                orderbook_ready=effective_orderbook_ready,
+            )
+            if block_reason != "all_guards_passed" and sports_liquidity_relaxation.get("allowed"):
+                effective_quote_ready = True
+                effective_orderbook_ready = True
+                pass_fail = True
+                liquidity = max(self.to_float(liquidity, 0.0) or 0.0, effective_topbook_liquidity, 1.0)
+                liquidity_value = liquidity
+                block_reason = "all_guards_passed"
+                final_blocker_source = "sports_thin_liquidity_warning"
+                self._emit_sports_liquidity_decision_log(
+                    "AION-SPORTS-LIQUIDITY-WARN",
+                    ticker=ticker,
+                    family=family,
+                    selected_side=resolved_side,
+                    decision=sports_liquidity_relaxation,
+                    reason="sports_thin_liquidity_warning",
+                )
+                self._emit_sports_liquidity_decision_log(
+                    "AION-SPORTS-LIQUIDITY-RELAXED",
+                    ticker=ticker,
+                    family=family,
+                    selected_side=resolved_side,
+                    decision=sports_liquidity_relaxation,
+                    reason="weak_sports_liquidity_converted_to_warning",
+                )
+            elif block_reason != "all_guards_passed":
+                self._emit_sports_liquidity_decision_log(
+                    "AION-SPORTS-LIQUIDITY-HARD-BLOCK",
+                    ticker=ticker,
+                    family=family,
+                    selected_side=resolved_side,
+                    decision=sports_liquidity_relaxation,
+                    reason=sports_liquidity_relaxation.get("reason"),
+                )
         orderbook_usability_payload = {
             "ticker": ticker,
             "side": resolved_side,
@@ -58449,7 +58707,7 @@ class KalshiSniperBot:
             ).strip().lower()
             controlled_spread_value = self.to_float(quote_readiness_diagnostic.get("spread"), None)
             controlled_family_allowed = bool(self.is_sports_family(selected_family) and selected_family != "KXBTC15M")
-            controlled_family_strong = bool(selected_family.startswith(("KXNBA", "KXMLB", "KXNFL")))
+            controlled_family_strong = bool(selected_family.startswith(("KXNBA", "KXMLB", "KXNFL", "KXATP", "KXTENNIS", "KXWTA", "KXITF")))
             controlled_spread_extreme = bool(
                 controlled_spread_value is None
                 or controlled_spread_value <= 0.0
@@ -58544,6 +58802,84 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
+            controlled_sports_liquidity_relaxation = None
+            if controlled_family_allowed and payload_preview is not None:
+                selected_side_hint = (
+                    (payload_preview or {}).get("selected_side")
+                    or (payload_preview or {}).get("side")
+                    or ("yes" if (payload_preview or {}).get("yes_price") is not None else None)
+                    or ("no" if (payload_preview or {}).get("no_price") is not None else None)
+                )
+                blocker_hint = (
+                    "quote_not_usable" if not controlled_quote_ready
+                    else "orderbook_not_usable" if not bool(selected_side_has_liquidity or depth_available or controlled_quote_ready)
+                    else "unsafe_spread" if controlled_spread_extreme
+                    else "spread_wait" if controlled_spread_bucket in {"unsafe", "wide_but_possible"}
+                    else None
+                )
+                controlled_sports_liquidity_relaxation = self._sports_liquidity_relaxation_decision(
+                    ticker=auto_live_ticker,
+                    family=selected_family,
+                    market_title=(selected_market or {}).get("title") or (selected_market or {}).get("market_title"),
+                    market=selected_market,
+                    selected_side=selected_side_hint,
+                    selected_price=selected_submission_price_hint,
+                    spread=controlled_spread_value,
+                    yes_top_size=quote_readiness_diagnostic.get("yes_top_size"),
+                    no_top_size=quote_readiness_diagnostic.get("no_top_size"),
+                    liquidity=quote_readiness_diagnostic.get("liquidity_depth") or quote_readiness_diagnostic.get("liquidity"),
+                    edge_after_cost=edge_after_cost,
+                    profitability_score=quote_readiness_diagnostic.get("profitability_score") or ((expectancy_summary or {}).get("profitability_score") if isinstance(expectancy_summary, dict) else None),
+                    blocker_reason=blocker_hint,
+                    unsafe_price_status=final_gate_unsafe_price_status,
+                    unsafe_resolution_reason=quote_readiness_diagnostic.get("unsafe_resolution_reason"),
+                    orderbook_age_seconds=quote_readiness_diagnostic.get("orderbook_age_seconds") or quote_readiness_diagnostic.get("cache_age_seconds"),
+                    market_lifecycle_state=self._get_sports_market_lifecycle_state(market=selected_market, family=selected_family),
+                    final_submit_allowed=bool(final_submit_allowed_by_realm_vv),
+                    quote_ready=controlled_quote_ready,
+                    orderbook_ready=bool(selected_side_has_liquidity or depth_available or controlled_quote_ready),
+                )
+                if blocker_hint and controlled_sports_liquidity_relaxation.get("allowed"):
+                    controlled_quote_ready = True
+                    controlled_quote_stale = False
+                    controlled_spread_extreme = False
+                    selected_side_has_liquidity = bool(selected_side_has_liquidity or depth_available or controlled_quote_ready)
+                    controlled_spread_bucket = "wide_but_possible" if controlled_spread_bucket in {"unsafe", "extreme_wide", "unknown"} else controlled_spread_bucket
+                    quote_readiness_diagnostic["quote_ready"] = True
+                    quote_readiness_diagnostic["quote_missing"] = False
+                    quote_readiness_diagnostic["selected_side_has_liquidity"] = True
+                    quote_readiness_diagnostic["sports_thin_liquidity_warning"] = True
+                    if isinstance(expectancy_summary, dict):
+                        expectancy_summary["quote_ready"] = True
+                        expectancy_summary["quote_missing"] = False
+                        expectancy_summary["sports_thin_liquidity_warning"] = True
+                        expectancy_summary["spread_bucket"] = controlled_spread_bucket
+                        expectancy_summary["sports_spread_bucket"] = controlled_spread_bucket
+                    self._emit_sports_liquidity_decision_log(
+                        "AION-SPORTS-LIQUIDITY-WARN",
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        selected_side=selected_side_hint,
+                        decision=controlled_sports_liquidity_relaxation,
+                        reason="final_gate_sports_thin_liquidity_warning",
+                    )
+                    self._emit_sports_liquidity_decision_log(
+                        "AION-SPORTS-LIQUIDITY-RELAXED",
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        selected_side=selected_side_hint,
+                        decision=controlled_sports_liquidity_relaxation,
+                        reason="final_gate_weak_liquidity_converted_to_warning",
+                    )
+                elif blocker_hint:
+                    self._emit_sports_liquidity_decision_log(
+                        "AION-SPORTS-LIQUIDITY-HARD-BLOCK",
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        selected_side=selected_side_hint,
+                        decision=controlled_sports_liquidity_relaxation,
+                        reason=controlled_sports_liquidity_relaxation.get("reason"),
+                    )
             controlled_lane_ok = bool(
                 aggressive_positive_edge_override
                 and (controlled_quote_ready or canonical_realm_vv_lane_survives)
@@ -58886,6 +59222,32 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
+            if canonical_allow_lane and not aggressive_lane_execution.get("aggressive_lane_approved"):
+                aggressive_lane_execution["aggressive_lane_approved"] = True
+                aggressive_lane_execution["aggressive_lane_block_reason"] = None
+                aggressive_lane_execution["block_reason"] = None
+                aggressive_lane_execution["execution_sanity_pass"] = True
+                aggressive_lane_execution["quote_ready"] = True
+                aggressive_lane_execution["spread_bucket"] = controlled_spread_bucket
+                print(
+                    "[AION-CANONICAL-LANE-AUTHORITY] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "final_submit_allowed_by_realm_vv": bool(final_submit_allowed_by_realm_vv),
+                            "canonical_final_submit_allowed_by_realm_vv": bool(canonical_final_submit_allowed_by_realm_vv),
+                            "payload_ready": bool(payload_preview is not None),
+                            "selected_price_valid": bool(selected_submission_price_valid),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "depth_available": bool(depth_available),
+                            "decision": "EXECUTE",
+                            "reason": "canonical_final_authority_after_hard_guards",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             if not aggressive_lane_execution.get("aggressive_lane_approved"):
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
                 self._emit_aion_final_gate(
@@ -58923,6 +59285,25 @@ class KalshiSniperBot:
                     block_reason = "invalid_bid_ask"
                 elif controlled_spread_extreme or not controlled_family_allowed or not controlled_family_strong:
                     block_reason = "spread_extreme"
+                self._emit_aion_final_execution_truth(
+                    ticker=auto_live_ticker,
+                    family=selected_family,
+                    decision="HARD_BLOCK" if self._classify_aion_execution_blocker(block_reason) == "hard_safety" else "SKIP",
+                    reason=block_reason,
+                    stage="aggressive_lane_gate",
+                    hard_block=(self._classify_aion_execution_blocker(block_reason) == "hard_safety"),
+                    final_submit_allowed=bool(final_submit_allowed_by_realm_vv),
+                    selected_price=(
+                        payload_preview.get("yes_price", payload_preview.get("no_price"))
+                        if isinstance(payload_preview, dict)
+                        else None
+                    ),
+                    selected_side=(
+                        payload_preview.get("selected_side") or payload_preview.get("side")
+                        if isinstance(payload_preview, dict)
+                        else None
+                    ),
+                )
                 self._emit_aion_execution_blocker(
                     ticker=auto_live_ticker,
                     family=selected_family,
@@ -60022,6 +60403,71 @@ class KalshiSniperBot:
             blocker_class = None
             blocker_detail = None
             tradeable = True
+        sports_liquidity_relaxation = None
+        if family != "KXBTC15M" and self.is_sports_family(family, ticker=ticker):
+            spread_dollars_for_relaxation = round(float(spread_cents) / 100.0, 4) if spread_cents is not None else None
+            sports_liquidity_relaxation = self._sports_liquidity_relaxation_decision(
+                ticker=ticker or None,
+                family=family,
+                market_title=market.get("title") or market.get("market_title"),
+                market=market,
+                selected_side=resolved_side,
+                selected_price=selected_price_dollars,
+                spread=spread_dollars_for_relaxation,
+                yes_top_size=orderbook_resolution.get("yes_top_size") or quote_diag.get("yes_top_size"),
+                no_top_size=orderbook_resolution.get("no_top_size") or quote_diag.get("no_top_size"),
+                liquidity=quote_diag.get("liquidity_depth") or quote_diag.get("liquidity"),
+                edge_after_cost=edge_after_cost_value,
+                profitability_score=quote_diag.get("profitability_score") or quote_diag.get("quality_score"),
+                blocker_reason=blocker_class,
+                unsafe_price_status=unsafe_price_status,
+                unsafe_resolution_reason=unsafe_resolution_reason,
+                orderbook_age_seconds=quote_diag.get("orderbook_age_seconds") or quote_diag.get("cache_age_seconds"),
+                market_lifecycle_state=self._get_sports_market_lifecycle_state(market=market, family=family),
+                final_submit_allowed=bool(final_submit_allowed_by_realm_vv or canonical_beast_submit_override),
+                quote_ready=quote_ready,
+                orderbook_ready=orderbook_ready,
+            )
+            if blocker_class in {"quote_not_usable", "orderbook_not_usable", "unsafe_spread", "unsafe_price", "spread_wait"} and sports_liquidity_relaxation.get("allowed"):
+                quote_ready = True
+                orderbook_ready = True
+                tradeable = True
+                blocker_class = None
+                blocker_detail = None
+                orderbook_not_usable_reason = "sports_thin_liquidity_warning"
+                if spread_classification in {"UNSAFE", "CAUTION_WAIT"}:
+                    spread_classification = "AGGRESSIVE_BUT_TRADEABLE"
+                    spread_classification_reason = "sports_thin_liquidity_warning"
+                    spread_is_catastrophic = False
+                    spread_is_survivable = True
+                    final_submit_allowed_by_realm_vv = True
+                    unsafe_price_status = "caution_wide_spread"
+                    unsafe_resolution_reason = "sports_thin_liquidity_warning"
+                self._emit_sports_liquidity_decision_log(
+                    "AION-SPORTS-LIQUIDITY-WARN",
+                    ticker=ticker or None,
+                    family=family,
+                    selected_side=resolved_side,
+                    decision=sports_liquidity_relaxation,
+                    reason="sports_thin_liquidity_warning",
+                )
+                self._emit_sports_liquidity_decision_log(
+                    "AION-SPORTS-LIQUIDITY-RELAXED",
+                    ticker=ticker or None,
+                    family=family,
+                    selected_side=resolved_side,
+                    decision=sports_liquidity_relaxation,
+                    reason="canonical_tradeability_liquidity_warning",
+                )
+            elif blocker_class in {"quote_not_usable", "orderbook_not_usable", "unsafe_spread", "unsafe_price", "spread_wait"}:
+                self._emit_sports_liquidity_decision_log(
+                    "AION-SPORTS-LIQUIDITY-HARD-BLOCK",
+                    ticker=ticker or None,
+                    family=family,
+                    selected_side=resolved_side,
+                    decision=sports_liquidity_relaxation,
+                    reason=sports_liquidity_relaxation.get("reason"),
+                )
         result = {
             "ticker": ticker or orderbook_resolution.get("ticker") or market.get("ticker") or None,
             "family": family,
@@ -60081,6 +60527,7 @@ class KalshiSniperBot:
             "edge_overwrite_detected": bool(edge_overwrite_detected),
             "previous_edge_value": previous_edge_value,
             "final_edge_value": edge_after_cost_value,
+            "sports_liquidity_relaxation": sports_liquidity_relaxation,
             "cost_assumption": cost_assumption,
             "liquidity": self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)),
             "orderbook_source": orderbook_resolution.get("orderbook_source"),
