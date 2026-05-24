@@ -28875,6 +28875,30 @@ class KalshiSniperBot:
             "elite_edge_kelly_max_multiplier",
             "structural_edge_size_multiplier",
             "cross_market_size_multiplier",
+            "expected_value",
+            "expected_roi",
+            "ev_edge",
+            "estimated_win_probability",
+            "market_implied_probability",
+            "selected_side",
+            "side",
+            "selected_price",
+            "selected_price_dollars",
+            "price",
+            "yes_bid",
+            "yes_ask",
+            "no_bid",
+            "no_ask",
+            "yes_top_size",
+            "no_top_size",
+            "liquidity",
+            "liquidity_depth",
+            "spread",
+            "orderbook_age_seconds",
+            "cache_age_seconds",
+            "stale_seconds",
+            "orderbook_ready",
+            "quote_ready",
         )
         for field in signal_fields:
             if field not in context and field in payload:
@@ -28929,6 +28953,12 @@ class KalshiSniperBot:
 
         chosen_label, chosen_raw = max(candidates, key=lambda item: item[1]) if candidates else ("base", base_size)
         chosen = max(1, min(hard_max, int(round(chosen_raw))))
+        chosen, quality_context = self._validate_elite_live_entry_size(
+            q,
+            requested_size=chosen,
+            payload=payload,
+            ev_context=context,
+        )
         original = self.to_float(explicit_size, None)
         if original is None:
             original = self.to_float(payload.get("count"), None)
@@ -28949,6 +28979,7 @@ class KalshiSniperBot:
                             "CROSS_MARKET_EDGE_SCORE": context.get("CROSS_MARKET_EDGE_SCORE"),
                             "ELITE_EDGE_CONFIDENCE": elite_confidence,
                             "conviction_size_multiplier": context.get("conviction_size_multiplier"),
+                            "elite_size_quality": quality_context,
                         },
                         sort_keys=True,
                         default=str,
@@ -28957,6 +28988,198 @@ class KalshiSniperBot:
             except Exception:
                 pass
         return chosen
+
+    def _validate_elite_live_entry_size(self, q=None, *, requested_size=None, payload=None, ev_context=None):
+        requested = max(1, min(int(MAX_LIVE_ORDER_SIZE or 1), int(round(self.to_float(requested_size, 1) or 1))))
+        if requested <= 5:
+            return requested, {"validated": False, "reason": "not_large_size"}
+
+        payload = payload if isinstance(payload, dict) else {}
+        entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+        context = dict(ev_context or {}) if isinstance(ev_context, dict) else {}
+
+        def _get(*keys):
+            for key in keys:
+                if key in context and context.get(key) is not None:
+                    return context.get(key)
+                if key in payload and payload.get(key) is not None:
+                    return payload.get(key)
+                if key in entry_context and entry_context.get(key) is not None:
+                    return entry_context.get(key)
+                if q is not None:
+                    try:
+                        value = getattr(q, key, None)
+                    except Exception:
+                        value = None
+                    if value is not None:
+                        return value
+            return None
+
+        def _price(value):
+            numeric = self.to_float(value, None)
+            if numeric is None:
+                return None
+            if 1.0 < numeric <= 100.0:
+                numeric = numeric / 100.0
+            return numeric if 0.0 < numeric < 1.0 else None
+
+        ticker = str(_get("ticker") or "").strip()
+        family = str(_get("family") or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip()
+        side = str(_get("selected_side", "side") or DEFAULT_LIVE_ORDER_SIDE).strip().lower()
+        if side not in {"yes", "no"}:
+            side = DEFAULT_LIVE_ORDER_SIDE
+        selected_price = _price(_get("selected_price_dollars", "selected_price", "price"))
+        if selected_price is None:
+            selected_price = _price(payload.get("yes_price") if side == "yes" else payload.get("no_price"))
+        yes_bid = _price(_get("yes_bid", "yes_bid_dollars"))
+        yes_ask = _price(_get("yes_ask", "yes_ask_dollars"))
+        no_bid = _price(_get("no_bid", "no_bid_dollars"))
+        no_ask = _price(_get("no_ask", "no_ask_dollars"))
+        side_bid = yes_bid if side == "yes" else no_bid
+        side_ask = yes_ask if side == "yes" else no_ask
+        side_top_size = self.to_float(_get("yes_top_size") if side == "yes" else _get("no_top_size"), None)
+        liquidity_depth = self.to_float(_get("liquidity_depth", "liquidity"), None)
+        spread = self.to_float(_get("spread"), None)
+        if spread is None and side_bid is not None and side_ask is not None:
+            spread = max(0.0, side_ask - side_bid)
+        orderbook_age = self.to_float(_get("orderbook_age_seconds", "cache_age_seconds", "stale_seconds"), None)
+        orderbook_ready = bool(_get("orderbook_ready") if _get("orderbook_ready") is not None else True)
+        quote_ready = bool(_get("quote_ready") if _get("quote_ready") is not None else True)
+        ev_tier = str(_get("ev_tier") or "").strip().upper()
+        expected_value = self.to_float(_get("expected_value"), None)
+        expected_roi = self.to_float(_get("expected_roi"), None)
+        ev_edge = self.to_float(_get("ev_edge"), None)
+        estimated_probability = self.to_float(_get("estimated_win_probability"), None)
+        market_probability = self.to_float(_get("market_implied_probability"), None)
+        structural_score = self.to_float(_get("STRUCTURAL_EDGE_SCORE", "structural_edge_score"), 0.0) or 0.0
+        cross_score = self.to_float(_get("CROSS_MARKET_EDGE_SCORE", "cross_market_edge_score"), 0.0) or 0.0
+        elite_confidence = self.to_float(_get("ELITE_EDGE_CONFIDENCE", "elite_edge_confidence"), 0.0) or 0.0
+
+        ev_positive = any(value is not None and value > 0.0 for value in (expected_value, expected_roi, ev_edge))
+        if not ev_positive and estimated_probability is not None and market_probability is not None:
+            ev_positive = bool(estimated_probability > market_probability + 0.003)
+        structural_support = bool(
+            elite_confidence >= 75.0
+            and (
+                structural_score >= 70.0
+                or cross_score >= 60.0
+                or (structural_score >= 58.0 and cross_score >= 42.0)
+            )
+        )
+        true_elite_support = bool(
+            elite_confidence >= 88.0
+            and ev_tier == "S"
+            and (
+                structural_score >= 82.0
+                or cross_score >= 75.0
+                or (structural_score >= 72.0 and cross_score >= 62.0)
+            )
+            and (
+                (expected_roi is not None and expected_roi >= 0.02)
+                or (ev_edge is not None and ev_edge >= 0.02)
+                or (expected_value is not None and expected_value > 0.0)
+            )
+        )
+        book_executable = bool(
+            orderbook_ready
+            and quote_ready
+            and selected_price is not None
+            and side_bid is not None
+            and side_ask is not None
+            and side_ask >= side_bid
+        )
+        spread_absurd = bool(spread is not None and spread > (0.16 if self.get_market_discovery_category(family) == "sports" else 0.08))
+        stale_book = bool(orderbook_age is not None and orderbook_age > 180.0)
+        selected_side_depth = side_top_size if side_top_size is not None and side_top_size > 0.0 else None
+        liquidity_supports_size = bool(selected_side_depth is not None and selected_side_depth >= requested)
+        weak_depth_hint = bool(selected_side_depth is None and liquidity_depth is not None and liquidity_depth > 0.0)
+        correlated_same_game = False
+        if self.get_market_discovery_category(family) == "sports" and ticker:
+            try:
+                _game_key, same_game_positions = self._get_correlated_sports_positions(ticker, family=family)
+                correlated_same_game = bool(same_game_positions)
+            except Exception:
+                correlated_same_game = False
+
+        cap = int(MAX_LIVE_ORDER_SIZE or requested)
+        reasons = []
+        if not ev_positive or ev_tier not in {"S", "A"}:
+            cap = min(cap, 1)
+            reasons.append("ev_not_positive_enough")
+        if not structural_support:
+            cap = min(cap, 5)
+            reasons.append("structural_proof_insufficient")
+        if requested > 10 and not true_elite_support:
+            cap = min(cap, 8)
+            reasons.append("true_elite_proof_insufficient")
+        if not book_executable:
+            cap = min(cap, 5 if selected_price is not None else 1)
+            reasons.append("book_not_fully_executable")
+        if spread_absurd:
+            cap = min(cap, 5)
+            reasons.append("spread_too_wide_for_large_size")
+        if stale_book:
+            cap = min(cap, 5 if orderbook_age <= 600.0 else 1)
+            reasons.append("stale_book_for_large_size")
+        if not liquidity_supports_size:
+            if selected_side_depth is not None:
+                cap = min(cap, max(1, int(selected_side_depth)))
+                reasons.append("selected_side_depth_below_requested")
+            elif weak_depth_hint:
+                cap = min(cap, 5)
+                reasons.append("topbook_size_missing")
+            else:
+                cap = min(cap, 5)
+                reasons.append("liquidity_depth_missing")
+        if correlated_same_game:
+            cap = min(cap, 5)
+            reasons.append("same_event_exposure_already_open")
+
+        final_size = max(1, min(requested, cap))
+        quality_context = {
+            "validated": True,
+            "requested_size": requested,
+            "final_size": final_size,
+            "reasons": reasons,
+            "ev_tier": ev_tier,
+            "ev_positive": bool(ev_positive),
+            "structural_support": bool(structural_support),
+            "true_elite_support": bool(true_elite_support),
+            "book_executable": bool(book_executable),
+            "liquidity_supports_size": bool(liquidity_supports_size),
+            "selected_side_depth": selected_side_depth,
+            "spread": spread,
+            "orderbook_age_seconds": orderbook_age,
+            "correlated_same_game": bool(correlated_same_game),
+        }
+        if final_size < requested:
+            try:
+                print(
+                    "[AION-ELITE-SIZE-DOWNGRADE] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "requested_size": requested,
+                            "final_size": final_size,
+                            "reasons": reasons,
+                            "ev_tier": ev_tier,
+                            "expected_roi": expected_roi,
+                            "ev_edge": ev_edge,
+                            "STRUCTURAL_EDGE_SCORE": structural_score,
+                            "CROSS_MARKET_EDGE_SCORE": cross_score,
+                            "ELITE_EDGE_CONFIDENCE": elite_confidence,
+                            "book_executable": bool(book_executable),
+                            "selected_side_depth": selected_side_depth,
+                            "spread": spread,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+        return final_size, quality_context
 
     def _apply_rank_only_memory_adjustments(self, ranked, *, source="ranking", markets=None):
         return kalshi_ranking_module.apply_rank_only_memory_adjustments(

@@ -175,12 +175,26 @@ class StructuralEdgeTests(unittest.TestCase):
             ELITE_EDGE_CONFIDENCE=91.0,
             STRUCTURAL_EDGE_SCORE=92.0,
             CROSS_MARKET_EDGE_SCORE=84.0,
+            expected_roi=0.11,
+            expected_value=0.038,
+            ev_edge=0.055,
+            selected_side="yes",
+            selected_price=0.34,
+            yes_bid=0.31,
+            yes_ask=0.35,
+            no_bid=0.64,
+            no_ask=0.69,
+            yes_top_size=18,
+            no_top_size=20,
+            spread=0.04,
+            orderbook_ready=True,
+            quote_ready=True,
         )
 
         resolved = bot._resolve_dynamic_live_entry_size(
             q,
             explicit_size=1,
-            payload={"ticker": q.ticker, "count": 1},
+            payload={"ticker": q.ticker, "count": 1, "selected_side": "yes", "selected_price": 0.34},
             ev_context={
                 "ticker": q.ticker,
                 "family": q.family,
@@ -189,11 +203,59 @@ class StructuralEdgeTests(unittest.TestCase):
                 "STRUCTURAL_EDGE_SCORE": 92.0,
                 "CROSS_MARKET_EDGE_SCORE": 84.0,
                 "elite_edge_size_multiplier": 8.0,
+                "expected_roi": 0.11,
+                "expected_value": 0.038,
+                "ev_edge": 0.055,
             },
         )
 
         self.assertGreaterEqual(resolved, 10)
         self.assertLessEqual(resolved, kw.MAX_LIVE_ORDER_SIZE)
+
+    def test_dynamic_entry_size_downgrades_fake_elite_without_positive_ev_or_book_depth(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBSTRIKEOUT-TEST-65",
+            family="KXMLBSTRIKEOUT",
+            ev_tier="S",
+            elite_edge_size_multiplier=12.0,
+            ELITE_EDGE_CONFIDENCE=94.0,
+            STRUCTURAL_EDGE_SCORE=91.0,
+            CROSS_MARKET_EDGE_SCORE=82.0,
+            expected_roi=-0.03,
+            expected_value=-0.01,
+            ev_edge=-0.02,
+            selected_side="yes",
+            selected_price=0.34,
+            yes_bid=None,
+            yes_ask=0.35,
+            no_bid=0.64,
+            no_ask=0.69,
+            yes_top_size=1,
+            spread=0.04,
+            orderbook_ready=True,
+            quote_ready=True,
+        )
+
+        resolved = bot._resolve_dynamic_live_entry_size(
+            q,
+            explicit_size=1,
+            payload={"ticker": q.ticker, "count": 1, "selected_side": "yes", "selected_price": 0.34},
+            ev_context={
+                "ticker": q.ticker,
+                "family": q.family,
+                "ev_tier": "S",
+                "ELITE_EDGE_CONFIDENCE": 94.0,
+                "STRUCTURAL_EDGE_SCORE": 91.0,
+                "CROSS_MARKET_EDGE_SCORE": 82.0,
+                "elite_edge_size_multiplier": 12.0,
+                "expected_roi": -0.03,
+                "expected_value": -0.01,
+                "ev_edge": -0.02,
+            },
+        )
+
+        self.assertEqual(resolved, 1)
 
     def test_dynamic_entry_size_keeps_weak_context_as_probe(self):
         bot = self._make_bot()
