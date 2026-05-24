@@ -201,6 +201,10 @@ import kalshi_memory as kalshi_memory_module
 import kalshi_orderbook as kalshi_orderbook_module
 import kalshi_ranking as kalshi_ranking_module
 import kalshi_risk as kalshi_risk_module
+try:
+    import elite_public_signals as elite_public_signals_module
+except Exception:
+    elite_public_signals_module = None
 
 
 DEBUG_LIVE = (os.environ.get("DEBUG_LIVE", "false") or "false").strip().lower() == "true"
@@ -1267,6 +1271,13 @@ KALSHI_ORDERBOOK_IMBALANCE_MIN_TOTAL_SIZE = _env_float("KALSHI_ORDERBOOK_IMBALAN
 KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND = _env_float("KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND", 0.12)
 KALSHI_ORDERBOOK_IMBALANCE_MAX_RANK_ADJUSTMENT = _env_float("KALSHI_ORDERBOOK_IMBALANCE_MAX_RANK_ADJUSTMENT", 1.0)
 KALSHI_ORDERBOOK_IMBALANCE_MAX_RANK_PENALTY = _env_float("KALSHI_ORDERBOOK_IMBALANCE_MAX_RANK_PENALTY", 0.35)
+AION_ELITE_SIGNAL_ENABLED = (os.environ.get("AION_ELITE_SIGNAL_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+AION_ELITE_SIGNAL_MAX_AGE_HOURS = _env_float("AION_ELITE_SIGNAL_MAX_AGE_HOURS", 72.0)
+AION_ELITE_SIGNAL_SCORE_BOOST = _env_float("AION_ELITE_SIGNAL_SCORE_BOOST", 0.04)
+AION_ELITE_SIGNAL_STRONG_BOOST = _env_float("AION_ELITE_SIGNAL_STRONG_BOOST", 0.08)
+AION_ELITE_SIGNAL_MIN_MATCH_CONFIDENCE = _env_float("AION_ELITE_SIGNAL_MIN_MATCH_CONFIDENCE", 0.78)
+AION_ELITE_SIGNAL_FILE = os.environ.get("AION_ELITE_SIGNAL_FILE", "data/elite_public_signals.jsonl")
+AION_ELITE_SIGNAL_CSV_FILE = os.environ.get("AION_ELITE_SIGNAL_CSV_FILE", "data/elite_public_signals.csv")
 KALSHI_POST_LOSS_TICKER_COOLDOWN_SECONDS = int(_env_float("KALSHI_POST_LOSS_TICKER_COOLDOWN_SECONDS", 1800))
 KALSHI_POST_LOSS_FAMILY_COOLDOWN_ENABLED = (os.environ.get("KALSHI_POST_LOSS_FAMILY_COOLDOWN_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 KALSHI_POST_LOSS_FAMILY_COOLDOWN_SECONDS = int(_env_float("KALSHI_POST_LOSS_FAMILY_COOLDOWN_SECONDS", 900))
@@ -1802,6 +1813,8 @@ class KalshiSniperBot:
         self.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
         self.family_profit_memory_log_markers = {}
         self.orderbook_imbalance_log_markers = {}
+        self.elite_public_signal_cache = {"loaded_at": 0.0, "signals": [], "summary": {}}
+        self.elite_public_signal_log_markers = {}
         self.live_recent_family_pnl_events = []
         self.live_recent_session_outcomes = []
         self.execution_diversity_family_seen = {}
@@ -25038,6 +25051,277 @@ class KalshiSniperBot:
             return str(getattr(item[1], "ticker", "") or "").strip()
         return ""
 
+    def _elite_signal_abs_path(self, path_value):
+        path_text = str(path_value or "").strip()
+        if not path_text:
+            return None
+        path_obj = _Path(path_text)
+        if not path_obj.is_absolute():
+            path_obj = _Path(os.path.dirname(os.path.abspath(__file__))) / path_obj
+        return path_obj
+
+    def _elite_signal_paths(self):
+        paths = []
+        for value in (AION_ELITE_SIGNAL_FILE, AION_ELITE_SIGNAL_CSV_FILE):
+            path_obj = self._elite_signal_abs_path(value)
+            if path_obj is not None:
+                paths.append(path_obj)
+        return paths
+
+    def _emit_elite_signal_log(self, tag, payload, marker=None):
+        markers = getattr(self, "elite_public_signal_log_markers", None)
+        if markers is None:
+            self.elite_public_signal_log_markers = {}
+            markers = self.elite_public_signal_log_markers
+        marker_key = None
+        if marker is not None:
+            marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+            if marker_key in markers:
+                return
+            markers[marker_key] = time.time()
+        try:
+            print(f"{tag} " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"{tag} " + json.dumps({"reason": "elite_signal_log_failed"}))
+
+    def _elite_signal_public_summary(self, signal):
+        if signal is None:
+            return {}
+        payload = signal.public_dict() if hasattr(signal, "public_dict") else {}
+        raw_text = str(payload.get("raw_text") or "")
+        if raw_text:
+            payload["raw_text_len"] = len(raw_text)
+            payload.pop("raw_text", None)
+        return {
+            key: payload.get(key)
+            for key in (
+                "trader_handle",
+                "source_url_or_label",
+                "observed_at",
+                "market_title",
+                "ticker",
+                "side",
+                "category",
+                "confidence_parse_score",
+                "resolved_ticker",
+                "resolved_category",
+                "match_confidence",
+                "raw_text_len",
+            )
+            if payload.get(key) not in (None, "")
+        }
+
+    def _refresh_elite_public_signals(self, markets=None, *, force=False, source="ranking"):
+        if not AION_ELITE_SIGNAL_ENABLED:
+            self._emit_elite_signal_log(
+                "[AION-ELITE-SIGNAL-SKIP]",
+                {"reason": "disabled", "source": source},
+                marker=("disabled",),
+            )
+            return []
+        if elite_public_signals_module is None:
+            self._emit_elite_signal_log(
+                "[AION-ELITE-SIGNAL-SKIP]",
+                {"reason": "module_unavailable", "source": source},
+                marker=("module_unavailable",),
+            )
+            return []
+        cache = getattr(self, "elite_public_signal_cache", {}) or {}
+        now_ts = time.time()
+        if not force and cache.get("signals") is not None and now_ts - self.to_float(cache.get("loaded_at"), 0.0) < 60.0:
+            return list(cache.get("signals") or [])
+        paths = self._elite_signal_paths()
+        signals, load_summary = elite_public_signals_module.load_signal_files(paths)
+        market_list = [market for market in (markets or []) if isinstance(market, dict)]
+        resolve_summary = {}
+        if market_list and signals:
+            signals, resolve_summary = elite_public_signals_module.resolve_signals_to_markets(
+                signals,
+                market_list,
+                min_confidence=max(0.0, min(1.0, AION_ELITE_SIGNAL_MIN_MATCH_CONFIDENCE)),
+            )
+        existing_paths = [str(path) for path in paths if path.exists()]
+        self.elite_public_signal_cache = {
+            "loaded_at": now_ts,
+            "signals": list(signals or []),
+            "summary": {
+                "load": load_summary,
+                "resolve": resolve_summary,
+                "existing_paths": existing_paths,
+            },
+        }
+        self._emit_elite_signal_log(
+            "[AION-ELITE-SIGNAL-LOAD]",
+            {
+                "source": source,
+                "enabled": True,
+                "signals_loaded": len(signals or []),
+                "existing_paths": existing_paths,
+                "files_missing": load_summary.get("files_missing"),
+                "rows_seen": load_summary.get("rows_seen"),
+                "rows_loaded": load_summary.get("rows_loaded"),
+                "rows_skipped": load_summary.get("rows_skipped"),
+                "errors": load_summary.get("errors"),
+                "resolved": resolve_summary.get("resolved"),
+                "unresolved": resolve_summary.get("unresolved"),
+                "min_match_confidence": AION_ELITE_SIGNAL_MIN_MATCH_CONFIDENCE,
+            },
+            marker=("load", tuple(existing_paths), load_summary.get("rows_loaded"), resolve_summary.get("resolved")),
+        )
+        if not existing_paths:
+            self._emit_elite_signal_log(
+                "[AION-ELITE-SIGNAL-SKIP]",
+                {
+                    "reason": "signal_input_missing",
+                    "source": source,
+                    "paths": [str(path) for path in paths],
+                },
+                marker=("missing_input", tuple(str(path) for path in paths)),
+            )
+        for signal in list(signals or [])[:50]:
+            resolved_ticker = str(getattr(signal, "resolved_ticker", "") or "")
+            marker = (
+                "resolved" if resolved_ticker else "unresolved",
+                str(getattr(signal, "source_url_or_label", "") or ""),
+                str(getattr(signal, "market_title", "") or getattr(signal, "raw_text", "") or "")[:80],
+                resolved_ticker,
+            )
+            if resolved_ticker:
+                self._emit_elite_signal_log(
+                    "[AION-ELITE-SIGNAL-MATCH]",
+                    {
+                        "source": source,
+                        "resolved_ticker": resolved_ticker,
+                        "match_confidence": round(self.to_float(getattr(signal, "match_confidence", 0.0), 0.0), 4),
+                        "signal": self._elite_signal_public_summary(signal),
+                    },
+                    marker=marker,
+                )
+            else:
+                self._emit_elite_signal_log(
+                    "[AION-ELITE-SIGNAL-UNRESOLVED]",
+                    {
+                        "source": source,
+                        "reason": "below_match_confidence_or_no_active_market",
+                        "min_match_confidence": AION_ELITE_SIGNAL_MIN_MATCH_CONFIDENCE,
+                        "signal": self._elite_signal_public_summary(signal),
+                    },
+                    marker=marker,
+                )
+        return list(signals or [])
+
+    def _elite_signal_candidate_title(self, *, item=None, market=None, q=None):
+        fields = []
+        market = market if isinstance(market, dict) else {}
+        if isinstance(item, dict):
+            fields.extend([item.get("market_title"), item.get("title"), item.get("raw_text")])
+            q = q or item.get("q") or item.get("quote")
+        fields.extend([
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("event_title"),
+            market.get("yes_sub_title"),
+            market.get("no_sub_title"),
+            market.get("event_ticker"),
+            market.get("series_ticker"),
+            market.get("ticker"),
+        ])
+        if q is not None:
+            fields.extend([
+                getattr(q, "market_title", None),
+                getattr(q, "title", None),
+                getattr(q, "ticker", None),
+            ])
+        return " ".join(str(value).strip() for value in fields if str(value or "").strip())
+
+    def _attach_elite_signal_context(self, item=None, q=None, context=None):
+        context = context if isinstance(context, dict) else {}
+        if isinstance(item, dict):
+            item["elite_public_signal_boost"] = context.get("boost", 0.0)
+            item["elite_public_signal_match"] = context.get("matched", False)
+            item["elite_public_signal_confidence"] = context.get("confidence")
+        if q is not None:
+            for field, value in (
+                ("elite_public_signal_boost", context.get("boost", 0.0)),
+                ("elite_public_signal_match", context.get("matched", False)),
+                ("elite_public_signal_confidence", context.get("confidence")),
+            ):
+                try:
+                    setattr(q, field, value)
+                except Exception:
+                    pass
+
+    def _get_elite_public_signal_match(self, item=None, *, market=None, q=None, ticker=None, family=None, category=None, source="ranking", markets=None):
+        if not AION_ELITE_SIGNAL_ENABLED or elite_public_signals_module is None:
+            return {"matched": False, "boost": 0.0, "reason": "disabled_or_unavailable"}
+        market = market if isinstance(market, dict) else {}
+        if isinstance(item, dict):
+            q = q or item.get("q") or item.get("quote")
+            ticker = ticker or item.get("ticker") or getattr(q, "ticker", None)
+            family = family or item.get("family")
+        elif isinstance(item, (list, tuple)):
+            q = q or (item[1] if len(item) > 1 else None)
+            ticker = ticker or getattr(q, "ticker", None)
+            family = family or (item[3] if len(item) > 3 else None)
+        ticker = str(ticker or getattr(q, "ticker", None) or market.get("ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        category = str(category or self.get_market_discovery_category(market or family) or "").strip().lower()
+        title = self._elite_signal_candidate_title(item=item, market=market, q=q)
+        signal_markets = markets if markets is not None else ([market] if market else None)
+        signals = self._refresh_elite_public_signals(markets=signal_markets, source=source)
+        if not signals:
+            return {"matched": False, "boost": 0.0, "reason": "no_signals"}
+        match = elite_public_signals_module.best_candidate_match(
+            signals,
+            ticker=ticker,
+            title=title,
+            category=category,
+            family=family,
+            max_age_hours=AION_ELITE_SIGNAL_MAX_AGE_HOURS,
+            min_confidence=max(0.0, min(1.0, AION_ELITE_SIGNAL_MIN_MATCH_CONFIDENCE)),
+        )
+        if not match.get("matched"):
+            return {
+                "matched": False,
+                "boost": 0.0,
+                "reason": match.get("reason") or "no_match",
+                "confidence": match.get("confidence"),
+            }
+        boost = AION_ELITE_SIGNAL_STRONG_BOOST if match.get("strong") else AION_ELITE_SIGNAL_SCORE_BOOST
+        signal = match.get("signal")
+        context = {
+            "matched": True,
+            "boost": round(max(0.0, self.to_float(boost, 0.0)), 4),
+            "confidence": round(self.to_float(match.get("confidence"), 0.0), 4),
+            "reason": match.get("reason"),
+            "strong": bool(match.get("strong")),
+            "ticker": ticker,
+            "family": family,
+            "category": category,
+            "signal": self._elite_signal_public_summary(signal),
+            "source": source,
+        }
+        self._attach_elite_signal_context(item=item, q=q, context=context)
+        self._emit_elite_signal_log(
+            "[AION-ELITE-SIGNAL-BOOST]",
+            context,
+            marker=("boost", source, ticker, context["boost"], context["confidence"]),
+        )
+        return context
+
+    def _get_elite_public_signal_rank_adjustment(self, item=None, *, market=None, q=None, family=None, source="ranking", markets=None, log=True):
+        context = self._get_elite_public_signal_match(
+            item,
+            market=market,
+            q=q,
+            family=family,
+            source=source,
+            markets=markets,
+        )
+        if not context.get("matched"):
+            self._attach_elite_signal_context(item=item, q=q, context=context)
+        return context
+
     def _extract_orderbook_imbalance_context(self, item=None, *, market=None, q=None, spread=None, family=None):
         return kalshi_orderbook_module.extract_orderbook_imbalance_context(
             self,
@@ -36201,6 +36485,15 @@ class KalshiSniperBot:
                 event_time_component -= EVENT_TIME_WEIGHT
             else:
                 event_time_component -= EVENT_TIME_WEIGHT / 2
+        elite_signal_context = self._get_elite_public_signal_match(
+            market=market,
+            q=quote_payload,
+            ticker=ticker,
+            family=family,
+            category=market_category,
+            source="presolve",
+        )
+        elite_signal_component = self.to_float(elite_signal_context.get("boost"), 0.0) if isinstance(elite_signal_context, dict) else 0.0
         score = (
             spread_component
             + liquidity_component
@@ -36215,6 +36508,7 @@ class KalshiSniperBot:
             + top_book_signal_component
             + sports_priority_component
             + sports_edge_component
+            + elite_signal_component
         )
         selector_score_before = round(score, 4)
         score += liquidity_priority_boost
@@ -36317,8 +36611,10 @@ class KalshiSniperBot:
                 "top_book_signal": round(top_book_signal_component, 4),
                 "sports_priority": round(sports_priority_component, 4),
                 "sports_edge": round(sports_edge_component, 4),
+                "elite_public_signal": round(elite_signal_component, 4),
                 "liquidity_priority_boost": round(liquidity_priority_boost, 4),
             },
+            "elite_signal_context": elite_signal_context,
             "sports_priority_profile": sports_priority_profile,
             "sports_edge_profile": sports_edge,
             "liquidity_priority_profile": liquidity_priority_profile,
@@ -39236,7 +39532,28 @@ class KalshiSniperBot:
             max(0.0, (min(volume, 100.0) / 100.0) * 7.5 + (spread_score / 25.0) * 7.5),
         )
         confidence_score = min(15.0, confidence_score + max(0.0, (0.55 - effective_confidence_floor) * 6.0))
-        pre_session_original_score = liquidity_score + spread_score + structure_score + timing_score + confidence_score + sports_priority_score + sports_edge_score + family_perf_adjustment + btc_volatility_score_boost
+        elite_signal_context = self._get_elite_public_signal_match(
+            market=market,
+            q=q,
+            ticker=ticker,
+            family=family,
+            category=self.get_market_discovery_category(family),
+            source="decision_scoring",
+        )
+        elite_signal_boost = self.to_float(elite_signal_context.get("boost"), 0.0) if isinstance(elite_signal_context, dict) else 0.0
+        debug_context["elite_public_signal"] = elite_signal_context
+        pre_session_original_score = (
+            liquidity_score
+            + spread_score
+            + structure_score
+            + timing_score
+            + confidence_score
+            + sports_priority_score
+            + sports_edge_score
+            + family_perf_adjustment
+            + btc_volatility_score_boost
+            + elite_signal_boost
+        )
         pre_session_total_score = pre_session_original_score + momentum_adjustment
         if self.get_market_discovery_category(family) == "sports":
             print(
@@ -39310,6 +39627,7 @@ class KalshiSniperBot:
             "sports_momentum": round(momentum_adjustment, 4),
             "family_performance": round(family_perf_adjustment, 4),
             "btc_volatility": round(btc_volatility_score_boost, 4),
+            "elite_public_signal": round(elite_signal_boost, 4),
             "psychology": round(psychology_delta, 4),
             "psychology_original_score": psychology_context.get("original_score"),
             "psychology_adjusted_score": psychology_context.get("adjusted_score"),
@@ -44177,6 +44495,19 @@ class KalshiSniperBot:
                     0.0,
                 )
                 adjusted_score += btc_volatility_adjustment
+                elite_signal_context = self._get_elite_public_signal_rank_adjustment(
+                    (score, q, spread, family),
+                    market=market,
+                    family=family,
+                    source="expectancy_rerank",
+                    markets=markets,
+                    log=True,
+                )
+                elite_signal_adjustment = self.to_float(
+                    elite_signal_context.get("boost"),
+                    0.0,
+                )
+                adjusted_score += elite_signal_adjustment
                 ev_context = self._attach_ev_score_to_candidate(
                     {
                         "raw_score": score,
@@ -44291,6 +44622,8 @@ class KalshiSniperBot:
                     "orderbook_imbalance_adjustment": orderbook_imbalance_adjustment,
                     "btc_volatility_adjustment": btc_volatility_adjustment,
                     "btc_volatility_context": btc_volatility_context,
+                    "elite_public_signal_adjustment": elite_signal_adjustment,
+                    "elite_public_signal_context": elite_signal_context,
                     "ev_context": ev_context,
                     "ev_score": ev_context.get("ev_score"),
                     "ev_tier": ev_context.get("ev_tier"),

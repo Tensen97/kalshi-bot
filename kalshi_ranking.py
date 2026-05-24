@@ -709,6 +709,17 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             log=True,
             source=source,
         )
+        if hasattr(bot, "_get_elite_public_signal_rank_adjustment"):
+            elite_signal_context = bot._get_elite_public_signal_rank_adjustment(
+                item,
+                market=market,
+                family=family,
+                source=source,
+                markets=markets,
+                log=True,
+            )
+        else:
+            elite_signal_context = {"boost": 0.0}
         ev_context = bot._attach_ev_score_to_candidate(
             item,
             market=market,
@@ -733,6 +744,7 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             + family_adjustment
             + bot.to_float(imbalance_context.get("adjustment"), 0.0)
             + bot.to_float(btc_volatility_context.get("adjustment"), 0.0)
+            + bot.to_float(elite_signal_context.get("boost"), 0.0)
             + bot._ev_rank_adjustment(ev_context)
             + bot.to_float(momentum_context.get("adjustment"), 0.0)
         )
