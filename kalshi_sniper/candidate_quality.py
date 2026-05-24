@@ -810,6 +810,43 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         orderbook_adjustment += max(-0.035, min(0.035, side_support * 0.035))
     orderbook_adjustment = max(-0.040, min(0.040, orderbook_adjustment))
 
+    structural_context = candidate.get("structural_edge_context") if isinstance(candidate.get("structural_edge_context"), dict) else {}
+    structural_score = to_float(
+        _pick(
+            candidate.get("STRUCTURAL_EDGE_SCORE"),
+            candidate.get("structural_edge_score"),
+            structural_context.get("STRUCTURAL_EDGE_SCORE"),
+            structural_context.get("structural_edge_score"),
+        ),
+        0.0,
+    ) or 0.0
+    structural_adjustment = to_float(
+        _pick(
+            candidate.get("structural_edge_probability_adjustment"),
+            structural_context.get("probability_adjustment"),
+        ),
+        None,
+    )
+    if structural_adjustment is None:
+        if structural_score >= 50.0:
+            structural_adjustment = 0.012 + ((min(100.0, structural_score) - 50.0) / 50.0) * 0.040
+        elif structural_score < 28.0:
+            structural_adjustment = max(-0.012, (structural_score - 28.0) / 28.0 * 0.012)
+        else:
+            structural_adjustment = 0.0
+    structural_adjustment = max(-0.030, min(0.060, structural_adjustment))
+    family_profile = candidate.get("family_profile") if isinstance(candidate.get("family_profile"), dict) else {}
+    live_state_context = candidate.get("live_state_context") if isinstance(candidate.get("live_state_context"), dict) else {}
+    live_state_score = to_float(live_state_context.get("live_state_score"), None)
+    family_profile_bias = max(
+        -0.020,
+        min(0.025, (to_float(family_profile.get("structural_edge_weight"), 1.0) - 1.0) * 0.035),
+    )
+    if live_state_score is not None and structural_score >= 45.0:
+        structural_adjustment += max(-0.012, min(0.018, (live_state_score - 0.50) * 0.035))
+    structural_adjustment += family_profile_bias
+    structural_adjustment = max(-0.035, min(0.065, structural_adjustment))
+
     raw_estimated_probability = max(
         0.03,
         min(
@@ -817,7 +854,8 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             (base_probability if base_probability is not None else market_implied_probability or 0.50)
             + family_adjustment
             + dynamic_adjustment
-            + orderbook_adjustment,
+            + orderbook_adjustment
+            + structural_adjustment,
         ),
     )
     bayes_result = apply_bayesian_candidate_adjustment(candidate, raw_estimated_probability)
@@ -836,11 +874,13 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
     expected_value = (estimated_win_probability * payout) - ((1.0 - estimated_win_probability) * cost)
     expected_roi = expected_value / cost if cost > 0.0 else 0.0
     ev_edge = estimated_win_probability - market_implied_probability
-    if ev_edge >= 0.08 or expected_roi >= 0.18:
+    structural_elite = bool(structural_score >= 78.0 and ev_edge > 0.0)
+    structural_strong = bool(structural_score >= 60.0 and (ev_edge > 0.0 or expected_value > 0.0))
+    if ev_edge >= 0.08 or expected_roi >= 0.18 or (structural_elite and expected_roi >= 0.08):
         ev_tier = "S"
         sizing_multiplier = 1.40
         action = "prioritize_size_up"
-    elif ev_edge >= 0.035 or expected_roi >= 0.08:
+    elif ev_edge >= 0.035 or expected_roi >= 0.08 or structural_strong:
         ev_tier = "A"
         sizing_multiplier = 1.00
         action = "prioritize_normal"
@@ -857,6 +897,24 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         sizing_multiplier = 0.0
         action = "deprioritize"
 
+    structural_size_multiplier = to_float(
+        _pick(candidate.get("structural_edge_size_multiplier"), structural_context.get("size_multiplier")),
+        1.0,
+    ) or 1.0
+    structural_size_multiplier = max(0.55, min(1.45, structural_size_multiplier))
+    family_size_bias = max(0.85, min(1.22, to_float(family_profile.get("sizing_bias"), 1.0) or 1.0))
+    conviction_size_multiplier = max(0.20, min(1.80, structural_size_multiplier * family_size_bias))
+    if ev_tier in {"S", "A"}:
+        sizing_multiplier = min(1.80, max(sizing_multiplier, sizing_multiplier * conviction_size_multiplier))
+    elif ev_tier in {"B", "C"}:
+        sizing_multiplier = max(0.10, min(0.95, sizing_multiplier * conviction_size_multiplier))
+    else:
+        sizing_multiplier = max(0.0, min(0.25, sizing_multiplier * min(1.0, conviction_size_multiplier)))
+    if structural_score < 24.0 and ev_tier in {"B", "C"}:
+        action = "probe_structural_weak"
+    elif structural_score >= 78.0 and ev_tier in {"S", "A"}:
+        action = "conviction_structural_size_up"
+
     candidate.update(
         {
             "market_implied_probability": round(market_implied_probability, 6),
@@ -870,11 +928,19 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             "ev_reason": (
                 f"base={round(base_probability if base_probability is not None else 0.5, 4)} "
                 f"family={round(family_adjustment, 4)} dynamic={round(dynamic_adjustment, 4)} "
-                f"orderbook={round(orderbook_adjustment, 4)} bayes={bayes_result.get('bayesian_delta')} "
+                f"orderbook={round(orderbook_adjustment, 4)} structural={round(structural_adjustment, 4)} "
+                f"bayes={bayes_result.get('bayesian_delta')} "
                 f"calibration={calibration_result.get('calibration_delta')}"
             ),
             "ev_sizing_multiplier": round(sizing_multiplier, 4),
             "ev_action": action,
+            "structural_edge_score": round(structural_score, 4),
+            "STRUCTURAL_EDGE_SCORE": round(structural_score, 4),
+            "structural_edge_probability_adjustment": round(structural_adjustment, 6),
+            "structural_edge_size_multiplier": round(structural_size_multiplier, 4),
+            "conviction_size_multiplier": round(conviction_size_multiplier, 4),
+            "family_profile": family_profile,
+            "live_state_context": live_state_context,
         }
     )
     return candidate

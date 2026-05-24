@@ -1,0 +1,100 @@
+import unittest
+from types import SimpleNamespace
+
+import kalshi_web as kw
+from kalshi_sniper.candidate_quality import compute_candidate_ev
+
+
+class StructuralEdgeTests(unittest.TestCase):
+    def _make_bot(self):
+        bot = kw.KalshiSniperBot.__new__(kw.KalshiSniperBot)
+        bot.structural_edge_log_markers = {}
+        bot.sports_edge_ranking_log_markers = {}
+        bot.sports_momentum_state = {}
+        bot.targeted_orderbook_cache = {}
+        bot.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
+        bot.family_profit_memory_log_markers = {}
+        return bot
+
+    def test_ladder_dislocation_gets_structural_score_and_boost(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBSTRIKEOUT-TEST-65",
+            selected_side="yes",
+            selected_price=0.34,
+            yes_bid=0.31,
+            yes_ask=0.35,
+            no_bid=0.64,
+            no_ask=0.69,
+            yes_top_size=4,
+            no_top_size=9,
+        )
+        market = {
+            "ticker": q.ticker,
+            "event_ticker": "KXMLBSTRIKEOUT-TEST",
+            "title": "Pitcher strikeouts over 6.5",
+            "yes_bid": 31,
+            "yes_ask": 35,
+            "no_bid": 64,
+            "no_ask": 69,
+        }
+        markets = [
+            market,
+            {
+                "ticker": "KXMLBSTRIKEOUT-TEST-55",
+                "event_ticker": "KXMLBSTRIKEOUT-TEST",
+                "title": "Pitcher strikeouts over 5.5",
+                "yes_bid": 58,
+                "yes_ask": 62,
+            },
+            {
+                "ticker": "KXMLBSTRIKEOUT-TEST-75",
+                "event_ticker": "KXMLBSTRIKEOUT-TEST",
+                "title": "Pitcher strikeouts over 7.5",
+                "yes_bid": 46,
+                "yes_ask": 50,
+            },
+        ]
+
+        context = bot._get_structural_edge_rank_adjustment(
+            market=market,
+            q=q,
+            spread=0.04,
+            family="KXMLBSTRIKEOUT",
+            markets=markets,
+            source="unit_test",
+            log=False,
+        )
+
+        self.assertGreater(context["STRUCTURAL_EDGE_SCORE"], 50.0)
+        self.assertGreater(context["boost"], 0.0)
+        self.assertGreater(context["probability_adjustment"], 0.0)
+        self.assertIn("STRUCTURAL_PROBABILITY_DISLOCATION", context["tags"])
+
+    def test_structural_context_increases_ev_conviction_sizing(self):
+        candidate = {
+            "ticker": "KXMLBSTRIKEOUT-TEST-65",
+            "family": "KXMLBSTRIKEOUT",
+            "selected_side": "yes",
+            "selected_price": 0.34,
+            "yes_bid": 0.31,
+            "yes_ask": 0.35,
+            "no_bid": 0.64,
+            "no_ask": 0.69,
+            "STRUCTURAL_EDGE_SCORE": 84.0,
+            "structural_edge_probability_adjustment": 0.052,
+            "structural_edge_size_multiplier": 1.34,
+            "family_profile": {"sizing_bias": 1.10, "structural_edge_weight": 1.25},
+            "live_state_context": {"live_state_score": 0.82},
+        }
+
+        ev = compute_candidate_ev(candidate)
+
+        self.assertGreater(ev["estimated_win_probability"], ev["market_implied_probability"])
+        self.assertIn(ev["ev_tier"], {"A", "S"})
+        self.assertGreater(ev["ev_sizing_multiplier"], 1.0)
+        self.assertGreater(ev["conviction_size_multiplier"], 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

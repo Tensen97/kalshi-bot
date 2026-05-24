@@ -1699,6 +1699,11 @@ AION_SPORTS_EDGE_USABLE_SPREAD = get_env_float("AION_SPORTS_EDGE_USABLE_SPREAD",
 AION_SPORTS_EDGE_MIN_TOP_DEPTH = get_env_float("AION_SPORTS_EDGE_MIN_TOP_DEPTH", 3.0)
 AION_SPORTS_EDGE_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_SIZE_MULTIPLIER", 1.15)
 AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER", 1.35)
+AION_STRUCTURAL_EDGE_ENABLED = get_env_bool("AION_STRUCTURAL_EDGE_ENABLED", 1)
+AION_STRUCTURAL_EDGE_MAX_RANK_BOOST = get_env_float("AION_STRUCTURAL_EDGE_MAX_RANK_BOOST", 4.5)
+AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT", 0.055)
+AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER", 1.45)
+AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER = get_env_float("AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER", 0.55)
 AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
 AION_DATA_COVERAGE_REFRESH_SECONDS = get_env_int("AION_DATA_COVERAGE_REFRESH_SECONDS", 900)
 AION_DATA_COVERAGE_INCLUDE_TELEMETRY = get_env_bool("AION_DATA_COVERAGE_INCLUDE_TELEMETRY", 0)
@@ -26555,6 +26560,592 @@ class KalshiSniperBot:
                 except Exception:
                     pass
 
+    def _emit_structural_edge_log(self, tag, payload, marker=None):
+        markers = getattr(self, "structural_edge_log_markers", None)
+        if markers is None:
+            self.structural_edge_log_markers = {}
+            markers = self.structural_edge_log_markers
+        marker_key = None
+        if marker is not None:
+            marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+            if marker_key in markers:
+                return
+            markers[marker_key] = time.time()
+        try:
+            print(f"{tag} " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"{tag} " + json.dumps({"reason": "structural_edge_log_failed"}))
+
+    def _attach_structural_edge_context(self, item=None, q=None, context=None):
+        context = context if isinstance(context, dict) else {}
+        tags = list(context.get("tags") or [])
+        if isinstance(item, dict):
+            item["structural_edge_context"] = context
+            item["structural_edge_score"] = context.get("structural_edge_score", context.get("score", 0.0))
+            item["STRUCTURAL_EDGE_SCORE"] = context.get("STRUCTURAL_EDGE_SCORE", context.get("structural_edge_score", 0.0))
+            item["structural_edge_rank_boost"] = context.get("boost", 0.0)
+            item["structural_edge_size_multiplier"] = context.get("size_multiplier", 1.0)
+            item["structural_edge_probability_adjustment"] = context.get("probability_adjustment", 0.0)
+            item["structural_edge_tags"] = tags
+            item["family_profile"] = context.get("family_profile") or {}
+            item["live_state_context"] = context.get("live_state") or {}
+        if q is not None:
+            for field, value in (
+                ("structural_edge_context", context),
+                ("structural_edge_score", context.get("structural_edge_score", context.get("score", 0.0))),
+                ("STRUCTURAL_EDGE_SCORE", context.get("STRUCTURAL_EDGE_SCORE", context.get("structural_edge_score", 0.0))),
+                ("structural_edge_rank_boost", context.get("boost", 0.0)),
+                ("structural_edge_size_multiplier", context.get("size_multiplier", 1.0)),
+                ("structural_edge_probability_adjustment", context.get("probability_adjustment", 0.0)),
+                ("structural_edge_tags", tags),
+                ("family_profile", context.get("family_profile") or {}),
+                ("live_state_context", context.get("live_state") or {}),
+            ):
+                try:
+                    setattr(q, field, value)
+                except Exception:
+                    pass
+
+    def _normalize_structural_text(self, value):
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").strip().lower()).strip()
+
+    def _extract_structural_line_value(self, *values):
+        text = " ".join(str(value or "") for value in values if str(value or "").strip())
+        if not text:
+            return None
+        matches = re.findall(r"(?<![A-Z0-9])[-+]?\d+(?:\.\d+)?(?![A-Z0-9])", text.upper())
+        candidates = []
+        for raw in matches:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if abs(value) > 500:
+                continue
+            candidates.append(value)
+        if not candidates:
+            return None
+        fractional = [value for value in candidates if abs(value - round(value)) > 0.0001]
+        if fractional:
+            return float(fractional[-1])
+        return float(candidates[-1])
+
+    def _structural_yes_mid(self, source):
+        source = source if source is not None else {}
+        yes_bid = self._sports_edge_price_value(
+            self._sports_edge_read_value([source], "yes_bid", "yes_bid_dollars", "yes_bid_price")
+        )
+        yes_ask = self._sports_edge_price_value(
+            self._sports_edge_read_value([source], "yes_ask", "yes_ask_dollars", "yes_ask_price")
+        )
+        if yes_bid is not None and yes_ask is not None and yes_bid > 0.0 and yes_ask > 0.0:
+            return round(max(0.01, min(0.99, (yes_bid + yes_ask) / 2.0)), 6)
+        if yes_ask is not None and yes_ask > 0.0:
+            return round(max(0.01, min(0.99, yes_ask)), 6)
+        if yes_bid is not None and yes_bid > 0.0:
+            return round(max(0.01, min(0.99, yes_bid)), 6)
+        last_price = self._sports_edge_price_value(
+            self._sports_edge_read_value([source], "last_price", "price", "selected_price", "selected_price_dollars")
+        )
+        if last_price is not None:
+            return round(max(0.01, min(0.99, last_price)), 6)
+        return None
+
+    def _build_structural_family_profile(self, family=None, category=None, market_type=None):
+        family_text = str(family or "").strip().upper() or "UNKNOWN"
+        category_text = str(category or "").strip().lower() or "unknown"
+        market_type_text = str(market_type or "").strip().lower() or "generic"
+        is_sports = bool(category_text == "sports" or self.is_sports_family(family_text))
+        profile = {
+            "family": family_text,
+            "category": category_text,
+            "market_type": market_type_text,
+            "structural_edge_weight": 1.0,
+            "timing_sensitivity": 0.50,
+            "volatility_tolerance": 0.50,
+            "sizing_bias": 1.0,
+            "profile_reason": "generic",
+        }
+        if is_sports:
+            profile.update(
+                {
+                    "structural_edge_weight": 1.18,
+                    "timing_sensitivity": 0.76,
+                    "volatility_tolerance": 0.68,
+                    "sizing_bias": 1.08,
+                    "profile_reason": "sports_structural",
+                }
+            )
+            text = f"{family_text} {market_type_text}"
+            if any(term in text for term in ("PROP", "STRIKE", "HR", "HIT", "RBI", "PLAYER")):
+                profile.update(
+                    {
+                        "structural_edge_weight": 1.28,
+                        "timing_sensitivity": 0.86,
+                        "volatility_tolerance": 0.82,
+                        "sizing_bias": 1.06,
+                        "profile_reason": "sports_prop_ladder",
+                    }
+                )
+            elif any(term in text for term in ("SPREAD", "TOTAL", "1H")):
+                profile.update(
+                    {
+                        "structural_edge_weight": 1.22,
+                        "timing_sensitivity": 0.80,
+                        "volatility_tolerance": 0.72,
+                        "sizing_bias": 1.10,
+                        "profile_reason": "sports_spread_total",
+                    }
+                )
+            elif any(term in text for term in ("TENNIS", "ATP")):
+                profile.update(
+                    {
+                        "structural_edge_weight": 1.16,
+                        "timing_sensitivity": 0.84,
+                        "volatility_tolerance": 0.78,
+                        "sizing_bias": 1.06,
+                        "profile_reason": "sports_tennis",
+                    }
+                )
+        elif family_text.startswith(("KXBTC", "KXETH")) or "CRYPTO" in family_text:
+            profile.update(
+                {
+                    "structural_edge_weight": 0.88,
+                    "timing_sensitivity": 0.90,
+                    "volatility_tolerance": 0.90,
+                    "sizing_bias": 0.96,
+                    "profile_reason": "crypto_fast_repricing",
+                }
+            )
+        elif "WEATHER" in family_text or "KXHIGH" in family_text or "KXTEMP" in family_text:
+            profile.update(
+                {
+                    "structural_edge_weight": 0.96,
+                    "timing_sensitivity": 0.42,
+                    "volatility_tolerance": 0.38,
+                    "sizing_bias": 0.96,
+                    "profile_reason": "weather_slow_repricing",
+                }
+            )
+        try:
+            stats = self._get_family_profit_memory_stats(family_text, refresh=False)
+        except Exception:
+            stats = {}
+        if isinstance(stats, dict):
+            pnl = self.to_float(stats.get("pnl") or stats.get("net_pnl") or stats.get("realized_pnl"), 0.0) or 0.0
+            win_rate = self.to_float(stats.get("win_rate"), None)
+            trade_count = int(self.to_float(stats.get("trade_count") or stats.get("trades") or stats.get("sample_size"), 0) or 0)
+            if trade_count >= 3 and pnl > 0.0:
+                profile["sizing_bias"] = min(1.18, self.to_float(profile.get("sizing_bias"), 1.0) + 0.04)
+                profile["structural_edge_weight"] = min(1.38, self.to_float(profile.get("structural_edge_weight"), 1.0) + 0.06)
+                profile["profile_reason"] = f"{profile['profile_reason']}+profitable_family"
+            elif trade_count >= 3 and pnl < 0.0:
+                profile["sizing_bias"] = max(0.86, self.to_float(profile.get("sizing_bias"), 1.0) - 0.05)
+                profile["structural_edge_weight"] = max(0.82, self.to_float(profile.get("structural_edge_weight"), 1.0) - 0.04)
+                profile["profile_reason"] = f"{profile['profile_reason']}+weak_family"
+            if win_rate is not None and trade_count >= 5 and win_rate >= 0.58:
+                profile["sizing_bias"] = min(1.22, self.to_float(profile.get("sizing_bias"), 1.0) + 0.03)
+        return profile
+
+    def _structural_related_markets(self, *, market=None, q=None, family=None, markets=None, ticker=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = str(family or self.get_market_family(market if market else {"ticker": ticker}) or "").strip().upper()
+        if not family or not markets:
+            return []
+        event_keys = {
+            str(market.get(key) or "").strip().upper()
+            for key in ("event_ticker", "eventTicker", "series_ticker", "seriesTicker")
+            if str(market.get(key) or "").strip()
+        }
+        title = self._normalize_structural_text(
+            " ".join(
+                str(value or "")
+                for value in (
+                    market.get("title"),
+                    market.get("subtitle"),
+                    market.get("event_title"),
+                    getattr(q, "title", None),
+                    getattr(q, "market_title", None),
+                )
+                if str(value or "").strip()
+            )
+        )
+        title_tokens = {token for token in title.split() if len(token) >= 3 and not token.isdigit()}
+        related = []
+        for candidate_market in markets or []:
+            if not isinstance(candidate_market, dict):
+                continue
+            candidate_ticker = str(candidate_market.get("ticker") or "").strip()
+            if not candidate_ticker or candidate_ticker == ticker:
+                continue
+            candidate_family = str(self.get_market_family(candidate_market) or "").strip().upper()
+            if candidate_family != family:
+                continue
+            candidate_event_keys = {
+                str(candidate_market.get(key) or "").strip().upper()
+                for key in ("event_ticker", "eventTicker", "series_ticker", "seriesTicker")
+                if str(candidate_market.get(key) or "").strip()
+            }
+            event_match = bool(event_keys and candidate_event_keys and event_keys.intersection(candidate_event_keys))
+            candidate_title = self._normalize_structural_text(
+                " ".join(
+                    str(candidate_market.get(key) or "")
+                    for key in ("title", "subtitle", "event_title")
+                    if str(candidate_market.get(key) or "").strip()
+                )
+            )
+            candidate_tokens = {token for token in candidate_title.split() if len(token) >= 3 and not token.isdigit()}
+            overlap = len(title_tokens.intersection(candidate_tokens))
+            if not event_match and overlap < 2:
+                continue
+            line_value = self._extract_structural_line_value(
+                candidate_market.get("title"),
+                candidate_market.get("subtitle"),
+                candidate_market.get("ticker"),
+            )
+            yes_mid = self._structural_yes_mid(candidate_market)
+            if yes_mid is None:
+                continue
+            related.append(
+                {
+                    "ticker": candidate_ticker,
+                    "line": line_value,
+                    "yes_mid": yes_mid,
+                    "title_overlap": overlap,
+                    "event_match": event_match,
+                }
+            )
+        related.sort(
+            key=lambda item: (
+                0 if item.get("line") is None else 1,
+                abs(self.to_float(item.get("line"), 0.0) or 0.0),
+                item.get("ticker") or "",
+            )
+        )
+        return related[:24]
+
+    def _get_structural_edge_rank_adjustment(
+        self,
+        item=None,
+        *,
+        market=None,
+        q=None,
+        spread=None,
+        family=None,
+        markets=None,
+        expectancy_summary=None,
+        quality_snapshot=None,
+        source="ranking",
+        log=True,
+    ):
+        if not AION_STRUCTURAL_EDGE_ENABLED:
+            return {"enabled": False, "boost": 0.0, "reason": "disabled", "tags": []}
+        market = market if isinstance(market, dict) else {}
+        expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+        quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+        if isinstance(item, dict):
+            q = q or item.get("q") or item.get("quote")
+            spread = spread if spread is not None else item.get("spread")
+            family = family or item.get("family")
+            if not expectancy_summary and isinstance(item.get("expectancy_summary"), dict):
+                expectancy_summary = item.get("expectancy_summary") or {}
+            if not quality_snapshot and isinstance(item.get("quality_snapshot"), dict):
+                quality_snapshot = item.get("quality_snapshot") or {}
+        elif isinstance(item, (list, tuple)):
+            q = q or (item[1] if len(item) > 1 else None)
+            spread = spread if spread is not None else (item[2] if len(item) > 2 else None)
+            family = family or (item[3] if len(item) > 3 else None)
+        sources = [expectancy_summary, quality_snapshot, item if isinstance(item, dict) else None, market, q]
+        ticker = str(
+            self._sports_edge_read_value(sources, "ticker")
+            or getattr(q, "ticker", "")
+            or market.get("ticker", "")
+            or ""
+        ).strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        category = str(self.get_market_discovery_category(market or family) or "").strip().lower() or "unknown"
+        market_type = self._classify_sports_liquidity_market_type(
+            family=family,
+            ticker=ticker,
+            title=self._sports_edge_read_value(sources, "title", "market_title", "event_title", "subtitle"),
+        ) if self.is_sports_family(family, ticker=ticker) else "generic"
+        family_profile = self._build_structural_family_profile(family=family, category=category, market_type=market_type)
+        selected_side = str(self._sports_edge_read_value(sources, "selected_side", "side") or "yes").strip().lower()
+        if selected_side not in {"yes", "no"}:
+            selected_side = "yes"
+        selected_price = self._sports_edge_price_value(
+            self._sports_edge_read_value(sources, "selected_price", "selected_price_dollars", "price", "ev_selected_price")
+        )
+        yes_bid = self._sports_edge_price_value(self._sports_edge_read_value(sources, "yes_bid", "yes_bid_dollars"))
+        yes_ask = self._sports_edge_price_value(self._sports_edge_read_value(sources, "yes_ask", "yes_ask_dollars"))
+        no_bid = self._sports_edge_price_value(self._sports_edge_read_value(sources, "no_bid", "no_bid_dollars"))
+        no_ask = self._sports_edge_price_value(self._sports_edge_read_value(sources, "no_ask", "no_ask_dollars"))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+        if selected_price is None:
+            selected_price = no_ask if selected_side == "no" else yes_ask
+        if selected_price is None:
+            selected_price = yes_ask or no_ask
+        current_yes_mid = self._structural_yes_mid(
+            {
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "last_price": selected_price if selected_side == "yes" else (None if selected_price is None else 1.0 - selected_price),
+            }
+        )
+        spread_value = self.to_float(spread, None)
+        if spread_value is None:
+            if selected_side == "no" and no_bid is not None and no_ask is not None:
+                spread_value = max(0.0, no_ask - no_bid)
+            elif yes_bid is not None and yes_ask is not None:
+                spread_value = max(0.0, yes_ask - yes_bid)
+            elif no_bid is not None and no_ask is not None:
+                spread_value = max(0.0, no_ask - no_bid)
+        selected_top_size = self.to_float(
+            self._sports_edge_read_value(sources, "yes_top_size", "yes_ask_size", "yes_size") if selected_side == "yes"
+            else self._sports_edge_read_value(sources, "no_top_size", "no_ask_size", "no_size"),
+            0.0,
+        ) or 0.0
+        opposite_top_size = self.to_float(
+            self._sports_edge_read_value(sources, "no_top_size", "no_ask_size", "no_size") if selected_side == "yes"
+            else self._sports_edge_read_value(sources, "yes_top_size", "yes_ask_size", "yes_size"),
+            0.0,
+        ) or 0.0
+        liquidity = self.to_float(self._sports_edge_read_value(sources, "liquidity", "liquidity_dollars", "liquidity_depth", "book_depth"), None)
+        related = self._structural_related_markets(market=market, q=q, family=family, markets=markets, ticker=ticker)
+        current_line = self._extract_structural_line_value(
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("ticker"),
+            getattr(q, "title", None),
+            ticker,
+        )
+        lower = []
+        higher = []
+        if current_line is not None:
+            for neighbor in related:
+                line_value = self.to_float(neighbor.get("line"), None)
+                if line_value is None:
+                    continue
+                if line_value < current_line:
+                    lower.append(neighbor)
+                elif line_value > current_line:
+                    higher.append(neighbor)
+            lower.sort(key=lambda item: abs(self.to_float(item.get("line"), current_line) - current_line))
+            higher.sort(key=lambda item: abs(self.to_float(item.get("line"), current_line) - current_line))
+        neighbor_prices = [self.to_float(item.get("yes_mid"), None) for item in related if self.to_float(item.get("yes_mid"), None) is not None]
+        curve_expected_yes = None
+        if lower and higher:
+            low = lower[0]
+            high = higher[0]
+            low_line = self.to_float(low.get("line"), None)
+            high_line = self.to_float(high.get("line"), None)
+            low_mid = self.to_float(low.get("yes_mid"), None)
+            high_mid = self.to_float(high.get("yes_mid"), None)
+            if low_line is not None and high_line is not None and high_line != low_line and low_mid is not None and high_mid is not None:
+                ratio = max(0.0, min(1.0, (current_line - low_line) / (high_line - low_line)))
+                curve_expected_yes = low_mid + ((high_mid - low_mid) * ratio)
+        elif neighbor_prices:
+            curve_expected_yes = sum(neighbor_prices[:4]) / max(1, min(4, len(neighbor_prices)))
+        curve_delta = 0.0
+        if current_yes_mid is not None and curve_expected_yes is not None:
+            if selected_side == "no":
+                curve_delta = current_yes_mid - curve_expected_yes
+            else:
+                curve_delta = curve_expected_yes - current_yes_mid
+        curve_component = self._clamp(max(0.0, curve_delta) / 0.075)
+        adjacent_component = 0.0
+        if current_yes_mid is not None and neighbor_prices:
+            nearest_gap = max(abs(current_yes_mid - price) for price in neighbor_prices[:4])
+            adjacent_component = self._clamp(max(0.0, nearest_gap - 0.035) / 0.14)
+        selected_price_value = self.to_float(selected_price, None)
+        payout_multiple = (1.0 / selected_price_value) if selected_price_value and selected_price_value > 0.0 else None
+        payout_component = 0.0
+        if payout_multiple is not None and payout_multiple >= 1.35 and (curve_component > 0.0 or selected_price_value <= 0.45):
+            payout_component = self._clamp((payout_multiple - 1.35) / 2.2)
+        liquidity_component = 0.0
+        total_top = selected_top_size + opposite_top_size
+        if total_top > 0.0:
+            liquidity_imbalance = (opposite_top_size - selected_top_size) / max(total_top, 1.0)
+            liquidity_component = self._clamp(max(0.0, liquidity_imbalance) / 0.75)
+            if selected_top_size > 0.0 and liquidity_component < 0.25:
+                liquidity_component = max(liquidity_component, 0.18)
+        if liquidity is not None and liquidity > 0.0:
+            liquidity_component = max(liquidity_component, min(0.45, liquidity / 80.0))
+        spread_component = 0.0
+        if spread_value is not None:
+            if spread_value <= 0.02:
+                spread_component = 1.0
+            elif spread_value <= 0.05:
+                spread_component = 0.72
+            elif spread_value <= (AION_SPORTS_MAX_SPREAD_SOFT if self.is_sports_family(family, ticker=ticker) else 0.10):
+                spread_component = 0.38
+        momentum_context = self._sports_edge_read_value(sources, "sports_momentum", "sports_momentum_context", "momentum_context")
+        if not isinstance(momentum_context, dict):
+            momentum_context = {
+                "momentum_score": self._sports_edge_read_value(sources, "momentum_score"),
+                "directional_bias": self._sports_edge_read_value(sources, "directional_bias"),
+                "repricing_velocity": self._sports_edge_read_value(sources, "repricing_velocity"),
+                "price_delta": self._sports_edge_read_value(sources, "price_delta"),
+            }
+        if not any(value not in (None, "") for value in momentum_context.values()) and market and self.is_sports_family(family, ticker=ticker):
+            try:
+                momentum_context = self.compute_live_sports_momentum(
+                    market if market else {"ticker": ticker},
+                    q=q,
+                    spread=spread_value,
+                    context=f"structural_edge:{source}",
+                    allow_synthetic_size=False,
+                )
+            except Exception:
+                momentum_context = {}
+        momentum_score = self.to_float(momentum_context.get("momentum_score"), 0.0) or 0.0
+        price_delta = self.to_float(momentum_context.get("price_delta"), 0.0) or 0.0
+        repricing_velocity = self.to_float(momentum_context.get("repricing_velocity"), 0.0) or 0.0
+        if selected_side == "no":
+            momentum_score *= -1.0
+            price_delta *= -1.0
+            repricing_velocity *= -1.0
+        repricing_component = self._clamp(max(0.0, momentum_score * 0.6 + price_delta * 8.0 + repricing_velocity * 35.0))
+        try:
+            lifecycle_state = self._get_sports_market_lifecycle_state(market=market if market else {"ticker": ticker}, family=family)
+        except Exception:
+            lifecycle_state = "unknown"
+        lifecycle_text = str(lifecycle_state or "unknown").strip().lower()
+        timing_component = 0.50
+        if lifecycle_text in {"active_near", "live_early", "pregame_near"}:
+            timing_component = 0.82
+        elif lifecycle_text in {"live_mid", "active_mid"}:
+            timing_component = 0.68
+        elif lifecycle_text in {"late", "live_late", "stale", "closed"}:
+            timing_component = 0.24
+        live_state_score = self._clamp((repricing_component * 0.65) + (timing_component * 0.35))
+        stale_ladder_component = self._clamp((curve_component * 0.70) + (repricing_component * 0.30)) if related else 0.0
+        components = {
+            "probability_curve": round(curve_component, 4),
+            "adjacent_gap": round(adjacent_component, 4),
+            "payout_dislocation": round(payout_component, 4),
+            "liquidity_asymmetry": round(liquidity_component, 4),
+            "spread_efficiency": round(spread_component, 4),
+            "repricing_lag": round(repricing_component, 4),
+            "live_state_alignment": round(live_state_score, 4),
+            "stale_ladder": round(stale_ladder_component, 4),
+        }
+        family_weight = self.to_float(family_profile.get("structural_edge_weight"), 1.0) or 1.0
+        weighted_score = (
+            curve_component * 24.0
+            + adjacent_component * 11.0
+            + payout_component * 13.0
+            + liquidity_component * 10.0
+            + spread_component * 10.0
+            + repricing_component * 14.0
+            + live_state_score * 10.0
+            + stale_ladder_component * 8.0
+        ) * family_weight
+        structural_edge_score = round(max(0.0, min(100.0, weighted_score)), 4)
+        tags = []
+        if curve_component >= 0.35:
+            tags.append("STRUCTURAL_PROBABILITY_DISLOCATION")
+        if stale_ladder_component >= 0.35:
+            tags.append("STRUCTURAL_STALE_LADDER")
+        if payout_component >= 0.30:
+            tags.append("STRUCTURAL_PAYOUT_DISLOCATION")
+        if liquidity_component >= 0.35:
+            tags.append("STRUCTURAL_LIQUIDITY_DISTORTION")
+        if repricing_component >= 0.32:
+            tags.append("STRUCTURAL_REPRICING_LAG")
+        if spread_component >= 0.70:
+            tags.append("STRUCTURAL_EFFICIENT_SPREAD")
+        if live_state_score >= 0.65:
+            tags.append("STRUCTURAL_LIVE_ALIGNMENT")
+        if self.to_float(family_profile.get("sizing_bias"), 1.0) > 1.04:
+            tags.append("FAMILY_SPECIALIZATION_POSITIVE")
+        elif self.to_float(family_profile.get("sizing_bias"), 1.0) < 0.96:
+            tags.append("FAMILY_SPECIALIZATION_CAUTION")
+        boost = 0.0
+        if structural_edge_score >= 25.0:
+            boost = min(
+                AION_STRUCTURAL_EDGE_MAX_RANK_BOOST,
+                max(0.0, ((structural_edge_score - 20.0) / 80.0) * AION_STRUCTURAL_EDGE_MAX_RANK_BOOST),
+            )
+        probability_adjustment = 0.0
+        if structural_edge_score >= 50.0:
+            probability_adjustment = min(
+                AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT,
+                0.012 + ((structural_edge_score - 50.0) / 50.0) * (AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT - 0.012),
+            )
+        elif structural_edge_score < 28.0:
+            probability_adjustment = max(-0.012, (structural_edge_score - 28.0) / 28.0 * 0.012)
+        size_multiplier = 1.0
+        if structural_edge_score >= 78.0:
+            size_multiplier = min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, 1.32 * self.to_float(family_profile.get("sizing_bias"), 1.0))
+        elif structural_edge_score >= 60.0:
+            size_multiplier = min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, 1.14 * self.to_float(family_profile.get("sizing_bias"), 1.0))
+        elif structural_edge_score >= 38.0:
+            size_multiplier = max(0.90, min(1.08, self.to_float(family_profile.get("sizing_bias"), 1.0)))
+        elif structural_edge_score < 24.0:
+            size_multiplier = max(AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER, 0.70 * min(1.0, self.to_float(family_profile.get("sizing_bias"), 1.0)))
+        context = {
+            "enabled": True,
+            "ticker": ticker,
+            "family": family,
+            "category": category,
+            "market_type": market_type,
+            "source": source,
+            "selected_side": selected_side,
+            "selected_price": round(selected_price_value, 6) if selected_price_value is not None else None,
+            "spread": round(spread_value, 6) if spread_value is not None else None,
+            "current_line": current_line,
+            "current_yes_mid": current_yes_mid,
+            "curve_expected_yes": round(curve_expected_yes, 6) if curve_expected_yes is not None else None,
+            "curve_delta": round(curve_delta, 6),
+            "related_count": len(related),
+            "components": components,
+            "tags": tags,
+            "structural_edge_score": structural_edge_score,
+            "STRUCTURAL_EDGE_SCORE": structural_edge_score,
+            "boost": round(boost, 4),
+            "probability_adjustment": round(probability_adjustment, 6),
+            "size_multiplier": round(max(AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER, min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
+            "family_profile": family_profile,
+            "live_state": {
+                "lifecycle_state": lifecycle_text,
+                "momentum_score": round(momentum_score, 4),
+                "price_delta": round(price_delta, 6),
+                "repricing_velocity": round(repricing_velocity, 6),
+                "live_state_score": round(live_state_score, 4),
+            },
+            "reason": "+".join(tags) if tags else "baseline_structure",
+        }
+        self._attach_structural_edge_context(item=item, q=q, context=context)
+        if log and (boost > 0.0 or tags):
+            self._emit_structural_edge_log(
+                "[AION-STRUCTURAL-EDGE]",
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "source": source,
+                    "STRUCTURAL_EDGE_SCORE": structural_edge_score,
+                    "boost": context["boost"],
+                    "probability_adjustment": context["probability_adjustment"],
+                    "size_multiplier": context["size_multiplier"],
+                    "tags": tags,
+                    "components": components,
+                    "related_count": len(related),
+                    "live_state": context["live_state"],
+                    "family_profile": {
+                        "profile_reason": family_profile.get("profile_reason"),
+                        "structural_edge_weight": family_profile.get("structural_edge_weight"),
+                        "sizing_bias": family_profile.get("sizing_bias"),
+                    },
+                },
+                marker=("structural", source, ticker, round(structural_edge_score, 2), tuple(tags)),
+            )
+        return context
+
     def _is_sports_edge_candidate(self, *, market=None, q=None, family=None, ticker=None, item=None, category=None):
         market = market if isinstance(market, dict) else {}
         if isinstance(item, dict):
@@ -27031,12 +27622,27 @@ class KalshiSniperBot:
             0.85,
             min(1.12, self.to_float(context.get("memory_sizing_confidence_multiplier"), 1.0) or 1.0),
         )
+        structural_context = {}
+        if q is not None:
+            structural_context = getattr(q, "structural_edge_context", None) or {}
+        if not isinstance(structural_context, dict) or not structural_context.get("enabled"):
+            structural_context = ev_context.get("structural_edge_context") if isinstance(ev_context.get("structural_edge_context"), dict) else {}
+        structural_size_multiplier = max(
+            AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER,
+            min(
+                AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER,
+                self.to_float(structural_context.get("size_multiplier"), 1.0) or 1.0,
+            ),
+        )
         if eligible:
             new_multiplier = max(
                 old_multiplier,
                 min(
                     max(1.0, AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER),
-                    old_multiplier * max(1.0, AION_SPORTS_EDGE_SIZE_MULTIPLIER) * memory_size_multiplier,
+                    old_multiplier
+                    * max(1.0, AION_SPORTS_EDGE_SIZE_MULTIPLIER)
+                    * memory_size_multiplier
+                    * max(0.95, min(1.18, structural_size_multiplier)),
                 ),
             )
             ev_context["ev_sizing_multiplier"] = round(new_multiplier, 4)
@@ -27059,6 +27665,8 @@ class KalshiSniperBot:
                 "old_multiplier": round(old_multiplier, 4),
                 "new_multiplier": round(new_multiplier, 4),
                 "memory_size_multiplier": round(memory_size_multiplier, 4),
+                "structural_size_multiplier": round(structural_size_multiplier, 4),
+                "STRUCTURAL_EDGE_SCORE": structural_context.get("STRUCTURAL_EDGE_SCORE"),
                 "tags": context.get("tags") or [],
                 "duplicate_blocked": duplicate_blocked,
                 "daily_loss_safe": daily_loss_safe,
@@ -27185,6 +27793,7 @@ class KalshiSniperBot:
         quality_snapshot=None,
         family_profit_memory_adjustment=0.0,
         orderbook_imbalance_context=None,
+        structural_edge_context=None,
         dynamic_memory_adjustment=0.0,
         adaptive_confidence_summary=None,
         source="ranking",
@@ -27196,6 +27805,7 @@ class KalshiSniperBot:
         expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
         quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
         orderbook_imbalance_context = orderbook_imbalance_context if isinstance(orderbook_imbalance_context, dict) else {}
+        structural_edge_context = structural_edge_context if isinstance(structural_edge_context, dict) else {}
         adaptive_confidence_summary = adaptive_confidence_summary if isinstance(adaptive_confidence_summary, dict) else {}
         if isinstance(item, dict):
             q = q or item.get("q") or item.get("quote")
@@ -27216,6 +27826,21 @@ class KalshiSniperBot:
             or ""
         ).strip()
         family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        if not structural_edge_context:
+            try:
+                structural_edge_context = self._get_structural_edge_rank_adjustment(
+                    item,
+                    market=market,
+                    q=q,
+                    spread=spread,
+                    family=family,
+                    expectancy_summary=expectancy_summary,
+                    quality_snapshot=quality_snapshot,
+                    source=f"{source}:ev",
+                    log=True,
+                )
+            except Exception:
+                structural_edge_context = {}
         memory_profile = {}
         try:
             memory_profile = dict((getattr(self, "market_memory_profiles", {}) or {}).get(ticker, {}) or {})
@@ -27274,6 +27899,15 @@ class KalshiSniperBot:
             "dynamic_memory_adjustment": dynamic_memory_adjustment,
             "orderbook_imbalance_adjustment": (orderbook_imbalance_context or {}).get("adjustment"),
             "orderbook_imbalance": orderbook_imbalance_context,
+            "structural_edge_context": structural_edge_context,
+            "structural_edge_score": structural_edge_context.get("structural_edge_score"),
+            "STRUCTURAL_EDGE_SCORE": structural_edge_context.get("STRUCTURAL_EDGE_SCORE"),
+            "structural_edge_probability_adjustment": structural_edge_context.get("probability_adjustment"),
+            "structural_edge_size_multiplier": structural_edge_context.get("size_multiplier"),
+            "structural_edge_rank_boost": structural_edge_context.get("boost"),
+            "structural_edge_tags": list(structural_edge_context.get("tags") or []),
+            "family_profile": structural_edge_context.get("family_profile") or {},
+            "live_state_context": structural_edge_context.get("live_state") or {},
             "memory_profile": memory_profile,
             "adaptive_confidence_summary": adaptive_confidence_summary,
             "expectancy_summary": expectancy_summary,
@@ -27342,6 +27976,16 @@ class KalshiSniperBot:
             "sports_edge_rank_boost",
             "sports_edge_score_at_entry",
             "sports_edge_size_multiplier",
+            "structural_edge_context",
+            "structural_edge_score",
+            "STRUCTURAL_EDGE_SCORE",
+            "structural_edge_probability_adjustment",
+            "structural_edge_size_multiplier",
+            "structural_edge_rank_boost",
+            "structural_edge_tags",
+            "family_profile",
+            "live_state_context",
+            "conviction_size_multiplier",
         )
         for target in (item if isinstance(item, dict) else None, expectancy_summary, quality_snapshot):
             if isinstance(target, dict):
@@ -46346,6 +46990,23 @@ class KalshiSniperBot:
                     0.0,
                 )
                 adjusted_score += elite_signal_adjustment
+                structural_edge_context = self._get_structural_edge_rank_adjustment(
+                    (score, q, spread, family),
+                    market=market,
+                    q=q,
+                    spread=spread,
+                    family=family,
+                    markets=markets,
+                    expectancy_summary=expectancy_summary,
+                    quality_snapshot=quality_snapshot,
+                    source="expectancy_rerank",
+                    log=True,
+                )
+                structural_edge_adjustment = self.to_float(
+                    structural_edge_context.get("boost"),
+                    0.0,
+                )
+                adjusted_score += structural_edge_adjustment
                 sports_edge_context = self._get_sports_edge_rank_adjustment(
                     (score, q, spread, family),
                     market=market,
@@ -46380,6 +47041,7 @@ class KalshiSniperBot:
                     quality_snapshot=quality_snapshot,
                     family_profit_memory_adjustment=family_profit_memory_adjustment,
                     orderbook_imbalance_context=orderbook_imbalance_context,
+                    structural_edge_context=structural_edge_context,
                     adaptive_confidence_summary=adaptive_confidence_summary,
                     source="expectancy_rerank",
                 )
@@ -46478,6 +47140,9 @@ class KalshiSniperBot:
                     "btc_volatility_context": btc_volatility_context,
                     "elite_public_signal_adjustment": elite_signal_adjustment,
                     "elite_public_signal_context": elite_signal_context,
+                    "structural_edge_adjustment": structural_edge_adjustment,
+                    "structural_edge_context": structural_edge_context,
+                    "STRUCTURAL_EDGE_SCORE": structural_edge_context.get("STRUCTURAL_EDGE_SCORE"),
                     "sports_edge_adjustment": sports_edge_adjustment,
                     "sports_edge_context": sports_edge_context,
                     "sports_edge_tags": list(sports_edge_context.get("tags") or []),

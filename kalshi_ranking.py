@@ -182,6 +182,9 @@ def emit_aion_kelly_log(bot, *, ticker=None, family=None, ev_context=None, price
                     "final_contract_size",
                     ev_context.get("kelly_contract_size"),
                 ),
+                "STRUCTURAL_EDGE_SCORE": ev_context.get("STRUCTURAL_EDGE_SCORE", ev_context.get("structural_edge_score")),
+                "conviction_size_multiplier": ev_context.get("conviction_size_multiplier"),
+                "structural_edge_size_multiplier": ev_context.get("structural_edge_size_multiplier"),
                 "action": action or kelly_result.get("reason") or ev_context.get("kelly_reason") or "selected",
             },
             sort_keys=True,
@@ -212,7 +215,20 @@ def resolve_ev_contract_size(
         multiplier = bot.to_float(getattr(q, "ev_sizing_multiplier", None), None)
     if multiplier is None:
         multiplier = 1.0
-    multiplier = max(0.0, min(1.60, float(multiplier)))
+    structural_score = bot.to_float(
+        ev_context.get("STRUCTURAL_EDGE_SCORE", ev_context.get("structural_edge_score")),
+        bot.to_float(getattr(q, "STRUCTURAL_EDGE_SCORE", None), 0.0) if q is not None else 0.0,
+    ) or 0.0
+    conviction_size_multiplier = bot.to_float(
+        ev_context.get("conviction_size_multiplier"),
+        bot.to_float(getattr(q, "conviction_size_multiplier", None), None) if q is not None else None,
+    )
+    multiplier_cap = max(1.60, min(2.25, bot.to_float(kelly_max_multiplier, 1.75) or 1.75))
+    if structural_score >= 78.0:
+        multiplier_cap = max(multiplier_cap, min(2.25, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 0.20))
+    if conviction_size_multiplier is not None and conviction_size_multiplier < 0.90:
+        multiplier_cap = min(multiplier_cap, 1.15)
+    multiplier = max(0.0, min(multiplier_cap, float(multiplier)))
     ev_tier = str(ev_context.get("ev_tier") or getattr(q, "ev_tier", None) or "C").strip().upper() or "C"
     requested_size = int(round(base_size * multiplier))
     if ev_tier == "S" and multiplier > 1.0 and max_size > base_size:
@@ -220,6 +236,29 @@ def resolve_ev_contract_size(
     if requested_size <= 0:
         requested_size = 1
     ev_adjusted_size = max(1, min(max_size, requested_size))
+    if structural_score > 0.0 or conviction_size_multiplier not in (None, 1.0):
+        try:
+            print(
+                "[AION-CONVICTION-SIZE] "
+                + json.dumps(
+                    {
+                        "ticker": ev_context.get("ticker") or getattr(q, "ticker", None),
+                        "family": ev_context.get("family") or getattr(q, "family", None),
+                        "ev_tier": ev_tier,
+                        "STRUCTURAL_EDGE_SCORE": round(structural_score, 4),
+                        "conviction_size_multiplier": None if conviction_size_multiplier is None else round(conviction_size_multiplier, 4),
+                        "ev_sizing_multiplier": round(multiplier, 4),
+                        "base_size": int(base_size),
+                        "requested_size": int(requested_size),
+                        "ev_adjusted_size": int(ev_adjusted_size),
+                        "max_size": int(max_size),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
 
     if calculate_fractional_kelly_size is None:
         bot.last_fractional_kelly_result = {
@@ -709,6 +748,17 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             log=True,
             source=source,
         )
+        if hasattr(bot, "_get_structural_edge_rank_adjustment"):
+            structural_edge_context = bot._get_structural_edge_rank_adjustment(
+                item,
+                market=market,
+                family=family,
+                markets=markets,
+                source=source,
+                log=True,
+            )
+        else:
+            structural_edge_context = {"boost": 0.0}
         if hasattr(bot, "_get_elite_public_signal_rank_adjustment"):
             elite_signal_context = bot._get_elite_public_signal_rank_adjustment(
                 item,
@@ -736,6 +786,7 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             family=family,
             family_profit_memory_adjustment=family_adjustment,
             orderbook_imbalance_context=imbalance_context,
+            structural_edge_context=structural_edge_context,
             source=source,
         )
         momentum_context = get_momentum_rank_adjustment(
@@ -754,6 +805,7 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             + family_adjustment
             + bot.to_float(imbalance_context.get("adjustment"), 0.0)
             + bot.to_float(btc_volatility_context.get("adjustment"), 0.0)
+            + bot.to_float(structural_edge_context.get("boost"), 0.0)
             + bot.to_float(elite_signal_context.get("boost"), 0.0)
             + bot.to_float(sports_edge_context.get("boost"), 0.0)
             + bot._ev_rank_adjustment(ev_context)
