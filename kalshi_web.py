@@ -8128,6 +8128,11 @@ class KalshiSniperBot:
                         ),
                         "sports_family_activity_level": sports_context.get("sports_family_activity_level"),
                         "sports_data_tag": ",".join(sports_context.get("data_readiness_tags") or []) if isinstance(sports_context.get("data_readiness_tags"), list) else None,
+                        "odds_bucket": sports_context.get("odds_bucket"),
+                        "asymmetry_bucket": sports_context.get("asymmetry_bucket"),
+                        "liquidity_bucket": sports_context.get("liquidity_bucket"),
+                        "spread_bucket": sports_context.get("spread_bucket"),
+                        "sport_type": sports_context.get("sport_type"),
                     }
                 )
             else:
@@ -25266,7 +25271,90 @@ class KalshiSniperBot:
             return "60_80"
         return "over_80"
 
-    def _get_aion_distilled_learning_signal(self, *, family=None, category=None, sports_tags=None, odds_bucket=None, book_quality_tag=None, elite_trader_handle=None):
+    def _aion_distilled_asymmetry_bucket(self, price=None, payout_multiple=None):
+        multiple = self.to_float(payout_multiple, None)
+        price_value = self.to_float(price, None)
+        if price_value is not None and price_value > 1.0 and price_value <= 100.0:
+            price_value = price_value / 100.0
+        if multiple is None and price_value is not None and price_value > 0.0:
+            multiple = 1.0 / price_value
+        if multiple is None:
+            return "unknown"
+        if multiple < 1.5:
+            return "low_asymmetry"
+        if multiple < 2.25:
+            return "moderate_asymmetry"
+        if multiple < 3.5:
+            return "strong_asymmetry"
+        return "extreme_asymmetry"
+
+    def _aion_distilled_spread_bucket(self, spread):
+        spread_value = self.to_float(spread, None)
+        if spread_value is None:
+            return "unknown"
+        if spread_value > 1.0 and spread_value <= 100.0:
+            spread_value = spread_value / 100.0
+        if spread_value <= 0.03:
+            return "tight"
+        if spread_value <= 0.06:
+            return "usable"
+        if spread_value <= 0.12:
+            return "wide"
+        return "very_wide"
+
+    def _aion_distilled_liquidity_bucket(self, liquidity):
+        liquidity_value = self.to_float(liquidity, None)
+        if liquidity_value is None:
+            return "unknown"
+        if liquidity_value < 25.0:
+            return "thin"
+        if liquidity_value < 250.0:
+            return "light"
+        if liquidity_value < 1000.0:
+            return "usable"
+        if liquidity_value < 5000.0:
+            return "deep"
+        return "very_deep"
+
+    def _aion_distilled_sport_type(self, family=None, title=None, ticker=None):
+        text = " ".join(str(value or "").upper() for value in (family, title, ticker))
+        if "NBA" in text or "WNBA" in text:
+            return "nba"
+        if "MLB" in text or "BASEBALL" in text:
+            return "mlb"
+        if "NFL" in text or "FOOTBALL" in text or "CFB" in text or "NCAAF" in text:
+            return "football"
+        if "NHL" in text or "HOCKEY" in text:
+            return "nhl"
+        if "NCAA" in text or "CBB" in text or "NCAAB" in text:
+            return "ncaa"
+        if "ATP" in text or "WTA" in text or "TENNIS" in text:
+            return "tennis"
+        if "GOLF" in text or "PGA" in text:
+            return "golf"
+        if "EPL" in text or "SOCCER" in text:
+            return "soccer"
+        if "UFC" in text or "MMA" in text or "BOX" in text:
+            return "combat"
+        if "IPL" in text or "CRICKET" in text:
+            return "cricket"
+        return "sports"
+
+    def _get_aion_distilled_learning_signal(
+        self,
+        *,
+        family=None,
+        category=None,
+        sports_tags=None,
+        odds_bucket=None,
+        book_quality_tag=None,
+        elite_trader_handle=None,
+        side=None,
+        asymmetry_bucket=None,
+        liquidity_bucket=None,
+        spread_bucket=None,
+        sport_type=None,
+    ):
         engine = getattr(self, "aion_persistent_intelligence", None)
         if not AION_DISTILLED_MEMORY_ENABLED or engine is None or not hasattr(engine, "get_distilled_learning_signal"):
             return {
@@ -25284,6 +25372,11 @@ class KalshiSniperBot:
                 odds_bucket=odds_bucket,
                 book_quality_tag=book_quality_tag,
                 elite_trader_handle=elite_trader_handle,
+                side=side,
+                asymmetry_bucket=asymmetry_bucket,
+                liquidity_bucket=liquidity_bucket,
+                spread_bucket=spread_bucket,
+                sport_type=sport_type,
             )
             return signal if isinstance(signal, dict) else {}
         except Exception as exc:
@@ -25306,6 +25399,7 @@ class KalshiSniperBot:
             family = str(event.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN"
             category = str(event.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower() or "unknown"
             sports_tags = event.get("sports_tags") if isinstance(event.get("sports_tags"), list) else []
+            sports_context = event.get("sports_edge_context") if isinstance(event.get("sports_edge_context"), dict) else {}
             selected_price = event.get("entry_price") if event.get("entry_price") is not None else event.get("price")
             record = {
                 **event,
@@ -25322,7 +25416,20 @@ class KalshiSniperBot:
                 "score_at_entry": event.get("sports_score_at_entry") or event.get("confidence"),
                 "sports_edge_score": event.get("sports_score_at_entry"),
                 "asymmetry_score": event.get("sports_payout_multiple"),
-                "odds_bucket": self._aion_distilled_odds_bucket(selected_price),
+                "odds_bucket": event.get("odds_bucket") or sports_context.get("odds_bucket") or self._aion_distilled_odds_bucket(selected_price),
+                "asymmetry_bucket": event.get("asymmetry_bucket") or sports_context.get("asymmetry_bucket") or self._aion_distilled_asymmetry_bucket(
+                    price=selected_price,
+                    payout_multiple=event.get("sports_payout_multiple") or sports_context.get("payout_multiple"),
+                ),
+                "liquidity_bucket": event.get("liquidity_bucket") or sports_context.get("liquidity_bucket") or self._aion_distilled_liquidity_bucket(
+                    event.get("liquidity_dollars") or sports_context.get("book_depth")
+                ),
+                "spread_bucket": event.get("spread_bucket") or sports_context.get("spread_bucket") or self._aion_distilled_spread_bucket(event.get("spread")),
+                "sport_type": event.get("sport_type") or sports_context.get("sport_type") or self._aion_distilled_sport_type(
+                    family=family,
+                    title=event.get("market_title"),
+                    ticker=event.get("ticker"),
+                ),
                 "orderbook_quality_tag": self._aion_distilled_book_quality_tag(
                     spread=event.get("spread"),
                     liquidity=event.get("liquidity_dollars"),
@@ -25374,6 +25481,11 @@ class KalshiSniperBot:
                         odds_bucket=record.get("odds_bucket"),
                         book_quality_tag=record.get("orderbook_quality_tag"),
                         elite_trader_handle=event.get("elite_trader_handle"),
+                        side=event.get("side"),
+                        asymmetry_bucket=record.get("asymmetry_bucket"),
+                        liquidity_bucket=record.get("liquidity_bucket"),
+                        spread_bucket=record.get("spread_bucket"),
+                        sport_type=record.get("sport_type"),
                     )
                     self._emit_aion_memory_log(
                         "[AION-MEMORY-LEARN]",
@@ -25759,6 +25871,8 @@ class KalshiSniperBot:
             "signal": signal_summary,
             "source": source,
         }
+        if memory_signal.get("components"):
+            context["history_aligned"] = any(str(component.get("label") or "").startswith("sports_history_") for component in memory_signal.get("components") or [])
         self._attach_elite_signal_context(item=item, q=q, context=context)
         self._emit_elite_signal_log(
             "[AION-ELITE-SIGNAL-BOOST]",
@@ -26199,9 +26313,27 @@ class KalshiSniperBot:
                 tags.append(data_tag)
         elite_handle = self._sports_edge_read_value(sources, "elite_trader_handle", "trader_handle")
         odds_bucket = self._aion_distilled_odds_bucket(selected_price)
+        liquidity_for_memory = None
+        if isinstance(liquidity_priority, dict):
+            liquidity_for_memory = (
+                liquidity_priority.get("liquidity")
+                or liquidity_priority.get("liquidity_dollars")
+                or liquidity_priority.get("liquidity_depth")
+                or liquidity_priority.get("top_book_depth")
+            )
+        if liquidity_for_memory is None:
+            liquidity_for_memory = self._sports_edge_read_value(depth_sources, "liquidity", "liquidity_dollars", "liquidity_depth")
+        asymmetry_bucket = self._aion_distilled_asymmetry_bucket(price=selected_price, payout_multiple=payout_multiple)
+        spread_bucket = self._aion_distilled_spread_bucket(spread_value)
+        liquidity_bucket = self._aion_distilled_liquidity_bucket(liquidity_for_memory if liquidity_for_memory is not None else book_depth)
+        sport_type = self._aion_distilled_sport_type(
+            family=family,
+            title=self._sports_edge_read_value(sources, "market_title", "title", "event_title", "subtitle"),
+            ticker=ticker,
+        )
         book_quality_tag = self._aion_distilled_book_quality_tag(
             spread=spread_value,
-            liquidity=liquidity_priority.get("liquidity") if isinstance(liquidity_priority, dict) else None,
+            liquidity=liquidity_for_memory,
             sports_tags=tags,
         )
         distilled_memory_signal = self._get_aion_distilled_learning_signal(
@@ -26211,6 +26343,11 @@ class KalshiSniperBot:
             odds_bucket=odds_bucket,
             book_quality_tag=book_quality_tag,
             elite_trader_handle=elite_handle,
+            side=selected_side,
+            asymmetry_bucket=asymmetry_bucket,
+            liquidity_bucket=liquidity_bucket,
+            spread_bucket=spread_bucket,
+            sport_type=sport_type,
         )
         distilled_rank_adjustment = self.to_float(distilled_memory_signal.get("rank_adjustment"), 0.0) or 0.0
         distilled_sports_boost_adjustment = self.to_float(distilled_memory_signal.get("sports_boost_adjustment"), 0.0) or 0.0
@@ -26285,6 +26422,10 @@ class KalshiSniperBot:
             "distilled_sports_boost_adjustment": round(distilled_sports_boost_adjustment, 4),
             "memory_sizing_confidence_multiplier": round(distilled_size_multiplier, 4),
             "odds_bucket": odds_bucket,
+            "asymmetry_bucket": asymmetry_bucket,
+            "liquidity_bucket": liquidity_bucket,
+            "spread_bucket": spread_bucket,
+            "sport_type": sport_type,
             "book_quality_tag": book_quality_tag,
             "elite_trader_handle": elite_handle,
             "tags": tags,
@@ -26312,6 +26453,10 @@ class KalshiSniperBot:
                     "sports_data_rank_boost": round(data_rank_boost, 4),
                     "distilled_sports_boost_adjustment": round(distilled_sports_boost_adjustment, 4),
                     "distilled_rank_adjustment": round(distilled_rank_adjustment, 4),
+                    "asymmetry_bucket": asymmetry_bucket,
+                    "liquidity_bucket": liquidity_bucket,
+                    "spread_bucket": spread_bucket,
+                    "sport_type": sport_type,
                     "memory_components": len(distilled_memory_signal.get("components") or []),
                 },
                 marker=("score", source, ticker, tuple(tags), boost),

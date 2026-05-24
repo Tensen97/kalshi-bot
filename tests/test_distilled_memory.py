@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -61,6 +62,71 @@ class DistilledMemoryTests(unittest.TestCase):
             self.assertEqual(audit["total_stored_trade_outcomes"], 4)
             self.assertEqual(audit["sports_trade_outcome_count"], 4)
             self.assertEqual(audit["elite_signal_linked_outcome_count"], 4)
+
+    def test_sports_history_backfill_signal_and_audit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "aion_persistent_intelligence.json"
+            engine = AIONPersistentIntelligence(state_file=state_file, enabled=True)
+            now = time.time()
+
+            for index in range(30):
+                result = engine.record_sports_history_market(
+                    {
+                        "timestamp": now - index * 3600,
+                        "ticker": f"KXNBA1HTOTAL-HIST-{index}",
+                        "market_title": "NBA first half total test",
+                        "sport_type": "nba",
+                        "family": "KXNBA1HTOTAL",
+                        "category": "sports",
+                        "yes_price": 0.30,
+                        "no_price": 0.70,
+                        "spread": 0.02,
+                        "liquidity": 500,
+                        "volume": 1200,
+                        "settlement_result": "yes",
+                        "data_source": "unit_test",
+                        "backfill_run_id": "test-run",
+                    },
+                    persist=False,
+                )
+                self.assertTrue(result["ok"])
+                self.assertFalse(result["skipped"])
+
+            duplicate = engine.record_sports_history_market(
+                {
+                    "timestamp": now,
+                    "ticker": "KXNBA1HTOTAL-HIST-0",
+                    "market_title": "NBA first half total test",
+                    "family": "KXNBA1HTOTAL",
+                    "yes_price": 0.30,
+                    "no_price": 0.70,
+                    "settlement_result": "yes",
+                    "data_source": "unit_test",
+                },
+                persist=False,
+            )
+            self.assertTrue(duplicate["ok"])
+            self.assertTrue(duplicate["skipped"])
+
+            signal = engine.get_distilled_learning_signal(
+                family="KXNBA1HTOTAL",
+                category="sports",
+                side="yes",
+                odds_bucket="20_35",
+                asymmetry_bucket="strong_asymmetry",
+                liquidity_bucket="usable",
+                spread_bucket="tight",
+                sport_type="nba",
+            )
+            self.assertGreater(signal["sports_boost_adjustment"], 0.0)
+            self.assertGreater(signal["sizing_confidence_multiplier"], 1.0)
+            self.assertTrue(any(str(component.get("label", "")).startswith("sports_history_") for component in signal["components"]))
+
+            audit = engine.audit_distilled_learning()
+            self.assertEqual(audit["sports_history_record_count"], 30)
+            self.assertIn("KXNBA1HTOTAL", audit["sports_history_families_covered"])
+            self.assertGreaterEqual(audit["sports_history_family_count"], 1)
+            self.assertTrue(audit["sports_history_asymmetry_bucket_performance"])
 
 
 if __name__ == "__main__":

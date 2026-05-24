@@ -109,6 +109,8 @@ def main() -> int:
     audit = engine.audit_distilled_learning()
     audit["oldest_timestamp"] = _iso_from_ts(audit.get("oldest_timestamp_ts"))
     audit["newest_timestamp"] = _iso_from_ts(audit.get("newest_timestamp_ts"))
+    audit["sports_history_oldest_timestamp"] = _iso_from_ts(audit.get("sports_history_oldest_timestamp_ts"))
+    audit["sports_history_newest_timestamp"] = _iso_from_ts(audit.get("sports_history_newest_timestamp_ts"))
     if hydrate is not None:
         audit["hydrate"] = hydrate
     print("[AION-MEMORY-AUDIT] " + json.dumps(audit, sort_keys=True, default=str))
