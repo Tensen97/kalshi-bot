@@ -133,6 +133,15 @@ except Exception:
     AIONPersistentIntelligence = None
 
 try:
+    from memory.btc_ladder_history_store import (
+        BTCLadderHistoryStore,
+        DEFAULT_DB_PATH as BTC_LADDER_HISTORY_DEFAULT_DB_PATH,
+    )
+except Exception:
+    BTCLadderHistoryStore = None
+    BTC_LADDER_HISTORY_DEFAULT_DB_PATH = None
+
+try:
     from strategy import formatting as strategy_formatting
 except Exception:
     strategy_formatting = None
@@ -1573,6 +1582,11 @@ AION_BTC_1H_LADDER_MAX_RANK_BOOST = get_env_float("AION_BTC_1H_LADDER_MAX_RANK_B
 AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT", 0.055)
 AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER = get_env_float("AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER", 2.25)
 AION_BTC_1H_LADDER_ABSURD_SPREAD = get_env_float("AION_BTC_1H_LADDER_ABSURD_SPREAD", 0.24)
+AION_BTC_1H_HISTORY_ENABLED = get_env_bool("AION_BTC_1H_HISTORY_ENABLED", 1)
+AION_BTC_1H_HISTORY_DB_PATH = (
+    os.environ.get("AION_BTC_1H_HISTORY_DB_PATH")
+    or (str(BTC_LADDER_HISTORY_DEFAULT_DB_PATH) if BTC_LADDER_HISTORY_DEFAULT_DB_PATH is not None else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "btc_ladder_history.sqlite"))
+)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS = int(_env_float("SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS", 45))
@@ -1977,6 +1991,9 @@ class KalshiSniperBot:
         self.btc_volatility_state = {}
         self.btc_volatility_log_markers = {}
         self.btc15m_dead_contract_cooldowns = {}
+        self.btc_1h_history_store = None
+        self.btc_1h_history_audit = {}
+        self.btc_1h_history_no_data_logged = False
         self.sports_quote_continuity_cache = {}
         self.sports_momentum_state = {}
         self.sports_edge_ranking_log_markers = {}
@@ -2101,6 +2118,22 @@ class KalshiSniperBot:
             except Exception as exc:
                 print(f"[AION-INTELLIGENCE-ERROR] reason={exc.__class__.__name__}")
                 self.aion_persistent_intelligence = None
+        try:
+            self._init_btc_1h_history_learner()
+        except Exception as exc:
+            self.btc_1h_history_store = None
+            print(
+                "[BTC-1H-HISTORY-NO-DATA] "
+                + json.dumps(
+                    {
+                        "reason": "startup_history_init_failed",
+                        "error": exc.__class__.__name__,
+                        "final_effect": "continue_live_without_history",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         try:
             self.aion_expectancy_state = self._load_aion_expectancy_state()
         except Exception as exc:
@@ -26837,6 +26870,185 @@ class KalshiSniperBot:
             return round(max(0.01, min(0.99, last_price)), 6)
         return None
 
+    def _init_btc_1h_history_learner(self):
+        self.btc_1h_history_store = None
+        self.btc_1h_history_audit = {}
+        if not AION_BTC_1H_HISTORY_ENABLED:
+            return None
+        if BTCLadderHistoryStore is None:
+            if not getattr(self, "btc_1h_history_no_data_logged", False):
+                self.btc_1h_history_no_data_logged = True
+                print(
+                    "[BTC-1H-HISTORY-NO-DATA] "
+                    + json.dumps(
+                        {
+                            "reason": "module_unavailable",
+                            "final_effect": "continue_live_without_history",
+                        },
+                        sort_keys=True,
+                    )
+                )
+            return None
+        db_path = str(AION_BTC_1H_HISTORY_DB_PATH or "").strip()
+        if not db_path or not os.path.exists(db_path):
+            if not getattr(self, "btc_1h_history_no_data_logged", False):
+                self.btc_1h_history_no_data_logged = True
+                print(
+                    "[BTC-1H-HISTORY-NO-DATA] "
+                    + json.dumps(
+                        {
+                            "reason": "history_db_missing",
+                            "db_path": db_path,
+                            "final_effect": "continue_live_without_history",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            return None
+        store = BTCLadderHistoryStore(db_path=db_path, log_fn=None, initialize=False, read_only=True)
+        self.btc_1h_history_store = store
+        try:
+            self.btc_1h_history_audit = store.audit(recompute=False)
+        except Exception:
+            self.btc_1h_history_audit = {}
+        print(
+            "[BTC-1H-HISTORY-LEARNED] "
+            + json.dumps(
+                {
+                    "reason": "startup_cache_loaded",
+                    "db_path": db_path,
+                    "total_records": self.btc_1h_history_audit.get("total_records"),
+                    "ladder_groups": self.btc_1h_history_audit.get("ladder_groups"),
+                    "learned_buckets": len(self.btc_1h_history_audit.get("learned_buckets") or []),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return store
+
+    def _btc_1h_history_session_bucket(self, when=None):
+        parsed = None
+        if when not in (None, ""):
+            try:
+                parsed = datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed = parsed.astimezone(timezone.utc)
+            except Exception:
+                parsed = None
+        if parsed is None:
+            parsed = datetime.now(timezone.utc)
+        hour = parsed.hour
+        if 0 <= hour < 7:
+            return "asia"
+        if 7 <= hour < 13:
+            return "europe"
+        if 13 <= hour < 17:
+            return "us_morning"
+        if 17 <= hour < 21:
+            return "us_afternoon"
+        return "us_evening"
+
+    def _btc_1h_history_time_bucket(self, market=None, family=None):
+        market = market if isinstance(market, dict) else {}
+        family_text = str(family or self.get_market_family(market) or "").strip().upper()
+        open_text = str(market.get("open_time") or "").strip()
+        close_text = str(market.get("close_time") or market.get("expiration_time") or market.get("latest_expiration_time") or "").strip()
+        if open_text and close_text:
+            try:
+                opened = datetime.fromisoformat(open_text.replace("Z", "+00:00"))
+                closed = datetime.fromisoformat(close_text.replace("Z", "+00:00"))
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                if closed.tzinfo is None:
+                    closed = closed.replace(tzinfo=timezone.utc)
+                minutes = (closed.astimezone(timezone.utc) - opened.astimezone(timezone.utc)).total_seconds() / 60.0
+                if minutes <= 35:
+                    return "sub_35m"
+                if minutes <= 75:
+                    return "hourly"
+                if minutes <= 180:
+                    return "multi_hour"
+                return "longer"
+            except Exception:
+                pass
+        if family_text == "KXBTC15M":
+            return "sub_35m"
+        return "hourly"
+
+    def _get_btc_1h_history_signal_for_context(
+        self,
+        *,
+        family=None,
+        selected_side=None,
+        selected_price=None,
+        spread=None,
+        liquidity=None,
+        market=None,
+        neighbor_gap_bucket="unknown",
+        strike_distance_bucket="unknown",
+        source="ranking",
+        ticker=None,
+        log=True,
+    ):
+        if not AION_BTC_1H_HISTORY_ENABLED:
+            return {"available": False, "reason": "disabled"}
+        store = getattr(self, "btc_1h_history_store", None)
+        if store is None:
+            store = self._init_btc_1h_history_learner()
+        if store is None:
+            return {"available": False, "reason": "history_db_missing"}
+        market = market if isinstance(market, dict) else {}
+        try:
+            signal = store.get_learning_signal(
+                family=family,
+                selected_side=selected_side,
+                selected_price=selected_price,
+                spread=spread,
+                liquidity=liquidity,
+                time_to_expiry_bucket_value=self._btc_1h_history_time_bucket(market=market, family=family),
+                session_bucket_value=self._btc_1h_history_session_bucket(
+                    market.get("close_time") or market.get("expiration_time") or market.get("latest_expiration_time")
+                ),
+                strike_distance_bucket_value=strike_distance_bucket,
+                neighbor_gap_bucket_value=neighbor_gap_bucket,
+            )
+        except Exception as exc:
+            if log:
+                self._emit_structural_edge_log(
+                    "[BTC-1H-HISTORY-NO-DATA]",
+                    {
+                        "ticker": ticker,
+                        "reason": "history_signal_failed",
+                        "error": exc.__class__.__name__,
+                        "final_effect": "continue_live_without_history",
+                    },
+                    marker=("btc_1h_history_no_data", source, ticker, exc.__class__.__name__),
+                )
+            return {"available": False, "reason": "history_signal_failed"}
+        if log and signal.get("available") and (
+            self.to_float(signal.get("historical_edge_boost"), 0.0) > 0.0
+            or self.to_float(signal.get("historical_risk_penalty"), 0.0) > 0.0
+        ):
+            self._emit_structural_edge_log(
+                "[BTC-1H-HISTORY-BOOST]",
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "selected_side": selected_side,
+                    "historical_edge_boost": signal.get("historical_edge_boost"),
+                    "historical_risk_penalty": signal.get("historical_risk_penalty"),
+                    "learned_winrate": signal.get("learned_winrate"),
+                    "learned_avg_pnl": signal.get("learned_avg_pnl"),
+                    "sample_size": signal.get("sample_size"),
+                    "reason": "matched_historical_btc_ladder_buckets",
+                },
+                marker=("btc_1h_history_boost", source, ticker),
+            )
+        return signal
+
     def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
         market = market if isinstance(market, dict) else {}
         text = " ".join(
@@ -26877,7 +27089,7 @@ class KalshiSniperBot:
                     value = float(str(raw).replace("$", "").replace(",", ""))
                 except (TypeError, ValueError):
                     continue
-                if 1000.0 <= value <= 1000000.0:
+                if 10000.0 <= value <= 1000000.0:
                     candidates.append(value)
                     if "$" in raw or "," in raw or any(term in text.lower() for term in ("bitcoin", "btc", "price", "above", "below")):
                         preferred.append(value)
@@ -27251,6 +27463,54 @@ class KalshiSniperBot:
             tags.append("BTC_1H_LADDER_NEARBY_CONFIRMATION")
         if fast_expiry_component >= 0.72:
             tags.append("BTC_1H_FAST_EXPIRY")
+
+        neighbor_gaps = []
+        for neighbor in (lower, higher):
+            if not neighbor:
+                continue
+            neighbor_strike = self.to_float(neighbor.get("strike"), None)
+            if neighbor_strike is not None:
+                neighbor_gaps.append(abs(float(current_strike) - float(neighbor_strike)))
+        nearest_neighbor_gap = min(neighbor_gaps) if neighbor_gaps else None
+        if nearest_neighbor_gap is None:
+            neighbor_gap_bucket = "unknown"
+        elif nearest_neighbor_gap <= 250.0:
+            neighbor_gap_bucket = "tight_strikes"
+        elif nearest_neighbor_gap <= 750.0:
+            neighbor_gap_bucket = "normal_strikes"
+        elif nearest_neighbor_gap <= 1500.0:
+            neighbor_gap_bucket = "wide_strikes"
+        else:
+            neighbor_gap_bucket = "very_wide_strikes"
+        history_signal = self._get_btc_1h_history_signal_for_context(
+            family=family,
+            selected_side=selected_side,
+            selected_price=selected_price_value,
+            spread=side_spread,
+            liquidity=selected_depth,
+            market=market,
+            neighbor_gap_bucket=neighbor_gap_bucket,
+            strike_distance_bucket="unknown",
+            source=source,
+            ticker=ticker,
+            log=log,
+        )
+        historical_edge_boost = self.to_float(history_signal.get("historical_edge_boost"), 0.0) or 0.0
+        historical_risk_penalty = self.to_float(history_signal.get("historical_risk_penalty"), 0.0) or 0.0
+        historical_probability_adjustment = self.to_float(history_signal.get("probability_adjustment"), 0.0) or 0.0
+        historical_size_multiplier = self.to_float(history_signal.get("sizing_confidence_multiplier"), 1.0) or 1.0
+        if history_signal.get("available"):
+            history_component = max(-1.0, min(1.0, (historical_edge_boost / 5.5) - (historical_risk_penalty / 1.75)))
+            components["historical_ladder_edge"] = round(history_component, 4)
+            score = round(
+                max(0.0, min(100.0, score + historical_edge_boost * 2.2 - historical_risk_penalty * 1.5)),
+                4,
+            )
+            if historical_edge_boost > 0.0:
+                tags.append("BTC_1H_HISTORY_PROFITABLE_BUCKET")
+            if historical_risk_penalty > 0.0:
+                tags.append("BTC_1H_HISTORY_WEAK_BUCKET")
+
         boost = 0.0
         if score >= 24.0:
             boost = min(AION_BTC_1H_LADDER_MAX_RANK_BOOST, ((score - 20.0) / 80.0) * AION_BTC_1H_LADDER_MAX_RANK_BOOST)
@@ -27260,6 +27520,7 @@ class KalshiSniperBot:
                 AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT,
                 0.012 + ((score - 45.0) / 55.0) * (AION_BTC_1H_LADDER_MAX_PROBABILITY_ADJUSTMENT - 0.012),
             )
+        probability_adjustment = max(0.0, probability_adjustment + historical_probability_adjustment)
         size_multiplier = 1.0
         if score >= 82.0:
             size_multiplier = AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER
@@ -27267,6 +27528,7 @@ class KalshiSniperBot:
             size_multiplier = min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, 1.72)
         elif score >= 45.0:
             size_multiplier = min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, 1.32)
+        size_multiplier = max(1.0, min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, size_multiplier * historical_size_multiplier))
         context = {
             "enabled": True,
             "ticker": ticker,
@@ -27289,6 +27551,13 @@ class KalshiSniperBot:
             "boost": round(max(0.0, boost), 4),
             "probability_adjustment": round(max(0.0, probability_adjustment), 6),
             "size_multiplier": round(max(1.0, min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
+            "history_signal": history_signal,
+            "historical_edge_boost": round(historical_edge_boost, 4),
+            "historical_risk_penalty": round(historical_risk_penalty, 4),
+            "learned_winrate": history_signal.get("learned_winrate"),
+            "learned_avg_pnl": history_signal.get("learned_avg_pnl"),
+            "history_sample_size": history_signal.get("sample_size"),
+            "neighbor_gap_bucket": neighbor_gap_bucket,
             "components": components,
             "tags": tags,
             "pattern_keys": [f"{family}|{tag}" for tag in tags[:8]] + [f"BTC_1H_LADDER|{tag}" for tag in tags[:8]],
@@ -27308,6 +27577,9 @@ class KalshiSniperBot:
                     "liquidity": selected_depth,
                     "top_size": selected_depth,
                     "ladder_boost": context["boost"],
+                    "historical_edge_boost": context.get("historical_edge_boost"),
+                    "historical_risk_penalty": context.get("historical_risk_penalty"),
+                    "history_sample_size": context.get("history_sample_size"),
                     "final_score": score,
                     "reason": context["reason"],
                 },
@@ -27327,6 +27599,9 @@ class KalshiSniperBot:
                     "liquidity": selected_depth,
                     "top_size": selected_depth,
                     "ladder_boost": context["boost"],
+                    "historical_edge_boost": context.get("historical_edge_boost"),
+                    "historical_risk_penalty": context.get("historical_risk_penalty"),
+                    "history_sample_size": context.get("history_sample_size"),
                     "final_score": score,
                     "reason": context["reason"],
                 },
@@ -28240,6 +28515,13 @@ class KalshiSniperBot:
         btc_1h_ladder_component = self._clamp(btc_1h_ladder_score / 100.0)
         if btc_1h_ladder_context.get("enabled"):
             components["btc_1h_ladder"] = round(btc_1h_ladder_component, 4)
+        btc_1h_history_boost = self.to_float(btc_1h_ladder_context.get("historical_edge_boost"), 0.0) or 0.0
+        btc_1h_history_penalty = self.to_float(btc_1h_ladder_context.get("historical_risk_penalty"), 0.0) or 0.0
+        if btc_1h_history_boost > 0.0 or btc_1h_history_penalty > 0.0:
+            components["btc_1h_history"] = round(
+                max(-1.0, min(1.0, (btc_1h_history_boost / 5.5) - (btc_1h_history_penalty / 1.75))),
+                4,
+            )
         family_weight = self.to_float(family_profile.get("structural_edge_weight"), 1.0) or 1.0
         weighted_score = (
             curve_component * 24.0
@@ -28426,6 +28708,12 @@ class KalshiSniperBot:
             "btc_1h_ladder_rank_boost": btc_1h_ladder_context.get("boost", 0.0),
             "btc_1h_ladder_probability_adjustment": btc_1h_ladder_context.get("probability_adjustment", 0.0),
             "btc_1h_ladder_size_multiplier": btc_1h_ladder_context.get("size_multiplier", 1.0),
+            "btc_1h_history_signal": btc_1h_ladder_context.get("history_signal"),
+            "btc_1h_history_boost": btc_1h_history_boost,
+            "btc_1h_history_penalty": btc_1h_history_penalty,
+            "btc_1h_history_sample_size": btc_1h_ladder_context.get("history_sample_size"),
+            "btc_1h_history_learned_winrate": btc_1h_ladder_context.get("learned_winrate"),
+            "btc_1h_history_learned_avg_pnl": btc_1h_ladder_context.get("learned_avg_pnl"),
             "structural_memory_signal": memory_signal,
             "structural_memory_rank_adjustment": round(memory_rank_adjustment, 4),
             "structural_memory_size_multiplier": round(memory_size_multiplier, 4),
@@ -28477,6 +28765,9 @@ class KalshiSniperBot:
                         "strike": btc_1h_ladder_context.get("strike"),
                         "settlement_group": btc_1h_ladder_context.get("settlement_group"),
                         "group_size": btc_1h_ladder_context.get("group_size"),
+                        "historical_edge_boost": btc_1h_history_boost,
+                        "historical_risk_penalty": btc_1h_history_penalty,
+                        "history_sample_size": btc_1h_ladder_context.get("history_sample_size"),
                         "reason": btc_1h_ladder_context.get("reason"),
                     },
                     "structural_memory": {

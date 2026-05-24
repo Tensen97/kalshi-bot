@@ -1,8 +1,12 @@
 import unittest
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import kalshi_web as kw
 from kalshi_sniper.candidate_quality import compute_candidate_ev
+from memory.btc_ladder_history_store import BTCLadderHistoryStore
 
 
 class StructuralEdgeTests(unittest.TestCase):
@@ -14,6 +18,9 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.targeted_orderbook_cache = {}
         bot.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
         bot.family_profit_memory_log_markers = {}
+        bot.btc_1h_history_store = None
+        bot.btc_1h_history_audit = {}
+        bot.btc_1h_history_no_data_logged = True
         return bot
 
     def test_ladder_dislocation_gets_structural_score_and_boost(self):
@@ -223,6 +230,126 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreater(context["size_multiplier"], 1.0)
         self.assertIn("BTC_1H_LADDER_RELATIVE_MISPRICING", context["tags"])
         self.assertEqual(getattr(q, "BTC_1H_LADDER_SCORE"), btc_context["BTC_1H_LADDER_SCORE"])
+
+    def test_btc_1h_ladder_history_boost_is_advisory_and_size_positive(self):
+        bot = self._make_bot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = BTCLadderHistoryStore(db_path=Path(tmpdir) / "btc_ladder.sqlite")
+            base = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
+            records = []
+            for group_idx in range(12):
+                opened = base - timedelta(hours=group_idx + 1)
+                closed = opened + timedelta(hours=1)
+                for strike in (70000, 70500, 71000):
+                    records.append(
+                        {
+                            "ticker": f"KXBTC1H-HIST-{group_idx}-{strike}",
+                            "event_ticker": f"KXBTC1H-HIST-{group_idx}",
+                            "family": "KXBTC1H",
+                            "title": f"Bitcoin above ${strike:,} at 3pm",
+                            "open_time": opened.isoformat().replace("+00:00", "Z"),
+                            "close_time": closed.isoformat().replace("+00:00", "Z"),
+                            "source_time": closed.isoformat().replace("+00:00", "Z"),
+                            "strike": strike,
+                            "outcome": "yes",
+                            "yes_bid": 0.35,
+                            "yes_ask": 0.37,
+                            "no_bid": 0.63,
+                            "no_ask": 0.65,
+                            "last_price": 0.36,
+                            "liquidity": 250,
+                        }
+                    )
+            store.insert_records(records, batch_size=10)
+            store.recompute_summaries()
+            bot.btc_1h_history_store = store
+
+            q = SimpleNamespace(
+                ticker="KXBTC1H-TEST-71000",
+                family="KXBTC1H",
+                selected_side="yes",
+                selected_price=0.37,
+                yes_bid=0.35,
+                yes_ask=0.37,
+                no_bid=0.63,
+                no_ask=0.65,
+                yes_top_size=32,
+                no_top_size=40,
+                price_delta=0.00,
+                repricing_velocity=0.00,
+            )
+            market = {
+                "ticker": q.ticker,
+                "series_ticker": "KXBTC1H",
+                "event_ticker": "KXBTC1H-TEST-HOUR",
+                "title": "Bitcoin above $71,000 at 4pm",
+                "yes_bid": 35,
+                "yes_ask": 37,
+                "no_bid": 63,
+                "no_ask": 65,
+                "yes_top_size": 32,
+                "no_top_size": 40,
+                "price_delta": 0.00,
+            }
+            markets = [
+                {
+                    "ticker": "KXBTC1H-TEST-70000",
+                    "series_ticker": "KXBTC1H",
+                    "event_ticker": "KXBTC1H-TEST-HOUR",
+                    "title": "Bitcoin above $70,000 at 4pm",
+                    "yes_bid": 67,
+                    "yes_ask": 69,
+                    "no_bid": 31,
+                    "no_ask": 33,
+                    "yes_top_size": 22,
+                    "no_top_size": 30,
+                    "price_delta": 0.04,
+                },
+                {
+                    "ticker": "KXBTC1H-TEST-70500",
+                    "series_ticker": "KXBTC1H",
+                    "event_ticker": "KXBTC1H-TEST-HOUR",
+                    "title": "Bitcoin above $70,500 at 4pm",
+                    "yes_bid": 60,
+                    "yes_ask": 62,
+                    "no_bid": 38,
+                    "no_ask": 40,
+                    "yes_top_size": 22,
+                    "no_top_size": 30,
+                    "price_delta": 0.035,
+                },
+                market,
+                {
+                    "ticker": "KXBTC1H-TEST-71500",
+                    "series_ticker": "KXBTC1H",
+                    "event_ticker": "KXBTC1H-TEST-HOUR",
+                    "title": "Bitcoin above $71,500 at 4pm",
+                    "yes_bid": 48,
+                    "yes_ask": 50,
+                    "no_bid": 50,
+                    "no_ask": 52,
+                    "yes_top_size": 20,
+                    "no_top_size": 25,
+                    "price_delta": 0.03,
+                },
+            ]
+
+            context = bot._get_structural_edge_rank_adjustment(
+                market=market,
+                q=q,
+                spread=0.02,
+                family="KXBTC1H",
+                markets=markets,
+                source="unit_test_btc_history",
+                log=False,
+            )
+
+            btc_context = context["btc_1h_ladder_context"]
+            self.assertTrue(btc_context["history_signal"]["available"])
+            self.assertGreater(btc_context["historical_edge_boost"], 0.0)
+            self.assertGreater(btc_context["history_sample_size"], 20)
+            self.assertIn("BTC_1H_HISTORY_PROFITABLE_BUCKET", context["tags"])
+            self.assertGreater(context["size_multiplier"], 1.0)
 
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {
