@@ -20378,18 +20378,6 @@ class KalshiSniperBot:
                 )
             )
 
-        self._emit_aion_final_execution_truth(
-            ticker=ticker,
-            family=family,
-            decision=final_action,
-            reason=canonical_reason,
-            stage="canonical_final_execution",
-            canonical_state=canonical_state,
-            hard_block=bool(hard_block_reason is not None),
-            final_submit_allowed=bool(final_submit_allowed),
-            selected_price=selected_price_value,
-            selected_side=executable_side,
-        )
         return {
             'ticker': str(ticker or '').strip() or None,
             'family': str(family or 'UNKNOWN').strip().upper() or 'UNKNOWN',
@@ -20505,18 +20493,6 @@ class KalshiSniperBot:
             'trace_id': canonical_final.get('trace_id'),
         }
         print('[AION-CANONICAL-FINAL] ' + json.dumps(payload, sort_keys=True, default=str))
-        self._emit_aion_final_execution_truth(
-            ticker=canonical_final.get("ticker"),
-            family=canonical_final.get("family"),
-            decision=canonical_final.get("final_action"),
-            reason=canonical_final.get("canonical_reason") or canonical_final.get("hard_block_reason"),
-            stage="canonical_final_emit",
-            canonical_state=canonical_final.get("canonical_state"),
-            hard_block=bool(canonical_final.get("hard_block")),
-            final_submit_allowed=bool(canonical_final.get("final_submit_allowed")),
-            selected_price=canonical_final.get("executable_price"),
-            selected_side=canonical_final.get("executable_side"),
-        )
         try:
             self._record_family_universe_health_sample(
                 canonical_final=canonical_final,
