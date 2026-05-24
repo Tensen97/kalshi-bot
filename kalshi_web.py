@@ -1709,7 +1709,7 @@ AION_CROSS_MARKET_EDGE_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_CROSS_MA
 AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER", 1.85)
 AION_ELITE_EDGE_ENABLED = get_env_bool("AION_ELITE_EDGE_ENABLED", 1)
 AION_ELITE_EDGE_MAX_RANK_BOOST = get_env_float("AION_ELITE_EDGE_MAX_RANK_BOOST", 4.25)
-AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER", 8.0)
+AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER", 12.0)
 AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER = get_env_float("AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER", 15.0)
 AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
 AION_DATA_COVERAGE_REFRESH_SECONDS = get_env_int("AION_DATA_COVERAGE_REFRESH_SECONDS", 900)
@@ -27421,19 +27421,19 @@ class KalshiSniperBot:
         kelly_max_multiplier = None
         if confidence >= 88.0:
             tier = "elite"
-            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 7.5)
+            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 12.0)
             rank_boost = AION_ELITE_EDGE_MAX_RANK_BOOST
             kelly_max_multiplier = min(18.0, AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER)
             tags.append("ELITE_CONCENTRATION_READY")
         elif confidence >= 75.0:
             tier = "strong"
-            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 4.75)
+            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 7.5)
             rank_boost = AION_ELITE_EDGE_MAX_RANK_BOOST * 0.74
             kelly_max_multiplier = min(14.0, AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER)
             tags.append("ELITE_CONCENTRATION_READY")
         elif confidence >= 60.0:
             tier = "promising"
-            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 2.35)
+            size_multiplier = min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 3.5)
             rank_boost = AION_ELITE_EDGE_MAX_RANK_BOOST * 0.38
             kelly_max_multiplier = min(8.0, AION_ELITE_EDGE_MAX_KELLY_MULTIPLIER)
         elif confidence >= 42.0:
@@ -28853,6 +28853,110 @@ class KalshiSniperBot:
             kelly_min_exploration_size=AION_KELLY_MIN_EXPLORATION_SIZE,
             calculate_fractional_kelly_size=candidate_quality_calculate_fractional_kelly_size,
         )
+
+    def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payload=None, ev_context=None, source=None):
+        hard_max = max(1, int(MAX_LIVE_ORDER_SIZE or 1))
+        base_size = max(1, min(hard_max, int(AION_AGGRESSIVE_MAX_CONTRACTS or 1)))
+        payload = payload if isinstance(payload, dict) else {}
+        context = dict(ev_context or {}) if isinstance(ev_context, dict) else {}
+
+        signal_fields = (
+            "ticker",
+            "family",
+            "ev_tier",
+            "ev_sizing_multiplier",
+            "conviction_size_multiplier",
+            "kelly_contract_size",
+            "STRUCTURAL_EDGE_SCORE",
+            "CROSS_MARKET_EDGE_SCORE",
+            "ELITE_EDGE_CONFIDENCE",
+            "elite_edge_confidence",
+            "elite_edge_size_multiplier",
+            "elite_edge_kelly_max_multiplier",
+            "structural_edge_size_multiplier",
+            "cross_market_size_multiplier",
+        )
+        for field in signal_fields:
+            if field not in context and field in payload:
+                context[field] = payload.get(field)
+            if q is not None and context.get(field) is None:
+                try:
+                    value = getattr(q, field, None)
+                except Exception:
+                    value = None
+                if value is not None:
+                    context[field] = value
+
+        candidates = []
+
+        def _candidate(label, value):
+            numeric = self.to_float(value, None)
+            if numeric is None or numeric <= 0:
+                return
+            candidates.append((label, numeric))
+
+        _candidate("base", base_size)
+        _candidate("explicit", explicit_size)
+        for field in ("count", "contracts", "contract_count", "kelly_contract_size", "ev_contract_size", "ev_adjusted_size"):
+            _candidate(f"payload.{field}", payload.get(field))
+            _candidate(f"context.{field}", context.get(field))
+
+        multiplier = 1.0
+        for field in (
+            "ev_sizing_multiplier",
+            "conviction_size_multiplier",
+            "elite_edge_size_multiplier",
+            "structural_edge_size_multiplier",
+            "cross_market_size_multiplier",
+        ):
+            numeric = self.to_float(context.get(field), None)
+            if numeric is not None and numeric > 0:
+                multiplier = max(multiplier, numeric)
+
+        elite_confidence = self.to_float(
+            context.get("ELITE_EDGE_CONFIDENCE", context.get("elite_edge_confidence")),
+            0.0,
+        ) or 0.0
+        if elite_confidence >= 88.0:
+            multiplier = max(multiplier, min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 12.0))
+        elif elite_confidence >= 75.0:
+            multiplier = max(multiplier, min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 7.5))
+        elif elite_confidence >= 60.0:
+            multiplier = max(multiplier, min(AION_ELITE_EDGE_MAX_SIZE_MULTIPLIER, 3.5))
+
+        if multiplier > 1.0:
+            _candidate("context.multiplier", base_size * multiplier)
+
+        chosen_label, chosen_raw = max(candidates, key=lambda item: item[1]) if candidates else ("base", base_size)
+        chosen = max(1, min(hard_max, int(round(chosen_raw))))
+        original = self.to_float(explicit_size, None)
+        if original is None:
+            original = self.to_float(payload.get("count"), None)
+        if str(source or "").strip().lower() == "submit_live_order" and original is not None and int(round(original)) != chosen:
+            try:
+                print(
+                    "[AION-DYNAMIC-CONCENTRATION] "
+                    + json.dumps(
+                        {
+                            "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                            "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                            "original_count": int(round(original)),
+                            "resolved_count": int(chosen),
+                            "hard_max": int(hard_max),
+                            "reason": chosen_label,
+                            "ev_tier": context.get("ev_tier"),
+                            "STRUCTURAL_EDGE_SCORE": context.get("STRUCTURAL_EDGE_SCORE"),
+                            "CROSS_MARKET_EDGE_SCORE": context.get("CROSS_MARKET_EDGE_SCORE"),
+                            "ELITE_EDGE_CONFIDENCE": elite_confidence,
+                            "conviction_size_multiplier": context.get("conviction_size_multiplier"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+        return chosen
 
     def _apply_rank_only_memory_adjustments(self, ranked, *, source="ranking", markets=None):
         return kalshi_ranking_module.apply_rank_only_memory_adjustments(
@@ -63356,7 +63460,11 @@ class KalshiSniperBot:
             return None
         if family != "KXBTC15M" and intended_side not in ("yes", "no"):
             intended_side = DEFAULT_LIVE_ORDER_SIDE
-        requested_count = size if size is not None else globals().get("MAX_LIVE_ORDER_SIZE", 1)
+        requested_count = self._resolve_dynamic_live_entry_size(
+            q,
+            explicit_size=size,
+            source="build_live_order_payload",
+        )
         count = min(requested_count, MAX_LIVE_ORDER_SIZE)
         if count != requested_count:
             print(f"[LIVE-SAFETY] size clamped from {requested_count} to {count}")

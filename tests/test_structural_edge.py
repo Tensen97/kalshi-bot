@@ -163,6 +163,53 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreater(ev["conviction_size_multiplier"], 4.0)
         self.assertEqual(ev["elite_edge_concentration_tier"], "strong")
 
+    def test_dynamic_entry_size_promotes_elite_context_above_legacy_one_contract_payload(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBSTRIKEOUT-TEST-65",
+            family="KXMLBSTRIKEOUT",
+            ev_tier="S",
+            ev_sizing_multiplier=1.0,
+            conviction_size_multiplier=1.0,
+            elite_edge_size_multiplier=8.0,
+            ELITE_EDGE_CONFIDENCE=91.0,
+            STRUCTURAL_EDGE_SCORE=92.0,
+            CROSS_MARKET_EDGE_SCORE=84.0,
+        )
+
+        resolved = bot._resolve_dynamic_live_entry_size(
+            q,
+            explicit_size=1,
+            payload={"ticker": q.ticker, "count": 1},
+            ev_context={
+                "ticker": q.ticker,
+                "family": q.family,
+                "ev_tier": "S",
+                "ELITE_EDGE_CONFIDENCE": 91.0,
+                "STRUCTURAL_EDGE_SCORE": 92.0,
+                "CROSS_MARKET_EDGE_SCORE": 84.0,
+                "elite_edge_size_multiplier": 8.0,
+            },
+        )
+
+        self.assertGreaterEqual(resolved, 10)
+        self.assertLessEqual(resolved, kw.MAX_LIVE_ORDER_SIZE)
+
+    def test_dynamic_entry_size_keeps_weak_context_as_probe(self):
+        bot = self._make_bot()
+        resolved = bot._resolve_dynamic_live_entry_size(
+            explicit_size=1,
+            payload={"ticker": "KXMLBSPREAD-TEST", "count": 1},
+            ev_context={
+                "ticker": "KXMLBSPREAD-TEST",
+                "ev_tier": "C",
+                "ELITE_EDGE_CONFIDENCE": 18.0,
+                "ev_sizing_multiplier": 1.0,
+            },
+        )
+
+        self.assertEqual(resolved, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

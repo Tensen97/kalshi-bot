@@ -625,6 +625,17 @@ def submit_live_order(
     payload = dict(payload_override) if isinstance(payload_override, dict) else bot.build_live_order_payload(q, size=size)
     if not payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
+    dynamic_size_resolver = getattr(bot, "_resolve_dynamic_live_entry_size", None)
+    if callable(dynamic_size_resolver):
+        try:
+            payload["count"] = dynamic_size_resolver(
+                q,
+                explicit_size=size,
+                payload=payload,
+                source="submit_live_order",
+            )
+        except Exception:
+            pass
     recent_order = bot.recent_submitted_order_for_ticker(payload.get("ticker"))
     if recent_order:
         reprice_result = maybe_auto_reprice_recent_order(
