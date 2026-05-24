@@ -1702,6 +1702,9 @@ AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_MAX_SIZE_
 AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
 AION_DATA_COVERAGE_REFRESH_SECONDS = get_env_int("AION_DATA_COVERAGE_REFRESH_SECONDS", 900)
 AION_DATA_COVERAGE_INCLUDE_TELEMETRY = get_env_bool("AION_DATA_COVERAGE_INCLUDE_TELEMETRY", 0)
+AION_DISTILLED_MEMORY_ENABLED = get_env_bool("AION_DISTILLED_MEMORY_ENABLED", 1)
+AION_DISTILLED_MEMORY_OBSERVATION_MIN_SECONDS = get_env_float("AION_DISTILLED_MEMORY_OBSERVATION_MIN_SECONDS", 900.0)
+AION_DISTILLED_MEMORY_AUDIT_SECONDS = get_env_float("AION_DISTILLED_MEMORY_AUDIT_SECONDS", 900.0)
 AION_CONTROLLED_LOOSENING_ENABLED = get_env_bool("AION_CONTROLLED_LOOSENING_ENABLED", 1)
 AION_PHASE55_FASTPATH_ENABLED = get_env_bool("AION_PHASE55_FASTPATH_ENABLED", 1)
 AION_MICRO_PULLBACK_RELAX_ENABLED = get_env_bool("AION_MICRO_PULLBACK_RELAX_ENABLED", 1)
@@ -1911,6 +1914,8 @@ class KalshiSniperBot:
         self.orderbook_imbalance_log_markers = {}
         self.elite_public_signal_cache = {"loaded_at": 0.0, "signals": [], "summary": {}}
         self.elite_public_signal_log_markers = {}
+        self.aion_distilled_memory_log_markers = {}
+        self.aion_distilled_memory_last_audit_ts = 0.0
         self.live_recent_family_pnl_events = []
         self.live_recent_session_outcomes = []
         self.execution_diversity_family_seen = {}
@@ -8007,6 +8012,21 @@ class KalshiSniperBot:
             side = str(self._learning_archive_value(sources, "selected_side", "side", "outcome_side") or "").strip().lower() or None
             sports_context = self._learning_archive_value(sources, "sports_edge_context", "sports_edge_ranking_context")
             sports_context = sports_context if isinstance(sports_context, dict) else {}
+            elite_signal_context = self._learning_archive_value(sources, "elite_public_signal_context", "elite_signal_context")
+            elite_signal_context = elite_signal_context if isinstance(elite_signal_context, dict) else {}
+            elite_signal_payload = elite_signal_context.get("signal") if isinstance(elite_signal_context.get("signal"), dict) else {}
+            elite_signal_used = bool(
+                self._learning_archive_value(sources, "elite_signal_used", "elite_public_signal_match")
+                or elite_signal_context.get("matched")
+            )
+            elite_trader_handle = (
+                self._learning_archive_value(sources, "elite_trader_handle", "trader_handle")
+                or elite_signal_payload.get("trader_handle")
+            )
+            elite_boost_used = self._learning_archive_float(
+                self._learning_archive_value(sources, "elite_boost_used", "elite_public_signal_boost")
+                or elite_signal_context.get("boost")
+            )
             sports_tags_raw = (
                 self._learning_archive_value(sources, "sports_tags", "sports_edge_tags")
                 or sports_context.get("tags")
@@ -8066,6 +8086,10 @@ class KalshiSniperBot:
                 "ticker": ticker or None,
                 "market_title": self._learning_archive_value(sources, "market_title", "title"),
                 "family": family or "UNKNOWN",
+                "category": self.get_market_discovery_category(family or ticker or "unknown"),
+                "elite_signal_used": elite_signal_used,
+                "elite_trader_handle": elite_trader_handle,
+                "elite_boost_used": elite_boost_used,
             }
             if event_type in {"candidate_seen", "trade_opened"}:
                 event.update(
@@ -8102,6 +8126,8 @@ class KalshiSniperBot:
                             self._learning_archive_value(sources, "sports_payout_multiple", "sports_edge_payout_multiple")
                             or sports_context.get("payout_multiple")
                         ),
+                        "sports_family_activity_level": sports_context.get("sports_family_activity_level"),
+                        "sports_data_tag": ",".join(sports_context.get("data_readiness_tags") or []) if isinstance(sports_context.get("data_readiness_tags"), list) else None,
                     }
                 )
             else:
@@ -8140,6 +8166,11 @@ class KalshiSniperBot:
                         "sports_tags": sports_tags,
                         "sports_score_at_entry": sports_score_at_entry,
                         "sports_edge_boost": sports_edge_boost,
+                        "entry_price": self._learning_archive_float(self._learning_archive_value(sources, "entry_price", "avg_price")),
+                        "exit_price": price,
+                        "contracts": contracts,
+                        "position_size": contracts,
+                        "sizing_reason": self._learning_archive_value(sources, "sizing_reason", "size_reason"),
                     }
                 )
             archive_path = _Path(AION_LEARNING_ARCHIVE_FILE)
@@ -8171,6 +8202,7 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
+            self._record_aion_distilled_memory_event(event_type, event)
             return {"ok": True, "path": str(archive_path), "event_type": event_type}
         except Exception as exc:
             try:
@@ -25182,6 +25214,242 @@ class KalshiSniperBot:
             max_rank_adjustment=KALSHI_FAMILY_PROFIT_MEMORY_MAX_RANK_ADJUSTMENT,
         )
 
+    def _emit_aion_memory_log(self, tag, payload, marker=None):
+        markers = getattr(self, "aion_distilled_memory_log_markers", None)
+        if markers is None:
+            self.aion_distilled_memory_log_markers = {}
+            markers = self.aion_distilled_memory_log_markers
+        if marker is not None:
+            marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+            if marker_key in markers:
+                return
+            markers[marker_key] = time.time()
+            if len(markers) > 1000:
+                cutoff = time.time() - 3600.0
+                self.aion_distilled_memory_log_markers = {
+                    key: value for key, value in markers.items() if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"{tag} " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"{tag} " + json.dumps({"reason": "memory_log_failed"}))
+
+    def _aion_distilled_book_quality_tag(self, *, spread=None, liquidity=None, sports_tags=None):
+        sports_tags = sports_tags if isinstance(sports_tags, list) else []
+        if "SPORTS_GOOD_BOOK" in sports_tags:
+            return "BOOK_GOOD"
+        if "SPORTS_THIN_BOOK_RISK" in sports_tags:
+            return "BOOK_THIN"
+        spread_value = self.to_float(spread, None)
+        liquidity_value = self.to_float(liquidity, None)
+        if spread_value is not None and spread_value <= 0.03 and (liquidity_value is None or liquidity_value >= 0.0):
+            return "BOOK_GOOD"
+        if spread_value is not None and spread_value >= 0.12:
+            return "BOOK_WIDE"
+        return "BOOK_UNKNOWN"
+
+    def _aion_distilled_odds_bucket(self, price):
+        price_value = self.to_float(price, None)
+        if price_value is None:
+            return "unknown"
+        if price_value > 1.0 and price_value <= 100.0:
+            price_value = price_value / 100.0
+        if price_value < 0.20:
+            return "under_20"
+        if price_value <= 0.35:
+            return "20_35"
+        if price_value <= 0.45:
+            return "35_45"
+        if price_value <= 0.60:
+            return "45_60"
+        if price_value <= 0.80:
+            return "60_80"
+        return "over_80"
+
+    def _get_aion_distilled_learning_signal(self, *, family=None, category=None, sports_tags=None, odds_bucket=None, book_quality_tag=None, elite_trader_handle=None):
+        engine = getattr(self, "aion_persistent_intelligence", None)
+        if not AION_DISTILLED_MEMORY_ENABLED or engine is None or not hasattr(engine, "get_distilled_learning_signal"):
+            return {
+                "rank_adjustment": 0.0,
+                "sports_boost_adjustment": 0.0,
+                "sizing_confidence_multiplier": 1.0,
+                "elite_trust_weight": 1.0,
+                "components": [],
+            }
+        try:
+            signal = engine.get_distilled_learning_signal(
+                family=family,
+                category=category,
+                sports_tags=sports_tags if isinstance(sports_tags, list) else [],
+                odds_bucket=odds_bucket,
+                book_quality_tag=book_quality_tag,
+                elite_trader_handle=elite_trader_handle,
+            )
+            return signal if isinstance(signal, dict) else {}
+        except Exception as exc:
+            self._emit_aion_memory_log(
+                "[AION-MEMORY-LEARN]",
+                {"reason": "signal_failed", "error": exc.__class__.__name__, "family": family},
+                marker=("signal_failed", family, exc.__class__.__name__),
+            )
+            return {}
+
+    def _record_aion_distilled_memory_event(self, event_type, event):
+        if not AION_DISTILLED_MEMORY_ENABLED:
+            return {"ok": False, "reason": "disabled"}
+        engine = getattr(self, "aion_persistent_intelligence", None)
+        if engine is None:
+            return {"ok": False, "reason": "engine_unavailable"}
+        if not isinstance(event, dict):
+            return {"ok": False, "reason": "invalid_event"}
+        try:
+            family = str(event.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            category = str(event.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower() or "unknown"
+            sports_tags = event.get("sports_tags") if isinstance(event.get("sports_tags"), list) else []
+            selected_price = event.get("entry_price") if event.get("entry_price") is not None else event.get("price")
+            record = {
+                **event,
+                "timestamp": event.get("timestamp_utc") or event.get("close_timestamp_utc"),
+                "category": category,
+                "family": family,
+                "yes_price": event.get("yes_ask") or event.get("yes_bid"),
+                "no_price": event.get("no_ask") or event.get("no_bid"),
+                "price": selected_price,
+                "entry_price": event.get("entry_price") or (selected_price if event_type in {"trade_opened", "candidate_seen"} else None),
+                "exit_price": event.get("exit_price") or (selected_price if event_type == "trade_closed" else None),
+                "position_size": event.get("contracts"),
+                "candidate_score": event.get("confidence"),
+                "score_at_entry": event.get("sports_score_at_entry") or event.get("confidence"),
+                "sports_edge_score": event.get("sports_score_at_entry"),
+                "asymmetry_score": event.get("sports_payout_multiple"),
+                "odds_bucket": self._aion_distilled_odds_bucket(selected_price),
+                "orderbook_quality_tag": self._aion_distilled_book_quality_tag(
+                    spread=event.get("spread"),
+                    liquidity=event.get("liquidity_dollars"),
+                    sports_tags=sports_tags,
+                ),
+                "decision": event.get("entry_reason") or event.get("result") or event_type,
+                "pnl": event.get("pnl_dollars"),
+            }
+            if event_type in {"candidate_seen", "trade_opened"}:
+                result = engine.record_distilled_observation(
+                    record,
+                    throttle_seconds=AION_DISTILLED_MEMORY_OBSERVATION_MIN_SECONDS,
+                )
+                if result.get("ok") and not result.get("skipped"):
+                    self._emit_aion_memory_log(
+                        "[AION-MEMORY-STORE]",
+                        {
+                            "event_type": event_type,
+                            "ticker": event.get("ticker"),
+                            "family": family,
+                            "category": category,
+                            "sports_tags": sports_tags,
+                            "elite_signal_used": bool(event.get("elite_signal_used")),
+                            "decision": record.get("decision"),
+                        },
+                        marker=("store", event_type, event.get("ticker"), record.get("odds_bucket")),
+                    )
+                return result
+            if event_type == "trade_closed":
+                result = engine.record_distilled_outcome(record)
+                if result.get("ok"):
+                    self._emit_aion_memory_log(
+                        "[AION-MEMORY-OUTCOME]",
+                        {
+                            "ticker": event.get("ticker"),
+                            "family": family,
+                            "category": category,
+                            "pnl": event.get("pnl_dollars"),
+                            "result": event.get("result"),
+                            "sports_tags": sports_tags,
+                            "elite_signal_used": bool(event.get("elite_signal_used")),
+                        },
+                        marker=("outcome", event.get("ticker"), event.get("result"), event.get("pnl_dollars")),
+                    )
+                    signal = self._get_aion_distilled_learning_signal(
+                        family=family,
+                        category=category,
+                        sports_tags=sports_tags,
+                        odds_bucket=record.get("odds_bucket"),
+                        book_quality_tag=record.get("orderbook_quality_tag"),
+                        elite_trader_handle=event.get("elite_trader_handle"),
+                    )
+                    self._emit_aion_memory_log(
+                        "[AION-MEMORY-LEARN]",
+                        {
+                            "ticker": event.get("ticker"),
+                            "family": family,
+                            "rank_adjustment": signal.get("rank_adjustment"),
+                            "sports_boost_adjustment": signal.get("sports_boost_adjustment"),
+                            "sizing_confidence_multiplier": signal.get("sizing_confidence_multiplier"),
+                            "elite_trust_weight": signal.get("elite_trust_weight"),
+                            "component_count": len(signal.get("components") or []),
+                        },
+                        marker=("learn", family, event.get("result"), round(self.to_float(event.get("pnl_dollars"), 0.0) or 0.0, 4)),
+                    )
+                    if category == "sports" or sports_tags or self.is_sports_family(family, ticker=event.get("ticker")):
+                        self._emit_aion_memory_log(
+                            "[AION-SPORTS-LEARN]",
+                            {
+                                "ticker": event.get("ticker"),
+                                "family": family,
+                                "tags": sports_tags,
+                                "pnl": event.get("pnl_dollars"),
+                                "rank_adjustment": signal.get("rank_adjustment"),
+                                "sports_boost_adjustment": signal.get("sports_boost_adjustment"),
+                            },
+                            marker=("sports_learn", family, event.get("ticker"), event.get("result")),
+                        )
+                    if event.get("elite_signal_used"):
+                        self._emit_aion_memory_log(
+                            "[AION-ELITE-LEARN]",
+                            {
+                                "ticker": event.get("ticker"),
+                                "family": family,
+                                "category": category,
+                                "elite_trader_handle": event.get("elite_trader_handle"),
+                                "pnl": event.get("pnl_dollars"),
+                                "elite_trust_weight": signal.get("elite_trust_weight"),
+                            },
+                            marker=("elite_learn", event.get("elite_trader_handle"), category, event.get("ticker")),
+                        )
+                    self._maybe_emit_aion_distilled_memory_audit(source="outcome")
+                return result
+        except Exception as exc:
+            self._emit_aion_memory_log(
+                "[AION-MEMORY-STORE]",
+                {"event_type": event_type, "reason": "write_failed", "error": exc.__class__.__name__, "action": "continue_trading"},
+                marker=("write_failed", event_type, exc.__class__.__name__),
+            )
+            return {"ok": False, "reason": exc.__class__.__name__}
+        return {"ok": False, "reason": "unsupported_event_type"}
+
+    def _maybe_emit_aion_distilled_memory_audit(self, *, force=False, source="live_cycle"):
+        engine = getattr(self, "aion_persistent_intelligence", None)
+        if engine is None or not hasattr(engine, "audit_distilled_learning"):
+            return {}
+        now_ts = time.time()
+        last_ts = self.to_float(getattr(self, "aion_distilled_memory_last_audit_ts", 0.0), 0.0) or 0.0
+        if not force and now_ts - last_ts < max(60.0, self.to_float(AION_DISTILLED_MEMORY_AUDIT_SECONDS, 900.0)):
+            return {}
+        try:
+            audit = engine.audit_distilled_learning()
+            self.aion_distilled_memory_last_audit_ts = now_ts
+            self._emit_aion_memory_log(
+                "[AION-MEMORY-AUDIT]",
+                {"source": source, **audit},
+                marker=("audit", int(now_ts // max(60.0, self.to_float(AION_DISTILLED_MEMORY_AUDIT_SECONDS, 900.0)))),
+            )
+            return audit
+        except Exception as exc:
+            self._emit_aion_memory_log(
+                "[AION-MEMORY-AUDIT]",
+                {"source": source, "reason": exc.__class__.__name__},
+                marker=("audit_failed", exc.__class__.__name__),
+            )
+            return {}
+
     def _extract_family_from_ranked_candidate(self, item):
         if isinstance(item, dict):
             return self._normalize_family_for_profit_memory(item.get("family"), ticker=item.get("ticker"))
@@ -25406,15 +25674,22 @@ class KalshiSniperBot:
 
     def _attach_elite_signal_context(self, item=None, q=None, context=None):
         context = context if isinstance(context, dict) else {}
+        signal = context.get("signal") if isinstance(context.get("signal"), dict) else {}
+        elite_handle = signal.get("trader_handle") or context.get("elite_trader_handle")
         if isinstance(item, dict):
+            item["elite_public_signal_context"] = context
             item["elite_public_signal_boost"] = context.get("boost", 0.0)
             item["elite_public_signal_match"] = context.get("matched", False)
             item["elite_public_signal_confidence"] = context.get("confidence")
+            item["elite_trader_handle"] = elite_handle
         if q is not None:
             for field, value in (
+                ("elite_public_signal_context", context),
                 ("elite_public_signal_boost", context.get("boost", 0.0)),
                 ("elite_public_signal_match", context.get("matched", False)),
                 ("elite_public_signal_confidence", context.get("confidence")),
+                ("elite_signal_used", bool(context.get("matched"))),
+                ("elite_trader_handle", elite_handle),
             ):
                 try:
                     setattr(q, field, value)
@@ -25457,18 +25732,31 @@ class KalshiSniperBot:
                 "reason": match.get("reason") or "no_match",
                 "confidence": match.get("confidence"),
             }
-        boost = AION_ELITE_SIGNAL_STRONG_BOOST if match.get("strong") else AION_ELITE_SIGNAL_SCORE_BOOST
         signal = match.get("signal")
+        signal_summary = self._elite_signal_public_summary(signal)
+        elite_handle = signal_summary.get("trader_handle")
+        memory_signal = self._get_aion_distilled_learning_signal(
+            family=family,
+            category=category,
+            elite_trader_handle=elite_handle,
+        )
+        trust_weight = self.to_float(memory_signal.get("elite_trust_weight"), 1.0) or 1.0
+        base_boost = AION_ELITE_SIGNAL_STRONG_BOOST if match.get("strong") else AION_ELITE_SIGNAL_SCORE_BOOST
+        boost = max(0.0, self.to_float(base_boost, 0.0) * max(0.65, min(1.35, trust_weight)))
         context = {
             "matched": True,
             "boost": round(max(0.0, self.to_float(boost, 0.0)), 4),
+            "base_boost": round(max(0.0, self.to_float(base_boost, 0.0)), 4),
+            "trust_weight": round(trust_weight, 4),
+            "memory_signal": memory_signal,
             "confidence": round(self.to_float(match.get("confidence"), 0.0), 4),
             "reason": match.get("reason"),
             "strong": bool(match.get("strong")),
             "ticker": ticker,
             "family": family,
             "category": category,
-            "signal": self._elite_signal_public_summary(signal),
+            "elite_trader_handle": elite_handle,
+            "signal": signal_summary,
             "source": source,
         }
         self._attach_elite_signal_context(item=item, q=q, context=context)
@@ -25909,6 +26197,24 @@ class KalshiSniperBot:
         for data_tag in data_readiness_tags:
             if data_tag not in tags:
                 tags.append(data_tag)
+        elite_handle = self._sports_edge_read_value(sources, "elite_trader_handle", "trader_handle")
+        odds_bucket = self._aion_distilled_odds_bucket(selected_price)
+        book_quality_tag = self._aion_distilled_book_quality_tag(
+            spread=spread_value,
+            liquidity=liquidity_priority.get("liquidity") if isinstance(liquidity_priority, dict) else None,
+            sports_tags=tags,
+        )
+        distilled_memory_signal = self._get_aion_distilled_learning_signal(
+            family=family,
+            category=category or "sports",
+            sports_tags=tags,
+            odds_bucket=odds_bucket,
+            book_quality_tag=book_quality_tag,
+            elite_trader_handle=elite_handle,
+        )
+        distilled_rank_adjustment = self.to_float(distilled_memory_signal.get("rank_adjustment"), 0.0) or 0.0
+        distilled_sports_boost_adjustment = self.to_float(distilled_memory_signal.get("sports_boost_adjustment"), 0.0) or 0.0
+        distilled_size_multiplier = self.to_float(distilled_memory_signal.get("sizing_confidence_multiplier"), 1.0) or 1.0
 
         boost = 0.0
         base_boost = max(0.0, self.to_float(AION_SPORTS_EDGE_BASE_BOOST, 0.0) or 0.0)
@@ -25922,6 +26228,7 @@ class KalshiSniperBot:
             boost += base_boost * 0.25
         if data_rank_boost > 0.0:
             boost += data_rank_boost
+        boost += distilled_sports_boost_adjustment
         if underdog_value and asymmetric_payout and good_book and not momentum_risk:
             boost = max(boost, self.to_float(AION_SPORTS_EDGE_STRONG_BOOST, boost) or boost)
         if not depth_usable:
@@ -25973,6 +26280,13 @@ class KalshiSniperBot:
             "sports_family_liquidity_samples": sports_data_signal.get("liquidity_samples"),
             "sports_family_win_rate": sports_data_signal.get("win_rate"),
             "sports_family_pnl_dollars": sports_data_signal.get("pnl_dollars"),
+            "distilled_memory_signal": distilled_memory_signal,
+            "distilled_memory_rank_adjustment": round(distilled_rank_adjustment, 4),
+            "distilled_sports_boost_adjustment": round(distilled_sports_boost_adjustment, 4),
+            "memory_sizing_confidence_multiplier": round(distilled_size_multiplier, 4),
+            "odds_bucket": odds_bucket,
+            "book_quality_tag": book_quality_tag,
+            "elite_trader_handle": elite_handle,
             "tags": tags,
             "boost": boost,
             "score_at_entry": round(score_at_entry, 4) if score_at_entry is not None else None,
@@ -25996,6 +26310,9 @@ class KalshiSniperBot:
                     "momentum_risk": momentum_risk,
                     "data_readiness_tags": data_readiness_tags,
                     "sports_data_rank_boost": round(data_rank_boost, 4),
+                    "distilled_sports_boost_adjustment": round(distilled_sports_boost_adjustment, 4),
+                    "distilled_rank_adjustment": round(distilled_rank_adjustment, 4),
+                    "memory_components": len(distilled_memory_signal.get("components") or []),
                 },
                 marker=("score", source, ticker, tuple(tags), boost),
             )
@@ -26099,12 +26416,16 @@ class KalshiSniperBot:
             old_multiplier = self.to_float(getattr(q, "ev_sizing_multiplier", None), None)
         old_multiplier = max(0.0, old_multiplier if old_multiplier is not None else 1.0)
         new_multiplier = old_multiplier
+        memory_size_multiplier = max(
+            0.85,
+            min(1.12, self.to_float(context.get("memory_sizing_confidence_multiplier"), 1.0) or 1.0),
+        )
         if eligible:
             new_multiplier = max(
                 old_multiplier,
                 min(
                     max(1.0, AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER),
-                    old_multiplier * max(1.0, AION_SPORTS_EDGE_SIZE_MULTIPLIER),
+                    old_multiplier * max(1.0, AION_SPORTS_EDGE_SIZE_MULTIPLIER) * memory_size_multiplier,
                 ),
             )
             ev_context["ev_sizing_multiplier"] = round(new_multiplier, 4)
@@ -26126,6 +26447,7 @@ class KalshiSniperBot:
                 "eligible": eligible,
                 "old_multiplier": round(old_multiplier, 4),
                 "new_multiplier": round(new_multiplier, 4),
+                "memory_size_multiplier": round(memory_size_multiplier, 4),
                 "tags": context.get("tags") or [],
                 "duplicate_blocked": duplicate_blocked,
                 "daily_loss_safe": daily_loss_safe,
@@ -52754,14 +53076,32 @@ class KalshiSniperBot:
         if side not in {"yes", "no"}:
             side = DEFAULT_LIVE_ORDER_SIDE
         price = self.normalize_contract_price(entry_price, ticker=ticker, source="record_live_position")
+        family = self._normalize_family_for_profit_memory(ticker=ticker, q=q)
+        sports_context = getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None) or {}
+        sports_context = sports_context if isinstance(sports_context, dict) else {}
+        elite_context = getattr(q, "elite_public_signal_context", None) or {}
+        elite_context = elite_context if isinstance(elite_context, dict) else {}
+        entry_context = {
+            "ticker": ticker,
+            "family": family,
+            "category": self.get_market_discovery_category(family),
+            "market_title": getattr(q, "market_title", None) or getattr(q, "title", None),
+            "sports_edge_context": sports_context,
+            "sports_tags": list(sports_context.get("tags") or []),
+            "elite_public_signal_context": elite_context,
+            "elite_signal_used": bool(elite_context.get("matched") or getattr(q, "elite_signal_used", False)),
+            "elite_trader_handle": getattr(q, "elite_trader_handle", None) or ((elite_context.get("signal") or {}).get("trader_handle") if isinstance(elite_context.get("signal"), dict) else None),
+        }
         row = {
             "ticker": ticker,
+            "family": family,
             "side": side,
             "count": count,
             "entry_price": price,
             "status": "open",
             "entry_ts": time.time(),
             "order_id": order_id,
+            "entry_context": entry_context,
         }
         self.live_positions = [
             position for position in (self.live_positions or [])
@@ -52769,6 +53109,25 @@ class KalshiSniperBot:
         ]
         self.live_positions.append(row)
         self.persist_live_entry_metadata(order={"ticker": ticker, "side": side, "count": count, "price": price, "order_id": order_id}, payload=row, order_id=order_id)
+        self.append_aion_learning_archive_event(
+            "trade_opened",
+            q=q,
+            payload=row,
+            extra={
+                "ticker": ticker,
+                "family": family,
+                "price": price,
+                "contracts": count,
+                "entry_reason": "record_live_position",
+                "entry_mode": "live_execution",
+                "phase_or_realm_source": "record_live_position",
+                "sports_edge_context": sports_context,
+                "sports_tags": list(sports_context.get("tags") or []),
+                "elite_public_signal_context": elite_context,
+                "elite_signal_used": bool(entry_context.get("elite_signal_used")),
+                "elite_trader_handle": entry_context.get("elite_trader_handle"),
+            },
+        )
         return row
 
     def _ensure_live_client_order_id(self, payload):
@@ -54109,6 +54468,7 @@ class KalshiSniperBot:
         self.maybe_send_telegram_heartbeat()
         markets = self.get_markets(limit=self.max_markets, status="open")
         self._refresh_aion_data_coverage_cache(source="live_cycle")
+        self._maybe_emit_aion_distilled_memory_audit(source="live_cycle")
         self._start_execution_failure_audit_cycle(source="live_cycle")
         self._start_live_edge_quality_cycle(source="live_cycle")
         markets_by_ticker = {str(market.get("ticker", "") or "").strip(): market for market in markets if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()}
