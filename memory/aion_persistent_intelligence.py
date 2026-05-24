@@ -20,6 +20,11 @@ except Exception:  # pragma: no cover - non-Linux fallback
 from risk.helpers import bounded_delta, clamp, safe_float, safe_ratio
 from runtime.paths import ensure_runtime_layout, legacy_runtime_artifact_paths, runtime_memory_file
 
+try:
+    from memory.aion_sports_history_store import AIONSportsHistoryStore
+except Exception:  # pragma: no cover - optional runtime store
+    AIONSportsHistoryStore = None
+
 
 def _now():
     return time.time()
@@ -121,6 +126,7 @@ DISTILLED_OBSERVATION_LIMIT = 1200
 DISTILLED_OUTCOME_LIMIT = 1200
 DISTILLED_SPORTS_HISTORY_LIMIT = 10000
 DISTILLED_SPORTS_HISTORY_SEEN_LIMIT = 25000
+_LAST_SQLITE_HISTORY_WARN_TS = 0.0
 
 SPORTS_FAMILY_PREFIXES = (
     "KXNBA",
@@ -835,6 +841,12 @@ class AIONPersistentIntelligence:
         self.ticker_profiles = {}
         self.family_profiles = {}
         self.distilled_learning = _ensure_distilled_learning_defaults({})
+        self.sports_history_store = None
+        if AIONSportsHistoryStore is not None:
+            try:
+                self.sports_history_store = AIONSportsHistoryStore(log_fn=builtins.print)
+            except Exception as exc:
+                builtins.print("[AION-SQLITE-AUDIT] " + json.dumps({"reason": "sqlite_store_unavailable", "error": exc.__class__.__name__, "action": "continue_without_sqlite"}, sort_keys=True))
         self.last_summary_ts = 0.0
         self.summary_interval_seconds = 120.0
         self.load()
@@ -1346,6 +1358,37 @@ class AIONPersistentIntelligence:
             add_component("sports_history_elite_family", "elite_trader_families", f"{elite_trader_handle}|{family_key}", 0.10, min_count=2, summary_source=sports_summaries)
         if elite_trader_handle and odds_bucket:
             add_component("sports_history_elite_odds", "elite_trader_odds", f"{elite_trader_handle}|{odds_bucket}", 0.08, min_count=2, summary_source=sports_summaries)
+
+        sqlite_store = getattr(self, "sports_history_store", None)
+        if sqlite_store is not None and hasattr(sqlite_store, "get_learning_signal"):
+            try:
+                sqlite_signal = sqlite_store.get_learning_signal(
+                    family=family_key,
+                    sport_type=sport_key,
+                    odds_bucket=odds_bucket,
+                    asymmetry_bucket=asymmetry_bucket,
+                    liquidity_bucket=liquidity_bucket,
+                    spread_bucket=spread_bucket,
+                )
+                for component in (sqlite_signal.get("components") or [])[:8]:
+                    if isinstance(component, dict):
+                        components.append(component)
+            except Exception as exc:
+                global _LAST_SQLITE_HISTORY_WARN_TS
+                now_ts = _now()
+                if now_ts - safe_float(_LAST_SQLITE_HISTORY_WARN_TS, 0.0) >= 300.0:
+                    _LAST_SQLITE_HISTORY_WARN_TS = now_ts
+                    builtins.print(
+                        "[AION-SQLITE-AUDIT] "
+                        + json.dumps(
+                            {
+                                "reason": "sqlite_learning_signal_failed",
+                                "error": exc.__class__.__name__,
+                                "action": "continue_with_json_memory",
+                            },
+                            sort_keys=True,
+                        )
+                    )
 
         raw_bias = sum(safe_float(item.get("bias"), 0.0) * safe_float(item.get("weight"), 0.0) for item in components)
         raw_bias = max(-1.0, min(1.0, raw_bias))

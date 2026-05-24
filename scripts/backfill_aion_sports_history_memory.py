@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -19,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from memory.aion_persistent_intelligence import AIONPersistentIntelligence  # noqa: E402
+from memory.aion_sports_history_store import AIONSportsHistoryStore, DEFAULT_DB_PATH  # noqa: E402
 from runtime.paths import runtime_memory_file  # noqa: E402
 from scripts.backfill_kalshi_market_history import (  # noqa: E402
     ENV_PATH,
@@ -239,36 +239,30 @@ def market_to_sports_history_record(market: dict[str, Any], *, backfill_run_id: 
     }
 
 
-def preserve_existing_owner(path: Path):
-    try:
-        return path.stat() if path.exists() else None
-    except Exception:
-        return None
-
-
-def restore_existing_owner(path: Path, original_stat) -> None:
-    if original_stat is None or not hasattr(os, "geteuid") or os.geteuid() != 0:
-        return
-    try:
-        os.chown(path, original_stat.st_uid, original_stat.st_gid)
-        os.chmod(path, original_stat.st_mode & 0o7777)
-    except Exception:
-        pass
-
-
 def emit_learning_logs(audit: dict[str, Any], *, source: str) -> None:
+    total_records = audit.get("total_records", audit.get("sports_history_record_count"))
+    oldest = audit.get("oldest_source_time", audit.get("sports_history_oldest_timestamp_ts"))
+    newest = audit.get("newest_source_time", audit.get("sports_history_newest_timestamp_ts"))
+    family_count = len(audit.get("records_by_family") or audit.get("sports_history_families_covered") or [])
     log(
         "[AION-SPORTS-HISTORY-LEARN]",
         source=source,
-        total_sports_records=audit.get("sports_history_record_count"),
-        oldest_timestamp_ts=audit.get("sports_history_oldest_timestamp_ts"),
-        newest_timestamp_ts=audit.get("sports_history_newest_timestamp_ts"),
-        family_count=audit.get("sports_history_family_count"),
+        total_sports_records=total_records,
+        oldest_source_time=oldest,
+        newest_source_time=newest,
+        family_count=family_count,
     )
-    for family in (audit.get("sports_history_profitable_families") or [])[:8]:
+    for family in (audit.get("family_performance") or audit.get("sports_history_profitable_families") or [])[:8]:
         log("[AION-SPORTS-FAMILY-LEARN]", source=source, **family)
-    for bucket in (audit.get("sports_history_asymmetry_bucket_performance") or [])[:8]:
+    for bucket in (audit.get("asymmetry_bucket_performance") or audit.get("sports_history_asymmetry_bucket_performance") or [])[:8]:
         log("[AION-SPORTS-ASYMMETRY-LEARN]", source=source, **bucket)
+
+
+def json_sports_history_records(engine: AIONPersistentIntelligence) -> list[dict[str, Any]]:
+    memory = getattr(engine, "distilled_learning", {}) if engine is not None else {}
+    sports_history = memory.get("sports_history") if isinstance(memory, dict) else {}
+    records = sports_history.get("records") if isinstance(sports_history, dict) else []
+    return [record for record in records or [] if isinstance(record, dict)]
 
 
 def backfill(args: argparse.Namespace) -> dict[str, Any]:
@@ -276,29 +270,51 @@ def backfill(args: argparse.Namespace) -> dict[str, Any]:
     start_dt, end_dt = resolve_date_range(args)
     family_specs = sports_family_specs(args.family)
     state_path = Path(runtime_memory_file("aion_persistent_intelligence.json"))
-    original_stat = preserve_existing_owner(state_path)
+    sqlite_path = Path(DEFAULT_DB_PATH)
     engine = AIONPersistentIntelligence(state_file=state_path, enabled=not args.dry_run)
+    store = None if args.dry_run else AIONSportsHistoryStore(db_path=sqlite_path, log_fn=print)
+    migration = {"stored": 0, "duplicates": 0, "malformed": 0, "errors": 0}
+    if store is not None:
+        migration = store.migrate_json_records(json_sports_history_records(engine), batch_size=max(100, int(args.batch_size or 250)))
     client = KalshiHistoryClient()
     run_id = args.run_id or f"sports-history-{int(time.time())}"
     limit = None if int(args.limit or 0) == 0 else max(1, int(args.limit))
     batch_size = max(1, int(args.batch_size or 100))
-    page_limit = max(1, min(200, int(args.page_limit or 100)))
+    page_limit = max(1, min(250, int(args.page_limit or 100)))
     summary = {
         "run_id": run_id,
         "dry_run": bool(args.dry_run),
         "market_seen": 0,
         "stored": 0,
         "duplicates": 0,
+        "malformed": 0,
+        "errors": 0,
         "date_skipped": 0,
         "non_sports_skipped": 0,
         "api_warnings": 0,
+        "sqlite_db_path": str(sqlite_path),
+        "migration": migration,
         "families": [spec.get("name") for spec in family_specs],
         "start_date": start_dt.date().isoformat(),
         "end_date": end_dt.date().isoformat(),
     }
+
+    def limit_progress() -> int:
+        if args.dry_run:
+            return int(summary["stored"])
+        return int(summary["stored"]) + int(summary["duplicates"]) + int(summary["malformed"]) + int(summary["errors"])
+
+    def limit_reached() -> bool:
+        return limit is not None and limit_progress() >= int(limit)
+
+    def remaining_limit() -> int:
+        if limit is None:
+            return batch_size
+        return max(0, int(limit) - limit_progress())
+
     if args.audit_only:
-        audit = engine.audit_distilled_learning()
-        log("[AION-SPORTS-BACKFILL-PROGRESS]", audit_only=True, **summary, audit=audit)
+        audit = store.audit(recompute=True) if store is not None else engine.audit_distilled_learning()
+        log("[AION-SPORTS-BACKFILL-SQLITE]", audit_only=True, **summary, audit=audit)
         emit_learning_logs(audit, source="audit_only")
         return summary
 
@@ -314,122 +330,111 @@ def backfill(args: argparse.Namespace) -> dict[str, Any]:
         max_records=args.max_records,
     )
 
-    original_persist = engine.persist
-    if not args.dry_run:
-        engine.persist = lambda: {}
-    try:
-        for family_spec in family_specs:
-            if limit is not None and summary["stored"] >= limit:
-                break
-            for series_ticker in tuple(family_spec.get("series_tickers") or (None,)):
-                if limit is not None and summary["stored"] >= limit:
-                    break
-                for status in SPORTS_STATUS_ORDER:
-                    if limit is not None and summary["stored"] >= limit:
-                        break
-                    cursor = None
-                    while True:
-                        try:
-                            markets, next_cursor = client.get_markets(
-                                limit=page_limit,
-                                status=status,
-                                cursor=cursor,
-                                series_ticker=series_ticker,
-                            )
-                        except requests.HTTPError as exc:
-                            summary["api_warnings"] += 1
-                            log(
-                                "[AION-SPORTS-BACKFILL-PROGRESS]",
-                                reason="markets_request_http_error",
-                                status_code=getattr(exc.response, "status_code", None),
-                                family=family_spec.get("name"),
-                                series_ticker=series_ticker,
-                                status=status,
-                            )
-                            break
-                        except requests.RequestException as exc:
-                            summary["api_warnings"] += 1
-                            log(
-                                "[AION-SPORTS-BACKFILL-PROGRESS]",
-                                reason="markets_request_failed",
-                                error=exc.__class__.__name__,
-                                family=family_spec.get("name"),
-                                series_ticker=series_ticker,
-                                status=status,
-                            )
-                            break
-                        if not markets:
-                            break
-                        reached_start = False
-                        for market in markets:
-                            if limit is not None and summary["stored"] >= limit:
-                                break
-                            summary["market_seen"] += 1
-                            if not should_include_family(market, family_spec):
-                                continue
-                            ref_dt = market_reference_datetime(market)
-                            if ref_dt is not None:
-                                if ref_dt < start_dt:
-                                    summary["date_skipped"] += 1
-                                    reached_start = True
-                                    continue
-                                if ref_dt > end_dt:
-                                    summary["date_skipped"] += 1
-                                    continue
-                            record = market_to_sports_history_record(market, backfill_run_id=run_id)
-                            if not record:
-                                summary["non_sports_skipped"] += 1
-                                continue
-                            if args.dry_run:
-                                summary["stored"] += 1
-                                if summary["stored"] <= 5 or summary["stored"] % batch_size == 0:
-                                    log(
-                                        "[AION-SPORTS-BACKFILL-STORE]",
-                                        dry_run=True,
-                                        ticker=record.get("ticker"),
-                                        family=record.get("family"),
-                                        sport_type=record.get("sport_type"),
-                                        stored=summary["stored"],
-                                    )
-                                continue
-                            result = engine.record_sports_history_market(
-                                record,
-                                max_records=args.max_records,
-                                persist=False,
-                            )
-                            if result.get("ok") and not result.get("skipped"):
-                                summary["stored"] += 1
-                                if summary["stored"] <= 5 or summary["stored"] % batch_size == 0:
-                                    log(
-                                        "[AION-SPORTS-BACKFILL-STORE]",
-                                        dry_run=False,
-                                        ticker=record.get("ticker"),
-                                        family=record.get("family"),
-                                        sport_type=record.get("sport_type"),
-                                        stored=summary["stored"],
-                                    )
-                            elif result.get("skipped"):
-                                summary["duplicates"] += 1
-                            if not args.dry_run and summary["stored"] and summary["stored"] % batch_size == 0:
-                                original_persist()
-                                restore_existing_owner(state_path, original_stat)
-                                log("[AION-SPORTS-BACKFILL-PROGRESS]", **summary)
-                        if limit is not None and summary["stored"] >= limit:
-                            break
-                        if args.sleep_seconds > 0:
-                            time.sleep(float(args.sleep_seconds))
-                        if reached_start or not next_cursor:
-                            break
-                        cursor = next_cursor
-    finally:
-        if not args.dry_run:
-            engine.persist = original_persist
-            original_persist()
-            restore_existing_owner(state_path, original_stat)
+    pending_records: list[dict[str, Any]] = []
 
-    audit = engine.audit_distilled_learning()
+    def flush_pending(*, force=False):
+        if args.dry_run or store is None or not pending_records:
+            return
+        if not force and len(pending_records) < batch_size:
+            return
+        batch = list(pending_records)
+        pending_records.clear()
+        result = store.insert_records(batch, batch_size=batch_size)
+        summary["stored"] += int(result.get("stored") or 0)
+        summary["duplicates"] += int(result.get("duplicates") or 0)
+        summary["malformed"] += int(result.get("malformed") or 0)
+        summary["errors"] += int(result.get("errors") or 0)
+        log("[AION-SPORTS-BACKFILL-SQLITE]", batch_size=len(batch), **summary)
+
+    for family_spec in family_specs:
+        if limit_reached():
+            break
+        for series_ticker in tuple(family_spec.get("series_tickers") or (None,)):
+            if limit_reached():
+                break
+            for status in SPORTS_STATUS_ORDER:
+                if limit_reached():
+                    break
+                cursor = None
+                while True:
+                    try:
+                        markets, next_cursor = client.get_markets(
+                            limit=page_limit,
+                            status=status,
+                            cursor=cursor,
+                            series_ticker=series_ticker,
+                        )
+                    except requests.HTTPError as exc:
+                        summary["api_warnings"] += 1
+                        log(
+                            "[AION-SPORTS-BACKFILL-PROGRESS]",
+                            reason="markets_request_http_error",
+                            status_code=getattr(exc.response, "status_code", None),
+                            family=family_spec.get("name"),
+                            series_ticker=series_ticker,
+                            status=status,
+                        )
+                        break
+                    except requests.RequestException as exc:
+                        summary["api_warnings"] += 1
+                        log(
+                            "[AION-SPORTS-BACKFILL-PROGRESS]",
+                            reason="markets_request_failed",
+                            error=exc.__class__.__name__,
+                            family=family_spec.get("name"),
+                            series_ticker=series_ticker,
+                            status=status,
+                        )
+                        break
+                    if not markets:
+                        break
+                    reached_start = False
+                    for market in markets:
+                        if limit_reached():
+                            break
+                        summary["market_seen"] += 1
+                        if not should_include_family(market, family_spec):
+                            continue
+                        ref_dt = market_reference_datetime(market)
+                        if ref_dt is not None:
+                            if ref_dt < start_dt:
+                                summary["date_skipped"] += 1
+                                reached_start = True
+                                continue
+                            if ref_dt > end_dt:
+                                summary["date_skipped"] += 1
+                                continue
+                        record = market_to_sports_history_record(market, backfill_run_id=run_id)
+                        if not record:
+                            summary["non_sports_skipped"] += 1
+                            continue
+                        if args.dry_run:
+                            summary["stored"] += 1
+                            if summary["stored"] <= 5 or summary["stored"] % batch_size == 0:
+                                log(
+                                    "[AION-SPORTS-BACKFILL-STORE]",
+                                    dry_run=True,
+                                    ticker=record.get("ticker"),
+                                    family=record.get("family"),
+                                    sport_type=record.get("sport_type"),
+                                    stored=summary["stored"],
+                            )
+                            continue
+                        pending_records.append(record)
+                        remaining = remaining_limit()
+                        flush_pending(force=remaining <= 0 or len(pending_records) >= min(batch_size, max(1, remaining)))
+                    if limit_reached():
+                        break
+                    if args.sleep_seconds > 0:
+                        time.sleep(float(args.sleep_seconds))
+                    if reached_start or not next_cursor:
+                        break
+                    cursor = next_cursor
+
+    flush_pending(force=True)
+    audit = store.audit(recompute=True) if store is not None else engine.audit_distilled_learning()
     summary["audit"] = audit
-    log("[AION-SPORTS-BACKFILL-PROGRESS]", done=True, **summary)
+    log("[AION-SPORTS-BACKFILL-SQLITE]", done=True, **summary)
     emit_learning_logs(audit, source="backfill")
     return summary
 
@@ -442,9 +447,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=5000, help="Maximum new sports markets to store. Use 0 for no explicit limit.")
     parser.add_argument("--family", default=None, help="Optional sports family name or series ticker.")
     parser.add_argument("--batch-size", type=int, default=100, help="Persist and log every N stored records.")
-    parser.add_argument("--page-limit", type=int, default=100, help="Kalshi markets page size, max 200.")
+    parser.add_argument("--page-limit", type=int, default=100, help="Kalshi markets page size, max 250.")
     parser.add_argument("--sleep-seconds", type=float, default=0.2, help="Small delay between API pages.")
-    parser.add_argument("--max-records", type=int, default=10000, help="Maximum compact sports history records retained in memory.")
+    parser.add_argument("--max-records", type=int, default=10000, help="Legacy JSON memory cap retained for compatibility; SQLite storage is not capped by this.")
     parser.add_argument("--run-id", default=None, help="Optional stable backfill run id.")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and log without writing memory.")
     parser.add_argument("--audit-only", action="store_true", help="Only print current sports-history audit.")
