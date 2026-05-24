@@ -1606,6 +1606,14 @@ AION_SPORTS_MAX_SPREAD_SOFT = _env_float("AION_SPORTS_MAX_SPREAD_SOFT", 0.18)
 AION_SPORTS_MAX_SPREAD_HARD = _env_float("AION_SPORTS_MAX_SPREAD_HARD", 0.24)
 AION_SPORTS_REQUIRE_DIRECTIONAL_BIAS = get_env_bool("AION_SPORTS_REQUIRE_DIRECTIONAL_BIAS", 1)
 AION_SPORTS_MIN_MOMENTUM_FOR_WIDE = get_env_float("AION_SPORTS_MIN_MOMENTUM_FOR_WIDE", 0.18)
+AION_SPORTS_EDGE_RANKING_ENABLED = get_env_bool("AION_SPORTS_EDGE_RANKING_ENABLED", 1)
+AION_SPORTS_EDGE_BASE_BOOST = get_env_float("AION_SPORTS_EDGE_BASE_BOOST", 2.0)
+AION_SPORTS_EDGE_STRONG_BOOST = get_env_float("AION_SPORTS_EDGE_STRONG_BOOST", 4.0)
+AION_SPORTS_EDGE_MAX_BOOST = get_env_float("AION_SPORTS_EDGE_MAX_BOOST", 5.0)
+AION_SPORTS_EDGE_USABLE_SPREAD = get_env_float("AION_SPORTS_EDGE_USABLE_SPREAD", 0.08)
+AION_SPORTS_EDGE_MIN_TOP_DEPTH = get_env_float("AION_SPORTS_EDGE_MIN_TOP_DEPTH", 3.0)
+AION_SPORTS_EDGE_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_SIZE_MULTIPLIER", 1.15)
+AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER", 1.35)
 AION_CONTROLLED_LOOSENING_ENABLED = get_env_bool("AION_CONTROLLED_LOOSENING_ENABLED", 1)
 AION_PHASE55_FASTPATH_ENABLED = get_env_bool("AION_PHASE55_FASTPATH_ENABLED", 1)
 AION_MICRO_PULLBACK_RELAX_ENABLED = get_env_bool("AION_MICRO_PULLBACK_RELAX_ENABLED", 1)
@@ -1854,6 +1862,7 @@ class KalshiSniperBot:
         self.btc15m_dead_contract_cooldowns = {}
         self.sports_quote_continuity_cache = {}
         self.sports_momentum_state = {}
+        self.sports_edge_ranking_log_markers = {}
         self.realm_vv_live_execution_gate_by_ticker = {}
         self.phase55_live_execution_gate_by_ticker = self.realm_vv_live_execution_gate_by_ticker
         self.live_direction_decisions_by_ticker = {}
@@ -3879,6 +3888,8 @@ class KalshiSniperBot:
             "no_vig_probability": round(no_vig_probability, 4),
             "no_vig_odds": round(no_vig_odds, 6),
             "sports_edge_raw": round(raw_edge, 4),
+            "raw_edge": round(raw_edge, 4),
+            "sports_post_cost_edge": round(final_edge, 4),
             "sports_edge_after_cost_before_family_bias": round(post_cost_edge_before_family_bias, 4),
             "sports_edge_after_cost": round(final_edge, 4),
             "sports_edge_after_cost_after_family_bias": round(final_edge, 4),
@@ -3890,6 +3901,7 @@ class KalshiSniperBot:
             "edge_margin_to_floor": round(edge_margin_to_floor, 4),
             "source_of_edge_value": selector_edge_info.get("source_of_edge_value"),
             "dynamic_buffer": round(spread_cost, 4),
+            "sports_dynamic_buffer": round(spread_cost, 4),
             "spread_cost": round(spread_cost, 4),
             "estimated_cost": round(estimated_cost, 4),
             "raw_price": round(market_price, 4),
@@ -7897,6 +7909,27 @@ class KalshiSniperBot:
             ticker = str(self._learning_archive_value(sources, "ticker", "market_ticker") or "").strip()
             family = str(self._learning_archive_value(sources, "family") or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")).strip().upper()
             side = str(self._learning_archive_value(sources, "selected_side", "side", "outcome_side") or "").strip().lower() or None
+            sports_context = self._learning_archive_value(sources, "sports_edge_context", "sports_edge_ranking_context")
+            sports_context = sports_context if isinstance(sports_context, dict) else {}
+            sports_tags_raw = (
+                self._learning_archive_value(sources, "sports_tags", "sports_edge_tags")
+                or sports_context.get("tags")
+                or []
+            )
+            if isinstance(sports_tags_raw, str):
+                sports_tags = [tag.strip() for tag in sports_tags_raw.replace(";", ",").split(",") if tag.strip()]
+            elif isinstance(sports_tags_raw, (list, tuple, set)):
+                sports_tags = [str(tag).strip() for tag in sports_tags_raw if str(tag or "").strip()]
+            else:
+                sports_tags = []
+            sports_score_at_entry = self._learning_archive_float(
+                self._learning_archive_value(sources, "sports_score_at_entry", "sports_edge_score_at_entry", "score_at_entry")
+                or sports_context.get("score_at_entry")
+            )
+            sports_edge_boost = self._learning_archive_float(
+                self._learning_archive_value(sources, "sports_edge_boost", "sports_edge_rank_boost", "sports_edge_score_boost")
+                or sports_context.get("boost")
+            )
             price = self._learning_archive_float(
                 self._learning_archive_value(
                     sources,
@@ -7962,6 +7995,17 @@ class KalshiSniperBot:
                         "max_daily_trade_cap": int(MAX_LIVE_TRADES_PER_DAY),
                         "position_id": self._learning_archive_value(sources, "position_id"),
                         "order_id": self._learning_archive_value(sources, "order_id", "id"),
+                        "sports_tags": sports_tags,
+                        "sports_score_at_entry": sports_score_at_entry,
+                        "sports_edge_boost": sports_edge_boost,
+                        "sports_implied_probability": self._learning_archive_float(
+                            self._learning_archive_value(sources, "sports_implied_probability", "sports_edge_implied_probability")
+                            or sports_context.get("implied_probability")
+                        ),
+                        "sports_payout_multiple": self._learning_archive_float(
+                            self._learning_archive_value(sources, "sports_payout_multiple", "sports_edge_payout_multiple")
+                            or sports_context.get("payout_multiple")
+                        ),
                     }
                 )
             else:
@@ -7997,6 +8041,9 @@ class KalshiSniperBot:
                         "original_ev_score": self._learning_archive_float(self._learning_archive_value(sources, "original_ev_score", "ev_score", "edge_after_cost", "final_edge")),
                         "position_id": self._learning_archive_value(sources, "position_id"),
                         "order_id": self._learning_archive_value(sources, "order_id", "exit_order_id", "id"),
+                        "sports_tags": sports_tags,
+                        "sports_score_at_entry": sports_score_at_entry,
+                        "sports_edge_boost": sports_edge_boost,
                     }
                 )
             archive_path = _Path(AION_LEARNING_ARCHIVE_FILE)
@@ -8011,6 +8058,23 @@ class KalshiSniperBot:
                     default=str,
                 )
             )
+            if sports_tags or self._is_sports_market_or_family(family):
+                print(
+                    "[AION-SPORTS-LEARN] "
+                    + json.dumps(
+                        {
+                            "event_type": event_type,
+                            "ticker": ticker or None,
+                            "family": family or "UNKNOWN",
+                            "tags": sports_tags,
+                            "score_at_entry": sports_score_at_entry,
+                            "pnl_dollars": event.get("pnl_dollars"),
+                            "result": event.get("result"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             return {"ok": True, "path": str(archive_path), "event_type": event_type}
         except Exception as exc:
             try:
@@ -10554,6 +10618,10 @@ class KalshiSniperBot:
         if yes_bid is not None and yes_ask is not None:
             spread = round(max(0.0, yes_ask - yes_bid), 4)
             mid_price = round((yes_bid + yes_ask) / 2.0, 4)
+        sports_edge_context = getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None) or {}
+        sports_edge_context = sports_edge_context if isinstance(sports_edge_context, dict) else {}
+        sports_tags_raw = getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None) or sports_edge_context.get("tags") or []
+        sports_tags = [str(tag).strip() for tag in sports_tags_raw if str(tag or "").strip()] if isinstance(sports_tags_raw, (list, tuple, set)) else []
         volatility_index = None
         if last_price is not None and mid_price is not None:
             volatility_index = round(abs(last_price - mid_price) / max(spread or 0.01, 0.01), 4)
@@ -10603,6 +10671,11 @@ class KalshiSniperBot:
             "no_ask": self._safe_round(no_ask, 4, None),
             "last_price": self._safe_round(last_price, 4, None),
             "time_to_event": self._safe_round(time_to_event, 4, None),
+            "sports_tags": sports_tags,
+            "sports_edge_boost": self._safe_round(sports_edge_context.get("boost"), 4, None),
+            "sports_score_at_entry": self._safe_round(sports_edge_context.get("score_at_entry"), 4, None),
+            "sports_implied_probability": self._safe_round(sports_edge_context.get("implied_probability"), 4, None),
+            "sports_payout_multiple": self._safe_round(sports_edge_context.get("payout_multiple"), 4, None),
             "source": source,
         }
 
@@ -23920,7 +23993,8 @@ class KalshiSniperBot:
         fallback_quote = None
         fallback_quote_ready = False
         fallback_source = "none"
-        recent_cache = dict(self.sports_quote_continuity_cache.get(ticker, {}) or {}) if self._is_sports_market_or_family(family) else {}
+        sports_quote_cache = getattr(self, "sports_quote_continuity_cache", {}) or {}
+        recent_cache = dict(sports_quote_cache.get(ticker, {}) or {}) if self._is_sports_market_or_family(family) else {}
         cache_age_seconds = None
         if recent_cache.get("ts"):
             try:
@@ -25322,6 +25396,474 @@ class KalshiSniperBot:
             self._attach_elite_signal_context(item=item, q=q, context=context)
         return context
 
+    def _sports_edge_read_value(self, sources, *names):
+        for source in sources or []:
+            if source is None:
+                continue
+            for name in names:
+                if isinstance(source, dict):
+                    value = source.get(name)
+                else:
+                    value = getattr(source, name, None)
+                if value not in (None, ""):
+                    return value
+        return None
+
+    def _sports_edge_price_value(self, value):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        if numeric > 1.0 and numeric <= 100.0:
+            numeric = numeric / 100.0
+        if numeric <= 0.0:
+            return None
+        return round(float(numeric), 6)
+
+    def _emit_sports_edge_log(self, tag, payload, marker=None):
+        markers = getattr(self, "sports_edge_ranking_log_markers", None)
+        if markers is None:
+            self.sports_edge_ranking_log_markers = {}
+            markers = self.sports_edge_ranking_log_markers
+        marker_key = None
+        if marker is not None:
+            marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+            if marker_key in markers:
+                return
+            markers[marker_key] = time.time()
+        try:
+            print(f"{tag} " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"{tag} " + json.dumps({"reason": "sports_edge_log_failed"}))
+
+    def _attach_sports_edge_context(self, item=None, q=None, context=None):
+        context = context if isinstance(context, dict) else {}
+        tags = list(context.get("tags") or [])
+        if isinstance(item, dict):
+            item["sports_edge_context"] = context
+            item["sports_edge_tags"] = tags
+            item["sports_edge_rank_boost"] = context.get("boost", 0.0)
+            item["sports_edge_score_at_entry"] = context.get("score_at_entry")
+        if q is not None:
+            for field, value in (
+                ("sports_edge_context", context),
+                ("sports_edge_ranking_context", context),
+                ("sports_edge_tags", tags),
+                ("sports_tags", tags),
+                ("sports_edge_rank_boost", context.get("boost", 0.0)),
+                ("sports_edge_score_boost", context.get("boost", 0.0)),
+                ("sports_edge_score_at_entry", context.get("score_at_entry")),
+                ("sports_edge_size_multiplier", context.get("size_multiplier", 1.0)),
+                ("sports_edge_implied_probability", context.get("implied_probability")),
+                ("sports_edge_payout_multiple", context.get("payout_multiple")),
+            ):
+                try:
+                    setattr(q, field, value)
+                except Exception:
+                    pass
+
+    def _is_sports_edge_candidate(self, *, market=None, q=None, family=None, ticker=None, item=None, category=None):
+        market = market if isinstance(market, dict) else {}
+        if isinstance(item, dict):
+            q = q or item.get("q") or item.get("quote")
+            ticker = ticker or item.get("ticker")
+            family = family or item.get("family")
+            category = category or item.get("category")
+        elif isinstance(item, (list, tuple)):
+            q = q or (item[1] if len(item) > 1 else None)
+            family = family or (item[3] if len(item) > 3 else None)
+        ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        category = str(category or self.get_market_discovery_category(market or family) or "").strip().lower()
+        if category == "sports" or self.is_sports_family(family, ticker=ticker):
+            return True, family, ticker, category or "sports"
+        sports_text = " ".join(
+            str(value or "").lower()
+            for value in (
+                market.get("title"),
+                market.get("subtitle"),
+                market.get("event_title"),
+                getattr(q, "title", None),
+                getattr(q, "market_title", None),
+                ticker,
+                family,
+            )
+            if str(value or "").strip()
+        )
+        sports_terms = (
+            "nba", "mlb", "nfl", "nhl", "ncaab", "ncaaf", "basketball",
+            "baseball", "football", "hockey", "spread", "total", "1h",
+            "first half", "strikeout", "player prop",
+        )
+        if any(term in sports_text for term in sports_terms):
+            return True, family, ticker, "sports"
+        return False, family, ticker, category or "unknown"
+
+    def _build_sports_edge_ranking_context(
+        self,
+        item=None,
+        *,
+        market=None,
+        q=None,
+        spread=None,
+        family=None,
+        category=None,
+        score_result=None,
+        expectancy_summary=None,
+        quality_snapshot=None,
+        source="ranking",
+        log=True,
+    ):
+        if not AION_SPORTS_EDGE_RANKING_ENABLED:
+            return {"is_sports": False, "boost": 0.0, "tags": [], "reason": "disabled"}
+        market = market if isinstance(market, dict) else {}
+        score_result = score_result if isinstance(score_result, dict) else {}
+        expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+        quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+        if isinstance(item, dict):
+            q = q or item.get("q") or item.get("quote")
+            spread = spread if spread is not None else item.get("spread")
+            family = family or item.get("family")
+            if not expectancy_summary and isinstance(item.get("expectancy_summary"), dict):
+                expectancy_summary = item.get("expectancy_summary") or {}
+            if not quality_snapshot and isinstance(item.get("quality_snapshot"), dict):
+                quality_snapshot = item.get("quality_snapshot") or {}
+        elif isinstance(item, (list, tuple)):
+            q = q or (item[1] if len(item) > 1 else None)
+            spread = spread if spread is not None else (item[2] if len(item) > 2 else None)
+            family = family or (item[3] if len(item) > 3 else None)
+        is_sports, family, ticker, category = self._is_sports_edge_candidate(
+            market=market,
+            q=q,
+            family=family,
+            item=item,
+            category=category,
+        )
+        if not is_sports:
+            context = {"is_sports": False, "boost": 0.0, "tags": [], "reason": "not_sports", "family": family, "ticker": ticker}
+            self._attach_sports_edge_context(item=item, q=q, context=context)
+            return context
+
+        sources = [expectancy_summary, quality_snapshot, score_result, item if isinstance(item, dict) else None, market, q]
+        selected_side = str(
+            self._sports_edge_read_value(sources, "selected_side", "side", "outcome_side")
+            or "yes"
+        ).strip().lower()
+        if selected_side not in {"yes", "no"}:
+            selected_side = "yes"
+        yes_bid = self._sports_edge_price_value(self._sports_edge_read_value(sources, "yes_bid", "yes_bid_dollars"))
+        yes_ask = self._sports_edge_price_value(self._sports_edge_read_value(sources, "yes_ask", "yes_ask_dollars"))
+        no_bid = self._sports_edge_price_value(self._sports_edge_read_value(sources, "no_bid", "no_bid_dollars"))
+        no_ask = self._sports_edge_price_value(self._sports_edge_read_value(sources, "no_ask", "no_ask_dollars"))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+        selected_price = self._sports_edge_price_value(
+            self._sports_edge_read_value(
+                sources,
+                "selected_price",
+                "selected_price_dollars",
+                "price",
+                "ev_selected_price",
+            )
+        )
+        if selected_price is None:
+            selected_price = no_ask if selected_side == "no" else yes_ask
+        if selected_price is None:
+            selected_price = yes_ask or no_ask
+        implied_probability = selected_price if selected_price is not None and 0.0 < selected_price < 1.0 else None
+        payout_multiple = round(1.0 / selected_price, 4) if selected_price is not None and selected_price > 0.0 else None
+        spread_value = self.to_float(spread, None)
+        if spread_value is None:
+            if selected_side == "no" and no_bid is not None and no_ask is not None:
+                spread_value = max(0.0, no_ask - no_bid)
+            elif yes_bid is not None and yes_ask is not None:
+                spread_value = max(0.0, yes_ask - yes_bid)
+            elif no_bid is not None and no_ask is not None:
+                spread_value = max(0.0, no_ask - no_bid)
+        spread_usable = bool(spread_value is not None and 0.0 <= spread_value <= min(AION_SPORTS_MAX_SPREAD_SOFT, AION_SPORTS_EDGE_USABLE_SPREAD))
+
+        liquidity_priority = {}
+        try:
+            if market or ticker:
+                liquidity_priority = self.get_market_liquidity_priority(market if market else {"ticker": ticker}, q=q)
+        except Exception:
+            liquidity_priority = {}
+        depth_sources = [expectancy_summary, quality_snapshot, liquidity_priority, market, q]
+        yes_top_size = self.to_float(
+            self._sports_edge_read_value(depth_sources, "yes_top_size", "yes_ask_size", "yes_ask_size_fp"),
+            None,
+        )
+        no_top_size = self.to_float(
+            self._sports_edge_read_value(depth_sources, "no_top_size", "no_ask_size", "no_ask_size_fp"),
+            None,
+        )
+        liquidity_depth = self.to_float(
+            self._sports_edge_read_value(depth_sources, "liquidity_depth", "top_book_depth", "depth"),
+            None,
+        )
+        if yes_top_size is None:
+            yes_top_size = 0.0
+        if no_top_size is None:
+            no_top_size = 0.0
+        two_sided_quotes = bool(
+            liquidity_priority.get("both_sides_quoted")
+            or (yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None)
+        )
+        book_depth = min(yes_top_size, no_top_size) if yes_top_size > 0.0 and no_top_size > 0.0 else max(yes_top_size, no_top_size, liquidity_depth or 0.0)
+        depth_usable = bool(two_sided_quotes and book_depth >= max(1.0, AION_SPORTS_EDGE_MIN_TOP_DEPTH))
+        good_book = bool(spread_usable and depth_usable)
+
+        momentum_context = self._sports_edge_read_value(sources, "sports_momentum", "sports_momentum_context", "momentum_context")
+        if not isinstance(momentum_context, dict):
+            momentum_context = {
+                "momentum_score": self._sports_edge_read_value(sources, "momentum_score"),
+                "directional_bias": self._sports_edge_read_value(sources, "directional_bias"),
+                "repricing_velocity": self._sports_edge_read_value(sources, "repricing_velocity"),
+                "price_delta": self._sports_edge_read_value(sources, "price_delta"),
+            }
+        has_momentum_fields = any(value not in (None, "") for value in momentum_context.values())
+        if not has_momentum_fields and market:
+            try:
+                momentum_context = self.compute_live_sports_momentum(
+                    market,
+                    q=q,
+                    liquidity_priority=liquidity_priority,
+                    spread=spread_value,
+                    context=f"sports_edge:{source}",
+                    allow_synthetic_size=False,
+                )
+            except Exception:
+                momentum_context = {}
+        raw_momentum_score = self.to_float(momentum_context.get("momentum_score"), 0.0) or 0.0
+        raw_price_delta = self.to_float(momentum_context.get("price_delta"), 0.0) or 0.0
+        raw_velocity = self.to_float(momentum_context.get("repricing_velocity"), 0.0) or 0.0
+        directional_bias = str(momentum_context.get("directional_bias") or "unknown").strip().lower()
+        selected_momentum_score = raw_momentum_score if selected_side != "no" else -raw_momentum_score
+        selected_price_delta = raw_price_delta if selected_side != "no" else -raw_price_delta
+        selected_velocity = raw_velocity if selected_side != "no" else -raw_velocity
+        selected_directional_bias = directional_bias
+        if selected_side == "no":
+            selected_directional_bias = "down" if directional_bias == "up" else "up" if directional_bias == "down" else directional_bias
+        momentum_risk = bool(
+            (selected_directional_bias == "down" and selected_momentum_score <= -0.12)
+            or selected_velocity <= -0.004
+            or selected_price_delta <= -0.018
+        )
+
+        underdog_value = bool(implied_probability is not None and 0.20 <= implied_probability <= 0.45)
+        asymmetric_payout = bool(payout_multiple is not None and payout_multiple >= 1.5)
+        positive_edge = bool(
+            max(
+                self.to_float(self._sports_edge_read_value(sources, "final_edge"), 0.0) or 0.0,
+                self.to_float(self._sports_edge_read_value(sources, "sports_edge_after_cost"), 0.0) or 0.0,
+                self.to_float(self._sports_edge_read_value(sources, "edge_after_cost"), 0.0) or 0.0,
+                self.to_float(self._sports_edge_read_value(sources, "ev_edge"), 0.0) or 0.0,
+            ) > 0.0
+        )
+        tags = []
+        if underdog_value:
+            tags.append("SPORTS_UNDERDOG_VALUE")
+        if asymmetric_payout:
+            tags.append("SPORTS_ASYMMETRIC_PAYOUT")
+        if good_book:
+            tags.append("SPORTS_GOOD_BOOK")
+        elif not depth_usable:
+            tags.append("SPORTS_THIN_BOOK_RISK")
+        if momentum_risk:
+            tags.append("SPORTS_MOMENTUM_RISK")
+
+        boost = 0.0
+        base_boost = max(0.0, self.to_float(AION_SPORTS_EDGE_BASE_BOOST, 0.0) or 0.0)
+        if underdog_value:
+            boost += base_boost * 0.45
+        if asymmetric_payout:
+            boost += base_boost * 0.35
+        if good_book:
+            boost += base_boost * 0.45
+        if positive_edge:
+            boost += base_boost * 0.25
+        if underdog_value and asymmetric_payout and good_book and not momentum_risk:
+            boost = max(boost, self.to_float(AION_SPORTS_EDGE_STRONG_BOOST, boost) or boost)
+        if not depth_usable:
+            boost *= 0.65
+        if momentum_risk:
+            boost *= 0.45
+        boost = round(max(0.0, min(self.to_float(AION_SPORTS_EDGE_MAX_BOOST, 5.0) or 5.0, boost)), 4)
+        score_at_entry = self.to_float(
+            self._sports_edge_read_value(
+                sources,
+                "adjusted_score",
+                "candidate_score",
+                "quality_score",
+                "ev_score",
+                "score",
+            ),
+            boost,
+        )
+        strong_score = bool(boost >= min(self.to_float(AION_SPORTS_EDGE_STRONG_BOOST, 4.0) or 4.0, self.to_float(AION_SPORTS_EDGE_MAX_BOOST, 5.0) or 5.0) or positive_edge)
+        size_eligible_signal = bool(strong_score and good_book and spread_usable and asymmetric_payout and not momentum_risk)
+        context = {
+            "is_sports": True,
+            "ticker": ticker,
+            "family": family,
+            "category": category or "sports",
+            "source": source,
+            "selected_side": selected_side,
+            "selected_price": round(selected_price, 6) if selected_price is not None else None,
+            "implied_probability": round(implied_probability, 6) if implied_probability is not None else None,
+            "payout_multiple": payout_multiple,
+            "spread": round(spread_value, 6) if spread_value is not None else None,
+            "spread_usable": spread_usable,
+            "yes_top_size": round(yes_top_size, 4),
+            "no_top_size": round(no_top_size, 4),
+            "book_depth": round(book_depth, 4),
+            "book_usable": good_book,
+            "momentum_score": round(selected_momentum_score, 4),
+            "directional_bias": selected_directional_bias,
+            "momentum_risk": momentum_risk,
+            "positive_edge": positive_edge,
+            "tags": tags,
+            "boost": boost,
+            "score_at_entry": round(score_at_entry, 4) if score_at_entry is not None else None,
+            "size_eligible_signal": size_eligible_signal,
+            "size_multiplier": round(AION_SPORTS_EDGE_SIZE_MULTIPLIER if size_eligible_signal else 1.0, 4),
+        }
+        self._attach_sports_edge_context(item=item, q=q, context=context)
+        if log and (tags or boost > 0.0):
+            self._emit_sports_edge_log(
+                "[AION-SPORTS-SCORE]",
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "source": source,
+                    "tags": tags,
+                    "boost": boost,
+                    "implied_probability": context["implied_probability"],
+                    "payout_multiple": payout_multiple,
+                    "spread": context["spread"],
+                    "book_depth": context["book_depth"],
+                    "momentum_risk": momentum_risk,
+                },
+                marker=("score", source, ticker, tuple(tags), boost),
+            )
+        if log and boost > 0.0:
+            self._emit_sports_edge_log(
+                "[AION-SPORTS-BOOST]",
+                {
+                    "ticker": ticker,
+                    "family": family,
+                    "source": source,
+                    "boost": boost,
+                    "tags": tags,
+                    "reason": "sports_underdog_asymmetry_book_boost",
+                },
+                marker=("boost", source, ticker, boost, tuple(tags)),
+            )
+        return context
+
+    def _get_sports_edge_rank_adjustment(self, item=None, *, market=None, q=None, spread=None, family=None, source="ranking", log=True, expectancy_summary=None, quality_snapshot=None):
+        return self._build_sports_edge_ranking_context(
+            item,
+            market=market,
+            q=q,
+            spread=spread,
+            family=family,
+            source=source,
+            log=log,
+            expectancy_summary=expectancy_summary,
+            quality_snapshot=quality_snapshot,
+        )
+
+    def _apply_sports_edge_sizing_hint(self, ev_context=None, *, item=None, market=None, q=None, spread=None, family=None, source="sizing"):
+        ev_context = ev_context if isinstance(ev_context, dict) else {}
+        context = {}
+        if q is not None:
+            context = getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None) or {}
+        if not isinstance(context, dict) or not context.get("is_sports"):
+            context = self._build_sports_edge_ranking_context(
+                item,
+                market=market,
+                q=q,
+                spread=spread,
+                family=family,
+                expectancy_summary=ev_context.get("expectancy_summary") if isinstance(ev_context.get("expectancy_summary"), dict) else {},
+                quality_snapshot=ev_context.get("quality_snapshot") if isinstance(ev_context.get("quality_snapshot"), dict) else {},
+                source=source,
+                log=True,
+            )
+        if not context.get("is_sports"):
+            return ev_context
+        ticker = str(context.get("ticker") or ev_context.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        duplicate_blocked = False
+        if ticker:
+            try:
+                duplicate_blocked = bool(self.check_live_duplicate_position_api(ticker).get("blocked"))
+            except Exception:
+                duplicate_blocked = False
+        daily_loss_safe = bool(
+            not getattr(self, "trading_halted", False)
+            and self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) > -MAX_DAILY_LOSS
+            and self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) > -MAX_DAILY_LOSS
+        )
+        synthetic_book = bool(
+            self._sports_edge_read_value(
+                [ev_context, context, item if isinstance(item, dict) else None, q],
+                "synthetic_book",
+                "fake_book",
+                "synthetic_orderbook",
+            )
+        )
+        eligible = bool(
+            context.get("size_eligible_signal")
+            and context.get("book_usable")
+            and context.get("spread_usable")
+            and "SPORTS_ASYMMETRIC_PAYOUT" in set(context.get("tags") or [])
+            and not duplicate_blocked
+            and daily_loss_safe
+            and not synthetic_book
+        )
+        old_multiplier = self.to_float(ev_context.get("ev_sizing_multiplier"), None)
+        if old_multiplier is None and q is not None:
+            old_multiplier = self.to_float(getattr(q, "ev_sizing_multiplier", None), None)
+        old_multiplier = max(0.0, old_multiplier if old_multiplier is not None else 1.0)
+        new_multiplier = old_multiplier
+        if eligible:
+            new_multiplier = max(
+                old_multiplier,
+                min(
+                    max(1.0, AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER),
+                    old_multiplier * max(1.0, AION_SPORTS_EDGE_SIZE_MULTIPLIER),
+                ),
+            )
+            ev_context["ev_sizing_multiplier"] = round(new_multiplier, 4)
+            ev_context["sports_edge_size_multiplier"] = round(new_multiplier, 4)
+            ev_context["sports_edge_context"] = context
+            ev_context["sports_edge_tags"] = list(context.get("tags") or [])
+            if q is not None:
+                try:
+                    setattr(q, "ev_sizing_multiplier", ev_context["ev_sizing_multiplier"])
+                    setattr(q, "sports_edge_size_multiplier", ev_context["sports_edge_size_multiplier"])
+                except Exception:
+                    pass
+        self._emit_sports_edge_log(
+            "[AION-SPORTS-SIZE]",
+            {
+                "ticker": ticker,
+                "family": context.get("family"),
+                "source": source,
+                "eligible": eligible,
+                "old_multiplier": round(old_multiplier, 4),
+                "new_multiplier": round(new_multiplier, 4),
+                "tags": context.get("tags") or [],
+                "duplicate_blocked": duplicate_blocked,
+                "daily_loss_safe": daily_loss_safe,
+                "synthetic_book": synthetic_book,
+            },
+            marker=("size", source, ticker, eligible, round(new_multiplier, 4), tuple(context.get("tags") or [])),
+        )
+        return ev_context
+
     def _extract_orderbook_imbalance_context(self, item=None, *, market=None, q=None, spread=None, family=None):
         return kalshi_orderbook_module.extract_orderbook_imbalance_context(
             self,
@@ -25535,6 +26077,31 @@ class KalshiSniperBot:
             "source": source,
         }
         ev_context = candidate_quality_compute_candidate_ev(ev_candidate)
+        sports_edge_context = self._get_sports_edge_rank_adjustment(
+            item,
+            market=market,
+            q=q,
+            spread=spread,
+            family=family,
+            source=source,
+            log=True,
+            expectancy_summary=expectancy_summary,
+            quality_snapshot=quality_snapshot,
+        )
+        if sports_edge_context.get("is_sports"):
+            ev_context["sports_edge_context"] = sports_edge_context
+            ev_context["sports_edge_tags"] = list(sports_edge_context.get("tags") or [])
+            ev_context["sports_edge_rank_boost"] = sports_edge_context.get("boost", 0.0)
+            ev_context["sports_edge_score_at_entry"] = sports_edge_context.get("score_at_entry")
+            self._apply_sports_edge_sizing_hint(
+                ev_context,
+                item=item,
+                market=market,
+                q=q,
+                spread=spread,
+                family=family,
+                source=source,
+            )
         ev_fields = (
             "market_implied_probability",
             "raw_probability",
@@ -25566,6 +26133,11 @@ class KalshiSniperBot:
             "ev_reason",
             "ev_sizing_multiplier",
             "ev_action",
+            "sports_edge_context",
+            "sports_edge_tags",
+            "sports_edge_rank_boost",
+            "sports_edge_score_at_entry",
+            "sports_edge_size_multiplier",
         )
         for target in (item if isinstance(item, dict) else None, expectancy_summary, quality_snapshot):
             if isinstance(target, dict):
@@ -26056,6 +26628,9 @@ class KalshiSniperBot:
     def _prune_price_family_cooldowns(self, now_ts=None):
         now_ts = float(now_ts or time.time())
         history_container = getattr(self, "live_price_family_reject_history", {}) or {}
+        if not isinstance(history_container, dict):
+            self.live_price_family_reject_history = {}
+            history_container = self.live_price_family_reject_history
         for family, state in list(history_container.items()):
             recent_timestamps = [
                 float(ts)
@@ -26069,6 +26644,9 @@ class KalshiSniperBot:
             else:
                 history_container.pop(family, None)
         cooldown_container = getattr(self, "live_price_family_cooldowns", {}) or {}
+        if not isinstance(cooldown_container, dict):
+            self.live_price_family_cooldowns = {}
+            cooldown_container = self.live_price_family_cooldowns
         for family, event in list(cooldown_container.items()):
             expires_at = float((event or {}).get("expires_at", 0.0) or 0.0)
             if expires_at and expires_at <= now_ts:
@@ -26082,14 +26660,16 @@ class KalshiSniperBot:
         now_ts = float(now_ts or time.time())
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
         self._prune_price_family_cooldowns(now_ts=now_ts)
-        history = dict((self.live_price_family_reject_history or {}).get(family, {}) or {})
+        history_store = getattr(self, "live_price_family_reject_history", {}) or {}
+        cooldown_store = getattr(self, "live_price_family_cooldowns", {}) or {}
+        history = dict(history_store.get(family, {}) or {}) if isinstance(history_store, dict) else {}
         recent_timestamps = [
             float(ts)
             for ts in list(history.get("recent_timestamps", []))
             if now_ts - float(ts or 0.0) <= float(AION_PRICE_FAMILY_WINDOW_SECONDS)
         ]
         recent_rejects = len(recent_timestamps)
-        cooldown_event = dict((self.live_price_family_cooldowns or {}).get(family, {}) or {})
+        cooldown_event = dict(cooldown_store.get(family, {}) or {}) if isinstance(cooldown_store, dict) else {}
         cooldown_expires_at = float(cooldown_event.get("expires_at", 0.0) or 0.0)
         cooldown_remaining_seconds = max(0.0, cooldown_expires_at - now_ts)
         cooldown_active = cooldown_remaining_seconds > 0.0
@@ -26119,7 +26699,11 @@ class KalshiSniperBot:
         ticker = str(ticker or "").strip().upper()
         reason = str(reason or "price_out_of_range").strip() or "price_out_of_range"
         self._prune_price_family_cooldowns(now_ts=now_ts)
-        history = dict((self.live_price_family_reject_history or {}).get(family, {}) or {})
+        history_store = getattr(self, "live_price_family_reject_history", None)
+        if not isinstance(history_store, dict):
+            self.live_price_family_reject_history = {}
+            history_store = self.live_price_family_reject_history
+        history = dict(history_store.get(family, {}) or {})
         recent_timestamps = [
             float(ts)
             for ts in list(history.get("recent_timestamps", []))
@@ -26130,7 +26714,7 @@ class KalshiSniperBot:
         history["last_ticker"] = ticker
         history["last_reason"] = reason
         history["last_ts"] = now_ts
-        self.live_price_family_reject_history[family] = history
+        history_store[family] = history
         family_state = self._get_price_family_penalty_state(family, now_ts=now_ts)
         print(
             "[AION-PRICE-FAMILY-PENALTY] "
@@ -36394,6 +36978,16 @@ class KalshiSniperBot:
             context="prescore",
         ) if market_category == "sports" else {"score": 0.0, "components": {}}
         sports_edge_component = min(24.0, sports_edge.get("score", 0.0) * 0.30)
+        sports_edge_rank_context = self._build_sports_edge_ranking_context(
+            market=market,
+            q=quote_payload,
+            spread=spread,
+            family=family,
+            category=market_category,
+            source="presolve",
+            log=True,
+        ) if market_category == "sports" else {"boost": 0.0, "tags": []}
+        sports_edge_rank_boost = self.to_float(sports_edge_rank_context.get("boost"), 0.0) if isinstance(sports_edge_rank_context, dict) else 0.0
         liquidity_priority_profile = self._compute_liquidity_priority_score(
             market,
             q=quote_payload,
@@ -36508,6 +37102,7 @@ class KalshiSniperBot:
             + top_book_signal_component
             + sports_priority_component
             + sports_edge_component
+            + sports_edge_rank_boost
             + elite_signal_component
         )
         selector_score_before = round(score, 4)
@@ -36611,12 +37206,14 @@ class KalshiSniperBot:
                 "top_book_signal": round(top_book_signal_component, 4),
                 "sports_priority": round(sports_priority_component, 4),
                 "sports_edge": round(sports_edge_component, 4),
+                "sports_edge_rank_boost": round(sports_edge_rank_boost, 4),
                 "elite_public_signal": round(elite_signal_component, 4),
                 "liquidity_priority_boost": round(liquidity_priority_boost, 4),
             },
             "elite_signal_context": elite_signal_context,
             "sports_priority_profile": sports_priority_profile,
             "sports_edge_profile": sports_edge,
+            "sports_edge_context": sports_edge_rank_context,
             "liquidity_priority_profile": liquidity_priority_profile,
             "market_priority_profile": market_priority_profile,
             "selector_score_before": selector_score_before,
@@ -39542,6 +40139,19 @@ class KalshiSniperBot:
         )
         elite_signal_boost = self.to_float(elite_signal_context.get("boost"), 0.0) if isinstance(elite_signal_context, dict) else 0.0
         debug_context["elite_public_signal"] = elite_signal_context
+        sports_edge_rank_context = self._build_sports_edge_ranking_context(
+            market=market,
+            q=q,
+            spread=spread,
+            family=family,
+            category=self.get_market_discovery_category(family),
+            score_result={"score": sports_edge_score},
+            expectancy_summary=sports_post_cost_edge,
+            source="decision_scoring",
+            log=True,
+        ) if self.get_market_discovery_category(family) == "sports" else {"boost": 0.0, "tags": []}
+        sports_edge_rank_boost = self.to_float(sports_edge_rank_context.get("boost"), 0.0) if isinstance(sports_edge_rank_context, dict) else 0.0
+        debug_context["sports_edge_context"] = sports_edge_rank_context
         pre_session_original_score = (
             liquidity_score
             + spread_score
@@ -39553,6 +40163,7 @@ class KalshiSniperBot:
             + family_perf_adjustment
             + btc_volatility_score_boost
             + elite_signal_boost
+            + sports_edge_rank_boost
         )
         pre_session_total_score = pre_session_original_score + momentum_adjustment
         if self.get_market_discovery_category(family) == "sports":
@@ -39624,6 +40235,8 @@ class KalshiSniperBot:
             "confidence": round(confidence_score, 4),
             "sports_priority": round(sports_priority_score, 4),
             "sports_edge": round(sports_edge_score, 4),
+            "sports_edge_rank_boost": round(sports_edge_rank_boost, 4),
+            "sports_edge_tags": list(sports_edge_rank_context.get("tags") or []) if isinstance(sports_edge_rank_context, dict) else [],
             "sports_momentum": round(momentum_adjustment, 4),
             "family_performance": round(family_perf_adjustment, 4),
             "btc_volatility": round(btc_volatility_score_boost, 4),
@@ -43974,6 +44587,20 @@ class KalshiSniperBot:
                 "selected_price_cents": fast_selected_price_cents,
                 "trace_id": fast_gate_record.get("trace_id"),
             }
+            fast_sports_edge_context = self._build_sports_edge_ranking_context(
+                market=fast_market,
+                q=fast_q,
+                spread=fast_spread,
+                family=fast_family,
+                score_result=fast_score_result,
+                expectancy_summary=fast_expectancy_summary,
+                source="fast_executable",
+                log=True,
+            )
+            if isinstance(fast_sports_edge_context, dict) and fast_sports_edge_context.get("is_sports"):
+                fast_expectancy_summary["sports_edge_context"] = fast_sports_edge_context
+                fast_expectancy_summary["sports_edge_tags"] = list(fast_sports_edge_context.get("tags") or [])
+                fast_expectancy_summary["sports_edge_rank_boost"] = fast_sports_edge_context.get("boost", 0.0)
             fast_trade_readiness_record = {
                 "ticker": fast_ticker,
                 "family": fast_family,
@@ -43985,6 +44612,9 @@ class KalshiSniperBot:
                 "final_edge": fast_edge_after_cost,
                 "edge_after_cost": fast_edge_after_cost,
                 "sports_edge_after_cost": fast_edge_after_cost,
+                "sports_edge_context": fast_expectancy_summary.get("sports_edge_context"),
+                "sports_edge_tags": fast_expectancy_summary.get("sports_edge_tags"),
+                "sports_edge_rank_boost": fast_expectancy_summary.get("sports_edge_rank_boost"),
                 "quote_ready": True,
                 "execution_safety_blocked": False,
             }
@@ -44508,6 +45138,22 @@ class KalshiSniperBot:
                     0.0,
                 )
                 adjusted_score += elite_signal_adjustment
+                sports_edge_context = self._get_sports_edge_rank_adjustment(
+                    (score, q, spread, family),
+                    market=market,
+                    q=q,
+                    spread=spread,
+                    family=family,
+                    source="expectancy_rerank",
+                    log=True,
+                    expectancy_summary=expectancy_summary,
+                    quality_snapshot=quality_snapshot,
+                )
+                sports_edge_adjustment = self.to_float(
+                    sports_edge_context.get("boost"),
+                    0.0,
+                )
+                adjusted_score += sports_edge_adjustment
                 ev_context = self._attach_ev_score_to_candidate(
                     {
                         "raw_score": score,
@@ -44624,6 +45270,9 @@ class KalshiSniperBot:
                     "btc_volatility_context": btc_volatility_context,
                     "elite_public_signal_adjustment": elite_signal_adjustment,
                     "elite_public_signal_context": elite_signal_context,
+                    "sports_edge_adjustment": sports_edge_adjustment,
+                    "sports_edge_context": sports_edge_context,
+                    "sports_edge_tags": list(sports_edge_context.get("tags") or []),
                     "ev_context": ev_context,
                     "ev_score": ev_context.get("ev_score"),
                     "ev_tier": ev_context.get("ev_tier"),
@@ -45923,6 +46572,10 @@ class KalshiSniperBot:
                 "phase55_ready": bool(phase55_entry_timing_pass),
                 "expectancy_score": expectancy_summary.get("expectancy_score"),
                 "sports_edge_after_cost": expectancy_summary.get("sports_edge_after_cost"),
+                "sports_edge_context": getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None),
+                "sports_edge_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
+                "sports_edge_rank_boost": getattr(q, "sports_edge_rank_boost", None),
+                "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
                 "spread_bucket": expectancy_summary.get("spread_bucket"),
                 "queue_state": expectancy_summary.get("queue_state"),
                 "positive_expectancy": expectancy_summary.get("positive_expectancy"),
@@ -46005,6 +46658,10 @@ class KalshiSniperBot:
                 "expectancy_score": expectancy_summary.get("expectancy_score") if isinstance(expectancy_summary, dict) else None,
                 "spread_bucket": expectancy_summary.get("spread_bucket") if isinstance(expectancy_summary, dict) else None,
                 "sports_edge_after_cost": expectancy_summary.get("sports_edge_after_cost") if isinstance(expectancy_summary, dict) else None,
+                "sports_edge_context": getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None),
+                "sports_edge_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
+                "sports_edge_rank_boost": getattr(q, "sports_edge_rank_boost", None),
+                "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
                 "positive_expectancy": expectancy_summary.get("positive_expectancy") if isinstance(expectancy_summary, dict) else None,
                 "strong_expectancy": expectancy_summary.get("strong_expectancy") if isinstance(expectancy_summary, dict) else None,
                 "queue_state": expectancy_summary.get("queue_state") if isinstance(expectancy_summary, dict) else None,
@@ -47098,10 +47755,15 @@ class KalshiSniperBot:
     def _get_realm_vv_live_execution_gate_record(self, ticker, *, stage=None, allow_raw_fallback=True):
         raw_ticker_key = str(ticker or "").strip()
         normalized_ticker_key = self.normalize_phase55_ticker_key(raw_ticker_key)
-        normalized_record = dict(self.realm_vv_live_execution_gate_by_ticker.get(normalized_ticker_key, {}) or {}) if normalized_ticker_key else {}
+        gate_store = getattr(self, "realm_vv_live_execution_gate_by_ticker", None)
+        if not isinstance(gate_store, dict):
+            self.realm_vv_live_execution_gate_by_ticker = {}
+            self.phase55_live_execution_gate_by_ticker = self.realm_vv_live_execution_gate_by_ticker
+            gate_store = self.realm_vv_live_execution_gate_by_ticker
+        normalized_record = dict(gate_store.get(normalized_ticker_key, {}) or {}) if normalized_ticker_key else {}
         raw_record = {}
         if allow_raw_fallback and raw_ticker_key and raw_ticker_key != normalized_ticker_key:
-            raw_record = dict(self.realm_vv_live_execution_gate_by_ticker.get(raw_ticker_key, {}) or {})
+            raw_record = dict(gate_store.get(raw_ticker_key, {}) or {})
         if (
             raw_ticker_key
             and normalized_ticker_key
@@ -47390,7 +48052,11 @@ class KalshiSniperBot:
         ts_ms = int(time.time() * 1000)
         short_hash = self._aion_candidate_short_hash(ticker_key)
         resolved_trace_id = str(trace_id or f"AION-{ts_ms}-{short_hash}").strip()
-        existing = dict(self.aion_candidate_trace_meta_by_ticker.get(ticker_key, {}) or {})
+        trace_meta_store = getattr(self, "aion_candidate_trace_meta_by_ticker", None)
+        if not isinstance(trace_meta_store, dict):
+            self.aion_candidate_trace_meta_by_ticker = {}
+            trace_meta_store = self.aion_candidate_trace_meta_by_ticker
+        existing = dict(trace_meta_store.get(ticker_key, {}) or {})
         if existing and existing.get("cycle_count") == current_cycle:
             if allow_create and not existing.get("trace_id"):
                 existing["trace_id"] = resolved_trace_id
@@ -47402,7 +48068,7 @@ class KalshiSniperBot:
                 existing["family"] = family_key
             if stage:
                 existing["last_stage"] = str(stage)
-            self.aion_candidate_trace_meta_by_ticker[ticker_key] = existing
+            trace_meta_store[ticker_key] = existing
             return existing
         if not allow_create and not existing:
             return {}
@@ -47419,7 +48085,7 @@ class KalshiSniperBot:
         }
         if existing:
             meta.update({k: v for k, v in existing.items() if k not in meta or meta.get(k) in {None, "", "unknown", "UNKNOWN"}})
-        self.aion_candidate_trace_meta_by_ticker[ticker_key] = meta
+        trace_meta_store[ticker_key] = meta
         return meta
 
     def _update_aion_candidate_trace_state(self, *, ticker=None, family=None, candidate_source=None, trace_id=None, stage=None, **fields):
@@ -47434,7 +48100,11 @@ class KalshiSniperBot:
         if not meta:
             return {}
         ticker_key = str(meta.get("ticker") or ticker or "").strip()
-        state = dict(self.aion_candidate_trace_state_by_ticker.get(ticker_key, {}) or {})
+        trace_state_store = getattr(self, "aion_candidate_trace_state_by_ticker", None)
+        if not isinstance(trace_state_store, dict):
+            self.aion_candidate_trace_state_by_ticker = {}
+            trace_state_store = self.aion_candidate_trace_state_by_ticker
+        state = dict(trace_state_store.get(ticker_key, {}) or {})
         state.update({k: v for k, v in fields.items() if v is not None})
         state["trace_id"] = meta.get("trace_id")
         state["ticker"] = ticker_key
@@ -47442,7 +48112,7 @@ class KalshiSniperBot:
         state["candidate_source"] = str(candidate_source or meta.get("candidate_source") or state.get("candidate_source") or "unknown").strip() or "unknown"
         state["cycle_count"] = meta.get("cycle_count")
         state["last_stage"] = str(stage or meta.get("last_stage") or state.get("last_stage") or "unknown").strip() or "unknown"
-        self.aion_candidate_trace_state_by_ticker[ticker_key] = state
+        trace_state_store[ticker_key] = state
         return dict(state)
 
     def _build_aion_candidate_blocker_chain(self, *, ticker=None, family=None, trace_state=None, final_block_reason=None):
@@ -52471,10 +53141,14 @@ class KalshiSniperBot:
             return
         now_ts = time.time()
         cooldown_until = now_ts + float(AION_PRICE_RANGE_REJECT_TICKER_COOLDOWN_SECONDS)
-        current_cooldown_until = float((self.market_cooldowns or {}).get(ticker, 0.0) or 0.0)
+        market_cooldowns = getattr(self, "market_cooldowns", None)
+        if not isinstance(market_cooldowns, dict):
+            self.market_cooldowns = {}
+            market_cooldowns = self.market_cooldowns
+        current_cooldown_until = float(market_cooldowns.get(ticker, 0.0) or 0.0)
         if current_cooldown_until > now_ts:
             return
-        self.market_cooldowns[ticker] = max(cooldown_until, current_cooldown_until)
+        market_cooldowns[ticker] = max(cooldown_until, current_cooldown_until)
         self._record_price_family_reject(family, ticker, reason, now_ts=now_ts)
         print(
             "[AION-PRICE-RANGE-PREFILTER] "
@@ -58615,8 +59289,9 @@ class KalshiSniperBot:
         ):
             if isinstance(source, dict) and source:
                 source_candidates.append((label, source))
-        raw_cache = self.targeted_orderbook_cache.get(raw_ticker) if raw_ticker else None
-        normalized_cache = self.targeted_orderbook_cache.get(normalized_ticker) if normalized_ticker else None
+        targeted_cache = getattr(self, "targeted_orderbook_cache", {}) or {}
+        raw_cache = targeted_cache.get(raw_ticker) if raw_ticker else None
+        normalized_cache = targeted_cache.get(normalized_ticker) if normalized_ticker else None
         cached_book_found = bool(isinstance(raw_cache, dict) and raw_cache) or bool(isinstance(normalized_cache, dict) and normalized_cache)
         cache_source_label = None
         cache_age_seconds = None
@@ -58959,7 +59634,8 @@ class KalshiSniperBot:
             both_sides_executable = bool(yes_candidate["valid"] and no_candidate["valid"])
             original_candidate = yes_candidate if resolved_side == "yes" else no_candidate
             opposite_candidate = no_candidate if resolved_side == "yes" else yes_candidate
-            resolved_direction_decision = self.live_direction_decisions_by_ticker.get(raw_ticker or "", {}) or self.live_direction_decisions_by_ticker.get(normalized_ticker or "", {})
+            direction_store = getattr(self, "live_direction_decisions_by_ticker", {}) or {}
+            resolved_direction_decision = direction_store.get(raw_ticker or "", {}) or direction_store.get(normalized_ticker or "", {}) if isinstance(direction_store, dict) else {}
             strategy_allows_yes = bool(
                 family != "KXBTC15M"
                 or str(resolved_direction_decision.get("intended_side") or "").strip().lower() in {"", "yes"}

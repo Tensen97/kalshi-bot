@@ -558,6 +558,9 @@ def maybe_auto_reprice_recent_order(
                     "entry_reason": "auto_reprice",
                     "entry_mode": "auto_reprice",
                     "phase_or_realm_source": "kalshi_execution.maybe_auto_reprice_recent_order",
+                    "sports_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
+                    "sports_edge_boost": getattr(q, "sports_edge_rank_boost", None),
+                    "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
                 },
             )
         print(
@@ -715,6 +718,9 @@ def submit_live_order(
                     "entry_reason": result.get("reason") or lane or "live_order_submitted",
                     "entry_mode": lane or "live_order",
                     "phase_or_realm_source": "kalshi_execution.submit_live_order",
+                    "sports_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
+                    "sports_edge_boost": getattr(q, "sports_edge_rank_boost", None),
+                    "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
                 },
             )
         print(

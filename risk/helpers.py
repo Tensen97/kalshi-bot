@@ -7,9 +7,13 @@ import json
 def safe_float(value, default=0.0):
     try:
         if value is None:
+            if default is None:
+                return None
             return float(default)
         return float(value)
     except Exception:
+        if default is None:
+            return None
         return float(default)
 
 
@@ -39,4 +43,3 @@ def log_module_load(module_name, **fields):
 
 
 log_module_load("risk.helpers", helpers=["safe_float", "clamp", "safe_ratio", "bounded_delta"])
-

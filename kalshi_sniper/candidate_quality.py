@@ -1679,7 +1679,7 @@ def build_expectancy_score(
         and quote_stability >= 0.40
     )
     repeated_near_miss = bool(near_miss_count >= 2 or queue_state in {"near_ready", "improving_watch", "strong_watch"})
-    controlled_loosening_enabled = bool(getattr(self, "AION_CONTROLLED_LOOSENING_ENABLED", False) and getattr(self, "AION_EXPECTANCY_SCORE_ENABLED", False))
+    controlled_loosening_enabled = bool(getattr(self, "AION_CONTROLLED_LOOSENING_ENABLED", True) and getattr(self, "AION_EXPECTANCY_SCORE_ENABLED", True))
     aggression_settings = self._aion_aggression_profile_settings(getattr(self, "AION_AGGRESSION_PROFILE", "safe"), family=family, spread_bucket=spread_bucket, context="phase55_fastpath")
     phase55_relaxation = self.to_float(aggression_settings.get("phase55_relaxation"), 0.0) or 0.0
     phase55_quote_stability_threshold = max(0.40, 0.48 - (phase55_relaxation * 0.50))
