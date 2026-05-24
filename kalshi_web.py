@@ -53677,6 +53677,22 @@ class KalshiSniperBot:
         active_timestamps = self._active_live_order_timestamps()
         if len(active_timestamps) >= int(LIVE_ORDER_RATE_LIMIT or 1):
             return {"submitted": False, "reason": "rate_limited", "payload": payload}
+        if bool(decision.get("is_sports_position")):
+            print(
+                "[SPORTS-HARVEST-EXECUTE] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "side": payload.get("side"),
+                        "sell_price": payload.get("price"),
+                        "contracts": payload.get("count"),
+                        "expected_pnl": decision.get("unrealized_pnl"),
+                        "reason": decision.get("reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         self.live_exit_pending_tickers.add(ticker)
         try:
             result = self.place_live_order(payload)

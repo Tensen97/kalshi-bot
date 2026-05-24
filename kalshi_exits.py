@@ -1,5 +1,6 @@
 """Dynamic exit helpers moved out of kalshi_web.py."""
 
+import json
 import time
 
 
@@ -154,6 +155,77 @@ def log_dynamic_exit_decision(bot, decision, *, log_cooldown_seconds):
     )
 
 
+def log_sports_harvest_decision(bot, decision, *, log_cooldown_seconds):
+    decision = decision if isinstance(decision, dict) else {}
+    if not decision.get("is_sports_position"):
+        return
+    ticker = str(decision.get("ticker") or "unknown").strip() or "unknown"
+    action = str(decision.get("action") or "hold").strip().lower() or "hold"
+    reason = str(decision.get("reason") or "unknown").strip().lower() or "unknown"
+    pnl = bot.to_float(decision.get("unrealized_pnl"), 0.0) or 0.0
+    current_probability = bot.to_float(decision.get("current_probability"), None)
+    marker = (
+        action,
+        reason,
+        round(pnl, 4),
+        round(bot.to_float(decision.get("exit_price"), 0.0) or 0.0, 4),
+        int((bot.to_float(decision.get("hold_seconds"), 0.0) or 0.0) // 30),
+    )
+    now_ts = time.time()
+    log_map = getattr(bot, "sports_harvest_log_markers", {})
+    if not isinstance(log_map, dict):
+        log_map = {}
+    previous = log_map.get(ticker)
+    previous_ts = bot.to_float(previous.get("ts"), 0.0) if isinstance(previous, dict) else 0.0
+    if isinstance(previous, dict) and previous.get("marker") == marker and now_ts - previous_ts < log_cooldown_seconds:
+        return
+    log_map[ticker] = {"marker": marker, "ts": now_ts}
+    bot.sports_harvest_log_markers = log_map
+
+    payload = {
+        "ticker": ticker,
+        "family": decision.get("family"),
+        "entry_price": decision.get("entry_price"),
+        "current_exit_price": decision.get("exit_price"),
+        "current_probability": current_probability,
+        "pnl_estimate": decision.get("unrealized_pnl"),
+        "pnl_pct": decision.get("pnl_pct"),
+        "reason": reason,
+        "action": action,
+    }
+    print("[SPORTS-HARVEST-DECISION] " + json.dumps(payload, sort_keys=True, default=str))
+
+    if action == "exit" and reason in {"defensive_exit", "late_game_decay_exit", "dead_prop_exit", "stale_sports_exit"}:
+        print(
+            "[SPORTS-DEFENSIVE-EXIT] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "reason": reason,
+                    "entry_price": decision.get("entry_price"),
+                    "current_exit_price": decision.get("exit_price"),
+                    "pnl_estimate": decision.get("unrealized_pnl"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+    elif action != "exit":
+        print(
+            "[SPORTS-HARVEST-HOLD] "
+            + json.dumps(
+                {
+                    "ticker": ticker,
+                    "reason": reason,
+                    "current_probability": current_probability,
+                    "pnl_estimate": decision.get("unrealized_pnl"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+
+
 def evaluate_dynamic_live_exit(
     bot,
     position,
@@ -217,6 +289,7 @@ def evaluate_dynamic_live_exit(
 
     pnl_per_contract = round(current_price - entry_price, 4)
     unrealized_pnl = round(pnl_per_contract * count, 4)
+    pnl_pct = round((pnl_per_contract / entry_price) * 100.0, 4) if entry_price and entry_price > 0.0 else None
     history = record_live_exit_price_observation(bot, ticker, current_price, now_ts=now_ts)
     recent_delta = bot.to_float(history.get("recent_delta"), 0.0) or 0.0
     last_step_delta = bot.to_float(history.get("last_step_delta"), 0.0) or 0.0
@@ -267,19 +340,117 @@ def evaluate_dynamic_live_exit(
             or hold_seconds >= max(min_hold_seconds * 3.0, 900.0)
         )
     )
+    executable_exit_price = bool(exit_price is not None and 0.0 < exit_price <= 1.0)
+    inverted_book = bool(
+        (
+            price_context.get("yes_bid") is not None
+            and price_context.get("yes_ask") is not None
+            and bot.to_float(price_context.get("yes_bid"), 0.0) > bot.to_float(price_context.get("yes_ask"), 0.0)
+        )
+        or (
+            price_context.get("no_bid") is not None
+            and price_context.get("no_ask") is not None
+            and bot.to_float(price_context.get("no_bid"), 0.0) > bot.to_float(price_context.get("no_ask"), 0.0)
+        )
+    )
+    sports_min_profit = min(max(0.005, min_profit * 0.55), min_profit)
+    sports_rotation_profit = max(0.006, min_profit * 0.45)
+    sports_fast_profit = max(0.012, min_profit * 0.75)
+    near_lock_harvest = bool(
+        is_sports_position
+        and executable_exit_price
+        and (
+            (current_price >= 0.95 and pnl_per_contract >= 0.0)
+            or (current_price >= 0.90 and pnl_per_contract >= sports_rotation_profit)
+        )
+    )
+    fast_green_harvest = bool(
+        is_sports_position
+        and executable_exit_price
+        and hold_seconds <= 900.0
+        and (
+            pnl_per_contract >= sports_fast_profit
+            or recent_delta >= max(0.018, momentum_eps * 4.0)
+            or last_step_delta >= max(0.012, momentum_eps * 3.0)
+        )
+        and pnl_per_contract > 0.0
+    )
+    capital_rotation_harvest = bool(
+        is_sports_position
+        and executable_exit_price
+        and pnl_per_contract >= sports_rotation_profit
+        and (hold_seconds >= 300.0 or current_price >= 0.82 or not strong_momentum)
+    )
+    sports_harvest_profit = bool(
+        is_sports_position
+        and executable_exit_price
+        and pnl_per_contract >= sports_min_profit
+        and (weak_momentum or not strong_momentum or spread is None or spread > max_exit_spread or hold_seconds >= 120.0)
+    )
+    defensive_sports_collapse = bool(
+        is_sports_position
+        and executable_exit_price
+        and hold_seconds >= fast_cut_min_hold_seconds
+        and (
+            probability_collapse
+            or current_price <= max(0.03, entry_price - max(0.025, entry_price * 0.18))
+            or (pnl_per_contract <= -max(0.012, base_stop_loss * 0.45) and adverse_movement)
+        )
+    )
+    late_game_decay_exit = bool(
+        late_or_stale_sports
+        and executable_exit_price
+        and (
+            pnl_per_contract < 0.0
+            or weak_momentum
+            or current_price <= max(0.08, entry_price * 0.65)
+        )
+    )
+    dead_prop_exit = bool(
+        is_sports_position
+        and executable_exit_price
+        and hold_seconds >= fast_cut_min_hold_seconds
+        and (
+            current_price <= 0.04
+            or (current_price <= max(0.05, entry_price * 0.35) and pnl_per_contract < 0.0)
+        )
+    )
 
     action = "hold"
     reason = "existing_hold_logic"
     required_loss_confirmations = int(loss_exit_confirmation_checks or 1)
     if not dynamic_exit_enabled:
         reason = "dynamic_exit_disabled"
-    elif exit_price is None or exit_price <= 0.0:
+    elif not executable_exit_price:
         reason = "missing_executable_exit_bid"
-    elif spread is not None and spread > max_exit_spread and pnl_per_contract > severe_stop_loss and not (is_sports_position and pnl_per_contract >= min_profit):
-        reason = "exit_spread_too_wide"
-    elif is_sports_position and pnl_per_contract >= min_profit and (weak_momentum or not strong_momentum or spread is not None and spread > max_exit_spread):
+    elif inverted_book:
+        reason = "inverted_exit_book"
+    elif is_sports_position and near_lock_harvest:
+        action = "exit"
+        reason = "near_lock_harvest"
+    elif is_sports_position and fast_green_harvest:
+        action = "exit"
+        reason = "fast_green_harvest"
+    elif is_sports_position and capital_rotation_harvest:
+        action = "exit"
+        reason = "capital_rotation_harvest"
+    elif is_sports_position and sports_harvest_profit:
         action = "exit"
         reason = "harvest_profit"
+    elif is_sports_position and dead_prop_exit:
+        action = "exit"
+        reason = "dead_prop_exit"
+        required_loss_confirmations = 1
+    elif is_sports_position and defensive_sports_collapse:
+        action = "exit"
+        reason = "defensive_exit"
+        required_loss_confirmations = 1
+    elif is_sports_position and late_game_decay_exit:
+        action = "exit"
+        reason = "late_game_decay_exit"
+        required_loss_confirmations = 1
+    elif spread is not None and spread > max_exit_spread and pnl_per_contract > severe_stop_loss and not is_sports_position:
+        reason = "exit_spread_too_wide"
     elif pnl_per_contract >= runner_take_profit:
         action = "exit"
         reason = "runner_profit_target"
@@ -343,6 +514,8 @@ def evaluate_dynamic_live_exit(
         "hold_seconds": hold_seconds,
         "pnl_per_contract": pnl_per_contract,
         "unrealized_pnl": unrealized_pnl,
+        "pnl_pct": pnl_pct,
+        "current_probability": current_price,
         "recent_delta": recent_delta,
         "last_step_delta": last_step_delta,
         "imbalance": imbalance,
@@ -353,8 +526,13 @@ def evaluate_dynamic_live_exit(
         "is_sports_position": bool(is_sports_position),
         "sports_lifecycle_state": sports_lifecycle_state,
         "probability_collapse": bool(probability_collapse),
+        "near_lock_harvest": bool(near_lock_harvest),
+        "fast_green_harvest": bool(fast_green_harvest),
+        "capital_rotation_harvest": bool(capital_rotation_harvest),
+        "dead_prop_exit": bool(dead_prop_exit),
     }
     log_dynamic_exit_decision(bot, decision, log_cooldown_seconds=log_cooldown_seconds)
+    log_sports_harvest_decision(bot, decision, log_cooldown_seconds=log_cooldown_seconds)
     return decision
 
 
