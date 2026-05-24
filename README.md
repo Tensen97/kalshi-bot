@@ -136,6 +136,6 @@ Relevant environment flags:
 - `AION_COOLDOWN_SOFT_BYPASS_ENABLED=1`
 - `AION_SHADOW_TRADE_TRACKING_ENABLED=1`
 - `AION_EXPECTANCY_SCORE_ENABLED=1`
-- `AION_MAX_RELAXATION_TRADES_PER_DAY=5`
+- `AION_MAX_RELAXATION_TRADES_PER_DAY=15`
 
 These settings only adjust telemetry and tiny ranking decisions after existing validation survives. They do not enable live arbitrage or remove hard safety gates.
