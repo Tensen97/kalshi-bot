@@ -26,6 +26,11 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.btc1h_cycle_last_summary = {}
         bot.btc1h_cycle_write_store = None
         bot.btc1h_cycle_storage_warning_logged = True
+        bot.last_lane_allocation_summary = {}
+        bot.last_dual_lane_buy_candidates = []
+        bot.last_dual_lane_execution_summary = {}
+        bot.live_trade_count_today = 0
+        bot.live_positions = []
         return bot
 
     def test_ladder_dislocation_gets_structural_score_and_boost(self):
@@ -430,6 +435,179 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreaterEqual(summary["promoted"], 1)
         self.assertTrue(bot.btc1h_cycle_priority_by_ticker)
         self.assertIn("markets_to_merge", summary)
+
+    def test_dual_lane_allocation_reserves_btc1h_over_weak_sports_prop(self):
+        bot = self._make_bot()
+        btc_q = SimpleNamespace(
+            ticker="KXBTC-26MAY2517-B74875",
+            selected_side="yes",
+            selected_price=0.04,
+            yes_bid=0.01,
+            yes_ask=0.04,
+            no_bid=0.96,
+            no_ask=0.99,
+            liquidity=258,
+        )
+        sports_q = SimpleNamespace(
+            ticker="KXMLBHR-PLAYER-LONGSHOT",
+            selected_side="yes",
+            selected_price=0.06,
+            yes_bid=0.03,
+            yes_ask=0.06,
+            no_bid=0.94,
+            no_ask=0.97,
+            liquidity=1,
+        )
+        markets = [
+            {
+                "ticker": btc_q.ticker,
+                "series_ticker": "KXBTC",
+                "event_ticker": "KXBTC-26MAY2517",
+                "title": "Bitcoin above $74,999.99 at 5pm",
+            },
+            {
+                "ticker": sports_q.ticker,
+                "series_ticker": "KXMLBHR",
+                "event_ticker": "KXMLBHR-GAME",
+                "title": "Player to hit a home run",
+            },
+        ]
+        expectancy = {
+            btc_q.ticker: {
+                "raw_score": 68.0,
+                "adjusted_score": 68.0,
+                "q": btc_q,
+                "spread": 0.03,
+                "family": "KXBTC",
+                "expectancy_summary": {"final_edge": 0.004, "selected_side": "yes", "selected_price": 0.04},
+                "quality_snapshot": {"selected_price": 0.04, "liquidity_depth": 258, "spread": 0.03},
+                "ev_context": {"ev_edge": 0.004},
+                "btc1h_cycle_context": {
+                    "final_score": 41.5,
+                    "cycle_rank_boost": 1.7,
+                    "historical_edge_boost": 0.4,
+                    "components": {"nearby_confirmation": 1.0},
+                },
+            },
+            sports_q.ticker: {
+                "raw_score": 82.0,
+                "adjusted_score": 82.0,
+                "q": sports_q,
+                "spread": 0.03,
+                "family": "KXMLBHR",
+                "expectancy_summary": {
+                    "final_edge": 0.0,
+                    "sports_edge_after_cost": 0.0,
+                    "selected_side": "yes",
+                    "selected_price": 0.06,
+                    "expectancy_score": 0.31,
+                },
+                "quality_snapshot": {"selected_price": 0.06, "liquidity_depth": 1, "spread": 0.03},
+                "sports_edge_context": {"boost": 0.0, "tags": []},
+                "ev_context": {"ev_edge": 0.0},
+            },
+        }
+
+        ranked = bot._apply_dual_lane_allocation_ranking(
+            [(82.0, sports_q, 0.03, "KXMLBHR"), (68.0, btc_q, 0.03, "KXBTC")],
+            markets,
+            expectancy_summary_by_ticker=expectancy,
+            source="unit_test",
+        )
+
+        self.assertEqual(ranked[0][1].ticker, btc_q.ticker)
+        self.assertEqual(expectancy[sports_q.ticker]["lane_allocation"]["decision"], "SKIP_WEAK_SPORT")
+        self.assertTrue(expectancy[btc_q.ticker]["lane_allocation"]["reserved"])
+
+    def test_sports_lane_allocation_keeps_strong_sports_candidate(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBSPREAD-QUALITY",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            liquidity=120,
+        )
+        context = bot._build_lane_allocation_context(
+            {
+                "raw_score": 74.0,
+                "adjusted_score": 74.0,
+                "q": q,
+                "spread": 0.02,
+                "family": "KXMLBSPREAD",
+                "expectancy_summary": {
+                    "final_edge": 0.018,
+                    "sports_edge_after_cost": 0.018,
+                    "selected_side": "yes",
+                    "selected_price": 0.47,
+                    "expectancy_score": 0.71,
+                },
+                "quality_snapshot": {"selected_price": 0.47, "liquidity_depth": 120, "spread": 0.02},
+                "sports_edge_context": {"boost": 4.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.018},
+            },
+            market={"ticker": q.ticker, "series_ticker": "KXMLBSPREAD", "title": "MLB spread"},
+        )
+
+        self.assertEqual(context["decision"], "ALLOW_STRONG_SPORT")
+        self.assertGreater(context["allocation_adjustment"], 0.0)
+
+    def test_dual_lane_secondary_executes_different_strong_lane_through_submit_guard(self):
+        bot = self._make_bot()
+        submitted = []
+        sports_q = SimpleNamespace(
+            ticker="KXMLBSPREAD-SECONDARY",
+            selected_side="yes",
+            selected_price=0.48,
+            yes_bid=0.46,
+            yes_ask=0.48,
+            no_bid=0.52,
+            no_ask=0.54,
+            liquidity=80,
+        )
+        bot.last_dual_lane_buy_candidates = [
+            {"ticker": "KXBTC-PRIMARY", "lane": "BTC1H_LADDER", "family": "KXBTC"},
+            {
+                "ticker": sports_q.ticker,
+                "lane": "SPORTS",
+                "family": "KXMLBSPREAD",
+                "q": sports_q,
+                "market": {"ticker": sports_q.ticker, "series_ticker": "KXMLBSPREAD"},
+                "allocation": {
+                    "lane": "SPORTS",
+                    "allocation_score": 81.0,
+                    "edge": 0.015,
+                    "confidence": 0.7,
+                    "spread": 0.02,
+                    "liquidity": 80,
+                    "decision": "ALLOW_STRONG_SPORT",
+                    "reason": "strong_positive_edge",
+                },
+            },
+        ]
+        bot.already_holding = lambda ticker: False
+        bot.check_live_duplicate_position_api = lambda ticker: {"blocked": False}
+        bot.build_live_order_payload = lambda q, **kwargs: {
+            "ticker": q.ticker,
+            "side": "yes",
+            "price": 0.48,
+            "count": 2,
+            "yes_price": 48,
+        }
+        bot.submit_live_order = lambda q, lane=None, payload_override=None, **kwargs: {
+            "submitted": True,
+            "reason": "submitted",
+            "payload": dict(payload_override or {}),
+        }
+        bot.record_live_position = lambda q, size=None, entry_price=None, side=None: submitted.append((q.ticker, size, entry_price, side))
+
+        result = bot._execute_dual_lane_secondary_candidate(primary_ticker="KXBTC-PRIMARY", primary_lane="BTC1H_LADDER")
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(submitted, [(sports_q.ticker, 2, 0.48, "yes")])
 
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {

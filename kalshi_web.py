@@ -1604,6 +1604,13 @@ AION_BTC1H_CYCLE_PAGE_LIMIT = get_env_int("AION_BTC1H_CYCLE_PAGE_LIMIT", 120)
 AION_BTC1H_CYCLE_MAX_SETTLEMENT_REFRESH = get_env_int("AION_BTC1H_CYCLE_MAX_SETTLEMENT_REFRESH", 120)
 AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE = get_env_float("AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE", 30.0)
 AION_BTC1H_CYCLE_LOG_TOP_N = get_env_int("AION_BTC1H_CYCLE_LOG_TOP_N", 5)
+AION_DUAL_LANE_ALLOCATION_ENABLED = get_env_bool("AION_DUAL_LANE_ALLOCATION_ENABLED", 1)
+AION_BTC1H_LANE_STRONG_BOOST = get_env_float("AION_BTC1H_LANE_STRONG_BOOST", 18.0)
+AION_BTC1H_LANE_RESERVED_BOOST = get_env_float("AION_BTC1H_LANE_RESERVED_BOOST", 8.0)
+AION_WEAK_SPORTS_DEMOTE = get_env_float("AION_WEAK_SPORTS_DEMOTE", 28.0)
+AION_WEAK_SPORTS_SKIP_DEMOTE = get_env_float("AION_WEAK_SPORTS_SKIP_DEMOTE", 75.0)
+AION_STRONG_SPORTS_LANE_BOOST = get_env_float("AION_STRONG_SPORTS_LANE_BOOST", 4.0)
+AION_DUAL_LANE_SECONDARY_ENABLED = get_env_bool("AION_DUAL_LANE_SECONDARY_ENABLED", 1)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS = int(_env_float("SPORTS_QUOTE_CONTINUITY_MAX_AGE_SECONDS", 45))
@@ -2016,6 +2023,9 @@ class KalshiSniperBot:
         self.btc1h_cycle_last_summary = {}
         self.btc1h_cycle_write_store = None
         self.btc1h_cycle_storage_warning_logged = False
+        self.last_lane_allocation_summary = {}
+        self.last_dual_lane_buy_candidates = []
+        self.last_dual_lane_execution_summary = {}
         self.sports_quote_continuity_cache = {}
         self.sports_momentum_state = {}
         self.sports_edge_ranking_log_markers = {}
@@ -27624,6 +27634,577 @@ class KalshiSniperBot:
             )
         )
 
+    def _candidate_execution_lane(self, *, family=None, ticker=None, market=None, q=None, expectancy_item=None):
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        ticker = str(ticker or getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip()
+        expectancy_item = expectancy_item if isinstance(expectancy_item, dict) else {}
+        btc_context = expectancy_item.get("btc1h_cycle_context")
+        if not isinstance(btc_context, dict):
+            btc_context = getattr(q, "btc_1h_ladder_context", None) if q is not None else None
+        if not isinstance(btc_context, dict):
+            structural_context = expectancy_item.get("structural_edge_context") or getattr(q, "structural_edge_context", None)
+            structural_context = structural_context if isinstance(structural_context, dict) else {}
+            btc_context = structural_context.get("btc_1h_ladder_context") if isinstance(structural_context.get("btc_1h_ladder_context"), dict) else {}
+        if self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market, q=q) or btc_context.get("enabled"):
+            return "BTC1H_LADDER"
+        if self._is_sports_market_or_family(family):
+            return "SPORTS"
+        return "OTHER"
+
+    def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_snapshot=None):
+        expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+        quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+        selected_side = str(
+            expectancy_summary.get("selected_side")
+            or quality_snapshot.get("selected_side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+            or "yes"
+        ).strip().lower()
+        selected_price = (
+            expectancy_summary.get("selected_price")
+            or expectancy_summary.get("selected_price_dollars")
+            or quality_snapshot.get("selected_price")
+            or quality_snapshot.get("selected_price_dollars")
+            or getattr(q, "selected_price", None)
+            or getattr(q, "selected_price_dollars", None)
+        )
+        if selected_price is None and q is not None:
+            selected_price = getattr(q, "no_ask", None) if selected_side == "no" else getattr(q, "yes_ask", None)
+        return selected_side, self.to_float(selected_price, None)
+
+    def _build_btc1h_lane_quality(self, item=None, *, market=None):
+        item = item if isinstance(item, dict) else {}
+        q = item.get("q")
+        ticker = str(getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip()
+        family = str(item.get("family") or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        expectancy_summary = item.get("expectancy_summary") if isinstance(item.get("expectancy_summary"), dict) else {}
+        quality_snapshot = item.get("quality_snapshot") if isinstance(item.get("quality_snapshot"), dict) else {}
+        ev_context = item.get("ev_context") if isinstance(item.get("ev_context"), dict) else {}
+        cycle_context = item.get("btc1h_cycle_context") if isinstance(item.get("btc1h_cycle_context"), dict) else {}
+        structural_context = item.get("structural_edge_context") if isinstance(item.get("structural_edge_context"), dict) else {}
+        ladder_context = structural_context.get("btc_1h_ladder_context") if isinstance(structural_context.get("btc_1h_ladder_context"), dict) else {}
+        selected_side, selected_price = self._extract_lane_selected_price(q, expectancy_summary, quality_snapshot)
+        spread = self.to_float(item.get("spread"), None)
+        if spread is None:
+            spread = self.to_float(quality_snapshot.get("spread"), self.to_float(expectancy_summary.get("spread"), None))
+        liquidity = self.to_float(
+            quality_snapshot.get("liquidity_depth"),
+            self.to_float(quality_snapshot.get("liquidity"), self.to_float(getattr(q, "liquidity", None), 0.0)),
+        ) or 0.0
+        final_edge = max(
+            self.to_float(expectancy_summary.get("final_edge"), -999.0),
+            self.to_float(expectancy_summary.get("edge_after_cost"), -999.0),
+            self.to_float(expectancy_summary.get("sports_edge_after_cost"), -999.0),
+            self.to_float(ev_context.get("ev_edge"), -999.0),
+            0.0,
+        )
+        btc_score = max(
+            self.to_float(cycle_context.get("final_score"), 0.0),
+            self.to_float(cycle_context.get("score"), 0.0),
+            self.to_float(ladder_context.get("score"), 0.0),
+            self.to_float(item.get("BTC_1H_LADDER_SCORE"), 0.0),
+        )
+        ladder_boost = max(
+            self.to_float(item.get("btc1h_cycle_adjustment"), 0.0),
+            self.to_float(cycle_context.get("cycle_rank_boost"), 0.0),
+            self.to_float(ladder_context.get("boost"), 0.0),
+        )
+        historical_boost = max(
+            self.to_float(cycle_context.get("historical_edge_boost"), 0.0),
+            self.to_float(ladder_context.get("historical_edge_boost"), 0.0),
+            self.to_float(item.get("btc_1h_history_boost"), 0.0),
+        )
+        momentum_alignment = self.to_float(
+            (cycle_context.get("components") or {}).get("nearby_confirmation") if isinstance(cycle_context.get("components"), dict) else None,
+            self.to_float((ladder_context.get("components") or {}).get("nearby_confirmation") if isinstance(ladder_context.get("components"), dict) else None, 0.0),
+        ) or 0.0
+        executable = bool(
+            selected_price is not None
+            and 0.0 < selected_price < 1.0
+            and (spread is None or 0.0 <= spread <= 0.18)
+            and liquidity > 0.0
+        )
+        strong = bool(
+            executable
+            and final_edge > 0.0
+            and (
+                btc_score >= AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE
+                or ladder_boost >= 1.0
+                or historical_boost > 0.0
+                or momentum_alignment >= 0.50
+            )
+        )
+        adjustment = 0.0
+        reasons = []
+        if strong:
+            adjustment += AION_BTC1H_LANE_STRONG_BOOST
+            reasons.append("btc1h_structural_lane_priority")
+            if ladder_boost > 0.0 or historical_boost > 0.0:
+                adjustment += AION_BTC1H_LANE_RESERVED_BOOST
+                reasons.append("btc1h_reserved_hourly_opportunity")
+        elif executable and (btc_score >= 22.0 or ladder_boost > 0.0):
+            adjustment += max(4.0, AION_BTC1H_LANE_RESERVED_BOOST * 0.5)
+            reasons.append("btc1h_moderate_ladder_priority")
+        else:
+            reasons.append("btc1h_not_strong_enough_for_reserved_lane")
+        return {
+            "lane": "BTC1H_LADDER",
+            "ticker": ticker,
+            "family": family,
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "spread": spread,
+            "liquidity": liquidity,
+            "edge": final_edge,
+            "btc1h_score": btc_score,
+            "btc1h_boost": ladder_boost,
+            "historical_boost": historical_boost,
+            "momentum_alignment": momentum_alignment,
+            "executable": executable,
+            "strong": strong,
+            "reserved": strong,
+            "allocation_adjustment": round(adjustment, 4),
+            "decision": "RESERVE_BTC1H" if strong else "ALLOW_BTC1H",
+            "reason": "+".join(reasons),
+        }
+
+    def _build_sports_lane_quality(self, item=None, *, market=None):
+        item = item if isinstance(item, dict) else {}
+        q = item.get("q")
+        ticker = str(getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip()
+        family = str(item.get("family") or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        expectancy_summary = item.get("expectancy_summary") if isinstance(item.get("expectancy_summary"), dict) else {}
+        quality_snapshot = item.get("quality_snapshot") if isinstance(item.get("quality_snapshot"), dict) else {}
+        sports_context = item.get("sports_edge_context") if isinstance(item.get("sports_edge_context"), dict) else {}
+        ev_context = item.get("ev_context") if isinstance(item.get("ev_context"), dict) else {}
+        selected_side, selected_price = self._extract_lane_selected_price(q, expectancy_summary, quality_snapshot)
+        spread = self.to_float(item.get("spread"), None)
+        if spread is None:
+            spread = self.to_float(quality_snapshot.get("spread"), self.to_float(expectancy_summary.get("spread"), None))
+        liquidity = self.to_float(
+            quality_snapshot.get("liquidity_depth"),
+            self.to_float(quality_snapshot.get("liquidity"), self.to_float(getattr(q, "liquidity", None), 0.0)),
+        ) or 0.0
+        final_edge = max(
+            self.to_float(expectancy_summary.get("final_edge"), -999.0),
+            self.to_float(expectancy_summary.get("edge_after_cost"), -999.0),
+            self.to_float(expectancy_summary.get("sports_edge_after_cost"), -999.0),
+            self.to_float(ev_context.get("ev_edge"), -999.0),
+            0.0,
+        )
+        confidence = max(
+            self.to_float(expectancy_summary.get("expectancy_score"), 0.0),
+            self.to_float(expectancy_summary.get("confidence_score"), 0.0),
+            self.to_float(quality_snapshot.get("confidence_score"), 0.0),
+            self.to_float(quality_snapshot.get("profitability_score"), 0.0) / 100.0,
+            self.to_float(sports_context.get("score_at_entry"), 0.0) / 100.0,
+        )
+        sports_boost = self.to_float(sports_context.get("boost"), 0.0) or 0.0
+        family_adjustment = self.to_float(item.get("family_profit_memory_adjustment"), 0.0) or 0.0
+        family_stats = {}
+        try:
+            family_stats = self._get_family_profit_memory_stats(family, refresh=False) or {}
+        except Exception:
+            family_stats = {}
+        family_pnl = self.to_float(
+            family_stats.get("pnl"),
+            self.to_float(family_stats.get("total_pnl"), self.to_float(family_stats.get("weighted_avg_pnl"), 0.0)),
+        ) or 0.0
+        loss_streak = int(self.to_float(family_stats.get("loss_streak"), 0.0) or 0)
+        tags = set(str(tag or "").strip().upper() for tag in (sports_context.get("tags") or []) if str(tag or "").strip())
+        spread_usable = bool(spread is None or 0.0 <= spread <= 0.18)
+        good_book = bool(
+            "SPORTS_GOOD_BOOK" in tags
+            or (spread is not None and spread <= 0.08 and liquidity >= 10.0)
+            or liquidity >= 40.0
+        )
+        prop_like = bool(
+            any(token in family for token in ("PROP", "HIT", "RBI", "HR", "HOMER", "STRIKEOUT", "TB"))
+            or any(token in str((market or {}).get("title") or "").upper() for token in ("HIT", "RBI", "HOME RUN", "STRIKEOUT", "TOTAL BASE"))
+        )
+        ultra_longshot = bool(selected_price is not None and selected_price <= 0.12)
+        weak_reasons = []
+        if final_edge <= 0.0:
+            weak_reasons.append("no_positive_edge")
+        if ultra_longshot and final_edge < 0.012 and sports_boost < 5.0:
+            weak_reasons.append("unsupported_ultra_low_probability_longshot")
+        if prop_like and liquidity < 8.0 and final_edge < 0.010 and sports_boost < 4.0:
+            weak_reasons.append("thin_prop_without_clear_edge")
+        if spread is not None and spread > 0.16 and final_edge < 0.014:
+            weak_reasons.append("poor_spread_without_edge")
+        if family_adjustment < -1.0 and final_edge < 0.010:
+            weak_reasons.append("recent_family_bleeding")
+        if family_pnl < -1.0 and loss_streak >= 2 and final_edge < 0.012:
+            weak_reasons.append("family_loss_streak")
+        strong_reasons = []
+        if final_edge >= 0.010:
+            strong_reasons.append("strong_positive_edge")
+        if confidence >= 0.62:
+            strong_reasons.append("strong_confidence")
+        if good_book and spread_usable:
+            strong_reasons.append("usable_book")
+        if sports_boost >= 3.0:
+            strong_reasons.append("sports_edge_boost")
+        strong = bool(
+            final_edge >= 0.008
+            and spread_usable
+            and (
+                confidence >= 0.58
+                or sports_boost >= 3.0
+                or good_book
+                or family_adjustment > 0.0
+            )
+            and not ("no_positive_edge" in weak_reasons)
+        )
+        severe_weak = bool(
+            weak_reasons
+            and not strong
+            and (
+                "no_positive_edge" in weak_reasons
+                or "unsupported_ultra_low_probability_longshot" in weak_reasons
+                or len(weak_reasons) >= 2
+            )
+        )
+        if severe_weak:
+            adjustment = -abs(AION_WEAK_SPORTS_SKIP_DEMOTE)
+            decision = "SKIP_WEAK_SPORT"
+            reason = "+".join(weak_reasons)
+        elif weak_reasons and not strong:
+            adjustment = -abs(AION_WEAK_SPORTS_DEMOTE)
+            decision = "DEMOTE_WEAK_SPORT"
+            reason = "+".join(weak_reasons)
+        elif strong:
+            adjustment = AION_STRONG_SPORTS_LANE_BOOST + max(0.0, min(3.0, family_adjustment))
+            decision = "ALLOW_STRONG_SPORT"
+            reason = "+".join(strong_reasons) or "sports_quality_clear"
+        else:
+            adjustment = 0.0
+            decision = "ALLOW_SPORT"
+            reason = "sports_quality_neutral"
+        return {
+            "lane": "SPORTS",
+            "ticker": ticker,
+            "family": family,
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "spread": spread,
+            "liquidity": liquidity,
+            "edge": final_edge,
+            "confidence": confidence,
+            "sports_boost": sports_boost,
+            "family_profit_memory_adjustment": family_adjustment,
+            "family_pnl": family_pnl,
+            "loss_streak": loss_streak,
+            "prop_like": prop_like,
+            "ultra_longshot": ultra_longshot,
+            "good_book": good_book,
+            "strong": strong,
+            "allocation_adjustment": round(adjustment, 4),
+            "decision": decision,
+            "reason": reason,
+        }
+
+    def _build_lane_allocation_context(self, item=None, *, market=None):
+        item = item if isinstance(item, dict) else {}
+        q = item.get("q")
+        ticker = str(getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip()
+        family = str(item.get("family") or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        lane = self._candidate_execution_lane(
+            family=family,
+            ticker=ticker,
+            market=market,
+            q=q,
+            expectancy_item=item,
+        )
+        if lane == "BTC1H_LADDER":
+            context = self._build_btc1h_lane_quality(item, market=market)
+        elif lane == "SPORTS":
+            context = self._build_sports_lane_quality(item, market=market)
+        else:
+            expectancy_summary = item.get("expectancy_summary") if isinstance(item.get("expectancy_summary"), dict) else {}
+            quality_snapshot = item.get("quality_snapshot") if isinstance(item.get("quality_snapshot"), dict) else {}
+            selected_side, selected_price = self._extract_lane_selected_price(q, expectancy_summary, quality_snapshot)
+            context = {
+                "lane": "OTHER",
+                "ticker": ticker,
+                "family": family,
+                "selected_side": selected_side,
+                "selected_price": selected_price,
+                "spread": self.to_float(item.get("spread"), None),
+                "liquidity": self.to_float(getattr(q, "liquidity", None), 0.0),
+                "edge": self.to_float(expectancy_summary.get("final_edge"), self.to_float(expectancy_summary.get("edge_after_cost"), 0.0)),
+                "allocation_adjustment": 0.0,
+                "decision": "ALLOW_OTHER",
+                "reason": "other_lane_neutral",
+            }
+        raw_score = self.to_float(item.get("raw_score"), 0.0)
+        adjusted_score = self.to_float(item.get("adjusted_score"), raw_score)
+        allocation_adjustment = self.to_float(context.get("allocation_adjustment"), 0.0) or 0.0
+        context["raw_score"] = raw_score
+        context["pre_lane_score"] = adjusted_score
+        context["allocation_score"] = round(adjusted_score + allocation_adjustment, 4)
+        return context
+
+    def _apply_dual_lane_allocation_ranking(self, ranked, markets=None, *, expectancy_summary_by_ticker=None, quality_summary_by_ticker=None, source="ranking"):
+        if not AION_DUAL_LANE_ALLOCATION_ENABLED:
+            return ranked or []
+        markets = markets or []
+        market_lookup = {
+            str(market.get("ticker") or "").strip(): market
+            for market in markets
+            if isinstance(market, dict) and str(market.get("ticker") or "").strip()
+        }
+        expectancy_summary_by_ticker = expectancy_summary_by_ticker if isinstance(expectancy_summary_by_ticker, dict) else {}
+        quality_summary_by_ticker = quality_summary_by_ticker if isinstance(quality_summary_by_ticker, dict) else {}
+        decorated = []
+        lane_counts = {}
+        weak_sports = []
+        strong_sports = []
+        btc_reserved = []
+        for index, candidate in enumerate(ranked or []):
+            if not isinstance(candidate, (list, tuple)) or len(candidate) < 4:
+                continue
+            score, q, spread, family = candidate[:4]
+            ticker = str(getattr(q, "ticker", "") or "").strip()
+            item = dict(expectancy_summary_by_ticker.get(ticker) or {})
+            item.setdefault("raw_score", score)
+            item.setdefault("adjusted_score", score)
+            item.setdefault("q", q)
+            item.setdefault("spread", spread)
+            item.setdefault("family", family)
+            if "quality_snapshot" not in item:
+                item["quality_snapshot"] = quality_summary_by_ticker.get(ticker) or {}
+            market = market_lookup.get(ticker, {})
+            allocation = self._build_lane_allocation_context(item, market=market)
+            lane = allocation.get("lane") or "OTHER"
+            lane_counts[lane] = lane_counts.get(lane, 0) + 1
+            item["lane_allocation"] = allocation
+            item["allocation_score"] = allocation.get("allocation_score")
+            item["adjusted_score"] = allocation.get("allocation_score", item.get("adjusted_score"))
+            expectancy_summary_by_ticker[ticker] = item
+            if lane == "BTC1H_LADDER" and allocation.get("reserved"):
+                btc_reserved.append(allocation)
+            if lane == "SPORTS":
+                if allocation.get("decision") in {"SKIP_WEAK_SPORT", "DEMOTE_WEAK_SPORT"}:
+                    weak_sports.append(allocation)
+                elif allocation.get("decision") == "ALLOW_STRONG_SPORT":
+                    strong_sports.append(allocation)
+            decorated.append((allocation, index, (allocation.get("allocation_score"), q, spread, family)))
+        decorated.sort(
+            key=lambda row: (
+                1 if row[0].get("decision") != "SKIP_WEAK_SPORT" else 0,
+                1 if row[0].get("lane") == "BTC1H_LADDER" and row[0].get("reserved") else 0,
+                self.to_float(row[0].get("allocation_score"), 0.0),
+                self.to_float(row[0].get("edge"), 0.0),
+                -self.to_float(row[0].get("spread"), 0.0),
+                self.to_float(row[0].get("liquidity"), 0.0),
+                -row[1],
+            ),
+            reverse=True,
+        )
+        summary = {
+            "source": source,
+            "lane_counts": lane_counts,
+            "btc1h_reserved_count": len(btc_reserved),
+            "weak_sports_count": len(weak_sports),
+            "strong_sports_count": len(strong_sports),
+            "top_lane": decorated[0][0].get("lane") if decorated else None,
+            "top_ticker": decorated[0][0].get("ticker") if decorated else None,
+            "top_score": decorated[0][0].get("allocation_score") if decorated else None,
+        }
+        self.last_lane_allocation_summary = summary
+        print("[AION-LANE-SPLIT] " + json.dumps(summary, sort_keys=True, default=str))
+        for allocation, rank_index, _candidate in decorated[:8]:
+            print(
+                "[AION-LANE-RANK] "
+                + json.dumps(
+                    {
+                        "rank": rank_index + 1,
+                        "lane": allocation.get("lane"),
+                        "ticker": allocation.get("ticker"),
+                        "family": allocation.get("family"),
+                        "score": allocation.get("allocation_score"),
+                        "pre_lane_score": allocation.get("pre_lane_score"),
+                        "EV": allocation.get("edge"),
+                        "confidence": allocation.get("confidence"),
+                        "spread": allocation.get("spread"),
+                        "liquidity": allocation.get("liquidity"),
+                        "btc1h_boost": allocation.get("btc1h_boost"),
+                        "sports_quality_reason": allocation.get("reason") if allocation.get("lane") == "SPORTS" else None,
+                        "final_decision": allocation.get("decision"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        for allocation in btc_reserved[:3]:
+            print(
+                "[AION-BTC1H-RESERVED] "
+                + json.dumps(
+                    {
+                        "lane": allocation.get("lane"),
+                        "ticker": allocation.get("ticker"),
+                        "family": allocation.get("family"),
+                        "score": allocation.get("allocation_score"),
+                        "EV": allocation.get("edge"),
+                        "spread": allocation.get("spread"),
+                        "liquidity": allocation.get("liquidity"),
+                        "BTC1H_boost": allocation.get("btc1h_boost"),
+                        "historical_boost": allocation.get("historical_boost"),
+                        "final_decision": allocation.get("decision"),
+                        "reason": allocation.get("reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        for allocation in (strong_sports[:3] + weak_sports[:5]):
+            tag = "[AION-WEAK-SPORT-DEMOTE]" if allocation.get("decision") in {"SKIP_WEAK_SPORT", "DEMOTE_WEAK_SPORT"} else "[AION-SPORTS-QUALITY]"
+            print(
+                tag
+                + " "
+                + json.dumps(
+                    {
+                        "lane": allocation.get("lane"),
+                        "ticker": allocation.get("ticker"),
+                        "family": allocation.get("family"),
+                        "score": allocation.get("allocation_score"),
+                        "EV": allocation.get("edge"),
+                        "confidence": allocation.get("confidence"),
+                        "spread": allocation.get("spread"),
+                        "liquidity": allocation.get("liquidity"),
+                        "sports_boost": allocation.get("sports_boost"),
+                        "sports_quality_reason": allocation.get("reason"),
+                        "final_decision": allocation.get("decision"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        final_ranked = [candidate for _allocation, _index, candidate in decorated]
+        print(
+            "[AION-FINAL-ALLOCATION] "
+            + json.dumps(
+                {
+                    "source": source,
+                    "top_candidates": [
+                        {
+                            "ticker": allocation.get("ticker"),
+                            "lane": allocation.get("lane"),
+                            "score": allocation.get("allocation_score"),
+                            "decision": allocation.get("decision"),
+                            "reason": allocation.get("reason"),
+                        }
+                        for allocation, _index, _candidate in decorated[:5]
+                    ],
+                    "final_decision": "ranked_for_execution",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return final_ranked
+
+    def _execute_dual_lane_secondary_candidate(self, *, primary_ticker=None, primary_lane=None):
+        if not AION_DUAL_LANE_SECONDARY_ENABLED:
+            return {"submitted": False, "reason": "dual_lane_secondary_disabled"}
+        primary_ticker = str(primary_ticker or "").strip()
+        primary_lane = str(primary_lane or "").strip().upper()
+        candidates = list(getattr(self, "last_dual_lane_buy_candidates", []) or [])
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            ticker = str(candidate.get("ticker") or "").strip()
+            lane = str(candidate.get("lane") or "").strip().upper()
+            allocation = candidate.get("allocation") if isinstance(candidate.get("allocation"), dict) else {}
+            if not ticker or ticker == primary_ticker:
+                continue
+            if lane not in {"BTC1H_LADDER", "SPORTS"}:
+                continue
+            if primary_lane and lane == primary_lane:
+                continue
+            if allocation.get("decision") == "SKIP_WEAK_SPORT":
+                continue
+            q = candidate.get("q")
+            market = candidate.get("market") if isinstance(candidate.get("market"), dict) else {}
+            family = str(candidate.get("family") or self.get_market_family(market or {"ticker": ticker}) or "UNKNOWN").strip().upper()
+            if self.already_holding(ticker):
+                reason = "duplicate_position_guard"
+                result = {"submitted": False, "reason": reason}
+            else:
+                duplicate = self.check_live_duplicate_position_api(ticker)
+                if duplicate.get("blocked"):
+                    result = {"submitted": False, "reason": duplicate.get("reason") or "duplicate_position_guard"}
+                elif int(self.live_trade_count_today or 0) >= int(MAX_LIVE_TRADES_PER_DAY or 0):
+                    result = {"submitted": False, "reason": "daily_trade_cap"}
+                else:
+                    payload = self.build_live_order_payload(
+                        q,
+                        market=market,
+                        selected_ticker=ticker,
+                        selection_stage="dual_lane_secondary",
+                        allow_orderbook_refresh=True,
+                    )
+                    result = self.submit_live_order(
+                        q,
+                        lane="dual_lane_secondary",
+                        payload_override=payload,
+                    ) if payload else {"submitted": False, "reason": "invalid_payload", "payload": payload}
+                    if result.get("submitted"):
+                        submitted_payload = result.get("payload") or payload or {}
+                        self.record_live_position(
+                            q,
+                            size=submitted_payload.get("count"),
+                            entry_price=submitted_payload.get("price"),
+                            side=submitted_payload.get("side"),
+                        )
+                        print(
+                            "[POSITION-OPEN] "
+                            + json.dumps(
+                                {
+                                    "ticker": ticker,
+                                    "family": family,
+                                    "side": submitted_payload.get("side"),
+                                    "price": submitted_payload.get("price"),
+                                    "count": submitted_payload.get("count"),
+                                    "subsystem": "kalshi_web.dual_lane_secondary",
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                        self._emit_btc1h_live_execute_log(
+                            ticker,
+                            result=result,
+                            payload=submitted_payload,
+                            family=family,
+                        )
+            payload_for_log = result.get("payload") if isinstance(result, dict) else {}
+            log_payload = {
+                "lane": lane,
+                "ticker": ticker,
+                "family": family,
+                "score": allocation.get("allocation_score"),
+                "EV": allocation.get("edge"),
+                "confidence": allocation.get("confidence"),
+                "spread": allocation.get("spread"),
+                "liquidity": allocation.get("liquidity"),
+                "btc1h_boost": allocation.get("btc1h_boost"),
+                "sports_quality_reason": allocation.get("reason") if lane == "SPORTS" else None,
+                "execution_result": "submitted" if result.get("submitted") else result.get("reason"),
+                "final_decision": "EXECUTE" if result.get("submitted") else "SKIP",
+                "side": (payload_for_log or {}).get("side"),
+                "price": (payload_for_log or {}).get("price"),
+                "count": (payload_for_log or {}).get("count"),
+            }
+            print("[AION-DUAL-LANE-EXECUTE] " + json.dumps(log_payload, sort_keys=True, default=str))
+            self.last_dual_lane_execution_summary = log_payload
+            if result.get("submitted"):
+                return result
+        self.last_dual_lane_execution_summary = {"submitted": False, "reason": "no_secondary_lane_candidate"}
+        return self.last_dual_lane_execution_summary
+
     def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
         market = market if isinstance(market, dict) else {}
         text = " ".join(
@@ -45032,6 +45613,9 @@ class KalshiSniperBot:
         self.aion_candidate_trace_state_by_ticker = {}
         self.aion_candidate_trace_stage_emitted = {}
         self.last_aion_candidate_trace_summary = {}
+        self.last_lane_allocation_summary = {}
+        self.last_dual_lane_buy_candidates = []
+        self.last_dual_lane_execution_summary = {}
         self._maybe_emit_shadow_arb_validation_snapshot()
         self._maybe_emit_shadow_arb_canary_readiness_dashboard()
         self._maybe_emit_shadow_arb_readiness_score()
@@ -46131,6 +46715,44 @@ class KalshiSniperBot:
             f"[LIVE-SELECT-COUNT] stage=time_window before={original_market_count} "
             f"after={len(time_window_markets)} filtered={original_market_count - len(time_window_markets)}"
         )
+        if AION_DUAL_LANE_ALLOCATION_ENABLED:
+            btc1h_promoted = getattr(self, "btc1h_cycle_priority_by_ticker", {}) or {}
+            if isinstance(btc1h_promoted, dict) and btc1h_promoted:
+                seen_time_window_tickers = {
+                    str(market.get("ticker", "") or "").strip()
+                    for market in time_window_markets
+                    if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
+                }
+                btc1h_reserved_added = []
+                for market in markets:
+                    if not isinstance(market, dict):
+                        continue
+                    ticker = str(market.get("ticker", "") or "").strip()
+                    if not ticker or ticker in seen_time_window_tickers or ticker not in btc1h_promoted:
+                        continue
+                    if bool(market.get("disabled")) or bool(market.get("is_disabled")):
+                        continue
+                    if str(market.get("status") or "").strip().lower() in {"disabled", "inactive", "suspended", "closed", "settled"}:
+                        continue
+                    time_window_markets.append(market)
+                    seen_time_window_tickers.add(ticker)
+                    btc1h_reserved_added.append(ticker)
+                if btc1h_reserved_added:
+                    print(
+                        "[AION-BTC1H-RESERVED] "
+                        + json.dumps(
+                            {
+                                "source": "time_window_reservation",
+                                "lane": "BTC1H_LADDER",
+                                "reserved_count": len(btc1h_reserved_added),
+                                "tickers": btc1h_reserved_added[:8],
+                                "reason": "btc1h_cycle_promoted_market_kept_for_final_allocation",
+                                "final_decision": "reserve_execution_opportunity",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
         in_window_family_counts = {}
         for market in time_window_markets:
             family = self.get_market_family(market)
@@ -48786,6 +49408,11 @@ class KalshiSniperBot:
             source="fast_executable_ranking",
             markets=markets,
         )
+        fast_ranked_candidates = self._apply_dual_lane_allocation_ranking(
+            fast_ranked_candidates,
+            markets,
+            source="fast_executable_preselection",
+        )
         for fast_rank, (fast_score, fast_q, fast_spread, fast_family) in enumerate(
             fast_ranked_candidates[:8],
             start=1,
@@ -48936,6 +49563,68 @@ class KalshiSniperBot:
                     ),
                 ),
             )
+            fast_expectancy_for_lane = {
+                **(fast_sports_context if isinstance(fast_sports_context, dict) else {}),
+                "ticker": fast_ticker,
+                "family": fast_family,
+                "final_edge": fast_edge_after_cost,
+                "edge_after_cost": fast_edge_after_cost,
+                "sports_edge_after_cost": fast_edge_after_cost,
+                "quote_ready": bool(fast_quote_ready),
+                "selected_side": fast_side,
+                "selected_price": fast_selected_price,
+                "selected_price_dollars": fast_selected_price,
+                "spread": fast_spread,
+            }
+            fast_quality_for_lane = {
+                "ticker": fast_ticker,
+                "family": fast_family,
+                "quote_ready": bool(fast_quote_ready),
+                "selected_side": fast_side,
+                "selected_price": fast_selected_price,
+                "selected_price_dollars": fast_selected_price,
+                "spread": fast_spread,
+                "liquidity": getattr(fast_q, "liquidity", None),
+                "liquidity_depth": getattr(fast_q, "liquidity", None),
+                "executable_side_present": bool(fast_selected_price is not None and 0.0 < self.to_float(fast_selected_price, 0.0) < 1.0),
+                "selected_price_in_bounds": bool(fast_price_bounds.get("bounds_pass")),
+            }
+            fast_lane_allocation = self._build_lane_allocation_context(
+                {
+                    "raw_score": fast_score,
+                    "adjusted_score": fast_score_result.get("candidate_score", fast_score),
+                    "q": fast_q,
+                    "spread": fast_spread,
+                    "family": fast_family,
+                    "expectancy_summary": fast_expectancy_for_lane,
+                    "quality_snapshot": fast_quality_for_lane,
+                    "sports_edge_context": fast_sports_context if isinstance(fast_sports_context, dict) else {},
+                },
+                market=fast_market,
+            )
+            if fast_lane_allocation.get("decision") == "SKIP_WEAK_SPORT":
+                print(
+                    "[AION-WEAK-SPORT-DEMOTE] "
+                    + json.dumps(
+                        {
+                            "source": "fast_executable_preselection",
+                            "lane": fast_lane_allocation.get("lane"),
+                            "ticker": fast_ticker,
+                            "family": fast_family,
+                            "score": fast_lane_allocation.get("allocation_score"),
+                            "EV": fast_lane_allocation.get("edge"),
+                            "confidence": fast_lane_allocation.get("confidence"),
+                            "spread": fast_lane_allocation.get("spread"),
+                            "liquidity": fast_lane_allocation.get("liquidity"),
+                            "sports_quality_reason": fast_lane_allocation.get("reason"),
+                            "final_decision": "SKIP",
+                            "why_candidate_lost": "weak_sports_quality_demoted_before_fast_execution",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                continue
             fast_authority_allows = bool(
                 fast_decision in {"BUY", "LIVE_PROMOTION"}
                 or fast_canonical_tradeability.get("final_submit_allowed_by_realm_vv")
@@ -49908,6 +50597,7 @@ class KalshiSniperBot:
                     "orderbook_imbalance_adjustment": orderbook_imbalance_adjustment,
                     "btc_volatility_adjustment": btc_volatility_adjustment,
                     "btc1h_cycle_adjustment": btc1h_cycle_adjustment,
+                    "btc1h_cycle_context": btc1h_cycle_context.get("context") if isinstance(btc1h_cycle_context, dict) else {},
                     "btc_volatility_context": btc_volatility_context,
                     "elite_public_signal_adjustment": elite_signal_adjustment,
                     "elite_public_signal_context": elite_signal_context,
@@ -49998,6 +50688,13 @@ class KalshiSniperBot:
             ranked = self._filter_unexecutable_price_ranked_candidates(
                 ranked,
                 source="post_open_market_rebalancer",
+            )
+            ranked = self._apply_dual_lane_allocation_ranking(
+                ranked,
+                markets,
+                expectancy_summary_by_ticker=expectancy_summary_by_ticker,
+                quality_summary_by_ticker=quality_summary_by_ticker,
+                source="post_expectancy_rebalance",
             )
         for rank_position, (score, q, spread, family) in enumerate(ranked[:10], start=1):
             market = next((item for item in markets if str(item.get("ticker", "") or "").strip() == q.ticker), None)
@@ -50287,6 +50984,8 @@ class KalshiSniperBot:
             return None, None
 
         selected = None
+        lane_buy_candidates = []
+        self.last_dual_lane_buy_candidates = []
         decision_buy_count = 0
         decision_skip_count = 0
         decision_buy_family_counts = {}
@@ -50383,6 +51082,59 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
+            lane_allocation = expectancy_item.get("lane_allocation") if isinstance(expectancy_item, dict) else {}
+            lane_allocation = lane_allocation if isinstance(lane_allocation, dict) else {}
+            if lane_allocation.get("decision") == "SKIP_WEAK_SPORT":
+                decision_skip_count += 1
+                decision_skip_family_counts[family] = decision_skip_family_counts.get(family, 0) + 1
+                decision_skip_reasons["weak_sports_quality_demoted"] = decision_skip_reasons.get("weak_sports_quality_demoted", 0) + 1
+                print(
+                    "[AION-WEAK-SPORT-DEMOTE] "
+                    + json.dumps(
+                        {
+                            "lane": lane_allocation.get("lane"),
+                            "ticker": q.ticker,
+                            "family": family,
+                            "score": lane_allocation.get("allocation_score"),
+                            "EV": lane_allocation.get("edge"),
+                            "confidence": lane_allocation.get("confidence"),
+                            "spread": lane_allocation.get("spread"),
+                            "liquidity": lane_allocation.get("liquidity"),
+                            "sports_quality_reason": lane_allocation.get("reason"),
+                            "final_decision": "SKIP",
+                            "why_candidate_lost": "weak_sports_quality_demoted_before_final_selection",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                trade_readiness_records.append({
+                    "trace_id": trace_id,
+                    "ticker": q.ticker,
+                    "family": family,
+                    "candidate_source": candidate_trace_source,
+                    "candidate_score": candidate_score,
+                    "raw_candidate_score": score_result.get("candidate_score", candidate_score),
+                    "probability_confidence": self.to_float(entry_timing_observation.get("probability_confidence"), 0.0),
+                    "decision": "SKIP",
+                    "decision_reason": "weak_sports_quality_demoted",
+                    "phase55_status": entry_timing_observation.get("phase55_status"),
+                    "entry_ready_reason": entry_timing_observation.get("entry_ready_reason"),
+                    "reject_reason": "weak_sports_quality_demoted",
+                    "score_breakdown": score_breakdown,
+                    "spread": spread,
+                    "liquidity": lane_allocation.get("liquidity"),
+                    "execution_safety_blocked": False,
+                    "payload_ready": False,
+                    "phase55_ready": bool(entry_timing_observation.get("phase55_status") == "entry_ready"),
+                    "expectancy_score": expectancy_summary.get("expectancy_score"),
+                    "sports_edge_after_cost": expectancy_summary.get("sports_edge_after_cost"),
+                    "sports_edge_context": getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None),
+                    "sports_edge_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
+                    "sports_edge_rank_boost": getattr(q, "sports_edge_rank_boost", None),
+                    "lane_allocation": lane_allocation,
+                })
+                continue
             if expectancy_summary.get("phase55_fastpath_allowed") and str(entry_timing_observation.get("phase55_status") or "").strip().lower() in {"trigger_wait", "pullback_wait"}:
                 skipped_wait_type = entry_timing_observation.get("pullback_rule_path") or entry_timing_observation.get("phase55_status")
                 entry_timing_observation = dict(entry_timing_observation)
@@ -51459,17 +52211,74 @@ class KalshiSniperBot:
                 continue
             decision_buy_count += 1
             decision_buy_family_counts[family] = decision_buy_family_counts.get(family, 0) + 1
-            selected = (score, q, spread, family)
+            buy_lane = str(lane_allocation.get("lane") or self._candidate_execution_lane(
+                family=family,
+                ticker=q.ticker,
+                market=market,
+                q=q,
+                expectancy_item=expectancy_item,
+            )).strip().upper() or "OTHER"
+            lane_buy_candidates.append({
+                "ticker": q.ticker,
+                "family": family,
+                "lane": buy_lane,
+                "q": q,
+                "market": market,
+                "score": score,
+                "candidate_score": candidate_score,
+                "spread": spread,
+                "allocation": lane_allocation,
+                "expectancy_summary": expectancy_summary,
+                "decision_reason": decision_reason,
+            })
+            if selected is None:
+                selected = (score, q, spread, family)
             print(
                 f"[LIVE-SELECT-DECISION] chosen rank={rank_position} ticker={q.ticker} family={family} "
                 f"raw_rank_score={score:.4f} final_score={candidate_score:.4f}"
             )
-            break
+            selected_lane = str((lane_buy_candidates[0].get("lane") if lane_buy_candidates else buy_lane) or "").strip().upper()
+            buy_lanes = {str(item.get("lane") or "").strip().upper() for item in lane_buy_candidates if item.get("lane")}
+            if selected is not None and len(buy_lanes.difference({"OTHER"})) >= 2:
+                break
+            if selected is not None and rank_position >= 12:
+                break
+            if selected_lane in {"BTC1H_LADDER", "SPORTS"} and any(lane in {"BTC1H_LADDER", "SPORTS"} and lane != selected_lane for lane in buy_lanes):
+                break
+            continue
+        self.last_dual_lane_buy_candidates = lane_buy_candidates
         top_decision_skip_reasons = sorted(
             decision_skip_reasons.items(),
             key=lambda item: item[1],
             reverse=True,
         )[:5]
+        if lane_buy_candidates:
+            print(
+                "[AION-FINAL-ALLOCATION] "
+                + json.dumps(
+                    {
+                        "source": "decision_loop",
+                        "selected_ticker": str(getattr(selected[1], "ticker", "") or "") if selected else None,
+                        "selected_lane": lane_buy_candidates[0].get("lane"),
+                        "buy_candidates": [
+                            {
+                                "ticker": item.get("ticker"),
+                                "lane": item.get("lane"),
+                                "family": item.get("family"),
+                                "score": item.get("candidate_score"),
+                                "EV": (item.get("allocation") or {}).get("edge"),
+                                "spread": item.get("spread"),
+                                "liquidity": (item.get("allocation") or {}).get("liquidity"),
+                                "decision_reason": item.get("decision_reason"),
+                            }
+                            for item in lane_buy_candidates[:4]
+                        ],
+                        "final_decision": "dual_lane_candidates_available" if len({item.get("lane") for item in lane_buy_candidates if item.get("lane") in {"BTC1H_LADDER", "SPORTS"}}) >= 2 else "single_lane_selected",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         spread_skip_count = (
             sum(
                 count for (reason, _family), count in prefilter_rejects.items()
@@ -62896,6 +63705,107 @@ class KalshiSniperBot:
                 or ("yes" if isinstance(payload_preview, dict) and payload_preview.get("yes_price") is not None else None)
                 or ("no" if isinstance(payload_preview, dict) and payload_preview.get("no_price") is not None else None)
             )
+            final_lane_expectancy = dict(expectancy_summary or {})
+            final_lane_expectancy.update(
+                {
+                    "ticker": auto_live_ticker,
+                    "family": selected_family,
+                    "final_edge": self.to_float(final_gate_edge, self.to_float(edge_after_cost, 0.0)),
+                    "edge_after_cost": self.to_float(edge_after_cost, self.to_float(final_gate_edge, 0.0)),
+                    "sports_edge_after_cost": self.to_float(edge_after_cost, self.to_float(final_gate_edge, 0.0)),
+                    "selected_side": submission_side,
+                    "selected_price": submission_price,
+                    "selected_price_dollars": submission_price,
+                    "spread": controlled_spread_value,
+                }
+            )
+            final_lane_quality = {
+                "ticker": auto_live_ticker,
+                "family": selected_family,
+                "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
+                "selected_side": submission_side,
+                "selected_price": submission_price,
+                "selected_price_dollars": submission_price,
+                "spread": controlled_spread_value,
+                "liquidity": quote_readiness_diagnostic.get("liquidity") or (payload_preview or {}).get("liquidity"),
+                "liquidity_depth": quote_readiness_diagnostic.get("liquidity") or (payload_preview or {}).get("liquidity"),
+                "executable_side_present": bool(submission_price is not None and 0.0 < self.to_float(submission_price, 0.0) < 1.0),
+                "selected_price_in_bounds": bool(submission_price is not None and 0.0 < self.to_float(submission_price, 0.0) < 1.0),
+                "orderbook_usable": bool(quote_readiness_diagnostic.get("orderbook_ready") or (payload_preview or {}).get("orderbook_ready")),
+            }
+            final_lane_allocation = self._build_lane_allocation_context(
+                {
+                    "raw_score": self.to_float(selected_ev_context.get("ev_score"), self.to_float(final_gate_edge, 0.0) * 1000.0),
+                    "adjusted_score": self.to_float(selected_ev_context.get("ev_score"), self.to_float(final_gate_edge, 0.0) * 1000.0),
+                    "q": selected_quote_for_submission,
+                    "spread": controlled_spread_value,
+                    "family": selected_family,
+                    "expectancy_summary": final_lane_expectancy,
+                    "quality_snapshot": final_lane_quality,
+                    "sports_edge_context": (
+                        getattr(selected_quote_for_submission, "sports_edge_context", None)
+                        or getattr(selected_quote_for_submission, "sports_edge_ranking_context", None)
+                        or {}
+                    ),
+                    "ev_context": selected_ev_context if isinstance(selected_ev_context, dict) else {},
+                },
+                market=selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
+            )
+            if final_lane_allocation.get("decision") == "SKIP_WEAK_SPORT":
+                print(
+                    "[AION-WEAK-SPORT-DEMOTE] "
+                    + json.dumps(
+                        {
+                            "source": "final_submit_preflight",
+                            "lane": final_lane_allocation.get("lane"),
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "score": final_lane_allocation.get("allocation_score"),
+                            "EV": final_lane_allocation.get("edge"),
+                            "confidence": final_lane_allocation.get("confidence"),
+                            "spread": final_lane_allocation.get("spread"),
+                            "liquidity": final_lane_allocation.get("liquidity"),
+                            "sports_quality_reason": final_lane_allocation.get("reason"),
+                            "final_decision": "SKIP",
+                            "why_candidate_lost": "weak_sports_quality_demoted_before_submit",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[AION-FINAL-REJECT] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "side": submission_side,
+                            "selected_price": submission_price,
+                            "spread": controlled_spread_value,
+                            "liquidity": final_lane_allocation.get("liquidity"),
+                            "volume": (payload_preview or {}).get("volume") or (quote_readiness_diagnostic or {}).get("volume"),
+                            "reason": "weak_sports_quality_demoted",
+                            "responsible_subsystem": "dual_lane_final_submit_preflight",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                self._emit_aion_final_execution_truth(
+                    ticker=auto_live_ticker,
+                    family=selected_family,
+                    decision="SKIP",
+                    reason="weak_sports_quality_demoted",
+                    stage="final_submit_preflight",
+                    hard_block=False,
+                    final_submit_allowed=False,
+                    selected_price=submission_price,
+                    selected_side=submission_side,
+                )
+                execution_funnel["execution_blocked"] = 1
+                trade_readiness_trade_submitted = False
+                emit_full_select_cycle_timing()
+                return
             print(
                 "[AION-QUALIFIED] "
                 + json.dumps(
@@ -63105,6 +64015,15 @@ class KalshiSniperBot:
                     result=result,
                     payload=payload,
                     family=selected_family,
+                )
+                primary_lane = None
+                for lane_candidate in getattr(self, "last_dual_lane_buy_candidates", []) or []:
+                    if str(lane_candidate.get("ticker") or "").strip() == str(auto_live_ticker or "").strip():
+                        primary_lane = lane_candidate.get("lane")
+                        break
+                self._execute_dual_lane_secondary_candidate(
+                    primary_ticker=auto_live_ticker,
+                    primary_lane=primary_lane,
                 )
             else:
                 execution_funnel["execution_blocked"] = 1
