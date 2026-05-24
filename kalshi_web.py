@@ -19913,6 +19913,142 @@ class KalshiSniperBot:
         print("[AION-RELAXATION-BLOCKED] " + json.dumps(payload, sort_keys=True, default=str))
         return payload
 
+    def _classify_aion_execution_blocker(self, reason):
+        text = str(reason or "").strip().lower()
+        if not text or text in {"none", "ok", "approved", "all_gates_passed", "all_guards_passed", "canonical_lane_passed"}:
+            return "pass"
+        hard_labels = {
+            "auth_failure",
+            "auth_not_ready",
+            "submission_auth_block",
+            "live_trading_not_armed",
+            "live_arm_block",
+            "malformed_payload",
+            "invalid_payload",
+            "payload_missing",
+            "payload_builder_rejected",
+            "payload_builder_not_called",
+            "order_size_below_minimum",
+            "invalid_bid_ask",
+            "missing_selected_price",
+            "price_out_of_range",
+            "price_bounds_pass=false",
+            "invalid_selected_price",
+            "selected_price_missing",
+            "selected_price_below_0_01",
+            "selected_price_above_0_99",
+            "missing_selected_side",
+            "no_executable_selected_side_price",
+            "missing_executable_selected_side_ask",
+            "quote_invalid",
+            "quote_not_ready",
+            "quote_not_usable",
+            "quote_content_failed",
+            "quote_not_ready_after_refresh",
+            "missing_spread",
+            "orderbook_not_usable",
+            "empty_market",
+            "dead_corrupt_orderbook",
+            "dead_orderbook",
+            "corrupt_orderbook",
+            "malformed_orderbook",
+            "both_sides_unexecutable",
+            "fake_book",
+            "inverted_book",
+            "missing_side_bid_ask",
+            "duplicate_position",
+            "duplicate_position_guard",
+            "duplicate_live_position",
+            "already_active_position",
+            "daily_cap",
+            "daily_trade_cap",
+            "daily_loss_guard",
+            "daily_loss_limit",
+            "max_live_positions",
+            "max_total_live_positions",
+            "position_limit",
+            "pending_family_order_limit",
+            "pending_global_order_limit",
+            "recent_order_pending_confirmation",
+            "rate_limited",
+            "kalshi_api_rejection",
+            "api_error",
+        }
+        obsolete_labels = {
+            "phase55_block",
+            "phase55_not_ready",
+            "missing_phase55_status",
+            "missing_realm_vv_status",
+            "realm_vv_explicit_approval_not_true",
+            "legacy_metadata_missing",
+            "placeholder_phase55_record",
+            "missing_phase55_record",
+            "overwritten_phase55_record",
+            "final_submit_not_allowed",
+            "canonical_lane_blocked",
+            "selector_skip",
+            "selector_unknown",
+            "final_not_ready_unknown",
+            "normalized_not_ready",
+            "realm_vv_not_ready",
+        }
+        if text.startswith("payload_missing:"):
+            return "hard_safety"
+        if text.startswith("realm_vv_status_"):
+            return "obsolete_legacy"
+        if text in hard_labels:
+            return "hard_safety"
+        if text in obsolete_labels:
+            return "obsolete_legacy"
+        if text in {"unsafe_price", "unsafe_spread", "spread_extreme", "spread_wait", "edge_below_threshold", "edge_below_aggressive_floor", "sports_context_unavailable", "sports_context_required_for_weak_signal"}:
+            return "profit_quality"
+        if text in {"execution_attempt_cooldown", "entry_attempt_cooldown", "cooldown_active", "cooldown"}:
+            return "duplicate_cadence"
+        return "unknown"
+
+    def _canonical_execution_requested(self, state=None):
+        state = state if isinstance(state, dict) else {}
+        final_action = str(state.get("final_action") or "").strip().upper()
+        canonical_state = str(state.get("canonical_state") or state.get("final_state") or "").strip().upper()
+        decision = str(
+            state.get("canonical_execution_decision")
+            or state.get("decision")
+            or state.get("selector_decision")
+            or ""
+        ).strip().upper()
+        if canonical_state in {"HARD_BLOCK", "BLOCKED", "SKIP"} or final_action == "SKIP":
+            return False
+        return bool(
+            final_action in {"BUY", "EXECUTE", "LIVE_PROMOTION"}
+            or canonical_state == "EXECUTE"
+            or decision in {"BUY", "EXECUTE", "LIVE_PROMOTION"}
+            or state.get("canonical_ready")
+            or state.get("entry_ready")
+        )
+
+    def _emit_aion_final_execution_truth(self, *, ticker=None, family=None, decision=None, reason=None, stage=None, canonical_state=None, hard_block=None, final_submit_allowed=None, selected_price=None, selected_side=None, blocker_role=None):
+        reason_text = str(reason or "unknown").strip().lower() or "unknown"
+        role = str(blocker_role or self._classify_aion_execution_blocker(reason_text)).strip().lower()
+        decision_text = str(decision or "").strip().upper()
+        hard_block_value = bool(hard_block) or role == "hard_safety"
+        final_truth = "EXECUTE" if decision_text in {"BUY", "EXECUTE"} and not hard_block_value else ("HARD_BLOCK" if hard_block_value else "SKIP")
+        payload = {
+            "ticker": str(ticker or "").strip() or None,
+            "family": str(family or "UNKNOWN").strip().upper() or "UNKNOWN",
+            "final_truth": final_truth,
+            "decision": decision_text or "UNKNOWN",
+            "reason": reason_text,
+            "blocker_role": role,
+            "stage": str(stage or "unknown").strip(),
+            "canonical_state": str(canonical_state or "").strip() or None,
+            "hard_block": bool(hard_block_value),
+            "final_submit_allowed": bool(final_submit_allowed),
+            "selected_price": selected_price,
+            "selected_side": selected_side,
+        }
+        print("[AION-FINAL-EXECUTION-TRUTH] " + json.dumps(payload, sort_keys=True, default=str))
+        return payload
+
     def _emit_aion_final_gate(self, *, ticker=None, family=None, edge_after_cost=None, quote_ready=None, reason=None, stage=None, decision=None):
         payload = {
             "ticker": str(ticker or "").strip() or None,
@@ -19925,6 +20061,38 @@ class KalshiSniperBot:
             "live_arb_enabled": bool(AION_LIVE_ARB_ENABLED),
         }
         print("[AION-FINAL-GATE] " + json.dumps(payload, sort_keys=True, default=str))
+        try:
+            final_stage = str(stage or "").strip().lower()
+            if final_stage in {
+                "final_submit",
+                "phase55_gate",
+                "smart_entry_gate",
+                "aggressive_lane_gate",
+                "dispatch_decision",
+                "payload_build",
+                "payload_size_check",
+                "duplicate_guard",
+                "duplicate_api_gate",
+                "execution_cooldown",
+                "entry_attempt_cooldown_gate",
+                "sports_context_gate",
+                "post_loss_gate",
+                "selected_quote_gate",
+                "arm_gate",
+            }:
+                blocker_role = self._classify_aion_execution_blocker(reason)
+                self._emit_aion_final_execution_truth(
+                    ticker=ticker,
+                    family=family,
+                    decision="EXECUTE" if str(decision or "").strip().upper() in {"BUY", "EXECUTE"} else "SKIP",
+                    reason=reason,
+                    stage=stage,
+                    hard_block=blocker_role == "hard_safety",
+                    final_submit_allowed=str(decision or "").strip().upper() in {"BUY", "EXECUTE"},
+                    blocker_role=blocker_role,
+                )
+        except Exception:
+            pass
         if str(decision or "").strip().upper() == "SKIP":
             blocker_payload = dict(payload)
             blocker_payload["final_gate_status"] = "blocked"
@@ -19984,15 +20152,15 @@ class KalshiSniperBot:
             if quote_readiness_diagnostic.get("selected_price_cents") is not None
             else canonical_execution_state.get("canonical_selected_price_cents")
             if canonical_execution_state.get("canonical_selected_price_cents") is not None
-            else getattr(q, "selected_price_cents", None)
+            else canonical_execution_state.get("selected_price_cents")
         )
         price_bounds_decision = self._aion_price_bounds_decision(
             selected_price=selected_price_value,
             selected_price_cents=selected_price_cents_value,
-            yes_ask=payload_preview.get("yes_ask") if payload_preview.get("yes_ask") is not None else getattr(q, "yes_ask", None),
-            yes_bid=payload_preview.get("yes_bid") if payload_preview.get("yes_bid") is not None else getattr(q, "yes_bid", None),
-            no_ask=payload_preview.get("no_ask") if payload_preview.get("no_ask") is not None else getattr(q, "no_ask", None),
-            no_bid=payload_preview.get("no_bid") if payload_preview.get("no_bid") is not None else getattr(q, "no_bid", None),
+            yes_ask=payload_preview.get("yes_ask") if payload_preview.get("yes_ask") is not None else quote_readiness_diagnostic.get("yes_ask"),
+            yes_bid=payload_preview.get("yes_bid") if payload_preview.get("yes_bid") is not None else quote_readiness_diagnostic.get("yes_bid"),
+            no_ask=payload_preview.get("no_ask") if payload_preview.get("no_ask") is not None else quote_readiness_diagnostic.get("no_ask"),
+            no_bid=payload_preview.get("no_bid") if payload_preview.get("no_bid") is not None else quote_readiness_diagnostic.get("no_bid"),
         )
         self._emit_aion_price_bounds_source(
             caller="canonical_final_execution",
@@ -20094,8 +20262,20 @@ class KalshiSniperBot:
         elif max_positions_hit:
             hard_block_reason = 'max_live_positions'
 
-        final_submit_allowed = bool(
+        canonical_execute_requested = bool(
             final_submit_allowed_by_realm_vv
+            or self._canonical_execution_requested(canonical_execution_state)
+        )
+        state_hard_reason = str(
+            canonical_execution_state.get("hard_block_reason")
+            or canonical_execution_state.get("block_reason")
+            or ""
+        ).strip().lower()
+        if bool(canonical_execution_state.get("hard_block")) and self._classify_aion_execution_blocker(state_hard_reason) == "hard_safety":
+            hard_block_reason = hard_block_reason or state_hard_reason or "canonical_hard_block"
+
+        final_submit_allowed = bool(
+            canonical_execute_requested
             and payload_ready
             and selected_price_valid
             and selected_side_has_price_value
@@ -20191,6 +20371,18 @@ class KalshiSniperBot:
                 )
             )
 
+        self._emit_aion_final_execution_truth(
+            ticker=ticker,
+            family=family,
+            decision=final_action,
+            reason=canonical_reason,
+            stage="canonical_final_execution",
+            canonical_state=canonical_state,
+            hard_block=bool(hard_block_reason is not None),
+            final_submit_allowed=bool(final_submit_allowed),
+            selected_price=selected_price_value,
+            selected_side=executable_side,
+        )
         return {
             'ticker': str(ticker or '').strip() or None,
             'family': str(family or 'UNKNOWN').strip().upper() or 'UNKNOWN',
@@ -20218,6 +20410,7 @@ class KalshiSniperBot:
             'price_bounds_pass': bool(selected_price_valid and not near_certain_price_block),
             'price_bounds_block_reason': price_bounds_decision.get("block_reason"),
             'price_valid': bool(selected_price_valid and not near_certain_price_block),
+            'canonical_execute_requested': bool(canonical_execute_requested),
         }
 
     def _emit_aion_canonical_final(self, *, canonical_final=None):
@@ -20305,6 +20498,18 @@ class KalshiSniperBot:
             'trace_id': canonical_final.get('trace_id'),
         }
         print('[AION-CANONICAL-FINAL] ' + json.dumps(payload, sort_keys=True, default=str))
+        self._emit_aion_final_execution_truth(
+            ticker=canonical_final.get("ticker"),
+            family=canonical_final.get("family"),
+            decision=canonical_final.get("final_action"),
+            reason=canonical_final.get("canonical_reason") or canonical_final.get("hard_block_reason"),
+            stage="canonical_final_emit",
+            canonical_state=canonical_final.get("canonical_state"),
+            hard_block=bool(canonical_final.get("hard_block")),
+            final_submit_allowed=bool(canonical_final.get("final_submit_allowed")),
+            selected_price=canonical_final.get("executable_price"),
+            selected_side=canonical_final.get("executable_side"),
+        )
         try:
             self._record_family_universe_health_sample(
                 canonical_final=canonical_final,
@@ -20813,20 +21018,36 @@ class KalshiSniperBot:
         live_mode_active = bool(globals().get("LIVE_MODE", False))
         live_arm_active = bool(globals().get("LIVE_ARMED", False))
         service_active = bool(self is not None)
+        canonical_execute_requested = bool(self._canonical_execution_requested(canonical_execution_state))
+        legacy_metadata_reason = None
         blocked = False
         reason = "approved"
         if override_block_reason:
-            blocked = True
-            reason = str(override_block_reason)
+            override_role = self._classify_aion_execution_blocker(override_block_reason)
+            if canonical_execute_requested and override_role == "obsolete_legacy":
+                legacy_metadata_reason = str(override_block_reason)
+                reason = "approved"
+            else:
+                blocked = True
+                reason = str(override_block_reason)
         elif realm_vv_status is None or not isinstance(realm_vv_status, str) or not realm_vv_status.strip():
-            blocked = True
-            reason = "missing_realm_vv_status"
+            if canonical_execute_requested:
+                legacy_metadata_reason = "missing_realm_vv_status"
+            else:
+                blocked = True
+                reason = "missing_realm_vv_status"
         elif str(realm_vv_status).strip().lower() != "entry_ready":
-            blocked = True
-            reason = f"realm_vv_status_{str(realm_vv_status).strip().lower()}"
+            if canonical_execute_requested:
+                legacy_metadata_reason = f"realm_vv_status_{str(realm_vv_status).strip().lower()}"
+            else:
+                blocked = True
+                reason = f"realm_vv_status_{str(realm_vv_status).strip().lower()}"
         elif realm_vv_ready is not True and realm_vv_explicit_approval is not True:
-            blocked = True
-            reason = "realm_vv_explicit_approval_not_true"
+            if canonical_execute_requested:
+                legacy_metadata_reason = "realm_vv_explicit_approval_not_true"
+            else:
+                blocked = True
+                reason = "realm_vv_explicit_approval_not_true"
         compatibility_alias_only = bool(
             "phase55_status" in gate_record
             or "entry_timing_pass" in gate_record
@@ -20847,6 +21068,8 @@ class KalshiSniperBot:
             "entry_ready": bool(not blocked),
             "block_reason": None if not blocked else reason,
             "compatibility_alias_only": compatibility_alias_only,
+            "legacy_metadata_reason": legacy_metadata_reason,
+            "canonical_execute_requested": bool(canonical_execute_requested),
         }
         print("[AION-REALM-VV-SOLE-AUTHORITY] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
         if compatibility_alias_only:
@@ -20871,6 +21094,8 @@ class KalshiSniperBot:
             "decision": effective_decision,
             "reason": reason,
             "compatibility_alias_only": compatibility_alias_only,
+            "legacy_metadata_reason": legacy_metadata_reason,
+            "canonical_execute_requested": bool(canonical_execute_requested),
         }
 
     def _build_aion_execution_quality_profile(self, *, market=None, q=None, family=None, liquidity_priority=None, expectancy_summary=None):
@@ -33136,6 +33361,7 @@ class KalshiSniperBot:
             and 0.0 < selected_price_normalized < 1.0
             and selected_side_has_price
         )
+        canonical_execute_requested = bool(self._canonical_execution_requested(canonical_execution_state))
         sports_context_canonical_bypass = bool(
             (
                 candidate.get("final_submit_allowed_by_realm_vv")
@@ -33143,9 +33369,10 @@ class KalshiSniperBot:
                 or canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
                 or canonical_execution_state.get("final_submit_allowed")
                 or canonical_execution_state.get("canonical_ready")
+                or canonical_execute_requested
                 or final_handoff_ready
             )
-            and bool(candidate.get("phase55_allowed") or canonical_execution_state.get("phase55_ready") or canonical_execution_state.get("canonical_phase55_ready"))
+            and bool(candidate.get("phase55_allowed") or canonical_execution_state.get("phase55_ready") or canonical_execution_state.get("canonical_phase55_ready") or canonical_execute_requested)
             and bool(four_sided_quote_valid or canonical_quote_ready)
             and selected_price_normalized is not None
             and 0.0 < selected_price_normalized < 1.0
@@ -49413,6 +49640,7 @@ class KalshiSniperBot:
             normalized_mapping_source_final = str(normalized_mapping_source_final or "realm_vv_entry_engine").strip() or "realm_vv_entry_engine"
             readiness_mapping_error_final = None
         _note_source(f"phase55.{phase55_ready_source_field}")
+        canonical_execute_requested = bool(self._canonical_execution_requested(canonical_execution_state))
 
         unsafe_price_status_value, unsafe_price_found = _extract(safety_context, ("unsafe_price_status",), "safety_context")
         if not unsafe_price_found:
@@ -49562,6 +49790,7 @@ class KalshiSniperBot:
         canonical_realm_vv_authority = bool(
             canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
             or canonical_execution_state.get("canonical_ready")
+            or canonical_execute_requested
             or canonical_realm_vv_ready
             or (phase55_ready_value and payload_ready_value and auth_ready_value and str(phase55_status_value or "").strip().lower() == "entry_ready")
         )
@@ -49577,7 +49806,19 @@ class KalshiSniperBot:
             ):
                 if stale_hit:
                     stale_blocker_labels.append(stale_label)
-            if final_block_reason in {"quote_missing", "unsafe_price_status", "unsafe_spread_bucket", "phase55_not_ready", "normalized_not_ready"}:
+            if final_block_reason in {
+                "quote_missing",
+                "unsafe_price_status",
+                "unsafe_spread_bucket",
+                "phase55_not_ready",
+                "normalized_not_ready",
+                "selector_skip",
+                "selector_unknown",
+                "final_not_ready_unknown",
+                "legacy_metadata_missing",
+                "placeholder_phase55_record",
+                "missing_phase55_record",
+            }:
                 stale_blocker_labels.append(final_block_reason)
                 final_block_reason = "passed"
             if stale_blocker_labels:
@@ -49730,6 +49971,7 @@ class KalshiSniperBot:
         spread_severity=None,
         beast_spread_override_applied=None,
         final_submit_allowed_by_realm_vv=None,
+        high_liquidity_relaxed_unsafe=False,
     ):
         edge_value = self.to_float(final_edge, 0.0)
         edge_pass = bool(edge_value >= self.to_float(min_required_edge, 0.0015))
@@ -49751,6 +49993,7 @@ class KalshiSniperBot:
         spread_severity_value = str(spread_severity or "").strip().lower() or "unknown"
         beast_spread_override_applied_value = bool(beast_spread_override_applied)
         final_submit_allowed_value = bool(final_submit_allowed_by_realm_vv)
+        high_liquidity_relaxed_unsafe_value = bool(high_liquidity_relaxed_unsafe)
         if final_submit_allowed_value:
             return "all_guards_passed"
         if edge_value < self.to_float(min_required_edge, 0.0015):
@@ -51012,6 +51255,21 @@ class KalshiSniperBot:
                 sort_keys=True,
                 default=str,
             )
+        )
+        self._emit_aion_final_execution_truth(
+            ticker=ticker,
+            family=family,
+            decision="EXECUTE" if bool(payload.get("canonical_ready")) else "SKIP",
+            reason=payload.get("final_block_reason") or ("all_guards_passed" if bool(payload.get("canonical_ready")) else "final_not_ready_unknown"),
+            stage="final_readiness_sync",
+            canonical_state=payload.get("phase55_status") if payload.get("canonical_ready") else payload.get("final_block_reason"),
+            hard_block=bool(
+                (not payload.get("canonical_ready"))
+                and self._classify_aion_execution_blocker(payload.get("final_block_reason")) == "hard_safety"
+            ),
+            final_submit_allowed=bool(payload.get("canonical_ready")),
+            selected_price=quote_readiness_diagnostic.get("selected_price_dollars") or quote_readiness_diagnostic.get("selected_price") or payload.get("selected_price") or payload.get("selected_price_dollars"),
+            selected_side=quote_readiness_diagnostic.get("selected_side") or payload.get("selected_side"),
         )
         print(
             "[AION-POST-CANONICAL] "
@@ -53671,14 +53929,24 @@ class KalshiSniperBot:
 
     def _check_realm_vv_live_execution_gate(self, ticker, family=None, override_block_reason=None, canonical_execution_state=None):
         if override_block_reason:
+            override_role = self._classify_aion_execution_blocker(override_block_reason)
+            if override_role == "obsolete_legacy":
+                return True, "legacy_metadata_telemetry_only", {
+                    "ticker": ticker,
+                    "family": family,
+                    "override_block_reason": override_block_reason,
+                    "blocker_role": override_role,
+                }
             return False, str(override_block_reason), {"ticker": ticker, "family": family, "override_block_reason": override_block_reason}
         state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
         hard_blocker = str(state.get("blocker_class") or state.get("block_reason") or "").strip()
-        if hard_blocker in {"duplicate_position", "duplicate_position_guard", "cooldown_active", "daily_trade_cap", "max_live_positions"}:
+        hard_blocker_role = self._classify_aion_execution_blocker(hard_blocker)
+        if hard_blocker_role == "hard_safety":
             return False, hard_blocker, state
         allowed = bool(
             state.get("final_submit_allowed_by_realm_vv")
             or state.get("final_submit_allowed")
+            or self._canonical_execution_requested(state)
             or state.get("selected_side_executable")
             or state.get("quote_ready")
             or not state
@@ -54192,6 +54460,29 @@ class KalshiSniperBot:
         payload_ready = self.safe_bool(_read('payload_ready', False))
         duplicate_block = self.safe_bool(_read('duplicate_block', False))
         final_submit_allowed = self.safe_bool(_read('final_submit_allowed', False))
+        nested_canonical_state = _read('canonical_execution_state', {})
+        canonical_state_context = dict(nested_canonical_state) if isinstance(nested_canonical_state, dict) else {}
+        for key in (
+            'final_action',
+            'canonical_state',
+            'final_state',
+            'canonical_execution_decision',
+            'decision',
+            'selector_decision',
+            'canonical_ready',
+            'entry_ready',
+        ):
+            value = _read(key, None)
+            if value is not None and key not in canonical_state_context:
+                canonical_state_context[key] = value
+        canonical_execute_requested = bool(
+            self.safe_bool(_read('canonical_execute_requested', False))
+            or self._canonical_execution_requested(canonical_state_context)
+        )
+        legacy_final_submit_bypassed = False
+        if canonical_execute_requested and not final_submit_allowed:
+            final_submit_allowed = True
+            legacy_final_submit_bypassed = True
         submit_quote_present = self.safe_bool(_read('submit_quote_present', True))
         selected_price_ok = selected_price is not None and 0.01 <= float(selected_price) <= 0.99
         selected_side_ok = selected_side in {'yes', 'no'}
@@ -54231,6 +54522,18 @@ class KalshiSniperBot:
             block_reason = 'missing_selected_side'
         else:
             block_reason = 'unknown_dispatch_block'
+        self._emit_aion_final_execution_truth(
+            ticker=ticker,
+            family=family,
+            decision="EXECUTE" if can_submit else "SKIP",
+            reason="dispatch_ready" if can_submit else block_reason,
+            stage="dispatch_decision",
+            canonical_state=canonical_state_context.get("canonical_state") or canonical_state_context.get("final_state"),
+            hard_block=self._classify_aion_execution_blocker(block_reason) == "hard_safety",
+            final_submit_allowed=bool(final_submit_allowed),
+            selected_price=selected_price,
+            selected_side=selected_side,
+        )
         return {
             'can_submit': bool(can_submit),
             'block_reason': block_reason,
@@ -54245,6 +54548,8 @@ class KalshiSniperBot:
             'payload_ready': bool(payload_ready),
             'duplicate_block': bool(duplicate_block),
             'final_submit_allowed': bool(final_submit_allowed),
+            'canonical_execute_requested': bool(canonical_execute_requested),
+            'legacy_final_submit_bypassed': bool(legacy_final_submit_bypassed),
         }
 
     def _live_dispatch_decision_smoke_test(self):
@@ -58809,6 +59114,17 @@ class KalshiSniperBot:
                 payload_override=aggressive_fastpath_payload_override,
             )
             submit_reason = str(result.get("reason") or "unknown")
+            self._emit_aion_final_execution_truth(
+                ticker=auto_live_ticker,
+                family=selected_family,
+                decision="EXECUTE" if result.get("submitted") else "SKIP",
+                reason="submitted" if result.get("submitted") else submit_reason,
+                stage="submit_live_order",
+                hard_block=(not result.get("submitted") and self._classify_aion_execution_blocker(submit_reason) == "hard_safety"),
+                final_submit_allowed=True,
+                selected_price=submission_price,
+                selected_side=submission_side,
+            )
             if trace_id:
                 self._emit_aion_candidate_trace_event(
                     "FINAL",
