@@ -219,13 +219,19 @@ def resolve_ev_contract_size(
         ev_context.get("STRUCTURAL_EDGE_SCORE", ev_context.get("structural_edge_score")),
         bot.to_float(getattr(q, "STRUCTURAL_EDGE_SCORE", None), 0.0) if q is not None else 0.0,
     ) or 0.0
+    cross_market_score = bot.to_float(
+        ev_context.get("CROSS_MARKET_EDGE_SCORE", ev_context.get("cross_market_edge_score")),
+        bot.to_float(getattr(q, "CROSS_MARKET_EDGE_SCORE", None), 0.0) if q is not None else 0.0,
+    ) or 0.0
     conviction_size_multiplier = bot.to_float(
         ev_context.get("conviction_size_multiplier"),
         bot.to_float(getattr(q, "conviction_size_multiplier", None), None) if q is not None else None,
     )
-    multiplier_cap = max(1.60, min(2.25, bot.to_float(kelly_max_multiplier, 1.75) or 1.75))
-    if structural_score >= 78.0:
-        multiplier_cap = max(multiplier_cap, min(2.25, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 0.20))
+    multiplier_cap = max(1.60, min(2.75, bot.to_float(kelly_max_multiplier, 1.75) or 1.75))
+    if structural_score >= 78.0 or cross_market_score >= 70.0:
+        multiplier_cap = max(multiplier_cap, min(2.75, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 0.35))
+    if structural_score >= 88.0 and cross_market_score >= 78.0:
+        multiplier_cap = max(multiplier_cap, min(2.75, (bot.to_float(kelly_max_multiplier, 1.75) or 1.75) + 0.55))
     if conviction_size_multiplier is not None and conviction_size_multiplier < 0.90:
         multiplier_cap = min(multiplier_cap, 1.15)
     multiplier = max(0.0, min(multiplier_cap, float(multiplier)))
@@ -236,7 +242,7 @@ def resolve_ev_contract_size(
     if requested_size <= 0:
         requested_size = 1
     ev_adjusted_size = max(1, min(max_size, requested_size))
-    if structural_score > 0.0 or conviction_size_multiplier not in (None, 1.0):
+    if structural_score > 0.0 or cross_market_score > 0.0 or conviction_size_multiplier not in (None, 1.0):
         try:
             print(
                 "[AION-CONVICTION-SIZE] "
@@ -246,6 +252,7 @@ def resolve_ev_contract_size(
                         "family": ev_context.get("family") or getattr(q, "family", None),
                         "ev_tier": ev_tier,
                         "STRUCTURAL_EDGE_SCORE": round(structural_score, 4),
+                        "CROSS_MARKET_EDGE_SCORE": round(cross_market_score, 4),
                         "conviction_size_multiplier": None if conviction_size_multiplier is None else round(conviction_size_multiplier, 4),
                         "ev_sizing_multiplier": round(multiplier, 4),
                         "base_size": int(base_size),

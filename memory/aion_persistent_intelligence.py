@@ -353,6 +353,19 @@ def _distilled_volatility_bucket(value):
     return "extreme"
 
 
+def _distilled_score_bucket(value, *, prefix="score"):
+    score = safe_float(value, None)
+    if score is None:
+        return f"{prefix}_unknown"
+    if score < 25.0:
+        return f"{prefix}_weak"
+    if score < 50.0:
+        return f"{prefix}_present"
+    if score < 75.0:
+        return f"{prefix}_strong"
+    return f"{prefix}_elite"
+
+
 def _distilled_sport_type(family=None, title=None, ticker=None):
     text = " ".join(str(value or "").upper() for value in (family, title, ticker))
     if "NBA" in text or "WNBA" in text:
@@ -1107,8 +1120,22 @@ class AIONPersistentIntelligence:
         elif isinstance(sports_tags, (tuple, set)):
             sports_tags = list(sports_tags)
         sports_tags = [str(tag).strip() for tag in sports_tags if str(tag or "").strip()][:12] if isinstance(sports_tags, list) else []
+        structural_tags = record.get("structural_tags") or record.get("structural_edge_tags") or []
+        if isinstance(structural_tags, str):
+            structural_tags = [tag.strip() for tag in structural_tags.replace(";", ",").split(",") if tag.strip()]
+        elif isinstance(structural_tags, (tuple, set)):
+            structural_tags = list(structural_tags)
+        structural_tags = [str(tag).strip() for tag in structural_tags if str(tag or "").strip()][:16] if isinstance(structural_tags, list) else []
+        structural_pattern_keys = record.get("structural_pattern_keys") or record.get("structural_patterns") or []
+        if isinstance(structural_pattern_keys, str):
+            structural_pattern_keys = [key.strip() for key in structural_pattern_keys.replace(";", ",").split(",") if key.strip()]
+        elif isinstance(structural_pattern_keys, (tuple, set)):
+            structural_pattern_keys = list(structural_pattern_keys)
+        structural_pattern_keys = [str(key).strip() for key in structural_pattern_keys if str(key or "").strip()][:24] if isinstance(structural_pattern_keys, list) else []
         elite_handle = str(record.get("elite_trader_handle") or record.get("trader_handle") or "").strip()
         price = record.get("entry_price") if record.get("entry_price") is not None else record.get("price")
+        structural_edge_score = safe_float(record.get("structural_edge_score", record.get("STRUCTURAL_EDGE_SCORE")), None)
+        cross_market_edge_score = safe_float(record.get("cross_market_edge_score", record.get("CROSS_MARKET_EDGE_SCORE")), None)
         normalized = {
             "timestamp": timestamp,
             "timestamp_ts": round(timestamp_ts, 6),
@@ -1131,6 +1158,12 @@ class AIONPersistentIntelligence:
             "orderbook_quality_tag": _distilled_book_quality_tag(record),
             "sports_data_tag": record.get("sports_data_tag") or record.get("sports_family_activity_level"),
             "sports_tags": sports_tags,
+            "structural_tags": structural_tags,
+            "structural_pattern_keys": structural_pattern_keys,
+            "structural_edge_score": structural_edge_score,
+            "cross_market_edge_score": cross_market_edge_score,
+            "structural_edge_bucket": record.get("structural_edge_bucket") or _distilled_score_bucket(structural_edge_score, prefix="structural"),
+            "cross_market_bucket": record.get("cross_market_bucket") or _distilled_score_bucket(cross_market_edge_score, prefix="cross"),
             "sports_edge_score": safe_float(record.get("sports_edge_score", record.get("sports_score_at_entry")), None),
             "asymmetry_score": safe_float(record.get("asymmetry_score", record.get("sports_payout_multiple")), None),
             "odds_bucket": record.get("odds_bucket") or _distilled_price_bucket(price),
@@ -1230,6 +1263,12 @@ class AIONPersistentIntelligence:
             update_bucket("sport_types", normalized.get("sport_type") or "sports")
             for tag in normalized.get("sports_tags") or []:
                 update_bucket("sports_tags", tag)
+            for tag in normalized.get("structural_tags") or []:
+                update_bucket("structural_tags", tag)
+            for pattern_key in normalized.get("structural_pattern_keys") or []:
+                update_bucket("structural_patterns", pattern_key)
+            update_bucket("structural_edge_buckets", normalized.get("structural_edge_bucket") or "structural_unknown")
+            update_bucket("cross_market_buckets", normalized.get("cross_market_bucket") or "cross_unknown")
             if normalized.get("elite_signal_used") and normalized.get("elite_trader_handle"):
                 handle = str(normalized.get("elite_trader_handle") or "").strip()
                 update_bucket("elite_traders", handle)
@@ -1294,12 +1333,17 @@ class AIONPersistentIntelligence:
         liquidity_bucket=None,
         spread_bucket=None,
         sport_type=None,
+        structural_tags=None,
+        structural_pattern_keys=None,
+        cross_market_bucket=None,
     ):
         memory = _ensure_distilled_learning_defaults(self.distilled_learning)
         summaries = memory.get("summaries") if isinstance(memory.get("summaries"), dict) else {}
         sports_history = _ensure_sports_history_defaults(memory.get("sports_history"))
         sports_summaries = sports_history.get("summaries") if isinstance(sports_history.get("summaries"), dict) else {}
         sports_tags = sports_tags if isinstance(sports_tags, list) else []
+        structural_tags = structural_tags if isinstance(structural_tags, list) else []
+        structural_pattern_keys = structural_pattern_keys if isinstance(structural_pattern_keys, list) else []
         components = []
 
         def add_component(label, section, key, weight, min_count=3, summary_source=None):
@@ -1331,6 +1375,11 @@ class AIONPersistentIntelligence:
         add_component("category", "categories", str(category or "").strip().lower(), 0.12, min_count=5)
         for tag in sports_tags[:8]:
             add_component("sports_tag", "sports_tags", tag, 0.18, min_count=3)
+        for tag in structural_tags[:10]:
+            add_component("structural_tag", "structural_tags", tag, 0.24, min_count=2)
+        for pattern_key in structural_pattern_keys[:12]:
+            add_component("structural_pattern", "structural_patterns", pattern_key, 0.30, min_count=2)
+        add_component("cross_market_bucket", "cross_market_buckets", cross_market_bucket, 0.16, min_count=2)
         add_component("odds_bucket", "odds_buckets", odds_bucket, 0.18, min_count=4)
         add_component("book_quality", "book_quality", book_quality_tag, 0.12, min_count=4)
         add_component("side", "side_buckets", side_key, 0.08, min_count=4)

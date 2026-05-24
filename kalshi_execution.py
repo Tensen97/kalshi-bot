@@ -561,6 +561,12 @@ def maybe_auto_reprice_recent_order(
                     "sports_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
                     "sports_edge_boost": getattr(q, "sports_edge_rank_boost", None),
                     "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
+                    "structural_edge_context": getattr(q, "structural_edge_context", None),
+                    "structural_tags": getattr(q, "structural_edge_tags", None),
+                    "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),
+                    "STRUCTURAL_EDGE_SCORE": getattr(q, "STRUCTURAL_EDGE_SCORE", None),
+                    "CROSS_MARKET_EDGE_SCORE": getattr(q, "CROSS_MARKET_EDGE_SCORE", None),
+                    "cross_market_edge_context": getattr(q, "cross_market_edge_context", None),
                 },
             )
         print(
@@ -687,6 +693,23 @@ def submit_live_order(
         source="submit_live_order.result_price",
     )
     payload["side"] = side if side in {"yes", "no"} else legacy_payload.get("side")
+    for field in (
+        "structural_edge_context",
+        "structural_edge_tags",
+        "structural_pattern_keys",
+        "STRUCTURAL_EDGE_SCORE",
+        "CROSS_MARKET_EDGE_SCORE",
+        "cross_market_edge_context",
+        "sports_edge_context",
+        "sports_edge_tags",
+    ):
+        if payload.get(field) is None and q is not None:
+            try:
+                value = getattr(q, field, None)
+            except Exception:
+                value = None
+            if value is not None:
+                payload[field] = value
     result = bot.place_live_order({**payload, **legacy_payload})
     if result.get("submitted"):
         bot._live_order_timestamps.append(time.time())
@@ -721,6 +744,12 @@ def submit_live_order(
                     "sports_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
                     "sports_edge_boost": getattr(q, "sports_edge_rank_boost", None),
                     "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
+                    "structural_edge_context": getattr(q, "structural_edge_context", None),
+                    "structural_tags": getattr(q, "structural_edge_tags", None),
+                    "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),
+                    "STRUCTURAL_EDGE_SCORE": getattr(q, "STRUCTURAL_EDGE_SCORE", None),
+                    "CROSS_MARKET_EDGE_SCORE": getattr(q, "CROSS_MARKET_EDGE_SCORE", None),
+                    "cross_market_edge_context": getattr(q, "cross_market_edge_context", None),
                 },
             )
         print(

@@ -1700,10 +1700,13 @@ AION_SPORTS_EDGE_MIN_TOP_DEPTH = get_env_float("AION_SPORTS_EDGE_MIN_TOP_DEPTH",
 AION_SPORTS_EDGE_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_SIZE_MULTIPLIER", 1.15)
 AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EDGE_MAX_SIZE_MULTIPLIER", 1.35)
 AION_STRUCTURAL_EDGE_ENABLED = get_env_bool("AION_STRUCTURAL_EDGE_ENABLED", 1)
-AION_STRUCTURAL_EDGE_MAX_RANK_BOOST = get_env_float("AION_STRUCTURAL_EDGE_MAX_RANK_BOOST", 4.5)
-AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT", 0.055)
-AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER", 1.45)
+AION_STRUCTURAL_EDGE_MAX_RANK_BOOST = get_env_float("AION_STRUCTURAL_EDGE_MAX_RANK_BOOST", 6.25)
+AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_STRUCTURAL_EDGE_MAX_PROBABILITY_ADJUSTMENT", 0.075)
+AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER", 1.90)
 AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER = get_env_float("AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER", 0.55)
+AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST = get_env_float("AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST", 4.75)
+AION_CROSS_MARKET_EDGE_MAX_PROBABILITY_ADJUSTMENT = get_env_float("AION_CROSS_MARKET_EDGE_MAX_PROBABILITY_ADJUSTMENT", 0.060)
+AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER = get_env_float("AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER", 1.85)
 AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
 AION_DATA_COVERAGE_REFRESH_SECONDS = get_env_int("AION_DATA_COVERAGE_REFRESH_SECONDS", 900)
 AION_DATA_COVERAGE_INCLUDE_TELEMETRY = get_env_bool("AION_DATA_COVERAGE_INCLUDE_TELEMETRY", 0)
@@ -8275,6 +8278,13 @@ class KalshiSniperBot:
             side = str(self._learning_archive_value(sources, "selected_side", "side", "outcome_side") or "").strip().lower() or None
             sports_context = self._learning_archive_value(sources, "sports_edge_context", "sports_edge_ranking_context")
             sports_context = sports_context if isinstance(sports_context, dict) else {}
+            structural_context = self._learning_archive_value(sources, "structural_edge_context")
+            structural_context = structural_context if isinstance(structural_context, dict) else {}
+            cross_market_context = (
+                self._learning_archive_value(sources, "cross_market_edge_context")
+                or structural_context.get("cross_market_edge_context")
+            )
+            cross_market_context = cross_market_context if isinstance(cross_market_context, dict) else {}
             elite_signal_context = self._learning_archive_value(sources, "elite_public_signal_context", "elite_signal_context")
             elite_signal_context = elite_signal_context if isinstance(elite_signal_context, dict) else {}
             elite_signal_payload = elite_signal_context.get("signal") if isinstance(elite_signal_context.get("signal"), dict) else {}
@@ -8301,6 +8311,40 @@ class KalshiSniperBot:
                 sports_tags = [str(tag).strip() for tag in sports_tags_raw if str(tag or "").strip()]
             else:
                 sports_tags = []
+            structural_tags_raw = (
+                self._learning_archive_value(sources, "structural_tags", "structural_edge_tags")
+                or structural_context.get("tags")
+                or []
+            )
+            if isinstance(structural_tags_raw, str):
+                structural_tags = [tag.strip() for tag in structural_tags_raw.replace(";", ",").split(",") if tag.strip()]
+            elif isinstance(structural_tags_raw, (list, tuple, set)):
+                structural_tags = [str(tag).strip() for tag in structural_tags_raw if str(tag or "").strip()]
+            else:
+                structural_tags = []
+            structural_pattern_keys_raw = (
+                self._learning_archive_value(sources, "structural_pattern_keys")
+                or structural_context.get("structural_pattern_keys")
+                or cross_market_context.get("pattern_keys")
+                or []
+            )
+            if isinstance(structural_pattern_keys_raw, str):
+                structural_pattern_keys = [key.strip() for key in structural_pattern_keys_raw.replace(";", ",").split(",") if key.strip()]
+            elif isinstance(structural_pattern_keys_raw, (list, tuple, set)):
+                structural_pattern_keys = [str(key).strip() for key in structural_pattern_keys_raw if str(key or "").strip()]
+            else:
+                structural_pattern_keys = []
+            structural_edge_score = self._learning_archive_float(
+                self._learning_archive_value(sources, "STRUCTURAL_EDGE_SCORE", "structural_edge_score")
+                or structural_context.get("STRUCTURAL_EDGE_SCORE")
+                or structural_context.get("structural_edge_score")
+            )
+            cross_market_edge_score = self._learning_archive_float(
+                self._learning_archive_value(sources, "CROSS_MARKET_EDGE_SCORE", "cross_market_edge_score")
+                or structural_context.get("CROSS_MARKET_EDGE_SCORE")
+                or cross_market_context.get("CROSS_MARKET_EDGE_SCORE")
+                or cross_market_context.get("score")
+            )
             sports_score_at_entry = self._learning_archive_float(
                 self._learning_archive_value(sources, "sports_score_at_entry", "sports_edge_score_at_entry", "score_at_entry")
                 or sports_context.get("score_at_entry")
@@ -8396,6 +8440,15 @@ class KalshiSniperBot:
                         "liquidity_bucket": sports_context.get("liquidity_bucket"),
                         "spread_bucket": sports_context.get("spread_bucket"),
                         "sport_type": sports_context.get("sport_type"),
+                        "structural_edge_score": structural_edge_score,
+                        "STRUCTURAL_EDGE_SCORE": structural_edge_score,
+                        "cross_market_edge_score": cross_market_edge_score,
+                        "CROSS_MARKET_EDGE_SCORE": cross_market_edge_score,
+                        "structural_tags": structural_tags,
+                        "structural_pattern_keys": structural_pattern_keys,
+                        "cross_market_bucket": cross_market_context.get("cross_market_bucket"),
+                        "cross_market_peer_count": cross_market_context.get("peer_count"),
+                        "cross_market_reason": cross_market_context.get("reason"),
                     }
                 )
             else:
@@ -8434,6 +8487,13 @@ class KalshiSniperBot:
                         "sports_tags": sports_tags,
                         "sports_score_at_entry": sports_score_at_entry,
                         "sports_edge_boost": sports_edge_boost,
+                        "structural_edge_score": structural_edge_score,
+                        "STRUCTURAL_EDGE_SCORE": structural_edge_score,
+                        "cross_market_edge_score": cross_market_edge_score,
+                        "CROSS_MARKET_EDGE_SCORE": cross_market_edge_score,
+                        "structural_tags": structural_tags,
+                        "structural_pattern_keys": structural_pattern_keys,
+                        "cross_market_bucket": cross_market_context.get("cross_market_bucket"),
                         "entry_price": self._learning_archive_float(self._learning_archive_value(sources, "entry_price", "avg_price")),
                         "exit_price": price,
                         "contracts": contracts,
@@ -8463,6 +8523,24 @@ class KalshiSniperBot:
                             "family": family or "UNKNOWN",
                             "tags": sports_tags,
                             "score_at_entry": sports_score_at_entry,
+                            "pnl_dollars": event.get("pnl_dollars"),
+                            "result": event.get("result"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            if structural_tags or structural_edge_score or cross_market_edge_score:
+                print(
+                    "[AION-STRUCTURAL-LEARN] "
+                    + json.dumps(
+                        {
+                            "event_type": event_type,
+                            "ticker": ticker or None,
+                            "family": family or "UNKNOWN",
+                            "STRUCTURAL_EDGE_SCORE": structural_edge_score,
+                            "CROSS_MARKET_EDGE_SCORE": cross_market_edge_score,
+                            "tags": structural_tags[:8],
                             "pnl_dollars": event.get("pnl_dollars"),
                             "result": event.get("result"),
                         },
@@ -25825,6 +25903,9 @@ class KalshiSniperBot:
         liquidity_bucket=None,
         spread_bucket=None,
         sport_type=None,
+        structural_tags=None,
+        structural_pattern_keys=None,
+        cross_market_bucket=None,
     ):
         engine = getattr(self, "aion_persistent_intelligence", None)
         if not AION_DISTILLED_MEMORY_ENABLED or engine is None or not hasattr(engine, "get_distilled_learning_signal"):
@@ -25848,6 +25929,9 @@ class KalshiSniperBot:
                 liquidity_bucket=liquidity_bucket,
                 spread_bucket=spread_bucket,
                 sport_type=sport_type,
+                structural_tags=structural_tags if isinstance(structural_tags, list) else [],
+                structural_pattern_keys=structural_pattern_keys if isinstance(structural_pattern_keys, list) else [],
+                cross_market_bucket=cross_market_bucket,
             )
             return signal if isinstance(signal, dict) else {}
         except Exception as exc:
@@ -25871,6 +25955,8 @@ class KalshiSniperBot:
             category = str(event.get("category") or self.get_market_discovery_category(family) or "unknown").strip().lower() or "unknown"
             sports_tags = event.get("sports_tags") if isinstance(event.get("sports_tags"), list) else []
             sports_context = event.get("sports_edge_context") if isinstance(event.get("sports_edge_context"), dict) else {}
+            structural_tags = event.get("structural_tags") if isinstance(event.get("structural_tags"), list) else []
+            structural_pattern_keys = event.get("structural_pattern_keys") if isinstance(event.get("structural_pattern_keys"), list) else []
             selected_price = event.get("entry_price") if event.get("entry_price") is not None else event.get("price")
             record = {
                 **event,
@@ -25886,6 +25972,11 @@ class KalshiSniperBot:
                 "candidate_score": event.get("confidence"),
                 "score_at_entry": event.get("sports_score_at_entry") or event.get("confidence"),
                 "sports_edge_score": event.get("sports_score_at_entry"),
+                "structural_tags": structural_tags,
+                "structural_pattern_keys": structural_pattern_keys,
+                "structural_edge_score": event.get("STRUCTURAL_EDGE_SCORE") or event.get("structural_edge_score"),
+                "cross_market_edge_score": event.get("CROSS_MARKET_EDGE_SCORE") or event.get("cross_market_edge_score"),
+                "cross_market_bucket": event.get("cross_market_bucket"),
                 "asymmetry_score": event.get("sports_payout_multiple"),
                 "odds_bucket": event.get("odds_bucket") or sports_context.get("odds_bucket") or self._aion_distilled_odds_bucket(selected_price),
                 "asymmetry_bucket": event.get("asymmetry_bucket") or sports_context.get("asymmetry_bucket") or self._aion_distilled_asymmetry_bucket(
@@ -25923,6 +26014,7 @@ class KalshiSniperBot:
                             "family": family,
                             "category": category,
                             "sports_tags": sports_tags,
+                            "structural_tags": structural_tags,
                             "elite_signal_used": bool(event.get("elite_signal_used")),
                             "decision": record.get("decision"),
                         },
@@ -25957,6 +26049,9 @@ class KalshiSniperBot:
                         liquidity_bucket=record.get("liquidity_bucket"),
                         spread_bucket=record.get("spread_bucket"),
                         sport_type=record.get("sport_type"),
+                        structural_tags=structural_tags,
+                        structural_pattern_keys=structural_pattern_keys,
+                        cross_market_bucket=record.get("cross_market_bucket"),
                     )
                     self._emit_aion_memory_log(
                         "[AION-MEMORY-LEARN]",
@@ -25967,10 +26062,26 @@ class KalshiSniperBot:
                             "sports_boost_adjustment": signal.get("sports_boost_adjustment"),
                             "sizing_confidence_multiplier": signal.get("sizing_confidence_multiplier"),
                             "elite_trust_weight": signal.get("elite_trust_weight"),
+                            "structural_tags": structural_tags[:8],
                             "component_count": len(signal.get("components") or []),
                         },
                         marker=("learn", family, event.get("result"), round(self.to_float(event.get("pnl_dollars"), 0.0) or 0.0, 4)),
                     )
+                    if structural_tags or structural_pattern_keys:
+                        self._emit_aion_memory_log(
+                            "[AION-STRUCTURAL-LEARN]",
+                            {
+                                "ticker": event.get("ticker"),
+                                "family": family,
+                                "STRUCTURAL_EDGE_SCORE": record.get("structural_edge_score"),
+                                "CROSS_MARKET_EDGE_SCORE": record.get("cross_market_edge_score"),
+                                "tags": structural_tags[:8],
+                                "rank_adjustment": signal.get("rank_adjustment"),
+                                "sizing_confidence_multiplier": signal.get("sizing_confidence_multiplier"),
+                                "pnl": event.get("pnl_dollars"),
+                            },
+                            marker=("structural_learn", family, event.get("ticker"), event.get("result")),
+                        )
                     if category == "sports" or sports_tags or self.is_sports_family(family, ticker=event.get("ticker")):
                         self._emit_aion_memory_log(
                             "[AION-SPORTS-LEARN]",
@@ -26583,10 +26694,14 @@ class KalshiSniperBot:
             item["structural_edge_context"] = context
             item["structural_edge_score"] = context.get("structural_edge_score", context.get("score", 0.0))
             item["STRUCTURAL_EDGE_SCORE"] = context.get("STRUCTURAL_EDGE_SCORE", context.get("structural_edge_score", 0.0))
+            item["cross_market_edge_context"] = context.get("cross_market_edge_context") or {}
+            item["cross_market_edge_score"] = context.get("cross_market_edge_score", context.get("CROSS_MARKET_EDGE_SCORE", 0.0))
+            item["CROSS_MARKET_EDGE_SCORE"] = context.get("CROSS_MARKET_EDGE_SCORE", context.get("cross_market_edge_score", 0.0))
             item["structural_edge_rank_boost"] = context.get("boost", 0.0)
             item["structural_edge_size_multiplier"] = context.get("size_multiplier", 1.0)
             item["structural_edge_probability_adjustment"] = context.get("probability_adjustment", 0.0)
             item["structural_edge_tags"] = tags
+            item["structural_pattern_keys"] = list(context.get("structural_pattern_keys") or [])
             item["family_profile"] = context.get("family_profile") or {}
             item["live_state_context"] = context.get("live_state") or {}
         if q is not None:
@@ -26594,10 +26709,14 @@ class KalshiSniperBot:
                 ("structural_edge_context", context),
                 ("structural_edge_score", context.get("structural_edge_score", context.get("score", 0.0))),
                 ("STRUCTURAL_EDGE_SCORE", context.get("STRUCTURAL_EDGE_SCORE", context.get("structural_edge_score", 0.0))),
+                ("cross_market_edge_context", context.get("cross_market_edge_context") or {}),
+                ("cross_market_edge_score", context.get("cross_market_edge_score", context.get("CROSS_MARKET_EDGE_SCORE", 0.0))),
+                ("CROSS_MARKET_EDGE_SCORE", context.get("CROSS_MARKET_EDGE_SCORE", context.get("cross_market_edge_score", 0.0))),
                 ("structural_edge_rank_boost", context.get("boost", 0.0)),
                 ("structural_edge_size_multiplier", context.get("size_multiplier", 1.0)),
                 ("structural_edge_probability_adjustment", context.get("probability_adjustment", 0.0)),
                 ("structural_edge_tags", tags),
+                ("structural_pattern_keys", list(context.get("structural_pattern_keys") or [])),
                 ("family_profile", context.get("family_profile") or {}),
                 ("live_state_context", context.get("live_state") or {}),
             ):
@@ -26825,6 +26944,319 @@ class KalshiSniperBot:
         )
         return related[:24]
 
+    def _structural_market_kind(self, *, family=None, ticker=None, title=None):
+        text = " ".join(str(value or "") for value in (family, ticker, title)).upper()
+        if any(term in text for term in ("TOTAL", "OVER/UNDER", " OVER ", " UNDER ", "1H TOTAL")):
+            return "total"
+        if any(term in text for term in ("SPREAD", "MARGIN", "HANDICAP")):
+            return "spread"
+        if any(term in text for term in ("STRIKEOUT", " STRIKE ", " PITCHER K", " KS ", "KXMLBSTRIKE")):
+            return "strikeout_ladder"
+        if any(term in text for term in ("HIT", "RBI", "HOME RUN", " HR", "RUNS", "TOTAL BASE", "PLAYER PROP", "PROP")):
+            return "player_prop"
+        if any(term in text for term in ("LADDER", "RANGE", "ALT LINE")):
+            return "ladder"
+        if any(term in text for term in ("TENNIS", "ATP", "WTA", "SET", "GAME")):
+            return "tennis_live"
+        return "generic"
+
+    def _structural_cross_market_peers(self, *, market=None, q=None, family=None, markets=None, ticker=None):
+        market = market if isinstance(market, dict) else {}
+        ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        if not ticker or not markets:
+            return []
+        title = self._normalize_structural_text(
+            " ".join(
+                str(value or "")
+                for value in (
+                    market.get("title"),
+                    market.get("subtitle"),
+                    market.get("event_title"),
+                    getattr(q, "title", None),
+                    getattr(q, "market_title", None),
+                )
+                if str(value or "").strip()
+            )
+        )
+        stopwords = {
+            "the", "and", "for", "will", "with", "than", "over", "under", "market",
+            "game", "team", "player", "total", "spread", "yes", "no",
+        }
+        title_tokens = {token for token in title.split() if len(token) >= 3 and token not in stopwords and not token.isdigit()}
+        event_keys = {
+            str(market.get(key) or "").strip().upper()
+            for key in ("event_ticker", "eventTicker", "series_ticker", "seriesTicker")
+            if str(market.get(key) or "").strip()
+        }
+        current_kind = self._structural_market_kind(family=family, ticker=ticker, title=title)
+        peers = []
+        for candidate_market in markets or []:
+            if not isinstance(candidate_market, dict):
+                continue
+            candidate_ticker = str(candidate_market.get("ticker") or "").strip()
+            if not candidate_ticker or candidate_ticker == ticker:
+                continue
+            candidate_family = self._normalize_family_for_profit_memory(
+                self.get_market_family(candidate_market),
+                ticker=candidate_ticker,
+                market=candidate_market,
+            )
+            candidate_title_raw = " ".join(
+                str(candidate_market.get(key) or "")
+                for key in ("title", "subtitle", "event_title")
+                if str(candidate_market.get(key) or "").strip()
+            )
+            candidate_title = self._normalize_structural_text(candidate_title_raw)
+            candidate_tokens = {token for token in candidate_title.split() if len(token) >= 3 and token not in stopwords and not token.isdigit()}
+            candidate_event_keys = {
+                str(candidate_market.get(key) or "").strip().upper()
+                for key in ("event_ticker", "eventTicker", "series_ticker", "seriesTicker")
+                if str(candidate_market.get(key) or "").strip()
+            }
+            event_match = bool(event_keys and candidate_event_keys and event_keys.intersection(candidate_event_keys))
+            overlap = len(title_tokens.intersection(candidate_tokens))
+            if not event_match and overlap < 2:
+                continue
+            candidate_kind = self._structural_market_kind(
+                family=candidate_family,
+                ticker=candidate_ticker,
+                title=candidate_title_raw,
+            )
+            if candidate_kind == current_kind and candidate_family == family:
+                continue
+            yes_mid = self._structural_yes_mid(candidate_market)
+            if yes_mid is None:
+                continue
+            candidate_yes_bid = self._sports_edge_price_value(candidate_market.get("yes_bid") or candidate_market.get("yes_bid_dollars"))
+            candidate_yes_ask = self._sports_edge_price_value(candidate_market.get("yes_ask") or candidate_market.get("yes_ask_dollars"))
+            candidate_spread = None
+            if candidate_yes_bid is not None and candidate_yes_ask is not None:
+                candidate_spread = max(0.0, candidate_yes_ask - candidate_yes_bid)
+            candidate_price_delta = self.to_float(
+                candidate_market.get("price_delta")
+                or candidate_market.get("recent_price_movement")
+                or candidate_market.get("movement")
+                or candidate_market.get("repricing_delta"),
+                0.0,
+            ) or 0.0
+            candidate_velocity = self.to_float(candidate_market.get("repricing_velocity") or candidate_market.get("velocity"), 0.0) or 0.0
+            peer_score = (3 if event_match else 0) + min(4, overlap)
+            peers.append(
+                {
+                    "ticker": candidate_ticker,
+                    "family": candidate_family,
+                    "kind": candidate_kind,
+                    "yes_mid": yes_mid,
+                    "spread": candidate_spread,
+                    "line": self._extract_structural_line_value(
+                        candidate_market.get("title"),
+                        candidate_market.get("subtitle"),
+                        candidate_ticker,
+                    ),
+                    "price_delta": candidate_price_delta,
+                    "repricing_velocity": candidate_velocity,
+                    "event_match": event_match,
+                    "title_overlap": overlap,
+                    "peer_score": peer_score,
+                }
+            )
+        peers.sort(key=lambda item: (item.get("peer_score") or 0, abs((self.to_float(item.get("yes_mid"), 0.5) or 0.5) - 0.5)), reverse=True)
+        return peers[:32]
+
+    def _build_cross_market_edge_context(
+        self,
+        *,
+        market=None,
+        q=None,
+        family=None,
+        ticker=None,
+        markets=None,
+        selected_side="yes",
+        selected_price=None,
+        current_yes_mid=None,
+        spread_value=None,
+        selected_top_size=0.0,
+        opposite_top_size=0.0,
+        repricing_component=0.0,
+        liquidity_component=0.0,
+        family_profile=None,
+    ):
+        market = market if isinstance(market, dict) else {}
+        family_profile = family_profile if isinstance(family_profile, dict) else {}
+        ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        selected_side = str(selected_side or "yes").strip().lower()
+        selected_price_value = self.to_float(selected_price, None)
+        current_kind = self._structural_market_kind(
+            family=family,
+            ticker=ticker,
+            title=" ".join(str(market.get(key) or "") for key in ("title", "subtitle", "event_title")),
+        )
+        peers = self._structural_cross_market_peers(market=market, q=q, family=family, markets=markets, ticker=ticker)
+        if not peers:
+            return {
+                "enabled": True,
+                "score": 0.0,
+                "CROSS_MARKET_EDGE_SCORE": 0.0,
+                "boost": 0.0,
+                "probability_adjustment": 0.0,
+                "size_multiplier": 1.0,
+                "tags": [],
+                "pattern_keys": [],
+                "peer_count": 0,
+                "reason": "no_cross_market_peers",
+            }
+
+        def avg_for(*kinds):
+            values = [
+                self.to_float(peer.get("yes_mid"), None)
+                for peer in peers
+                if peer.get("kind") in set(kinds) and self.to_float(peer.get("yes_mid"), None) is not None
+            ]
+            if not values:
+                return None
+            return sum(values) / len(values)
+
+        spread_avg = avg_for("spread")
+        total_avg = avg_for("total")
+        prop_avg = avg_for("player_prop", "strikeout_ladder", "ladder")
+        all_mids = [self.to_float(peer.get("yes_mid"), None) for peer in peers if self.to_float(peer.get("yes_mid"), None) is not None]
+        peer_signal_yes = max(all_mids) if all_mids else None
+        peer_signal_no = 1.0 - min(all_mids) if all_mids else None
+        selected_contract_probability = selected_price_value
+        if selected_contract_probability is None and current_yes_mid is not None:
+            selected_contract_probability = current_yes_mid if selected_side == "yes" else 1.0 - current_yes_mid
+        if selected_contract_probability is not None:
+            selected_contract_probability = max(0.01, min(0.99, selected_contract_probability))
+        peer_signal = peer_signal_no if selected_side == "no" else peer_signal_yes
+        if peer_signal is None:
+            peer_signal = 0.50
+        peer_pressure = max(abs((value or 0.5) - 0.5) for value in all_mids) * 2.0 if all_mids else 0.0
+        peer_velocity = max(
+            abs(self.to_float(peer.get("price_delta"), 0.0) or 0.0) * 8.0
+            + abs(self.to_float(peer.get("repricing_velocity"), 0.0) or 0.0) * 35.0
+            for peer in peers
+        ) if peers else 0.0
+        spread_total_disagreement = 0.0
+        if spread_avg is not None and total_avg is not None:
+            spread_total_disagreement = self._clamp(abs(spread_avg - total_avg) / 0.18)
+        underreaction_gap = 0.0
+        if selected_contract_probability is not None:
+            underreaction_gap = max(0.0, peer_signal - selected_contract_probability)
+        distribution_inconsistency = self._clamp(underreaction_gap / 0.18)
+        correlated_prop_divergence = 0.0
+        if prop_avg is not None and current_yes_mid is not None:
+            if selected_side == "no":
+                correlated_prop_divergence = self._clamp(max(0.0, current_yes_mid - prop_avg) / 0.14)
+            else:
+                correlated_prop_divergence = self._clamp(max(0.0, prop_avg - current_yes_mid) / 0.14)
+        pace_mismatch = 0.0
+        if current_kind in {"player_prop", "strikeout_ladder", "ladder", "tennis_live"}:
+            pace_mismatch = self._clamp((peer_pressure * 0.38) + (max(0.0, repricing_component) * 0.42) + (peer_velocity * 0.20))
+        tail_compression = 0.0
+        if selected_contract_probability is not None:
+            tail_base = max(0.0, 0.46 - selected_contract_probability) / 0.35
+            if selected_contract_probability <= 0.46 or underreaction_gap > 0.05:
+                tail_compression = self._clamp((tail_base * 0.62) + (peer_pressure * 0.24) + (distribution_inconsistency * 0.14))
+        repricing_sequence_lag = self._clamp(
+            (max(0.0, repricing_component) * 0.48)
+            + (peer_velocity * 0.24)
+            + (peer_pressure * 0.18)
+            + (distribution_inconsistency * 0.10)
+        )
+        liquidity_vacuum = self._clamp(
+            (max(0.0, liquidity_component) * 0.50)
+            + ((1.0 if (selected_top_size <= 2.0 and opposite_top_size >= 5.0) else 0.0) * 0.34)
+            + (0.16 if spread_value is not None and spread_value <= 0.10 else 0.0)
+        )
+        components = {
+            "spread_total_disagreement": round(spread_total_disagreement, 4),
+            "live_pace_mismatch": round(pace_mismatch, 4),
+            "correlated_prop_divergence": round(correlated_prop_divergence, 4),
+            "tail_compression": round(tail_compression, 4),
+            "distribution_inconsistency": round(distribution_inconsistency, 4),
+            "repricing_sequence_lag": round(repricing_sequence_lag, 4),
+            "liquidity_vacuum": round(liquidity_vacuum, 4),
+        }
+        family_weight = max(0.80, min(1.45, self.to_float(family_profile.get("structural_edge_weight"), 1.0) or 1.0))
+        raw_score = (
+            spread_total_disagreement * 13.0
+            + pace_mismatch * 15.0
+            + correlated_prop_divergence * 15.0
+            + tail_compression * 15.0
+            + distribution_inconsistency * 18.0
+            + repricing_sequence_lag * 14.0
+            + liquidity_vacuum * 10.0
+        ) * family_weight
+        score = round(max(0.0, min(100.0, raw_score)), 4)
+        tags = []
+        if spread_total_disagreement >= 0.32:
+            tags.append("CROSS_MARKET_SPREAD_TOTAL_DISAGREEMENT")
+        if pace_mismatch >= 0.35:
+            tags.append("CROSS_MARKET_LIVE_PACE_MISMATCH")
+        if correlated_prop_divergence >= 0.32:
+            tags.append("CROSS_MARKET_CORRELATED_PROP_DIVERGENCE")
+        if tail_compression >= 0.35:
+            tags.append("CROSS_MARKET_TAIL_COMPRESSION")
+        if distribution_inconsistency >= 0.34:
+            tags.append("CROSS_MARKET_DISTRIBUTION_INCONSISTENCY")
+        if repricing_sequence_lag >= 0.34:
+            tags.append("CROSS_MARKET_REPRICING_SEQUENCE_LAG")
+        if liquidity_vacuum >= 0.38:
+            tags.append("CROSS_MARKET_LIQUIDITY_VACUUM")
+        boost = 0.0
+        if score >= 25.0:
+            boost = min(AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST, ((score - 20.0) / 80.0) * AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST)
+        probability_adjustment = 0.0
+        if score >= 45.0:
+            probability_adjustment = min(
+                AION_CROSS_MARKET_EDGE_MAX_PROBABILITY_ADJUSTMENT,
+                0.010 + ((score - 45.0) / 55.0) * (AION_CROSS_MARKET_EDGE_MAX_PROBABILITY_ADJUSTMENT - 0.010),
+            )
+        size_multiplier = 1.0
+        if score >= 82.0:
+            size_multiplier = min(AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER, 1.58 * self.to_float(family_profile.get("sizing_bias"), 1.0))
+        elif score >= 65.0:
+            size_multiplier = min(AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER, 1.34 * self.to_float(family_profile.get("sizing_bias"), 1.0))
+        elif score >= 42.0:
+            size_multiplier = min(AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER, 1.12 * self.to_float(family_profile.get("sizing_bias"), 1.0))
+        elif score < 20.0:
+            size_multiplier = 0.82
+        odds_bucket = self._aion_distilled_odds_bucket(selected_contract_probability)
+        cross_bucket = "cross_elite" if score >= 82.0 else "cross_strong" if score >= 65.0 else "cross_present" if score >= 35.0 else "cross_weak"
+        pattern_keys = []
+        for tag in tags[:8]:
+            pattern_keys.append(f"{family}|{tag}")
+            pattern_keys.append(f"{current_kind}|{tag}")
+        if odds_bucket:
+            pattern_keys.append(f"{family}|{current_kind}|{odds_bucket}|{cross_bucket}")
+        return {
+            "enabled": True,
+            "ticker": ticker,
+            "family": family,
+            "market_kind": current_kind,
+            "score": score,
+            "cross_market_edge_score": score,
+            "CROSS_MARKET_EDGE_SCORE": score,
+            "boost": round(max(0.0, boost), 4),
+            "probability_adjustment": round(max(0.0, probability_adjustment), 6),
+            "size_multiplier": round(max(0.65, min(AION_CROSS_MARKET_EDGE_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
+            "components": components,
+            "tags": tags,
+            "pattern_keys": list(dict.fromkeys(pattern_keys))[:16],
+            "cross_market_bucket": cross_bucket,
+            "peer_count": len(peers),
+            "peer_kinds": sorted({str(peer.get("kind") or "unknown") for peer in peers}),
+            "peer_pressure": round(peer_pressure, 4),
+            "peer_velocity": round(peer_velocity, 4),
+            "spread_avg_yes_mid": round(spread_avg, 6) if spread_avg is not None else None,
+            "total_avg_yes_mid": round(total_avg, 6) if total_avg is not None else None,
+            "prop_avg_yes_mid": round(prop_avg, 6) if prop_avg is not None else None,
+            "underreaction_gap": round(underreaction_gap, 6),
+            "reason": "+".join(tags) if tags else "cross_market_baseline",
+        }
+
     def _get_structural_edge_rank_adjustment(
         self,
         item=None,
@@ -27034,6 +27466,28 @@ class KalshiSniperBot:
             "live_state_alignment": round(live_state_score, 4),
             "stale_ladder": round(stale_ladder_component, 4),
         }
+        cross_market_context = self._build_cross_market_edge_context(
+            market=market,
+            q=q,
+            family=family,
+            ticker=ticker,
+            markets=markets,
+            selected_side=selected_side,
+            selected_price=selected_price_value,
+            current_yes_mid=current_yes_mid,
+            spread_value=spread_value,
+            selected_top_size=selected_top_size,
+            opposite_top_size=opposite_top_size,
+            repricing_component=repricing_component,
+            liquidity_component=liquidity_component,
+            family_profile=family_profile,
+        )
+        cross_market_score = self.to_float(
+            cross_market_context.get("CROSS_MARKET_EDGE_SCORE", cross_market_context.get("score")),
+            0.0,
+        ) or 0.0
+        cross_market_component = self._clamp(cross_market_score / 100.0)
+        components["cross_market"] = round(cross_market_component, 4)
         family_weight = self.to_float(family_profile.get("structural_edge_weight"), 1.0) or 1.0
         weighted_score = (
             curve_component * 24.0
@@ -27045,6 +27499,7 @@ class KalshiSniperBot:
             + live_state_score * 10.0
             + stale_ladder_component * 8.0
         ) * family_weight
+        weighted_score += cross_market_component * 30.0 * max(0.90, min(1.35, family_weight))
         structural_edge_score = round(max(0.0, min(100.0, weighted_score)), 4)
         tags = []
         if curve_component >= 0.35:
@@ -27065,12 +27520,57 @@ class KalshiSniperBot:
             tags.append("FAMILY_SPECIALIZATION_POSITIVE")
         elif self.to_float(family_profile.get("sizing_bias"), 1.0) < 0.96:
             tags.append("FAMILY_SPECIALIZATION_CAUTION")
+        for cross_tag in cross_market_context.get("tags") or []:
+            if cross_tag not in tags:
+                tags.append(cross_tag)
+        structural_pattern_keys = []
+        market_kind = cross_market_context.get("market_kind") or self._structural_market_kind(
+            family=family,
+            ticker=ticker,
+            title=self._sports_edge_read_value(sources, "title", "market_title", "event_title", "subtitle"),
+        )
+        odds_bucket = self._aion_distilled_odds_bucket(selected_price_value)
+        for tag in tags[:12]:
+            structural_pattern_keys.append(f"{family}|{tag}")
+            structural_pattern_keys.append(f"{market_kind}|{tag}")
+        for key in cross_market_context.get("pattern_keys") or []:
+            structural_pattern_keys.append(str(key))
+        if odds_bucket:
+            structural_pattern_keys.append(f"{family}|{market_kind}|{odds_bucket}")
+        structural_pattern_keys = list(dict.fromkeys(key for key in structural_pattern_keys if key))[:24]
+        memory_signal = self._get_aion_distilled_learning_signal(
+            family=family,
+            category=category,
+            structural_tags=tags,
+            structural_pattern_keys=structural_pattern_keys,
+            cross_market_bucket=cross_market_context.get("cross_market_bucket"),
+            odds_bucket=odds_bucket,
+            liquidity_bucket=self._aion_distilled_liquidity_bucket(liquidity),
+            spread_bucket=self._aion_distilled_spread_bucket(spread_value),
+            side=selected_side,
+            sport_type=self._aion_distilled_sport_type(
+                family=family,
+                title=self._sports_edge_read_value(sources, "title", "market_title", "event_title", "subtitle"),
+                ticker=ticker,
+            ),
+        )
+        memory_rank_adjustment = self.to_float(memory_signal.get("rank_adjustment"), 0.0) or 0.0
+        memory_size_multiplier = max(0.86, min(1.16, self.to_float(memory_signal.get("sizing_confidence_multiplier"), 1.0) or 1.0))
         boost = 0.0
         if structural_edge_score >= 25.0:
             boost = min(
                 AION_STRUCTURAL_EDGE_MAX_RANK_BOOST,
                 max(0.0, ((structural_edge_score - 20.0) / 80.0) * AION_STRUCTURAL_EDGE_MAX_RANK_BOOST),
             )
+        boost = max(
+            0.0,
+            min(
+                AION_STRUCTURAL_EDGE_MAX_RANK_BOOST + AION_CROSS_MARKET_EDGE_MAX_RANK_BOOST,
+                boost
+                + (self.to_float(cross_market_context.get("boost"), 0.0) or 0.0)
+                + max(-0.65, min(1.65, memory_rank_adjustment * 0.85)),
+            ),
+        )
         probability_adjustment = 0.0
         if structural_edge_score >= 50.0:
             probability_adjustment = min(
@@ -27079,15 +27579,31 @@ class KalshiSniperBot:
             )
         elif structural_edge_score < 28.0:
             probability_adjustment = max(-0.012, (structural_edge_score - 28.0) / 28.0 * 0.012)
+        probability_adjustment = max(
+            -0.018,
+            min(
+                0.095,
+                probability_adjustment
+                + (self.to_float(cross_market_context.get("probability_adjustment"), 0.0) or 0.0)
+                + max(-0.012, min(0.018, memory_rank_adjustment * 0.014)),
+            ),
+        )
         size_multiplier = 1.0
         if structural_edge_score >= 78.0:
-            size_multiplier = min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, 1.32 * self.to_float(family_profile.get("sizing_bias"), 1.0))
+            size_multiplier = min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, 1.52 * self.to_float(family_profile.get("sizing_bias"), 1.0))
         elif structural_edge_score >= 60.0:
-            size_multiplier = min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, 1.14 * self.to_float(family_profile.get("sizing_bias"), 1.0))
+            size_multiplier = min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, 1.24 * self.to_float(family_profile.get("sizing_bias"), 1.0))
         elif structural_edge_score >= 38.0:
-            size_multiplier = max(0.90, min(1.08, self.to_float(family_profile.get("sizing_bias"), 1.0)))
+            size_multiplier = max(0.90, min(1.14, self.to_float(family_profile.get("sizing_bias"), 1.0)))
         elif structural_edge_score < 24.0:
             size_multiplier = max(AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER, 0.70 * min(1.0, self.to_float(family_profile.get("sizing_bias"), 1.0)))
+        cross_size_multiplier = self.to_float(cross_market_context.get("size_multiplier"), 1.0) or 1.0
+        if cross_market_score >= 42.0:
+            size_multiplier = max(size_multiplier, cross_size_multiplier)
+        size_multiplier = max(
+            AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER,
+            min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, size_multiplier * memory_size_multiplier),
+        )
         context = {
             "enabled": True,
             "ticker": ticker,
@@ -27105,8 +27621,18 @@ class KalshiSniperBot:
             "related_count": len(related),
             "components": components,
             "tags": tags,
+            "structural_pattern_keys": structural_pattern_keys,
             "structural_edge_score": structural_edge_score,
             "STRUCTURAL_EDGE_SCORE": structural_edge_score,
+            "cross_market_edge_context": cross_market_context,
+            "cross_market_edge_score": cross_market_score,
+            "CROSS_MARKET_EDGE_SCORE": cross_market_score,
+            "cross_market_edge_rank_boost": cross_market_context.get("boost", 0.0),
+            "cross_market_probability_adjustment": cross_market_context.get("probability_adjustment", 0.0),
+            "cross_market_size_multiplier": cross_market_context.get("size_multiplier", 1.0),
+            "structural_memory_signal": memory_signal,
+            "structural_memory_rank_adjustment": round(memory_rank_adjustment, 4),
+            "structural_memory_size_multiplier": round(memory_size_multiplier, 4),
             "boost": round(boost, 4),
             "probability_adjustment": round(probability_adjustment, 6),
             "size_multiplier": round(max(AION_STRUCTURAL_EDGE_MIN_SIZE_MULTIPLIER, min(AION_STRUCTURAL_EDGE_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
@@ -27129,11 +27655,23 @@ class KalshiSniperBot:
                     "family": family,
                     "source": source,
                     "STRUCTURAL_EDGE_SCORE": structural_edge_score,
+                    "CROSS_MARKET_EDGE_SCORE": cross_market_score,
                     "boost": context["boost"],
                     "probability_adjustment": context["probability_adjustment"],
                     "size_multiplier": context["size_multiplier"],
                     "tags": tags,
                     "components": components,
+                    "cross_market": {
+                        "boost": cross_market_context.get("boost"),
+                        "peer_count": cross_market_context.get("peer_count"),
+                        "peer_kinds": cross_market_context.get("peer_kinds"),
+                        "reason": cross_market_context.get("reason"),
+                    },
+                    "structural_memory": {
+                        "rank_adjustment": context.get("structural_memory_rank_adjustment"),
+                        "size_multiplier": context.get("structural_memory_size_multiplier"),
+                        "component_count": len((memory_signal or {}).get("components") or []),
+                    },
                     "related_count": len(related),
                     "live_state": context["live_state"],
                     "family_profile": {
@@ -27902,10 +28440,16 @@ class KalshiSniperBot:
             "structural_edge_context": structural_edge_context,
             "structural_edge_score": structural_edge_context.get("structural_edge_score"),
             "STRUCTURAL_EDGE_SCORE": structural_edge_context.get("STRUCTURAL_EDGE_SCORE"),
+            "cross_market_edge_context": structural_edge_context.get("cross_market_edge_context") or {},
+            "cross_market_edge_score": structural_edge_context.get("cross_market_edge_score"),
+            "CROSS_MARKET_EDGE_SCORE": structural_edge_context.get("CROSS_MARKET_EDGE_SCORE"),
+            "cross_market_size_multiplier": structural_edge_context.get("cross_market_size_multiplier"),
             "structural_edge_probability_adjustment": structural_edge_context.get("probability_adjustment"),
             "structural_edge_size_multiplier": structural_edge_context.get("size_multiplier"),
             "structural_edge_rank_boost": structural_edge_context.get("boost"),
             "structural_edge_tags": list(structural_edge_context.get("tags") or []),
+            "structural_pattern_keys": list(structural_edge_context.get("structural_pattern_keys") or []),
+            "structural_memory_size_multiplier": structural_edge_context.get("structural_memory_size_multiplier"),
             "family_profile": structural_edge_context.get("family_profile") or {},
             "live_state_context": structural_edge_context.get("live_state") or {},
             "memory_profile": memory_profile,
@@ -27979,10 +28523,16 @@ class KalshiSniperBot:
             "structural_edge_context",
             "structural_edge_score",
             "STRUCTURAL_EDGE_SCORE",
+            "cross_market_edge_context",
+            "cross_market_edge_score",
+            "CROSS_MARKET_EDGE_SCORE",
+            "cross_market_size_multiplier",
             "structural_edge_probability_adjustment",
             "structural_edge_size_multiplier",
             "structural_edge_rank_boost",
             "structural_edge_tags",
+            "structural_pattern_keys",
+            "structural_memory_size_multiplier",
             "family_profile",
             "live_state_context",
             "conviction_size_multiplier",

@@ -71,6 +71,68 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreater(context["probability_adjustment"], 0.0)
         self.assertIn("STRUCTURAL_PROBABILITY_DISLOCATION", context["tags"])
 
+    def test_cross_market_disagreement_adds_cross_market_score(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBSTRIKEOUT-TEST-65",
+            selected_side="yes",
+            selected_price=0.22,
+            yes_bid=0.20,
+            yes_ask=0.24,
+            no_bid=0.76,
+            no_ask=0.80,
+            yes_top_size=1,
+            no_top_size=10,
+        )
+        market = {
+            "ticker": q.ticker,
+            "event_ticker": "KXMLB-GAME-TEST",
+            "title": "Pitcher strikeouts over 6.5",
+            "yes_bid": 20,
+            "yes_ask": 24,
+            "no_bid": 76,
+            "no_ask": 80,
+        }
+        markets = [
+            market,
+            {
+                "ticker": "KXMLBTOTAL-TEST-85",
+                "event_ticker": "KXMLB-GAME-TEST",
+                "title": "Game total over 8.5",
+                "yes_bid": 70,
+                "yes_ask": 74,
+            },
+            {
+                "ticker": "KXMLBSPREAD-TEST-HOME",
+                "event_ticker": "KXMLB-GAME-TEST",
+                "title": "Home team spread -1.5",
+                "yes_bid": 66,
+                "yes_ask": 70,
+            },
+            {
+                "ticker": "KXMLBPROP-TEST-HITS",
+                "event_ticker": "KXMLB-GAME-TEST",
+                "title": "Player hits over 1.5",
+                "yes_bid": 60,
+                "yes_ask": 64,
+            },
+        ]
+
+        context = bot._get_structural_edge_rank_adjustment(
+            market=market,
+            q=q,
+            spread=0.04,
+            family="KXMLBSTRIKEOUT",
+            markets=markets,
+            source="unit_test_cross",
+            log=False,
+        )
+
+        self.assertGreater(context["CROSS_MARKET_EDGE_SCORE"], 35.0)
+        self.assertGreater(context["cross_market_edge_context"]["peer_count"], 0)
+        self.assertIn("CROSS_MARKET_DISTRIBUTION_INCONSISTENCY", context["tags"])
+        self.assertGreater(context["size_multiplier"], 1.0)
+
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {
             "ticker": "KXMLBSTRIKEOUT-TEST-65",
@@ -82,6 +144,8 @@ class StructuralEdgeTests(unittest.TestCase):
             "no_bid": 0.64,
             "no_ask": 0.69,
             "STRUCTURAL_EDGE_SCORE": 84.0,
+            "CROSS_MARKET_EDGE_SCORE": 76.0,
+            "cross_market_edge_context": {"size_multiplier": 1.52, "probability_adjustment": 0.04},
             "structural_edge_probability_adjustment": 0.052,
             "structural_edge_size_multiplier": 1.34,
             "family_profile": {"sizing_bias": 1.10, "structural_edge_weight": 1.25},

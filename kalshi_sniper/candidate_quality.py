@@ -820,6 +820,20 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         ),
         0.0,
     ) or 0.0
+    cross_market_context = candidate.get("cross_market_edge_context") if isinstance(candidate.get("cross_market_edge_context"), dict) else {}
+    if not cross_market_context and isinstance(structural_context.get("cross_market_edge_context"), dict):
+        cross_market_context = structural_context.get("cross_market_edge_context") or {}
+    cross_market_score = to_float(
+        _pick(
+            candidate.get("CROSS_MARKET_EDGE_SCORE"),
+            candidate.get("cross_market_edge_score"),
+            structural_context.get("CROSS_MARKET_EDGE_SCORE"),
+            structural_context.get("cross_market_edge_score"),
+            cross_market_context.get("CROSS_MARKET_EDGE_SCORE"),
+            cross_market_context.get("score"),
+        ),
+        0.0,
+    ) or 0.0
     structural_adjustment = to_float(
         _pick(
             candidate.get("structural_edge_probability_adjustment"),
@@ -845,7 +859,19 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
     if live_state_score is not None and structural_score >= 45.0:
         structural_adjustment += max(-0.012, min(0.018, (live_state_score - 0.50) * 0.035))
     structural_adjustment += family_profile_bias
-    structural_adjustment = max(-0.035, min(0.065, structural_adjustment))
+    if cross_market_score >= 45.0:
+        cross_probability_adjustment = to_float(
+            _pick(
+                candidate.get("cross_market_probability_adjustment"),
+                structural_context.get("cross_market_probability_adjustment"),
+                cross_market_context.get("probability_adjustment"),
+            ),
+            None,
+        )
+        if cross_probability_adjustment is None:
+            cross_probability_adjustment = 0.010 + ((min(100.0, cross_market_score) - 45.0) / 55.0) * 0.045
+        structural_adjustment += max(0.0, min(0.060, cross_probability_adjustment))
+    structural_adjustment = max(-0.035, min(0.095, structural_adjustment))
 
     raw_estimated_probability = max(
         0.03,
@@ -874,12 +900,12 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
     expected_value = (estimated_win_probability * payout) - ((1.0 - estimated_win_probability) * cost)
     expected_roi = expected_value / cost if cost > 0.0 else 0.0
     ev_edge = estimated_win_probability - market_implied_probability
-    structural_elite = bool(structural_score >= 78.0 and ev_edge > 0.0)
-    structural_strong = bool(structural_score >= 60.0 and (ev_edge > 0.0 or expected_value > 0.0))
-    if ev_edge >= 0.08 or expected_roi >= 0.18 or (structural_elite and expected_roi >= 0.08):
+    structural_elite = bool((structural_score >= 82.0 or cross_market_score >= 78.0) and ev_edge > 0.0)
+    structural_strong = bool((structural_score >= 60.0 or cross_market_score >= 58.0) and (ev_edge > 0.0 or expected_value > 0.0))
+    if ev_edge >= 0.08 or expected_roi >= 0.18 or (structural_elite and expected_roi >= 0.045):
         ev_tier = "S"
-        sizing_multiplier = 1.40
-        action = "prioritize_size_up"
+        sizing_multiplier = 1.62
+        action = "prioritize_conviction_size_up"
     elif ev_edge >= 0.035 or expected_roi >= 0.08 or structural_strong:
         ev_tier = "A"
         sizing_multiplier = 1.00
@@ -901,19 +927,43 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
         _pick(candidate.get("structural_edge_size_multiplier"), structural_context.get("size_multiplier")),
         1.0,
     ) or 1.0
-    structural_size_multiplier = max(0.55, min(1.45, structural_size_multiplier))
+    cross_market_size_multiplier = to_float(
+        _pick(
+            candidate.get("cross_market_size_multiplier"),
+            structural_context.get("cross_market_size_multiplier"),
+            cross_market_context.get("size_multiplier"),
+        ),
+        1.0,
+    ) or 1.0
+    if cross_market_score >= 42.0:
+        structural_size_multiplier = max(structural_size_multiplier, cross_market_size_multiplier)
+    structural_size_multiplier = max(0.55, min(1.90, structural_size_multiplier))
     family_size_bias = max(0.85, min(1.22, to_float(family_profile.get("sizing_bias"), 1.0) or 1.0))
-    conviction_size_multiplier = max(0.20, min(1.80, structural_size_multiplier * family_size_bias))
+    memory_size_multiplier = max(
+        0.86,
+        min(
+            1.16,
+            to_float(
+                _pick(
+                    candidate.get("structural_memory_size_multiplier"),
+                    structural_context.get("structural_memory_size_multiplier"),
+                ),
+                1.0,
+            )
+            or 1.0,
+        ),
+    )
+    conviction_size_multiplier = max(0.20, min(2.35, structural_size_multiplier * family_size_bias * memory_size_multiplier))
     if ev_tier in {"S", "A"}:
-        sizing_multiplier = min(1.80, max(sizing_multiplier, sizing_multiplier * conviction_size_multiplier))
+        sizing_multiplier = min(2.35, max(sizing_multiplier, sizing_multiplier * conviction_size_multiplier))
     elif ev_tier in {"B", "C"}:
-        sizing_multiplier = max(0.10, min(0.95, sizing_multiplier * conviction_size_multiplier))
+        sizing_multiplier = max(0.10, min(1.05, sizing_multiplier * conviction_size_multiplier))
     else:
         sizing_multiplier = max(0.0, min(0.25, sizing_multiplier * min(1.0, conviction_size_multiplier)))
     if structural_score < 24.0 and ev_tier in {"B", "C"}:
         action = "probe_structural_weak"
-    elif structural_score >= 78.0 and ev_tier in {"S", "A"}:
-        action = "conviction_structural_size_up"
+    elif (structural_score >= 78.0 or cross_market_score >= 70.0) and ev_tier in {"S", "A"}:
+        action = "conviction_structural_cross_market_size_up"
 
     candidate.update(
         {
@@ -929,6 +979,7 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
                 f"base={round(base_probability if base_probability is not None else 0.5, 4)} "
                 f"family={round(family_adjustment, 4)} dynamic={round(dynamic_adjustment, 4)} "
                 f"orderbook={round(orderbook_adjustment, 4)} structural={round(structural_adjustment, 4)} "
+                f"cross_market={round(cross_market_score, 4)} "
                 f"bayes={bayes_result.get('bayesian_delta')} "
                 f"calibration={calibration_result.get('calibration_delta')}"
             ),
@@ -936,8 +987,11 @@ def compute_candidate_ev(candidate: Dict[str, Any]) -> Dict[str, Any]:
             "ev_action": action,
             "structural_edge_score": round(structural_score, 4),
             "STRUCTURAL_EDGE_SCORE": round(structural_score, 4),
+            "cross_market_edge_score": round(cross_market_score, 4),
+            "CROSS_MARKET_EDGE_SCORE": round(cross_market_score, 4),
             "structural_edge_probability_adjustment": round(structural_adjustment, 6),
             "structural_edge_size_multiplier": round(structural_size_multiplier, 4),
+            "cross_market_edge_context": cross_market_context,
             "conviction_size_multiplier": round(conviction_size_multiplier, 4),
             "family_profile": family_profile,
             "live_state_context": live_state_context,
