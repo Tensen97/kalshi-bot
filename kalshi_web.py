@@ -1629,6 +1629,12 @@ AION_BTC1H_LANE_RESERVED_BOOST = get_env_float("AION_BTC1H_LANE_RESERVED_BOOST",
 AION_WEAK_SPORTS_DEMOTE = get_env_float("AION_WEAK_SPORTS_DEMOTE", 28.0)
 AION_WEAK_SPORTS_SKIP_DEMOTE = get_env_float("AION_WEAK_SPORTS_SKIP_DEMOTE", 75.0)
 AION_STRONG_SPORTS_LANE_BOOST = get_env_float("AION_STRONG_SPORTS_LANE_BOOST", 4.0)
+AION_STRUCTURED_LADDER_QUALITY_BOOST = get_env_float("AION_STRUCTURED_LADDER_QUALITY_BOOST", 14.0)
+AION_SPORTS_TRASH_PROP_PENALTY = get_env_float("AION_SPORTS_TRASH_PROP_PENALTY", 55.0)
+AION_SPORTS_TRASH_PROP_SKIP_PENALTY = get_env_float("AION_SPORTS_TRASH_PROP_SKIP_PENALTY", 95.0)
+AION_SPORTS_TRASH_EXCEPTION_EDGE = get_env_float("AION_SPORTS_TRASH_EXCEPTION_EDGE", 0.020)
+AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE = get_env_float("AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE", 0.70)
+AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY = get_env_float("AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY", 80.0)
 AION_DUAL_LANE_SECONDARY_ENABLED = get_env_bool("AION_DUAL_LANE_SECONDARY_ENABLED", 1)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -27788,6 +27794,197 @@ class KalshiSniperBot:
             selected_price = getattr(q, "no_ask", None) if selected_side == "no" else getattr(q, "yes_ask", None)
         return selected_side, self.to_float(selected_price, None)
 
+    def _quality_market_text(self, *, family=None, ticker=None, market=None, q=None):
+        market = market if isinstance(market, dict) else {}
+        parts = [
+            family,
+            ticker,
+            market.get("ticker"),
+            market.get("series_ticker"),
+            market.get("event_ticker"),
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("event_title"),
+            market.get("rules_primary"),
+            market.get("rules_secondary"),
+            getattr(q, "ticker", None),
+            getattr(q, "title", None),
+            getattr(q, "market_title", None),
+        ]
+        return " ".join(str(value or "") for value in parts if str(value or "").strip()).upper()
+
+    def _is_structured_quality_ladder(self, *, lane=None, family=None, ticker=None, market=None, q=None, context=None):
+        context = context if isinstance(context, dict) else {}
+        lane = str(lane or context.get("lane") or "").strip().upper()
+        family = str(family or context.get("family") or "").strip().upper()
+        ticker = str(ticker or context.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        text = self._quality_market_text(family=family, ticker=ticker, market=market, q=q)
+        reasons = []
+        if lane in {"CRYPTO_LADDER", "BTC1H_LADDER"} or self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q):
+            reasons.append("crypto_ladder_structure")
+        if "NBA" in text and ("1H" in text or "FIRST HALF" in text or "1ST HALF" in text) and "TOTAL" in text:
+            reasons.append("nba_1h_total_ladder")
+        if ("TOTAL" in family or "TOTAL" in text) and any(term in text for term in ("LADDER", "RANGE", "BETWEEN", "ABOVE", "BELOW", "OVER/UNDER", "OVER UNDER")):
+            reasons.append("structured_total_ladder")
+        if market and isinstance(market, dict) and (market.get("price_ranges") or market.get("price_level_structure")) and ("TOTAL" in family or "SPREAD" in family):
+            reasons.append("sports_range_structure")
+        if any(tag in {"CRYPTO_LADDER_RELATIVE_MISPRICING", "BTC_1H_LADDER_RELATIVE_MISPRICING"} for tag in (context.get("tags") or [])):
+            reasons.append("relative_ladder_signal")
+        return bool(reasons), reasons
+
+    def _detect_trash_sports_prop_patterns(self, *, family=None, ticker=None, market=None, q=None, context=None):
+        context = context if isinstance(context, dict) else {}
+        family = str(family or context.get("family") or "").strip().upper()
+        ticker = str(ticker or context.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        text = self._quality_market_text(family=family, ticker=ticker, market=market, q=q)
+        selected_price = self.to_float(context.get("selected_price"), None)
+        spread = self.to_float(context.get("spread"), None)
+        liquidity = self.to_float(context.get("liquidity"), 0.0) or 0.0
+        confidence = self.to_float(context.get("confidence"), 0.0) or 0.0
+        edge = self.to_float(context.get("edge"), 0.0) or 0.0
+        family_adjustment = self.to_float(context.get("family_profit_memory_adjustment"), 0.0) or 0.0
+        family_pnl = self.to_float(context.get("family_pnl"), 0.0) or 0.0
+        loss_streak = int(self.to_float(context.get("loss_streak"), 0.0) or 0)
+        prop_like = bool(context.get("prop_like")) or any(term in text for term in (" PROP", "PLAYER", "HIT", "RBI", "HOME RUN", "TOTAL BASE", "STRIKEOUT", " HR", " HRR"))
+        patterns = []
+        if re.search(r"\b(?:1\+|2\+|3\+|ONE|TWO|THREE)?\s*(?:HR|HRS|HOME RUNS?)\b", text) or "KXMLBHR" in family:
+            patterns.append("home_run_prop")
+        if re.search(r"\b(?:2\+|3\+|TWO|THREE)\s*(?:HR|HRS|HOME RUNS?)\b", text):
+            patterns.append("multi_home_run_moonshot")
+        if any(term in text for term in ("HITS + RUNS + RBIS", "HITS+RUNS+RBIS", "HIT + RUN + RBI", "HRR", "TOTAL BASE", "HITS AND RBIS", "RUNS AND RBIS")) or "KXMLBHRR" in family:
+            patterns.append("stat_combo_prop")
+        if "SPREAD" in family and (
+            (selected_price is not None and selected_price <= 0.12)
+            or re.search(r"(?:WIN|WINS|BY|OVER|MORE THAN)\s+(?:4\.5|5\.5|6\.5|7\.5|8\.5|9\.5|[5-9])", text)
+            or any((self.to_float(match, 0.0) or 0.0) >= 4.5 for match in re.findall(r"[+-](\d{1,2}(?:\.5)?)", text))
+        ):
+            patterns.append("extreme_alternate_spread")
+        if any(term in text for term in ("TENNIS", " ATP", " WTA", "CHALLENGER")) and (confidence < 0.62 or liquidity < 20.0 or edge < 0.010):
+            patterns.append("weak_tennis_player_pick")
+        if selected_price is not None and selected_price <= 0.10:
+            patterns.append("ultra_low_probability_longshot")
+        elif selected_price is not None and selected_price <= 0.14 and (confidence < 0.58 or edge < 0.012):
+            patterns.append("low_probability_longshot")
+        if prop_like and liquidity < 12.0 and edge < 0.014:
+            patterns.append("thin_player_prop")
+        if liquidity <= 1.0 and edge < 0.014:
+            patterns.append("low_liquidity_market")
+        if spread is not None and spread > 0.16 and edge < 0.018:
+            patterns.append("poor_spread_market")
+        if family_adjustment < -1.0 or (family_pnl < -1.0 and loss_streak >= 2):
+            patterns.append("weak_family_performance")
+        deduped = []
+        for pattern in patterns:
+            if pattern not in deduped:
+                deduped.append(pattern)
+        return deduped
+
+    def _calibrate_final_execution_quality(self, context=None, *, item=None, market=None, q=None, source="allocation"):
+        context = dict(context or {})
+        item = item if isinstance(item, dict) else {}
+        q = q or item.get("q")
+        family = str(context.get("family") or item.get("family") or self.get_market_family(market or {"ticker": context.get("ticker")}) or "").strip().upper()
+        ticker = str(context.get("ticker") or getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip()
+        lane = str(context.get("lane") or "OTHER").strip().upper()
+        market_title = str((market or {}).get("title") or getattr(q, "title", None) or getattr(q, "market_title", None) or "").strip()
+        edge = self.to_float(context.get("edge"), 0.0) or 0.0
+        confidence = self.to_float(context.get("confidence"), 0.0) or 0.0
+        spread = self.to_float(context.get("spread"), None)
+        liquidity = self.to_float(context.get("liquidity"), 0.0) or 0.0
+        sports_boost = self.to_float(context.get("sports_boost"), 0.0) or 0.0
+        good_book = bool(context.get("good_book")) or bool(spread is not None and spread <= 0.08 and liquidity >= 10.0)
+        structured, structured_reasons = self._is_structured_quality_ladder(
+            lane=lane,
+            family=family,
+            ticker=ticker,
+            market=market,
+            q=q,
+            context=context,
+        )
+        trash_patterns = []
+        exceptional_trash_quality = False
+        if lane == "SPORTS" and not structured:
+            trash_patterns = self._detect_trash_sports_prop_patterns(
+                family=family,
+                ticker=ticker,
+                market=market,
+                q=q,
+                context=context,
+            )
+            exceptional_trash_quality = bool(
+                trash_patterns
+                and edge >= AION_SPORTS_TRASH_EXCEPTION_EDGE
+                and (
+                    confidence >= AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE
+                    or liquidity >= AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY
+                    or sports_boost >= 5.0
+                    or good_book
+                )
+                and (spread is None or spread <= 0.08)
+            )
+        structured_boost = 0.0
+        if structured:
+            structured_boost = AION_STRUCTURED_LADDER_QUALITY_BOOST
+            if lane in {"CRYPTO_LADDER", "BTC1H_LADDER"}:
+                structured_boost += max(2.0, AION_STRUCTURED_LADDER_QUALITY_BOOST * 0.35)
+            elif edge > 0.0 or good_book:
+                structured_boost += 2.0
+        trash_penalty = 0.0
+        final_action = "allow"
+        final_reason = "+".join(structured_reasons) if structured_reasons else "quality_neutral"
+        severe_trash = bool(
+            trash_patterns
+            and not exceptional_trash_quality
+            and (
+                edge <= 0.0
+                or len(trash_patterns) >= 2
+                or any(pattern in trash_patterns for pattern in ("multi_home_run_moonshot", "ultra_low_probability_longshot", "thin_player_prop", "low_liquidity_market", "poor_spread_market"))
+            )
+        )
+        if trash_patterns and not exceptional_trash_quality:
+            trash_penalty = AION_SPORTS_TRASH_PROP_SKIP_PENALTY if severe_trash else AION_SPORTS_TRASH_PROP_PENALTY
+            final_action = "skip" if severe_trash else "demote"
+            final_reason = "+".join(trash_patterns)
+            context["decision"] = "SKIP_WEAK_SPORT" if severe_trash else "DEMOTE_WEAK_SPORT"
+            context["strong"] = False
+        elif trash_patterns and exceptional_trash_quality:
+            final_action = "allow_exceptional_trash_pattern"
+            final_reason = "exceptional_quality_overrode_trash_pattern:" + "+".join(trash_patterns)
+        elif lane == "SPORTS" and structured:
+            final_action = "allow_structured_sports_ladder"
+            final_reason = "+".join(structured_reasons)
+            if context.get("decision") in {"SKIP_WEAK_SPORT", "DEMOTE_WEAK_SPORT"} and (edge > 0.0 or good_book or sports_boost > 0.0):
+                context["decision"] = "ALLOW_STRONG_SPORT"
+                context["strong"] = True
+        elif lane == "SPORTS" and str(context.get("decision") or "").startswith("ALLOW"):
+            final_action = "allow_sports_quality"
+            final_reason = context.get("reason") or "sports_quality_pass"
+        elif lane in {"CRYPTO_LADDER", "BTC1H_LADDER"}:
+            final_action = "allow_crypto_ladder"
+            final_reason = "+".join(structured_reasons) or "crypto_ladder_quality_priority"
+        allocation_adjustment = self.to_float(context.get("allocation_adjustment"), 0.0) or 0.0
+        allocation_adjustment += structured_boost
+        allocation_adjustment -= trash_penalty
+        if final_action == "demote" and context.get("decision") not in {"SKIP_WEAK_SPORT", "DEMOTE_WEAK_SPORT"}:
+            context["decision"] = "DEMOTE_WEAK_SPORT"
+        context.update(
+            {
+                "market_title": market_title,
+                "structured_ladder": bool(structured),
+                "structured_ladder_reasons": structured_reasons,
+                "structured_ladder_boost": round(structured_boost, 4),
+                "quality_boost": round(structured_boost, 4),
+                "trash_prop_patterns": trash_patterns,
+                "trash_prop_penalty": round(trash_penalty, 4),
+                "exceptional_trash_quality": bool(exceptional_trash_quality),
+                "final_quality_action": final_action,
+                "final_quality_reason": final_reason,
+                "allocation_adjustment": round(allocation_adjustment, 4),
+                "quality_calibration_source": source,
+            }
+        )
+        return context
+
     def _build_btc1h_lane_quality(self, item=None, *, market=None):
         item = item if isinstance(item, dict) else {}
         q = item.get("q")
@@ -28062,6 +28259,13 @@ class KalshiSniperBot:
                 "decision": "ALLOW_OTHER",
                 "reason": "other_lane_neutral",
             }
+        context = self._calibrate_final_execution_quality(
+            context,
+            item=item,
+            market=market,
+            q=q,
+            source="lane_allocation",
+        )
         raw_score = self.to_float(item.get("raw_score"), 0.0)
         adjusted_score = self.to_float(item.get("adjusted_score"), raw_score)
         allocation_adjustment = self.to_float(context.get("allocation_adjustment"), 0.0) or 0.0
@@ -28161,12 +28365,60 @@ class KalshiSniperBot:
                         "asset": allocation.get("asset"),
                         "timeframe": allocation.get("timeframe"),
                         "sports_quality_reason": allocation.get("reason") if allocation.get("lane") == "SPORTS" else None,
+                        "market_title": allocation.get("market_title"),
+                        "quality_boost": allocation.get("quality_boost"),
+                        "trash_prop_penalty": allocation.get("trash_prop_penalty"),
+                        "structured_ladder_boost": allocation.get("structured_ladder_boost"),
+                        "trash_patterns": allocation.get("trash_prop_patterns"),
+                        "final_quality_action": allocation.get("final_quality_action"),
+                        "final_quality_reason": allocation.get("final_quality_reason"),
                         "final_decision": allocation.get("decision"),
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
+        for allocation, _rank_index, _candidate in decorated[:8]:
+            quality_payload = {
+                "lane": allocation.get("lane"),
+                "ticker": allocation.get("ticker"),
+                "family": allocation.get("family"),
+                "market_title": allocation.get("market_title"),
+                "trash_pattern_matched": allocation.get("trash_prop_patterns"),
+                "EV": allocation.get("edge"),
+                "confidence": allocation.get("confidence"),
+                "spread": allocation.get("spread"),
+                "liquidity": allocation.get("liquidity"),
+                "quality_boost": allocation.get("quality_boost"),
+                "trash_prop_penalty": allocation.get("trash_prop_penalty"),
+                "structured_ladder_boost": allocation.get("structured_ladder_boost"),
+                "final_action": allocation.get("final_quality_action"),
+                "reason": allocation.get("final_quality_reason"),
+                "final_decision": allocation.get("decision"),
+            }
+            print("[AION-QUALITY-CALIBRATION] " + json.dumps(quality_payload, sort_keys=True, default=str))
+            if self.to_float(allocation.get("structured_ladder_boost"), 0.0) > 0.0:
+                print(
+                    "[AION-STRUCTURED-LADDER-BOOST] "
+                    + json.dumps(
+                        {
+                            "lane": allocation.get("lane"),
+                            "ticker": allocation.get("ticker"),
+                            "family": allocation.get("family"),
+                            "market_title": allocation.get("market_title"),
+                            "structured_ladder_reasons": allocation.get("structured_ladder_reasons"),
+                            "EV": allocation.get("edge"),
+                            "confidence": allocation.get("confidence"),
+                            "spread": allocation.get("spread"),
+                            "liquidity": allocation.get("liquidity"),
+                            "quality_boost": allocation.get("quality_boost"),
+                            "final_action": allocation.get("final_quality_action"),
+                            "reason": allocation.get("final_quality_reason"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
         for allocation in crypto_reserved[:3]:
             print(
                 "[AION-BTC1H-RESERVED] "
@@ -28213,7 +28465,12 @@ class KalshiSniperBot:
                 )
             )
         for allocation in (strong_sports[:3] + weak_sports[:5]):
-            tag = "[AION-WEAK-SPORT-DEMOTE]" if allocation.get("decision") in {"SKIP_WEAK_SPORT", "DEMOTE_WEAK_SPORT"} else "[AION-SPORTS-QUALITY]"
+            if allocation.get("decision") == "SKIP_WEAK_SPORT":
+                tag = "[AION-TRASH-PROP-SKIP]"
+            elif allocation.get("decision") == "DEMOTE_WEAK_SPORT":
+                tag = "[AION-TRASH-PROP-DEMOTE]"
+            else:
+                tag = "[AION-SPORTS-QUALITY-PASS]"
             print(
                 tag
                 + " "
@@ -28222,13 +28479,18 @@ class KalshiSniperBot:
                         "lane": allocation.get("lane"),
                         "ticker": allocation.get("ticker"),
                         "family": allocation.get("family"),
+                        "market_title": allocation.get("market_title"),
+                        "trash_pattern_matched": allocation.get("trash_prop_patterns"),
                         "score": allocation.get("allocation_score"),
                         "EV": allocation.get("edge"),
                         "confidence": allocation.get("confidence"),
                         "spread": allocation.get("spread"),
                         "liquidity": allocation.get("liquidity"),
                         "sports_boost": allocation.get("sports_boost"),
-                        "sports_quality_reason": allocation.get("reason"),
+                        "quality_boost": allocation.get("quality_boost"),
+                        "trash_prop_penalty": allocation.get("trash_prop_penalty"),
+                        "sports_quality_reason": allocation.get("final_quality_reason") or allocation.get("reason"),
+                        "final_action": allocation.get("final_quality_action"),
                         "final_decision": allocation.get("decision"),
                     },
                     sort_keys=True,
@@ -28249,6 +28511,8 @@ class KalshiSniperBot:
                             "timeframe": allocation.get("timeframe"),
                             "score": allocation.get("allocation_score"),
                             "decision": allocation.get("decision"),
+                            "quality_action": allocation.get("final_quality_action"),
+                            "quality_reason": allocation.get("final_quality_reason"),
                             "reason": allocation.get("reason"),
                         }
                         for allocation, _index, _candidate in decorated[:5]
@@ -28279,7 +28543,29 @@ class KalshiSniperBot:
                 continue
             if primary_lane and lane == primary_lane:
                 continue
-            if allocation.get("decision") == "SKIP_WEAK_SPORT":
+            if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
+                print(
+                    "[AION-FINAL-QUALITY-GATE] "
+                    + json.dumps(
+                        {
+                            "source": "dual_lane_secondary",
+                            "lane": lane,
+                            "ticker": ticker,
+                            "family": allocation.get("family"),
+                            "trash_pattern_matched": allocation.get("trash_prop_patterns"),
+                            "EV": allocation.get("edge"),
+                            "confidence": allocation.get("confidence"),
+                            "spread": allocation.get("spread"),
+                            "liquidity": allocation.get("liquidity"),
+                            "quality_boost": allocation.get("quality_boost"),
+                            "trash_prop_penalty": allocation.get("trash_prop_penalty"),
+                            "final_action": "skip",
+                            "reason": allocation.get("final_quality_reason") or allocation.get("reason"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
                 continue
             q = candidate.get("q")
             market = candidate.get("market") if isinstance(candidate.get("market"), dict) else {}
@@ -64125,9 +64411,34 @@ class KalshiSniperBot:
                 },
                 market=selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
             )
-            if final_lane_allocation.get("decision") == "SKIP_WEAK_SPORT":
+            print(
+                "[AION-FINAL-QUALITY-GATE] "
+                + json.dumps(
+                    {
+                        "source": "final_submit_preflight",
+                        "lane": final_lane_allocation.get("lane"),
+                        "ticker": auto_live_ticker,
+                        "family": selected_family,
+                        "market_title": final_lane_allocation.get("market_title"),
+                        "trash_pattern_matched": final_lane_allocation.get("trash_prop_patterns"),
+                        "EV": final_lane_allocation.get("edge"),
+                        "confidence": final_lane_allocation.get("confidence"),
+                        "spread": final_lane_allocation.get("spread"),
+                        "liquidity": final_lane_allocation.get("liquidity"),
+                        "quality_boost": final_lane_allocation.get("quality_boost"),
+                        "trash_prop_penalty": final_lane_allocation.get("trash_prop_penalty"),
+                        "structured_ladder_boost": final_lane_allocation.get("structured_ladder_boost"),
+                        "final_action": final_lane_allocation.get("final_quality_action"),
+                        "reason": final_lane_allocation.get("final_quality_reason"),
+                        "final_decision": final_lane_allocation.get("decision"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            if final_lane_allocation.get("decision") == "SKIP_WEAK_SPORT" or final_lane_allocation.get("final_quality_action") == "skip":
                 print(
-                    "[AION-WEAK-SPORT-DEMOTE] "
+                    "[AION-TRASH-PROP-SKIP] "
                     + json.dumps(
                         {
                             "source": "final_submit_preflight",
@@ -64139,7 +64450,12 @@ class KalshiSniperBot:
                             "confidence": final_lane_allocation.get("confidence"),
                             "spread": final_lane_allocation.get("spread"),
                             "liquidity": final_lane_allocation.get("liquidity"),
-                            "sports_quality_reason": final_lane_allocation.get("reason"),
+                            "market_title": final_lane_allocation.get("market_title"),
+                            "trash_pattern_matched": final_lane_allocation.get("trash_prop_patterns"),
+                            "quality_boost": final_lane_allocation.get("quality_boost"),
+                            "trash_prop_penalty": final_lane_allocation.get("trash_prop_penalty"),
+                            "sports_quality_reason": final_lane_allocation.get("final_quality_reason") or final_lane_allocation.get("reason"),
+                            "final_action": final_lane_allocation.get("final_quality_action"),
                             "final_decision": "SKIP",
                             "why_candidate_lost": "weak_sports_quality_demoted_before_submit",
                         },

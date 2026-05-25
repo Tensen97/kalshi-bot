@@ -634,6 +634,135 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(context["decision"], "ALLOW_STRONG_SPORT")
         self.assertGreater(context["allocation_adjustment"], 0.0)
 
+    def test_quality_calibration_skips_trash_hr_moonshot(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBHR-PLAYER-2HR-MOONSHOT",
+            selected_side="yes",
+            selected_price=0.05,
+            yes_bid=0.02,
+            yes_ask=0.05,
+            no_bid=0.95,
+            no_ask=0.98,
+            liquidity=1,
+        )
+        context = bot._build_lane_allocation_context(
+            {
+                "raw_score": 86.0,
+                "adjusted_score": 86.0,
+                "q": q,
+                "spread": 0.03,
+                "family": "KXMLBHR",
+                "expectancy_summary": {
+                    "final_edge": 0.0,
+                    "sports_edge_after_cost": 0.0,
+                    "selected_side": "yes",
+                    "selected_price": 0.05,
+                    "expectancy_score": 0.28,
+                },
+                "quality_snapshot": {"selected_price": 0.05, "liquidity_depth": 1, "spread": 0.03},
+                "sports_edge_context": {"boost": 0.0, "tags": []},
+                "ev_context": {"ev_edge": 0.0},
+            },
+            market={
+                "ticker": q.ticker,
+                "series_ticker": "KXMLBHR",
+                "title": "Player 2+ home runs",
+            },
+        )
+
+        self.assertEqual(context["decision"], "SKIP_WEAK_SPORT")
+        self.assertEqual(context["final_quality_action"], "skip")
+        self.assertIn("home_run_prop", context["trash_prop_patterns"])
+        self.assertIn("multi_home_run_moonshot", context["trash_prop_patterns"])
+        self.assertGreater(context["trash_prop_penalty"], 0.0)
+
+    def test_quality_calibration_boosts_nba_1h_total_ladder(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-OKCSAS-1125",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.44,
+            yes_ask=0.46,
+            no_bid=0.54,
+            no_ask=0.56,
+            liquidity=65,
+        )
+        context = bot._build_lane_allocation_context(
+            {
+                "raw_score": 70.0,
+                "adjusted_score": 70.0,
+                "q": q,
+                "spread": 0.02,
+                "family": "KXNBA1HTOTAL",
+                "expectancy_summary": {
+                    "final_edge": 0.009,
+                    "sports_edge_after_cost": 0.009,
+                    "selected_side": "yes",
+                    "selected_price": 0.46,
+                    "expectancy_score": 0.58,
+                },
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 65, "spread": 0.02},
+                "sports_edge_context": {"boost": 3.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.009},
+            },
+            market={
+                "ticker": q.ticker,
+                "series_ticker": "KXNBA1HTOTAL",
+                "title": "NBA 1H total ladder over 112.5",
+                "price_ranges": [{"floor": 110, "cap": 115}],
+            },
+        )
+
+        self.assertNotEqual(context["decision"], "SKIP_WEAK_SPORT")
+        self.assertEqual(context["final_quality_action"], "allow_structured_sports_ladder")
+        self.assertIn("nba_1h_total_ladder", context["structured_ladder_reasons"])
+        self.assertGreater(context["structured_ladder_boost"], 0.0)
+        self.assertGreater(context["allocation_score"], context["pre_lane_score"])
+
+    def test_quality_calibration_allows_exceptional_hr_quality(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBHR-PLAYER-STRONG",
+            selected_side="yes",
+            selected_price=0.22,
+            yes_bid=0.20,
+            yes_ask=0.22,
+            no_bid=0.78,
+            no_ask=0.80,
+            liquidity=140,
+        )
+        context = bot._build_lane_allocation_context(
+            {
+                "raw_score": 76.0,
+                "adjusted_score": 76.0,
+                "q": q,
+                "spread": 0.02,
+                "family": "KXMLBHR",
+                "expectancy_summary": {
+                    "final_edge": 0.026,
+                    "sports_edge_after_cost": 0.026,
+                    "selected_side": "yes",
+                    "selected_price": 0.22,
+                    "expectancy_score": 0.76,
+                },
+                "quality_snapshot": {"selected_price": 0.22, "liquidity_depth": 140, "spread": 0.02},
+                "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.026},
+            },
+            market={
+                "ticker": q.ticker,
+                "series_ticker": "KXMLBHR",
+                "title": "Player to hit a home run",
+            },
+        )
+
+        self.assertNotEqual(context["decision"], "SKIP_WEAK_SPORT")
+        self.assertTrue(context["exceptional_trash_quality"])
+        self.assertEqual(context["final_quality_action"], "allow_exceptional_trash_pattern")
+        self.assertIn("home_run_prop", context["trash_prop_patterns"])
+
     def test_dual_lane_secondary_executes_different_strong_lane_through_submit_guard(self):
         bot = self._make_bot()
         submitted = []
