@@ -1,4 +1,9 @@
-"""SQLite storage and lightweight learning for BTC 1H ladder history."""
+"""SQLite storage and lightweight learning for crypto ladder history.
+
+The original BTC table names stay in place for compatibility with existing
+live code and backfill scripts. Asset/timeframe columns let the same store
+cover BTC, ETH, SOL, XRP, DOGE, HYPE, BNB, and future liquid crypto ladders.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB_PATH = REPO_ROOT / "data" / "btc_ladder_history.sqlite"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_CRYPTO_ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB")
 
 
 def utc_now_iso() -> str:
@@ -106,6 +112,79 @@ def parse_btc_strike(*values: Any) -> float | None:
     return fallback
 
 
+def parse_crypto_asset(*values: Any) -> str | None:
+    text = " ".join(str(value or "") for value in values if str(value or "").strip()).upper()
+    if not text:
+        return None
+    aliases = {
+        "BTC": ("BTC", "BITCOIN", "KXBTC"),
+        "ETH": ("ETH", "ETHEREUM", "KXETH"),
+        "SOL": ("SOL", "SOLANA", "KXSOL"),
+        "XRP": ("XRP", "RIPPLE", "KXXRP"),
+        "DOGE": ("DOGE", "DOGECOIN", "KXDOGE"),
+        "HYPE": ("HYPE", "HYPERLIQUID", "KXHYPE"),
+        "BNB": ("BNB", "BINANCE", "KXBNB"),
+    }
+    for asset, tokens in aliases.items():
+        if any(re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", text) for token in tokens):
+            return asset
+    match = re.search(r"\bKX([A-Z]{2,8})(?:15M|1H|PRICE|USD)?\b", text)
+    if match and match.group(1) in SUPPORTED_CRYPTO_ASSETS:
+        return match.group(1)
+    return None
+
+
+def parse_crypto_timeframe(*values: Any) -> str:
+    text = " ".join(str(value or "") for value in values if str(value or "").strip()).upper()
+    if "15M" in text or "15 MIN" in text or "15-MIN" in text or "15 MINUTE" in text:
+        return "15m"
+    if "1H" in text or "1 HOUR" in text or "HOURLY" in text or "HOUR" in text:
+        return "1h"
+    if "DAILY" in text or "TODAY" in text or "24H" in text:
+        return "daily"
+    if "MONTH" in text or "HIGH" in text or "LOW" in text:
+        return "monthly_high_low"
+    if re.search(r"\b(?:[0-2]?\d)(?::[0-5]\d)?\s*(?:AM|PM|ET|EDT|EST|UTC)\b", text):
+        return "time_settlement"
+    return "unknown"
+
+
+def parse_crypto_strike(*values: Any, asset_symbol: str | None = None) -> float | None:
+    asset = str(asset_symbol or parse_crypto_asset(*values) or "").upper()
+    if asset == "BTC":
+        return parse_btc_strike(*values)
+    for value in values:
+        match = re.search(r"-(?:B|T)(\d+(?:\.\d+)?)", str(value or "").upper())
+        if match:
+            return safe_float(match.group(1), None)
+    fallback = None
+    for value in values:
+        text = str(value or "")
+        if not text.strip():
+            continue
+        lowered = text.lower()
+        preferred = []
+        candidates = []
+        for raw in re.findall(r"\$?\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\$?\b\d+(?:\.\d+)?\b", text):
+            number = safe_float(str(raw).replace("$", "").replace(",", ""), None)
+            if number is None or number <= 0:
+                continue
+            if asset == "ETH" and not (100.0 <= number <= 100_000.0):
+                continue
+            if asset in {"SOL", "BNB", "HYPE"} and not (1.0 <= number <= 10_000.0):
+                continue
+            if asset in {"XRP", "DOGE"} and not (0.001 <= number <= 100.0):
+                continue
+            candidates.append(number)
+            if "$" in raw or any(term in lowered for term in ("price", "above", "below", "range", "between", "target")):
+                preferred.append(number)
+        if preferred:
+            return float(preferred[-1])
+        if candidates and fallback is None:
+            fallback = float(candidates[-1])
+    return fallback
+
+
 def market_family(market: dict[str, Any]) -> str:
     for key in ("series_ticker", "series", "family"):
         value = str(market.get(key) or "").strip().upper()
@@ -138,6 +217,29 @@ def is_btc_ladder_market(market: dict[str, Any]) -> bool:
     return any(term in text for term in ("BTC PRICE", "BTC ABOVE", "BTC BELOW", "BTC AT"))
 
 
+def is_crypto_ladder_market(market: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            market_family(market),
+            market.get("ticker"),
+            market.get("event_ticker"),
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("rules_primary"),
+            market.get("rules_secondary"),
+        )
+    ).upper()
+    asset = parse_crypto_asset(text)
+    if not asset:
+        return False
+    if asset == "BTC" and is_btc_ladder_market(market):
+        return True
+    if f"KX{asset}" in text or (asset == "XRP" and "KXXRP" in text):
+        return True
+    return any(term in text for term in ("PRICE", "ABOVE", "BELOW", "BETWEEN", "RANGE", "TARGET", "HIGH", "LOW"))
+
+
 def ladder_group_key(market: dict[str, Any], family: str | None = None) -> str:
     event = str(market.get("event_ticker") or "").strip().upper()
     if event:
@@ -147,7 +249,9 @@ def ladder_group_key(market: dict[str, Any], family: str | None = None) -> str:
         or ""
     )
     if close_time:
-        return f"{str(family or market_family(market) or 'KXBTC').upper()}|{close_time[:13]}"
+        asset = parse_crypto_asset(family, market.get("ticker"), market.get("title"), market.get("subtitle")) or "BTC"
+        timeframe = parse_crypto_timeframe(family, market.get("ticker"), market.get("title"), market.get("subtitle"))
+        return f"{asset}|{timeframe}|{str(family or market_family(market) or 'KXBTC').upper()}|{close_time[:13]}"
     ticker = str(market.get("ticker") or "").strip().upper()
     parts = ticker.split("-")
     return "-".join(parts[:2]) if len(parts) >= 2 else ticker
@@ -342,6 +446,8 @@ class BTCLadderHistoryStore:
                     ticker TEXT NOT NULL UNIQUE,
                     event_ticker TEXT,
                     family TEXT,
+                    asset_symbol TEXT,
+                    timeframe TEXT,
                     ladder_group TEXT,
                     title TEXT,
                     subtitle TEXT,
@@ -404,6 +510,16 @@ class BTCLadderHistoryStore:
                 CREATE INDEX IF NOT EXISTS idx_btc_ladder_summary_type ON btc_ladder_summaries(summary_type);
                 """
             )
+            existing_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(btc_ladder_markets)").fetchall()
+            }
+            if "asset_symbol" not in existing_columns:
+                conn.execute("ALTER TABLE btc_ladder_markets ADD COLUMN asset_symbol TEXT")
+            if "timeframe" not in existing_columns:
+                conn.execute("ALTER TABLE btc_ladder_markets ADD COLUMN timeframe TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_btc_ladder_asset ON btc_ladder_markets(asset_symbol)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_btc_ladder_timeframe ON btc_ladder_markets(timeframe)")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
         self._log("[BTC-1H-HISTORY-LEARNED]", db_path=self.db_path, journal_mode=journal_mode, reason="sqlite_init")
@@ -422,14 +538,40 @@ class BTCLadderHistoryStore:
         if not ticker:
             return None
         family = str(record.get("family") or market_family(record)).strip().upper()
+        asset_symbol = str(
+            record.get("asset_symbol")
+            or parse_crypto_asset(
+                family,
+                ticker,
+                record.get("event_ticker"),
+                record.get("title"),
+                record.get("subtitle"),
+                record.get("rules_primary"),
+                record.get("rules_secondary"),
+            )
+            or "BTC"
+        ).strip().upper()
+        timeframe = str(
+            record.get("timeframe")
+            or parse_crypto_timeframe(
+                family,
+                ticker,
+                record.get("event_ticker"),
+                record.get("title"),
+                record.get("subtitle"),
+                record.get("rules_primary"),
+                record.get("rules_secondary"),
+            )
+        ).strip().lower()
         strike = safe_float(record.get("strike"), None)
         if strike is None:
-            strike = parse_btc_strike(
+            strike = parse_crypto_strike(
                 record.get("title"),
                 record.get("subtitle"),
                 record.get("rules_primary"),
                 record.get("rules_secondary"),
                 ticker,
+                asset_symbol=asset_symbol,
             )
         yes_bid = normalize_price(first_value(record, "yes_bid", "yes_bid_dollars"))
         yes_ask = normalize_price(first_value(record, "yes_ask", "yes_ask_dollars"))
@@ -469,6 +611,8 @@ class BTCLadderHistoryStore:
             "ticker": ticker,
             "event_ticker": str(record.get("event_ticker") or "").strip(),
             "family": family,
+            "asset_symbol": asset_symbol,
+            "timeframe": timeframe,
             "ladder_group": str(record.get("ladder_group") or ladder_group_key(record, family)).strip(),
             "title": str(record.get("title") or record.get("market_title") or "").strip(),
             "subtitle": str(record.get("subtitle") or "").strip(),
@@ -523,7 +667,7 @@ class BTCLadderHistoryStore:
         if not normalized:
             return {"stored": 0, "duplicates": 0, "malformed": malformed, "errors": 0}
         columns = (
-            "ticker", "event_ticker", "family", "ladder_group", "title", "subtitle", "rules_primary", "rules_secondary",
+            "ticker", "event_ticker", "family", "asset_symbol", "timeframe", "ladder_group", "title", "subtitle", "rules_primary", "rules_secondary",
             "status", "open_time", "close_time", "expiration_time", "settlement_time", "source_time", "strike",
             "settlement_value", "outcome", "yes_bid", "yes_ask", "no_bid", "no_ask", "last_price", "previous_price",
             "implied_probability", "spread", "liquidity", "volume", "open_interest", "implied_probability_bucket",
@@ -559,7 +703,7 @@ class BTCLadderHistoryStore:
         if not normalized:
             return {"stored": 0, "updated": 0, "duplicates": 0, "malformed": malformed, "errors": 0}
         columns = (
-            "ticker", "event_ticker", "family", "ladder_group", "title", "subtitle", "rules_primary", "rules_secondary",
+            "ticker", "event_ticker", "family", "asset_symbol", "timeframe", "ladder_group", "title", "subtitle", "rules_primary", "rules_secondary",
             "status", "open_time", "close_time", "expiration_time", "settlement_time", "source_time", "strike",
             "settlement_value", "outcome", "yes_bid", "yes_ask", "no_bid", "no_ask", "last_price", "previous_price",
             "implied_probability", "spread", "liquidity", "volume", "open_interest", "implied_probability_bucket",
@@ -675,7 +819,9 @@ class BTCLadderHistoryStore:
             side_prices = {"yes": implied, "no": round(1.0 - implied, 6)}
             for side, price in side_prices.items():
                 side_prefix = f"{side}|"
+                update("side_asset", side_prefix + str(row.get("asset_symbol") or "unknown"), side=side, price=price, outcome=outcome, row=row)
                 update("side_family", side_prefix + str(row.get("family") or "unknown"), side=side, price=price, outcome=outcome, row=row)
+                update("side_timeframe", side_prefix + str(row.get("timeframe") or "unknown"), side=side, price=price, outcome=outcome, row=row)
                 update("side_odds_bucket", side_prefix + odds_bucket(price), side=side, price=price, outcome=outcome, row=row)
                 update("side_spread_bucket", side_prefix + str(row.get("spread_bucket") or "unknown"), side=side, price=price, outcome=outcome, row=row)
                 update("side_liquidity_bucket", side_prefix + str(row.get("liquidity_bucket") or "unknown"), side=side, price=price, outcome=outcome, row=row)
@@ -761,6 +907,8 @@ class BTCLadderHistoryStore:
                 ).fetchall()
             ]
             records_by_family = grouped("family")
+            records_by_asset = grouped("asset_symbol")
+            records_by_timeframe = grouped("timeframe")
             records_by_odds_bucket = grouped("implied_probability_bucket")
             records_by_spread_bucket = grouped("spread_bucket")
             records_by_liquidity_bucket = grouped("liquidity_bucket")
@@ -775,6 +923,8 @@ class BTCLadderHistoryStore:
             "newest_source_time": newest,
             "latest_backfill_run_id": latest_run["backfill_run_id"] if latest_run else None,
             "records_by_family": records_by_family,
+            "records_by_asset": records_by_asset,
+            "records_by_timeframe": records_by_timeframe,
             "records_by_odds_bucket": records_by_odds_bucket,
             "records_by_spread_bucket": records_by_spread_bucket,
             "records_by_liquidity_bucket": records_by_liquidity_bucket,
@@ -788,6 +938,8 @@ class BTCLadderHistoryStore:
         self,
         *,
         family: str | None = None,
+        asset_symbol: str | None = None,
+        timeframe: str | None = None,
         selected_side: str | None = None,
         selected_price: Any = None,
         spread: Any = None,
@@ -802,7 +954,9 @@ class BTCLadderHistoryStore:
             side = "yes"
         price_bucket = odds_bucket(selected_price)
         requested = [
+            ("side_asset", f"{side}|{str(asset_symbol or '').strip().upper()}", 0.16, 20),
             ("side_family", f"{side}|{str(family or '').strip().upper()}", 0.24, 20),
+            ("side_timeframe", f"{side}|{str(timeframe or '').strip().lower()}", 0.10, 20),
             ("side_odds_bucket", f"{side}|{price_bucket}", 0.20, 25),
             ("side_spread_bucket", f"{side}|{spread_bucket(spread)}", 0.12, 25),
             ("side_liquidity_bucket", f"{side}|{liquidity_bucket(liquidity)}", 0.10, 25),

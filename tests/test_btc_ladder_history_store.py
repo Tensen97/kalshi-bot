@@ -112,6 +112,39 @@ class BTCLadderHistoryStoreTests(unittest.TestCase):
             self.assertEqual(row["outcome"], "yes")
             self.assertEqual(row["settlement_value"], 71000)
 
+    def test_store_accepts_non_btc_crypto_ladder_asset_and_timeframe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = BTCLadderHistoryStore(db_path=Path(tmpdir) / "crypto_ladder.sqlite")
+            opened = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
+            closed = opened + timedelta(minutes=15)
+            record = {
+                "ticker": "KXETH15M-UNIT-3600",
+                "event_ticker": "KXETH15M-UNIT",
+                "family": "KXETH15M",
+                "title": "Ethereum above $3,600 in 15 minutes",
+                "open_time": opened.isoformat().replace("+00:00", "Z"),
+                "close_time": closed.isoformat().replace("+00:00", "Z"),
+                "source_time": closed.isoformat().replace("+00:00", "Z"),
+                "yes_bid": 0.43,
+                "yes_ask": 0.45,
+                "liquidity": 180,
+                "outcome": "yes",
+            }
+
+            result = store.insert_records([record])
+            audit = store.audit(recompute=True)
+            with store.connect() as conn:
+                row = conn.execute(
+                    "SELECT asset_symbol, timeframe, strike FROM btc_ladder_markets WHERE ticker = ?",
+                    ("KXETH15M-UNIT-3600",),
+                ).fetchone()
+
+            self.assertEqual(result["stored"], 1)
+            self.assertEqual(row["asset_symbol"], "ETH")
+            self.assertEqual(row["timeframe"], "15m")
+            self.assertEqual(row["strike"], 3600)
+            self.assertIn({"key": "ETH", "records": 1}, audit["records_by_asset"])
+
 
 if __name__ == "__main__":
     unittest.main()

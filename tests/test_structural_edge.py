@@ -436,6 +436,85 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(bot.btc1h_cycle_priority_by_ticker)
         self.assertIn("markets_to_merge", summary)
 
+    def test_crypto_ladder_cycle_promotes_eth_ladder_and_uses_crypto_lane(self):
+        bot = self._make_bot()
+        bot._fetch_btc1h_cycle_markets = lambda status="open", limit=None: ([], [])
+        bot._refresh_btc1h_settlement_learning = lambda source="unit": {
+            "stored": 0,
+            "updated": 0,
+            "duplicates": 0,
+            "malformed": 0,
+            "errors": 0,
+            "records_seen": 0,
+        }
+        markets = [
+            {
+                "ticker": "KXETH1H-CYCLE-3600",
+                "series_ticker": "KXETH1H",
+                "event_ticker": "KXETH1H-CYCLE-HOUR",
+                "title": "Ethereum above $3,600 at 4pm",
+                "yes_bid": 67,
+                "yes_ask": 69,
+                "no_bid": 31,
+                "no_ask": 33,
+                "yes_top_size": 35,
+                "no_top_size": 30,
+                "price_delta": 0.04,
+            },
+            {
+                "ticker": "KXETH1H-CYCLE-3650",
+                "series_ticker": "KXETH1H",
+                "event_ticker": "KXETH1H-CYCLE-HOUR",
+                "title": "Ethereum above $3,650 at 4pm",
+                "yes_bid": 60,
+                "yes_ask": 62,
+                "no_bid": 38,
+                "no_ask": 40,
+                "yes_top_size": 35,
+                "no_top_size": 30,
+                "price_delta": 0.035,
+            },
+            {
+                "ticker": "KXETH1H-CYCLE-3700",
+                "series_ticker": "KXETH1H",
+                "event_ticker": "KXETH1H-CYCLE-HOUR",
+                "title": "Ethereum above $3,700 at 4pm",
+                "yes_bid": 35,
+                "yes_ask": 37,
+                "no_bid": 63,
+                "no_ask": 65,
+                "yes_top_size": 35,
+                "no_top_size": 30,
+                "price_delta": 0.00,
+            },
+        ]
+
+        summary = bot._run_btc1h_adaptive_cycle(markets=markets, source="unit_eth_cycle", force=True)
+        promoted = next(iter(bot.btc1h_cycle_priority_by_ticker.values()))
+        q = SimpleNamespace(
+            ticker=promoted["ticker"],
+            selected_side=promoted["selected_side"],
+            selected_price=promoted["selected_price"],
+            yes_bid=0.35,
+            yes_ask=0.37,
+            no_bid=0.63,
+            no_ask=0.65,
+            liquidity=35,
+        )
+        lane = bot._candidate_execution_lane(
+            family="KXETH1H",
+            ticker=q.ticker,
+            market=next(item for item in markets if item["ticker"] == q.ticker),
+            q=q,
+            expectancy_item={"btc1h_cycle_context": promoted},
+        )
+
+        self.assertTrue(summary["enabled"])
+        self.assertIn("ETH", summary["crypto_assets_detected"])
+        self.assertEqual(promoted["asset_symbol"], "ETH")
+        self.assertEqual(promoted["timeframe"], "1h")
+        self.assertEqual(lane, "CRYPTO_LADDER")
+
     def test_dual_lane_allocation_reserves_btc1h_over_weak_sports_prop(self):
         bot = self._make_bot()
         btc_q = SimpleNamespace(

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Backfill compact BTC 1H ladder history into local SQLite.
+"""Backfill compact crypto ladder history into local SQLite.
 
 This is intentionally standalone from live execution. It fetches available
-Kalshi market metadata, stores compact BTC ladder records, and recomputes
-advisory summaries consumed by the live BTC ladder scorer.
+Kalshi market metadata, stores compact crypto ladder records, and recomputes
+advisory summaries consumed by the live crypto ladder scorer.
 """
 
 from __future__ import annotations
@@ -27,10 +27,14 @@ from memory.btc_ladder_history_store import (  # noqa: E402
     DEFAULT_DB_PATH,
     first_value,
     is_btc_ladder_market,
+    is_crypto_ladder_market,
     ladder_group_key,
     market_family,
     normalize_outcome,
     normalize_price,
+    parse_crypto_asset,
+    parse_crypto_strike,
+    parse_crypto_timeframe,
     parse_btc_strike,
     parse_datetime,
     safe_float,
@@ -48,7 +52,15 @@ from scripts.backfill_kalshi_market_history import (  # noqa: E402
 
 
 MAX_DAYS_BACK = 365
-DEFAULT_SERIES_TICKERS = ("KXBTC1H", "KXBTC", "KXBTCPRICE", "KXBTCUSD")
+DEFAULT_SERIES_TICKERS = (
+    "KXBTC1H", "KXBTC", "KXBTCPRICE", "KXBTC15M",
+    "KXETH", "KXETH1H", "KXETHPRICE", "KXETH15M",
+    "KXSOL", "KXSOL1H", "KXSOLPRICE",
+    "KXXRP", "KXXRP1H", "KXXRPPRICE",
+    "KXDOGE", "KXDOGE1H", "KXDOGEPRICE",
+    "KXHYPE", "KXHYPE1H", "KXHYPEPRICE",
+    "KXBNB", "KXBNB1H", "KXBNBPRICE", "KXCRYPTO",
+)
 
 
 def utc_now_iso() -> str:
@@ -92,19 +104,37 @@ def btc_ladder_record_from_market(
     backfill_run_id: str,
     orderbook_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if not isinstance(market, dict) or not is_btc_ladder_market(market):
+    if not isinstance(market, dict) or not is_crypto_ladder_market(market):
         return None
     ticker = clean_text(market.get("ticker"))
     if not ticker:
         return None
     family = market_family(market)
-    strike = parse_btc_strike(
+    asset_symbol = parse_crypto_asset(
+        family,
+        ticker,
+        market.get("title"),
+        market.get("subtitle"),
+        market.get("rules_primary"),
+        market.get("rules_secondary"),
+    ) or "BTC"
+    timeframe = parse_crypto_timeframe(
+        family,
+        ticker,
+        market.get("event_ticker"),
+        market.get("title"),
+        market.get("subtitle"),
+        market.get("rules_primary"),
+        market.get("rules_secondary"),
+    )
+    strike = parse_crypto_strike(
         market.get("title"),
         market.get("subtitle"),
         market.get("rules_primary"),
         market.get("rules_secondary"),
         market.get("event_title"),
         ticker,
+        asset_symbol=asset_symbol,
     )
     if strike is None:
         return None
@@ -124,6 +154,8 @@ def btc_ladder_record_from_market(
         "ticker": ticker,
         "event_ticker": clean_text(market.get("event_ticker")),
         "family": family,
+        "asset_symbol": asset_symbol,
+        "timeframe": timeframe,
         "ladder_group": ladder_group_key(market, family),
         "title": clean_text(market.get("title")),
         "subtitle": clean_text(market.get("subtitle")),
@@ -192,6 +224,7 @@ def run_backfill(args: argparse.Namespace) -> dict[str, Any]:
         "db_path": str(db_path),
         "markets_seen": 0,
         "btc_candidates_seen": 0,
+        "crypto_candidates_seen": 0,
         "ladder_groups_found": 0,
         "records_stored": 0,
         "duplicates_skipped": 0,
@@ -215,6 +248,7 @@ def run_backfill(args: argparse.Namespace) -> dict[str, Any]:
         page_limit=page_limit,
         batch_size=batch_size,
     )
+    log("[CRYPTO-LADDER-HISTORY-BOOST]", reason="backfill_started", series_tickers=summary["series_tickers"], dry_run=bool(args.dry_run))
 
     pending: list[dict[str, Any]] = []
     groups_found: set[str] = set()
@@ -280,9 +314,10 @@ def run_backfill(args: argparse.Namespace) -> dict[str, Any]:
                     if limit_reached():
                         break
                     summary["markets_seen"] += 1
-                    if not is_btc_ladder_market(market):
+                    if not is_crypto_ladder_market(market):
                         continue
                     summary["btc_candidates_seen"] += 1
+                    summary["crypto_candidates_seen"] += 1
                     ref_dt = market_reference_datetime(market)
                     if ref_dt is not None:
                         if ref_dt < start_dt:
@@ -312,7 +347,7 @@ def run_backfill(args: argparse.Namespace) -> dict[str, Any]:
                     record = btc_ladder_record_from_market(market, backfill_run_id=run_id, orderbook_payload=orderbook_payload)
                     if not record:
                         summary["malformed_skipped"] += 1
-                        log("[BTC-1H-HISTORY-BACKFILL-SKIP]", reason="not_parseable_btc_ladder", ticker=ticker)
+                        log("[BTC-1H-HISTORY-BACKFILL-SKIP]", reason="not_parseable_crypto_ladder", ticker=ticker)
                         continue
                     groups_found.add(str(record.get("ladder_group") or ""))
                     if args.dry_run:
@@ -323,6 +358,8 @@ def run_backfill(args: argparse.Namespace) -> dict[str, Any]:
                                 dry_run=True,
                                 ticker=record.get("ticker"),
                                 ladder_group=record.get("ladder_group"),
+                                asset=record.get("asset_symbol"),
+                                timeframe=record.get("timeframe"),
                                 strike=record.get("strike"),
                                 outcome=record.get("outcome"),
                                 stored_preview=summary["records_stored"],
@@ -352,20 +389,28 @@ def run_backfill(args: argparse.Namespace) -> dict[str, Any]:
             oldest_source_time=audit.get("oldest_source_time"),
             newest_source_time=audit.get("newest_source_time"),
         )
+        log(
+            "[CRYPTO-LADDER-HISTORY-BOOST]",
+            reason="backfill_done",
+            total_records=audit.get("total_records"),
+            records_by_asset=audit.get("records_by_asset"),
+            records_by_timeframe=audit.get("records_by_timeframe"),
+            learned_buckets=len(audit.get("learned_buckets") or []),
+        )
     return {"summary": summary, "audit": audit}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Backfill BTC 1H ladder history into local SQLite.")
+    parser = argparse.ArgumentParser(description="Backfill crypto ladder history into local SQLite.")
     parser.add_argument("--days-back", type=int, default=MAX_DAYS_BACK, help="Lookback days, capped at 365.")
     parser.add_argument("--start-date", default=None, help="Explicit UTC start date, YYYY-MM-DD.")
     parser.add_argument("--end-date", default=None, help="Explicit UTC end date, YYYY-MM-DD.")
-    parser.add_argument("--limit", type=int, default=5000, help="Maximum new BTC ladder records to collect. Use 0 for no explicit limit.")
+    parser.add_argument("--limit", type=int, default=5000, help="Maximum new crypto ladder records to collect. Use 0 for no explicit limit.")
     parser.add_argument("--page-limit", type=int, default=100, help="Kalshi markets page size, max 250.")
     parser.add_argument("--batch-size", type=int, default=100, help="Persist every N records.")
     parser.add_argument("--sleep-seconds", type=float, default=0.2, help="Small delay between API pages.")
     parser.add_argument("--series-ticker", default=None, help="Optional single Kalshi series ticker to query.")
-    parser.add_argument("--broad-scan", action="store_true", help="Also scan generic markets pages and filter for BTC ladder names.")
+    parser.add_argument("--broad-scan", action="store_true", help="Also scan generic markets pages and filter for crypto ladder names.")
     parser.add_argument("--include-orderbook", action="store_true", help="Attempt current orderbook snapshot fetches where available.")
     parser.add_argument("--run-id", default=None, help="Optional stable backfill run id.")
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="SQLite output path.")

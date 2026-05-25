@@ -1595,15 +1595,34 @@ AION_BTC_1H_HISTORY_DB_PATH = (
 )
 AION_BTC1H_CYCLE_ENABLED = get_env_bool("AION_BTC1H_CYCLE_ENABLED", 1)
 AION_BTC1H_CYCLE_INTERVAL_SECONDS = get_env_float("AION_BTC1H_CYCLE_INTERVAL_SECONDS", 60.0)
+_DEFAULT_CRYPTO_LADDER_SERIES = (
+    "KXBTC,KXBTC1H,KXBTCPRICE,KXBTC15M,"
+    "KXETH,KXETH1H,KXETHPRICE,KXETH15M,"
+    "KXSOL,KXSOL1H,KXSOLPRICE,"
+    "KXXRP,KXXRP1H,KXXRPPRICE,"
+    "KXDOGE,KXDOGE1H,KXDOGEPRICE,"
+    "KXHYPE,KXHYPE1H,KXHYPEPRICE,"
+    "KXBNB,KXBNB1H,KXBNBPRICE,KXCRYPTO"
+)
+AION_CRYPTO_LADDER_ASSETS = tuple(
+    item.strip().upper()
+    for item in (os.environ.get("AION_CRYPTO_LADDER_ASSETS") or "BTC,ETH,SOL,XRP,DOGE,HYPE,BNB").split(",")
+    if item.strip()
+)
+AION_CRYPTO_LADDER_SERIES_TICKERS = tuple(
+    item.strip().upper()
+    for item in (os.environ.get("AION_CRYPTO_LADDER_SERIES_TICKERS") or _DEFAULT_CRYPTO_LADDER_SERIES).split(",")
+    if item.strip()
+)
 AION_BTC1H_CYCLE_SERIES_TICKERS = tuple(
     item.strip().upper()
-    for item in (os.environ.get("AION_BTC1H_CYCLE_SERIES_TICKERS") or "KXBTC,KXBTC1H,KXBTCPRICE,KXBTCUSD").split(",")
+    for item in (os.environ.get("AION_BTC1H_CYCLE_SERIES_TICKERS") or ",".join(AION_CRYPTO_LADDER_SERIES_TICKERS)).split(",")
     if item.strip()
 )
 AION_BTC1H_CYCLE_PAGE_LIMIT = get_env_int("AION_BTC1H_CYCLE_PAGE_LIMIT", 120)
 AION_BTC1H_CYCLE_MAX_SETTLEMENT_REFRESH = get_env_int("AION_BTC1H_CYCLE_MAX_SETTLEMENT_REFRESH", 120)
 AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE = get_env_float("AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE", 30.0)
-AION_BTC1H_CYCLE_LOG_TOP_N = get_env_int("AION_BTC1H_CYCLE_LOG_TOP_N", 5)
+AION_BTC1H_CYCLE_LOG_TOP_N = get_env_int("AION_BTC1H_CYCLE_LOG_TOP_N", 2)
 AION_DUAL_LANE_ALLOCATION_ENABLED = get_env_bool("AION_DUAL_LANE_ALLOCATION_ENABLED", 1)
 AION_BTC1H_LANE_STRONG_BOOST = get_env_float("AION_BTC1H_LANE_STRONG_BOOST", 18.0)
 AION_BTC1H_LANE_RESERVED_BOOST = get_env_float("AION_BTC1H_LANE_RESERVED_BOOST", 8.0)
@@ -27014,6 +27033,8 @@ class KalshiSniperBot:
         self,
         *,
         family=None,
+        asset_symbol=None,
+        timeframe=None,
         selected_side=None,
         selected_price=None,
         spread=None,
@@ -27036,6 +27057,8 @@ class KalshiSniperBot:
         try:
             signal = store.get_learning_signal(
                 family=family,
+                asset_symbol=asset_symbol,
+                timeframe=timeframe,
                 selected_side=selected_side,
                 selected_price=selected_price,
                 spread=spread,
@@ -27067,7 +27090,9 @@ class KalshiSniperBot:
             self._emit_structural_edge_log(
                 "[BTC-1H-HISTORY-BOOST]",
                 {
+                    "asset": asset_symbol,
                     "ticker": ticker,
+                    "timeframe": timeframe,
                     "family": family,
                     "selected_side": selected_side,
                     "historical_edge_boost": signal.get("historical_edge_boost"),
@@ -27082,7 +27107,9 @@ class KalshiSniperBot:
             self._emit_structural_edge_log(
                 "[BTC1H-HISTORY-BOOST]",
                 {
+                    "asset": asset_symbol,
                     "ticker": ticker,
+                    "timeframe": timeframe,
                     "family": family,
                     "selected_side": selected_side,
                     "historical_boost": signal.get("historical_edge_boost"),
@@ -27094,12 +27121,29 @@ class KalshiSniperBot:
                 },
                 marker=("btc1h_history_boost", source, ticker),
             )
+            self._emit_structural_edge_log(
+                "[CRYPTO-LADDER-HISTORY-BOOST]",
+                {
+                    "asset": asset_symbol,
+                    "ticker": ticker,
+                    "timeframe": timeframe,
+                    "family": family,
+                    "selected_side": selected_side,
+                    "historical_boost": signal.get("historical_edge_boost"),
+                    "historical_penalty": signal.get("historical_risk_penalty"),
+                    "learned_winrate": signal.get("learned_winrate"),
+                    "learned_avg_pnl": signal.get("learned_avg_pnl"),
+                    "sample_size": signal.get("sample_size"),
+                    "reason": "matched_historical_crypto_ladder_buckets",
+                },
+                marker=("crypto_ladder_history_boost", source, ticker),
+            )
         return signal
 
     def _btc1h_cycle_series_tickers(self):
         seen = set()
         series = []
-        for item in list(AION_BTC1H_CYCLE_SERIES_TICKERS or ()) + ["KXBTC"]:
+        for item in list(AION_BTC1H_CYCLE_SERIES_TICKERS or ()) + list(AION_CRYPTO_LADDER_SERIES_TICKERS or ()) + ["KXBTC"]:
             value = str(item or "").strip().upper()
             if not value or value in seen:
                 continue
@@ -27121,7 +27165,7 @@ class KalshiSniperBot:
                 log_fn=None,
                 initialize=True,
                 read_only=False,
-                use_wal=False,
+                use_wal=True,
             )
             self.btc1h_cycle_write_store = store
             return store
@@ -27147,15 +27191,18 @@ class KalshiSniperBot:
         market = market if isinstance(market, dict) else {}
         ticker = str(market.get("ticker") or "").strip()
         family = str(self.get_market_family(market) or "").strip().upper()
-        if not ticker or not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market):
+        if not ticker or not self._is_crypto_ladder_market(family=family, ticker=ticker, market=market):
             return None
-        strike = self._parse_btc_1h_ladder_strike(
+        asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market) or "BTC"
+        timeframe = self._crypto_ladder_timeframe(family=family, ticker=ticker, market=market)
+        strike = self._parse_crypto_ladder_strike(
             market.get("title"),
             market.get("subtitle"),
             market.get("rules_primary"),
             market.get("rules_secondary"),
             market.get("event_title"),
             ticker,
+            asset_symbol=asset,
         )
         if strike is None:
             return None
@@ -27183,6 +27230,8 @@ class KalshiSniperBot:
             "ticker": ticker,
             "event_ticker": market.get("event_ticker") or market.get("eventTicker"),
             "family": family,
+            "asset_symbol": asset,
+            "timeframe": timeframe,
             "ladder_group": self._btc_1h_ladder_group_key(market, ticker=ticker, family=family),
             "title": market.get("title") or market.get("market_title") or "",
             "subtitle": market.get("subtitle") or "",
@@ -27240,15 +27289,17 @@ class KalshiSniperBot:
             if not ticker:
                 continue
             family = str(self.get_market_family(market) or "").strip().upper()
-            if not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market):
+            if not self._is_crypto_ladder_market(family=family, ticker=ticker, market=market):
                 continue
-            if self._parse_btc_1h_ladder_strike(
+            asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market) or "BTC"
+            if self._parse_crypto_ladder_strike(
                 market.get("title"),
                 market.get("subtitle"),
                 market.get("rules_primary"),
                 market.get("rules_secondary"),
                 market.get("event_title"),
                 ticker,
+                asset_symbol=asset,
             ) is None:
                 continue
             by_ticker[ticker] = market
@@ -27264,16 +27315,38 @@ class KalshiSniperBot:
             snapshots = [snapshot for snapshot in snapshots if snapshot]
             if len(snapshots) >= int(AION_BTC_1H_LADDER_MIN_GROUP_SIZE or 3):
                 ordered = sorted(snapshots, key=lambda item: self.to_float(item.get("strike"), 0.0) or 0.0)
+                group_asset = ordered[0].get("asset_symbol") if ordered else None
+                group_timeframe = ordered[0].get("timeframe") if ordered else None
+                group_market_type = ordered[0].get("market_type") if ordered else None
                 print(
-                    "[BTC1H-LADDER-DETECTED] "
+                    "[CRYPTO-LADDER-DETECTED] "
                     + json.dumps(
                         {
-                            "settlement_hour": group_key,
+                            "asset": group_asset,
+                            "timeframe": group_timeframe,
+                            "market_type": group_market_type,
+                            "settlement_group": group_key,
                             "ladder_group": group_key,
                             "group_size": len(ordered),
                             "min_strike": ordered[0].get("strike") if ordered else None,
                             "max_strike": ordered[-1].get("strike") if ordered else None,
                             "reason": "continuous_cycle_grouped",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[CRYPTO-LADDER-GROUP] "
+                    + json.dumps(
+                        {
+                            "asset": group_asset,
+                            "timeframe": group_timeframe,
+                            "market_type": group_market_type,
+                            "settlement_group": group_key,
+                            "tickers": [item.get("ticker") for item in ordered[:12]],
+                            "group_size": len(ordered),
+                            "reason": "asset_timeframe_ladder_grouped",
                         },
                         sort_keys=True,
                         default=str,
@@ -27337,14 +27410,19 @@ class KalshiSniperBot:
                     context["cycle_rank_boost"] = cycle_rank_boost
                     context["final_score"] = round(ladder_score + cycle_rank_boost, 4)
                     context["source"] = source
+                    if self.to_float(context.get("final_score"), 0.0) <= 0.0 and not context.get("tags"):
+                        continue
                     side_contexts.append(context)
                 if not side_contexts:
                     print(
-                        "[BTC1H-LADDER-SKIP] "
+                        "[CRYPTO-LADDER-SKIP] "
                         + json.dumps(
                             {
+                                "asset": snapshot.get("asset_symbol"),
                                 "ticker": ticker,
-                                "settlement_hour": group_key,
+                                "timeframe": snapshot.get("timeframe"),
+                                "market_type": snapshot.get("market_type"),
+                                "settlement_group": group_key,
                                 "ladder_group": group_key,
                                 "strike": snapshot.get("strike"),
                                 "reason": "no_executable_side_price",
@@ -27365,12 +27443,15 @@ class KalshiSniperBot:
                 reverse=True,
             )[: max(1, int(AION_BTC1H_CYCLE_LOG_TOP_N or 5))]:
                 print(
-                    "[BTC1H-LADDER-SCORE] "
+                    "[CRYPTO-LADDER-SCORE] "
                     + json.dumps(
                         {
+                            "asset": context.get("asset_symbol"),
                             "ticker": context.get("ticker"),
+                            "timeframe": context.get("timeframe"),
+                            "market_type": context.get("market_type"),
                             "strike": context.get("strike"),
-                            "settlement_hour": group_key,
+                            "settlement_group": group_key,
                             "ladder_group": group_key,
                             "selected_side": context.get("selected_side"),
                             "price": context.get("selected_price"),
@@ -27378,6 +27459,7 @@ class KalshiSniperBot:
                             "ask": context.get("ask"),
                             "spread": context.get("spread"),
                             "liquidity": context.get("liquidity"),
+                            "volume": next((snapshot.get("volume") for snapshot in snapshots if snapshot.get("ticker") == context.get("ticker")), None),
                             "top_size": context.get("top_size"),
                             "momentum_alignment": (context.get("components") or {}).get("nearby_confirmation"),
                             "historical_boost": context.get("historical_edge_boost"),
@@ -27395,17 +27477,21 @@ class KalshiSniperBot:
             ):
                 promoted[best_for_group.get("ticker")] = best_for_group
                 print(
-                    "[BTC1H-LADDER-PROMOTE] "
+                    "[CRYPTO-LADDER-PROMOTE] "
                     + json.dumps(
                         {
+                            "asset": best_for_group.get("asset_symbol"),
                             "ticker": best_for_group.get("ticker"),
+                            "timeframe": best_for_group.get("timeframe"),
+                            "market_type": best_for_group.get("market_type"),
                             "strike": best_for_group.get("strike"),
-                            "settlement_hour": group_key,
+                            "settlement_group": group_key,
                             "ladder_group": group_key,
                             "selected_side": best_for_group.get("selected_side"),
                             "price": best_for_group.get("selected_price"),
                             "spread": best_for_group.get("spread"),
                             "liquidity": best_for_group.get("liquidity"),
+                            "volume": next((snapshot.get("volume") for snapshot in snapshots if snapshot.get("ticker") == best_for_group.get("ticker")), None),
                             "momentum_alignment": (best_for_group.get("components") or {}).get("nearby_confirmation"),
                             "historical_boost": best_for_group.get("historical_edge_boost"),
                             "ladder_boost": best_for_group.get("cycle_rank_boost"),
@@ -27494,6 +27580,20 @@ class KalshiSniperBot:
                 default=str,
             )
         )
+        print(
+            "[CRYPTO-LADDER-DETECTED] "
+            + json.dumps(
+                {
+                    "cycle_count": int(getattr(self, "cycle_count", 0) or 0),
+                    "started_at": cycle_started,
+                    "series": self._btc1h_cycle_series_tickers(),
+                    "assets": list(AION_CRYPTO_LADDER_ASSETS or ()),
+                    "reason": "cycle_scan_started",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         combined_by_ticker = {}
         for market in markets or []:
             if not isinstance(market, dict):
@@ -27548,6 +27648,15 @@ class KalshiSniperBot:
             "active_markets_seen": len(combined_by_ticker),
             "btc1h_markets": len(score_result.get("markets") or []),
             "btc1h_markets_merged": len(markets_to_merge),
+            "crypto_ladder_markets": len(score_result.get("markets") or []),
+            "crypto_ladder_markets_merged": len(markets_to_merge),
+            "crypto_assets_detected": sorted(
+                set(
+                    str(context.get("asset_symbol") or "").strip().upper()
+                    for context in (score_result.get("score_rows") or [])
+                    if str(context.get("asset_symbol") or "").strip()
+                )
+            ),
             "ladder_groups": len(score_result.get("groups") or {}),
             "scored": len(score_result.get("score_rows") or []),
             "promoted": len(promoted),
@@ -27581,11 +27690,14 @@ class KalshiSniperBot:
         boost = self.to_float(context.get("cycle_rank_boost"), 0.0) or 0.0
         if boost > 0.0:
             self._emit_structural_edge_log(
-                "[BTC1H-LADDER-PROMOTE]",
+                "[CRYPTO-LADDER-PROMOTE]",
                 {
+                    "asset": context.get("asset_symbol"),
                     "ticker": ticker,
+                    "timeframe": context.get("timeframe"),
+                    "market_type": context.get("market_type"),
                     "strike": context.get("strike"),
-                    "settlement_hour": context.get("settlement_group"),
+                    "settlement_group": context.get("settlement_group"),
                     "ladder_group": context.get("settlement_group"),
                     "selected_side": context.get("selected_side"),
                     "price": context.get("selected_price"),
@@ -27597,7 +27709,7 @@ class KalshiSniperBot:
                     "final_score": context.get("final_score"),
                     "reason": f"cycle_rank_boost_{source}",
                 },
-                marker=("btc1h_cycle_rank_boost", source, ticker),
+                marker=("crypto_ladder_cycle_rank_boost", source, ticker),
             )
         return {"available": True, "boost": boost, "context": context}
 
@@ -27609,12 +27721,15 @@ class KalshiSniperBot:
         result = result if isinstance(result, dict) else {}
         payload = payload if isinstance(payload, dict) else {}
         print(
-            "[BTC1H-LIVE-EXECUTE] "
+            "[CRYPTO-LADDER-EXECUTE] "
             + json.dumps(
                 {
+                    "asset": context.get("asset_symbol"),
                     "ticker": ticker,
                     "family": family,
-                    "settlement_hour": context.get("settlement_group"),
+                    "timeframe": context.get("timeframe"),
+                    "market_type": context.get("market_type"),
+                    "settlement_group": context.get("settlement_group"),
                     "ladder_group": context.get("settlement_group"),
                     "strike": context.get("strike"),
                     "side": payload.get("side") or context.get("selected_side"),
@@ -27645,8 +27760,8 @@ class KalshiSniperBot:
             structural_context = expectancy_item.get("structural_edge_context") or getattr(q, "structural_edge_context", None)
             structural_context = structural_context if isinstance(structural_context, dict) else {}
             btc_context = structural_context.get("btc_1h_ladder_context") if isinstance(structural_context.get("btc_1h_ladder_context"), dict) else {}
-        if self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market, q=q) or btc_context.get("enabled"):
-            return "BTC1H_LADDER"
+        if self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q) or btc_context.get("enabled"):
+            return "CRYPTO_LADDER"
         if self._is_sports_market_or_family(family):
             return "SPORTS"
         return "OTHER"
@@ -27699,16 +27814,21 @@ class KalshiSniperBot:
             self.to_float(ev_context.get("ev_edge"), -999.0),
             0.0,
         )
-        btc_score = max(
+        asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market, q=q) or cycle_context.get("asset_symbol") or ladder_context.get("asset_symbol") or "BTC"
+        timeframe = self._crypto_ladder_timeframe(family=family, ticker=ticker, market=market, q=q) or cycle_context.get("timeframe") or ladder_context.get("timeframe")
+        crypto_score = max(
             self.to_float(cycle_context.get("final_score"), 0.0),
             self.to_float(cycle_context.get("score"), 0.0),
             self.to_float(ladder_context.get("score"), 0.0),
+            self.to_float(ladder_context.get("CRYPTO_LADDER_SCORE"), 0.0),
             self.to_float(item.get("BTC_1H_LADDER_SCORE"), 0.0),
+            self.to_float(item.get("CRYPTO_LADDER_SCORE"), 0.0),
         )
         ladder_boost = max(
             self.to_float(item.get("btc1h_cycle_adjustment"), 0.0),
             self.to_float(cycle_context.get("cycle_rank_boost"), 0.0),
             self.to_float(ladder_context.get("boost"), 0.0),
+            self.to_float(ladder_context.get("crypto_ladder_boost"), 0.0),
         )
         historical_boost = max(
             self.to_float(cycle_context.get("historical_edge_boost"), 0.0),
@@ -27729,7 +27849,7 @@ class KalshiSniperBot:
             executable
             and final_edge > 0.0
             and (
-                btc_score >= AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE
+                crypto_score >= AION_BTC1H_CYCLE_MIN_PROMOTE_SCORE
                 or ladder_boost >= 1.0
                 or historical_boost > 0.0
                 or momentum_alignment >= 0.50
@@ -27739,33 +27859,37 @@ class KalshiSniperBot:
         reasons = []
         if strong:
             adjustment += AION_BTC1H_LANE_STRONG_BOOST
-            reasons.append("btc1h_structural_lane_priority")
+            reasons.append("crypto_ladder_structural_lane_priority")
             if ladder_boost > 0.0 or historical_boost > 0.0:
                 adjustment += AION_BTC1H_LANE_RESERVED_BOOST
-                reasons.append("btc1h_reserved_hourly_opportunity")
-        elif executable and (btc_score >= 22.0 or ladder_boost > 0.0):
+                reasons.append("crypto_ladder_reserved_opportunity")
+        elif executable and (crypto_score >= 22.0 or ladder_boost > 0.0):
             adjustment += max(4.0, AION_BTC1H_LANE_RESERVED_BOOST * 0.5)
-            reasons.append("btc1h_moderate_ladder_priority")
+            reasons.append("crypto_ladder_moderate_priority")
         else:
-            reasons.append("btc1h_not_strong_enough_for_reserved_lane")
+            reasons.append("crypto_ladder_not_strong_enough_for_reserved_lane")
         return {
-            "lane": "BTC1H_LADDER",
+            "lane": "CRYPTO_LADDER",
             "ticker": ticker,
             "family": family,
+            "asset": asset,
+            "timeframe": timeframe,
             "selected_side": selected_side,
             "selected_price": selected_price,
             "spread": spread,
             "liquidity": liquidity,
             "edge": final_edge,
-            "btc1h_score": btc_score,
+            "btc1h_score": crypto_score,
+            "crypto_ladder_score": crypto_score,
             "btc1h_boost": ladder_boost,
+            "crypto_ladder_boost": ladder_boost,
             "historical_boost": historical_boost,
             "momentum_alignment": momentum_alignment,
             "executable": executable,
             "strong": strong,
             "reserved": strong,
             "allocation_adjustment": round(adjustment, 4),
-            "decision": "RESERVE_BTC1H" if strong else "ALLOW_BTC1H",
+            "decision": "RESERVE_CRYPTO_LADDER" if strong else "ALLOW_CRYPTO_LADDER",
             "reason": "+".join(reasons),
         }
 
@@ -27917,7 +28041,7 @@ class KalshiSniperBot:
             q=q,
             expectancy_item=item,
         )
-        if lane == "BTC1H_LADDER":
+        if lane in {"CRYPTO_LADDER", "BTC1H_LADDER"}:
             context = self._build_btc1h_lane_quality(item, market=market)
         elif lane == "SPORTS":
             context = self._build_sports_lane_quality(item, market=market)
@@ -27961,7 +28085,7 @@ class KalshiSniperBot:
         lane_counts = {}
         weak_sports = []
         strong_sports = []
-        btc_reserved = []
+        crypto_reserved = []
         for index, candidate in enumerate(ranked or []):
             if not isinstance(candidate, (list, tuple)) or len(candidate) < 4:
                 continue
@@ -27983,8 +28107,8 @@ class KalshiSniperBot:
             item["allocation_score"] = allocation.get("allocation_score")
             item["adjusted_score"] = allocation.get("allocation_score", item.get("adjusted_score"))
             expectancy_summary_by_ticker[ticker] = item
-            if lane == "BTC1H_LADDER" and allocation.get("reserved"):
-                btc_reserved.append(allocation)
+            if lane in {"CRYPTO_LADDER", "BTC1H_LADDER"} and allocation.get("reserved"):
+                crypto_reserved.append(allocation)
             if lane == "SPORTS":
                 if allocation.get("decision") in {"SKIP_WEAK_SPORT", "DEMOTE_WEAK_SPORT"}:
                     weak_sports.append(allocation)
@@ -27994,7 +28118,7 @@ class KalshiSniperBot:
         decorated.sort(
             key=lambda row: (
                 1 if row[0].get("decision") != "SKIP_WEAK_SPORT" else 0,
-                1 if row[0].get("lane") == "BTC1H_LADDER" and row[0].get("reserved") else 0,
+                1 if row[0].get("lane") in {"CRYPTO_LADDER", "BTC1H_LADDER"} and row[0].get("reserved") else 0,
                 self.to_float(row[0].get("allocation_score"), 0.0),
                 self.to_float(row[0].get("edge"), 0.0),
                 -self.to_float(row[0].get("spread"), 0.0),
@@ -28006,7 +28130,8 @@ class KalshiSniperBot:
         summary = {
             "source": source,
             "lane_counts": lane_counts,
-            "btc1h_reserved_count": len(btc_reserved),
+            "btc1h_reserved_count": len(crypto_reserved),
+            "crypto_ladder_reserved_count": len(crypto_reserved),
             "weak_sports_count": len(weak_sports),
             "strong_sports_count": len(strong_sports),
             "top_lane": decorated[0][0].get("lane") if decorated else None,
@@ -28015,6 +28140,7 @@ class KalshiSniperBot:
         }
         self.last_lane_allocation_summary = summary
         print("[AION-LANE-SPLIT] " + json.dumps(summary, sort_keys=True, default=str))
+        print("[AION-LANE-ALLOCATION] " + json.dumps(summary, sort_keys=True, default=str))
         for allocation, rank_index, _candidate in decorated[:8]:
             print(
                 "[AION-LANE-RANK] "
@@ -28031,6 +28157,9 @@ class KalshiSniperBot:
                         "spread": allocation.get("spread"),
                         "liquidity": allocation.get("liquidity"),
                         "btc1h_boost": allocation.get("btc1h_boost"),
+                        "crypto_ladder_boost": allocation.get("crypto_ladder_boost"),
+                        "asset": allocation.get("asset"),
+                        "timeframe": allocation.get("timeframe"),
                         "sports_quality_reason": allocation.get("reason") if allocation.get("lane") == "SPORTS" else None,
                         "final_decision": allocation.get("decision"),
                     },
@@ -28038,12 +28167,14 @@ class KalshiSniperBot:
                     default=str,
                 )
             )
-        for allocation in btc_reserved[:3]:
+        for allocation in crypto_reserved[:3]:
             print(
                 "[AION-BTC1H-RESERVED] "
                 + json.dumps(
                     {
                         "lane": allocation.get("lane"),
+                        "asset": allocation.get("asset"),
+                        "timeframe": allocation.get("timeframe"),
                         "ticker": allocation.get("ticker"),
                         "family": allocation.get("family"),
                         "score": allocation.get("allocation_score"),
@@ -28051,6 +28182,28 @@ class KalshiSniperBot:
                         "spread": allocation.get("spread"),
                         "liquidity": allocation.get("liquidity"),
                         "BTC1H_boost": allocation.get("btc1h_boost"),
+                        "historical_boost": allocation.get("historical_boost"),
+                        "final_decision": allocation.get("decision"),
+                        "reason": allocation.get("reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            print(
+                "[CRYPTO-LADDER-PROMOTE] "
+                + json.dumps(
+                    {
+                        "lane": allocation.get("lane"),
+                        "asset": allocation.get("asset"),
+                        "timeframe": allocation.get("timeframe"),
+                        "ticker": allocation.get("ticker"),
+                        "family": allocation.get("family"),
+                        "score": allocation.get("allocation_score"),
+                        "EV": allocation.get("edge"),
+                        "spread": allocation.get("spread"),
+                        "liquidity": allocation.get("liquidity"),
+                        "ladder_boost": allocation.get("crypto_ladder_boost"),
                         "historical_boost": allocation.get("historical_boost"),
                         "final_decision": allocation.get("decision"),
                         "reason": allocation.get("reason"),
@@ -28092,6 +28245,8 @@ class KalshiSniperBot:
                         {
                             "ticker": allocation.get("ticker"),
                             "lane": allocation.get("lane"),
+                            "asset": allocation.get("asset"),
+                            "timeframe": allocation.get("timeframe"),
                             "score": allocation.get("allocation_score"),
                             "decision": allocation.get("decision"),
                             "reason": allocation.get("reason"),
@@ -28120,7 +28275,7 @@ class KalshiSniperBot:
             allocation = candidate.get("allocation") if isinstance(candidate.get("allocation"), dict) else {}
             if not ticker or ticker == primary_ticker:
                 continue
-            if lane not in {"BTC1H_LADDER", "SPORTS"}:
+            if lane not in {"CRYPTO_LADDER", "BTC1H_LADDER", "SPORTS"}:
                 continue
             if primary_lane and lane == primary_lane:
                 continue
@@ -28205,7 +28360,7 @@ class KalshiSniperBot:
         self.last_dual_lane_execution_summary = {"submitted": False, "reason": "no_secondary_lane_candidate"}
         return self.last_dual_lane_execution_summary
 
-    def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
+    def _crypto_ladder_asset_symbol(self, *, family=None, ticker=None, market=None, q=None):
         market = market if isinstance(market, dict) else {}
         text = " ".join(
             str(value or "")
@@ -28224,13 +28379,163 @@ class KalshiSniperBot:
             )
             if str(value or "").strip()
         ).upper()
-        if "BTC" not in text and "BITCOIN" not in text:
+        aliases = {
+            "BTC": ("BTC", "BITCOIN", "KXBTC"),
+            "ETH": ("ETH", "ETHEREUM", "KXETH"),
+            "SOL": ("SOL", "SOLANA", "KXSOL"),
+            "XRP": ("XRP", "RIPPLE", "KXXRP"),
+            "DOGE": ("DOGE", "DOGECOIN", "KXDOGE"),
+            "HYPE": ("HYPE", "HYPERLIQUID", "KXHYPE"),
+            "BNB": ("BNB", "BINANCE", "KXBNB"),
+        }
+        supported = set(str(item or "").strip().upper() for item in (AION_CRYPTO_LADDER_ASSETS or ()) if str(item or "").strip())
+        for asset, tokens in aliases.items():
+            if supported and asset not in supported:
+                continue
+            if any(re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", text) for token in tokens):
+                return asset
+        match = re.search(r"\bKX([A-Z]{2,8})(?:15M|1H|PRICE|USD)?\b", text)
+        if match:
+            asset = match.group(1)
+            if not supported or asset in supported:
+                return asset
+        return None
+
+    def _crypto_ladder_timeframe(self, *, family=None, ticker=None, market=None, q=None):
+        market = market if isinstance(market, dict) else {}
+        text = " ".join(
+            str(value or "")
+            for value in (
+                family,
+                ticker,
+                market.get("ticker"),
+                market.get("series_ticker"),
+                market.get("event_ticker"),
+                market.get("title"),
+                market.get("subtitle"),
+                market.get("event_title"),
+                market.get("rules_primary"),
+                market.get("rules_secondary"),
+                getattr(q, "ticker", None),
+                getattr(q, "title", None),
+                getattr(q, "market_title", None),
+            )
+            if str(value or "").strip()
+        ).upper()
+        if "15M" in text or "15 MIN" in text or "15-MIN" in text or "15 MINUTE" in text:
+            return "15m"
+        if "1H" in text or "1 HOUR" in text or "HOURLY" in text or "HOUR" in text:
+            return "1h"
+        if "DAILY" in text or "TODAY" in text or "24H" in text:
+            return "daily"
+        if "MONTH" in text or "HIGH" in text or "LOW" in text:
+            return "monthly_high_low"
+        if re.search(r"\b(?:[0-2]?\d)(?::[0-5]\d)?\s*(?:AM|PM|ET|EDT|EST|UTC)\b", text):
+            return "time_settlement"
+        return "unknown"
+
+    def _crypto_ladder_market_structure_type(self, *, family=None, ticker=None, market=None, q=None):
+        market = market if isinstance(market, dict) else {}
+        text = " ".join(
+            str(value or "")
+            for value in (
+                family,
+                ticker,
+                market.get("ticker"),
+                market.get("series_ticker"),
+                market.get("title"),
+                market.get("subtitle"),
+                market.get("rules_primary"),
+                market.get("rules_secondary"),
+                getattr(q, "title", None),
+                getattr(q, "market_title", None),
+            )
+            if str(value or "").strip()
+        ).upper()
+        if any(term in text for term in ("BETWEEN", "RANGE")):
+            return "range"
+        if any(term in text for term in ("HIGH", "LOW")) and "MONTH" in text:
+            return "monthly_high_low"
+        if any(term in text for term in ("ABOVE", "BELOW", "OVER", "UNDER", "PRICE")):
+            return "strike_ladder"
+        return "crypto_ladder"
+
+    def _is_crypto_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
+        market = market if isinstance(market, dict) else {}
+        asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market, q=q)
+        if not asset:
             return False
-        return bool(
-            "KXBTC" in text
-            or "BITCOIN" in text
-            or any(term in text for term in ("BTC PRICE", "BTC ABOVE", "BTC BELOW", "BTC AT"))
-        )
+        text = " ".join(
+            str(value or "")
+            for value in (
+                family,
+                ticker,
+                market.get("ticker"),
+                market.get("series_ticker"),
+                market.get("event_ticker"),
+                market.get("title"),
+                market.get("subtitle"),
+                market.get("event_title"),
+                market.get("rules_primary"),
+                market.get("rules_secondary"),
+                getattr(q, "ticker", None),
+                getattr(q, "title", None),
+                getattr(q, "market_title", None),
+            )
+            if str(value or "").strip()
+        ).upper()
+        if "CRYPTO" in text or f"KX{asset}" in text or (asset == "XRP" and "KXXRP" in text):
+            return True
+        return any(term in text for term in ("PRICE", "ABOVE", "BELOW", "BETWEEN", "RANGE", "TARGET", "HIGH", "LOW"))
+
+    def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
+        return self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q)
+
+    def _parse_crypto_ladder_strike(self, *values, asset_symbol=None):
+        asset = str(asset_symbol or "").strip().upper()
+        if not asset:
+            asset = self._crypto_ladder_asset_symbol(
+                family=values[0] if values else None,
+                ticker=values[-1] if values else None,
+            ) or "BTC"
+        if asset == "BTC":
+            return self._parse_btc_1h_ladder_strike(*values)
+        for source in values:
+            match = re.search(r"-(?:B|T)(\d+(?:\.\d+)?)", str(source or "").upper())
+            if match:
+                try:
+                    return float(match.group(1))
+                except (TypeError, ValueError):
+                    pass
+        fallback = None
+        for source in values:
+            text = str(source or "")
+            if not text.strip():
+                continue
+            lowered = text.lower()
+            candidates = []
+            preferred = []
+            for raw in re.findall(r"\$?\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\$?\b\d+(?:\.\d+)?\b", text):
+                try:
+                    value = float(str(raw).replace("$", "").replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+                if value <= 0:
+                    continue
+                if asset == "ETH" and not (100.0 <= value <= 100000.0):
+                    continue
+                if asset in {"SOL", "BNB", "HYPE"} and not (1.0 <= value <= 10000.0):
+                    continue
+                if asset in {"XRP", "DOGE"} and not (0.001 <= value <= 100.0):
+                    continue
+                candidates.append(value)
+                if "$" in raw or any(term in lowered for term in ("price", "above", "below", "range", "between", "target")):
+                    preferred.append(value)
+            if preferred:
+                return float(preferred[-1])
+            if candidates and fallback is None:
+                fallback = float(candidates[-1])
+        return fallback
 
     def _parse_btc_1h_ladder_strike(self, *values):
         fallback = None
@@ -28258,10 +28563,13 @@ class KalshiSniperBot:
     def _btc_1h_ladder_group_key(self, market=None, *, ticker=None, family=None):
         market = market if isinstance(market, dict) else {}
         ticker = str(ticker or market.get("ticker") or "").strip()
+        asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market) or "BTC"
+        timeframe = self._crypto_ladder_timeframe(family=family, ticker=ticker, market=market)
+        structure_type = self._crypto_ladder_market_structure_type(family=family, ticker=ticker, market=market)
         for key in ("event_ticker", "eventTicker"):
             value = str(market.get(key) or "").strip().upper()
             if value:
-                return value
+                return f"{asset}|{timeframe}|{structure_type}|{value}"
         close_or_expiration = str(
             market.get("close_time")
             or market.get("expiration_time")
@@ -28270,25 +28578,29 @@ class KalshiSniperBot:
             or ""
         ).strip()
         if close_or_expiration:
-            return f"{str(family or self.get_market_family(market) or 'KXBTC').upper()}|{close_or_expiration[:13]}"
+            return f"{asset}|{timeframe}|{structure_type}|{str(family or self.get_market_family(market) or 'KXBTC').upper()}|{close_or_expiration[:13]}"
         parts = ticker.split("-")
         if len(parts) >= 2:
-            return "-".join(parts[:2]).upper()
-        return ticker.upper()
+            return f"{asset}|{timeframe}|{structure_type}|{'-'.join(parts[:2]).upper()}"
+        return f"{asset}|{timeframe}|{structure_type}|{ticker.upper()}"
 
     def _btc_1h_ladder_contract_snapshot(self, market=None):
         market = market if isinstance(market, dict) else {}
         ticker = str(market.get("ticker") or "").strip()
         family = self.get_market_family(market) if ticker else ""
-        if not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market):
+        if not self._is_crypto_ladder_market(family=family, ticker=ticker, market=market):
             return None
-        strike = self._parse_btc_1h_ladder_strike(
+        asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market) or "BTC"
+        timeframe = self._crypto_ladder_timeframe(family=family, ticker=ticker, market=market)
+        market_type = self._crypto_ladder_market_structure_type(family=family, ticker=ticker, market=market)
+        strike = self._parse_crypto_ladder_strike(
             market.get("title"),
             market.get("subtitle"),
             market.get("rules_primary"),
             market.get("rules_secondary"),
             market.get("event_title"),
             ticker,
+            asset_symbol=asset,
         )
         if strike is None:
             return None
@@ -28333,6 +28645,9 @@ class KalshiSniperBot:
         return {
             "ticker": ticker,
             "family": family,
+            "asset_symbol": asset,
+            "timeframe": timeframe,
+            "market_type": market_type,
             "group_key": self._btc_1h_ladder_group_key(market, ticker=ticker, family=family),
             "strike": strike,
             "yes_mid": yes_mid,
@@ -28352,6 +28667,7 @@ class KalshiSniperBot:
             ) or 0.0,
             "repricing_velocity": self.to_float(market.get("repricing_velocity") or market.get("velocity"), 0.0) or 0.0,
             "close_time": market.get("close_time") or market.get("expiration_time"),
+            "volume": self.to_float(market.get("volume") or market.get("volume_dollars") or market.get("volume_24h"), 0.0) or 0.0,
         }
 
     def _get_btc_1h_ladder_rank_adjustment(
@@ -28375,9 +28691,12 @@ class KalshiSniperBot:
         market = market if isinstance(market, dict) else {}
         ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
         family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
-        if not self._is_btc_1h_ladder_market(family=family, ticker=ticker, market=market, q=q):
-            return {"enabled": False, "score": 0.0, "boost": 0.0, "reason": "not_btc_ladder", "tags": []}
-        current_strike = self._parse_btc_1h_ladder_strike(
+        if not self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q):
+            return {"enabled": False, "score": 0.0, "boost": 0.0, "reason": "not_crypto_ladder", "tags": []}
+        asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market, q=q) or "BTC"
+        timeframe = self._crypto_ladder_timeframe(family=family, ticker=ticker, market=market, q=q)
+        market_type = self._crypto_ladder_market_structure_type(family=family, ticker=ticker, market=market, q=q)
+        current_strike = self._parse_crypto_ladder_strike(
             market.get("title"),
             market.get("subtitle"),
             market.get("rules_primary"),
@@ -28386,17 +28705,21 @@ class KalshiSniperBot:
             getattr(q, "title", None),
             getattr(q, "market_title", None),
             ticker,
+            asset_symbol=asset,
         )
         if current_strike is None:
             if log:
                 self._emit_structural_edge_log(
-                    "[BTC-1H-LADDER-SKIP]",
+                    "[CRYPTO-LADDER-SKIP]",
                     {
+                        "asset": asset,
                         "ticker": ticker,
+                        "timeframe": timeframe,
+                        "market_type": market_type,
                         "settlement_group": self._btc_1h_ladder_group_key(market, ticker=ticker, family=family),
                         "reason": "strike_parse_failed",
                     },
-                    marker=("btc_1h_ladder_skip", source, ticker, "strike"),
+                    marker=("crypto_ladder_skip", source, ticker, "strike"),
                 )
             return {"enabled": True, "score": 0.0, "boost": 0.0, "reason": "strike_parse_failed", "tags": []}
 
@@ -28436,30 +28759,36 @@ class KalshiSniperBot:
         group_size = len(ladder)
         if log and group_size >= int(AION_BTC_1H_LADDER_MIN_GROUP_SIZE or 3):
             self._emit_structural_edge_log(
-                "[BTC-1H-LADDER-DETECTED]",
+                "[CRYPTO-LADDER-DETECTED]",
                 {
+                    "asset": asset,
                     "ticker": ticker,
+                    "timeframe": timeframe,
+                    "market_type": market_type,
                     "strike": current_strike,
                     "settlement_group": group_key,
                     "group_size": group_size,
                     "min_strike": ladder[0].get("strike") if ladder else None,
                     "max_strike": ladder[-1].get("strike") if ladder else None,
-                    "reason": "btc_ladder_grouped",
+                    "reason": "crypto_ladder_grouped",
                 },
-                marker=("btc_1h_ladder_detected", source, group_key),
+                marker=("crypto_ladder_detected", source, group_key),
             )
         if current_index is None or group_size < int(AION_BTC_1H_LADDER_MIN_GROUP_SIZE or 3):
             if log:
                 self._emit_structural_edge_log(
-                    "[BTC-1H-LADDER-SKIP]",
+                    "[CRYPTO-LADDER-SKIP]",
                     {
+                        "asset": asset,
                         "ticker": ticker,
+                        "timeframe": timeframe,
+                        "market_type": market_type,
                         "strike": current_strike,
                         "settlement_group": group_key,
                         "group_size": group_size,
                         "reason": "insufficient_ladder_neighbors",
                     },
-                    marker=("btc_1h_ladder_skip", source, ticker, "neighbors"),
+                    marker=("crypto_ladder_skip", source, ticker, "neighbors"),
                 )
             return {"enabled": True, "score": 0.0, "boost": 0.0, "reason": "insufficient_ladder_neighbors", "tags": []}
 
@@ -28493,9 +28822,12 @@ class KalshiSniperBot:
             )
             if log:
                 self._emit_structural_edge_log(
-                    "[BTC-1H-LADDER-SKIP]",
+                    "[CRYPTO-LADDER-SKIP]",
                     {
+                        "asset": asset,
                         "ticker": ticker,
+                        "timeframe": timeframe,
+                        "market_type": market_type,
                         "strike": current_strike,
                         "settlement_group": group_key,
                         "price": selected_price_value,
@@ -28506,7 +28838,7 @@ class KalshiSniperBot:
                         "final_score": 0.0,
                         "reason": reason,
                     },
-                    marker=("btc_1h_ladder_skip", source, ticker, reason),
+                    marker=("crypto_ladder_skip", source, ticker, reason),
                 )
             return {"enabled": True, "score": 0.0, "boost": 0.0, "reason": reason, "tags": []}
 
@@ -28610,15 +28942,21 @@ class KalshiSniperBot:
         )
         tags = []
         if curve_component >= 0.32:
-            tags.append("BTC_1H_LADDER_RELATIVE_MISPRICING")
+            tags.append("CRYPTO_LADDER_RELATIVE_MISPRICING")
         if monotonic_component >= 0.25:
-            tags.append("BTC_1H_LADDER_MONOTONIC_BREAK")
+            tags.append("CRYPTO_LADDER_MONOTONIC_BREAK")
         if repricing_lag_component >= 0.28:
-            tags.append("BTC_1H_LADDER_REPRICING_LAG")
+            tags.append("CRYPTO_LADDER_REPRICING_LAG")
         if nearby_confirmation >= 0.45:
-            tags.append("BTC_1H_LADDER_NEARBY_CONFIRMATION")
+            tags.append("CRYPTO_LADDER_NEARBY_CONFIRMATION")
         if fast_expiry_component >= 0.72:
-            tags.append("BTC_1H_FAST_EXPIRY")
+            tags.append("CRYPTO_FAST_EXPIRY")
+        if asset == "BTC":
+            tags.extend(
+                tag.replace("CRYPTO_LADDER", "BTC_1H_LADDER").replace("CRYPTO_FAST_EXPIRY", "BTC_1H_FAST_EXPIRY")
+                for tag in list(tags)
+                if tag.startswith("CRYPTO_")
+            )
 
         neighbor_gaps = []
         for neighbor in (lower, higher):
@@ -28640,6 +28978,8 @@ class KalshiSniperBot:
             neighbor_gap_bucket = "very_wide_strikes"
         history_signal = self._get_btc_1h_history_signal_for_context(
             family=family,
+            asset_symbol=asset,
+            timeframe=timeframe,
             selected_side=selected_side,
             selected_price=selected_price_value,
             spread=side_spread,
@@ -28663,9 +29003,13 @@ class KalshiSniperBot:
                 4,
             )
             if historical_edge_boost > 0.0:
-                tags.append("BTC_1H_HISTORY_PROFITABLE_BUCKET")
+                tags.append("CRYPTO_LADDER_HISTORY_PROFITABLE_BUCKET")
+                if asset == "BTC":
+                    tags.append("BTC_1H_HISTORY_PROFITABLE_BUCKET")
             if historical_risk_penalty > 0.0:
-                tags.append("BTC_1H_HISTORY_WEAK_BUCKET")
+                tags.append("CRYPTO_LADDER_HISTORY_WEAK_BUCKET")
+                if asset == "BTC":
+                    tags.append("BTC_1H_HISTORY_WEAK_BUCKET")
 
         boost = 0.0
         if score >= 24.0:
@@ -28689,6 +29033,9 @@ class KalshiSniperBot:
             "enabled": True,
             "ticker": ticker,
             "family": family,
+            "asset_symbol": asset,
+            "timeframe": timeframe,
+            "market_type": market_type,
             "strike": current_strike,
             "settlement_group": group_key,
             "group_size": group_size,
@@ -28704,6 +29051,8 @@ class KalshiSniperBot:
             "top_size": selected_depth,
             "score": score,
             "BTC_1H_LADDER_SCORE": score,
+            "CRYPTO_LADDER_SCORE": score,
+            "crypto_ladder_boost": round(max(0.0, boost), 4),
             "boost": round(max(0.0, boost), 4),
             "probability_adjustment": round(max(0.0, probability_adjustment), 6),
             "size_multiplier": round(max(1.0, min(AION_BTC_1H_LADDER_MAX_SIZE_MULTIPLIER, size_multiplier)), 4),
@@ -28716,14 +29065,17 @@ class KalshiSniperBot:
             "neighbor_gap_bucket": neighbor_gap_bucket,
             "components": components,
             "tags": tags,
-            "pattern_keys": [f"{family}|{tag}" for tag in tags[:8]] + [f"BTC_1H_LADDER|{tag}" for tag in tags[:8]],
-            "reason": "+".join(tags) if tags else "btc_ladder_baseline",
+            "pattern_keys": [f"{family}|{tag}" for tag in tags[:8]] + [f"{asset}|CRYPTO_LADDER|{tag}" for tag in tags[:8]],
+            "reason": "+".join(tags) if tags else "crypto_ladder_baseline",
         }
         if log and (score > 0.0 or tags):
             self._emit_structural_edge_log(
-                "[BTC-1H-LADDER-SCORE]",
+                "[CRYPTO-LADDER-SCORE]",
                 {
+                    "asset": asset,
                     "ticker": ticker,
+                    "timeframe": timeframe,
+                    "market_type": market_type,
                     "strike": current_strike,
                     "settlement_group": group_key,
                     "price": context["selected_price"],
@@ -28739,13 +29091,16 @@ class KalshiSniperBot:
                     "final_score": score,
                     "reason": context["reason"],
                 },
-                marker=("btc_1h_ladder_score", source, ticker),
+                marker=("crypto_ladder_score", source, ticker),
             )
         if log and boost > 0.0:
             self._emit_structural_edge_log(
-                "[BTC-1H-LADDER-PROMOTE]",
+                "[CRYPTO-LADDER-PROMOTE]",
                 {
+                    "asset": asset,
                     "ticker": ticker,
+                    "timeframe": timeframe,
+                    "market_type": market_type,
                     "strike": current_strike,
                     "settlement_group": group_key,
                     "price": context["selected_price"],
@@ -28761,7 +29116,7 @@ class KalshiSniperBot:
                     "final_score": score,
                     "reason": context["reason"],
                 },
-                marker=("btc_1h_ladder_promote", source, ticker),
+                marker=("crypto_ladder_promote", source, ticker),
             )
         return context
 
@@ -29671,6 +30026,7 @@ class KalshiSniperBot:
         btc_1h_ladder_component = self._clamp(btc_1h_ladder_score / 100.0)
         if btc_1h_ladder_context.get("enabled"):
             components["btc_1h_ladder"] = round(btc_1h_ladder_component, 4)
+            components["crypto_ladder"] = round(btc_1h_ladder_component, 4)
         btc_1h_history_boost = self.to_float(btc_1h_ladder_context.get("historical_edge_boost"), 0.0) or 0.0
         btc_1h_history_penalty = self.to_float(btc_1h_ladder_context.get("historical_risk_penalty"), 0.0) or 0.0
         if btc_1h_history_boost > 0.0 or btc_1h_history_penalty > 0.0:
@@ -46716,19 +47072,19 @@ class KalshiSniperBot:
             f"after={len(time_window_markets)} filtered={original_market_count - len(time_window_markets)}"
         )
         if AION_DUAL_LANE_ALLOCATION_ENABLED:
-            btc1h_promoted = getattr(self, "btc1h_cycle_priority_by_ticker", {}) or {}
-            if isinstance(btc1h_promoted, dict) and btc1h_promoted:
+            crypto_ladder_promoted = getattr(self, "btc1h_cycle_priority_by_ticker", {}) or {}
+            if isinstance(crypto_ladder_promoted, dict) and crypto_ladder_promoted:
                 seen_time_window_tickers = {
                     str(market.get("ticker", "") or "").strip()
                     for market in time_window_markets
                     if isinstance(market, dict) and str(market.get("ticker", "") or "").strip()
                 }
-                btc1h_reserved_added = []
+                crypto_ladder_reserved_added = []
                 for market in markets:
                     if not isinstance(market, dict):
                         continue
                     ticker = str(market.get("ticker", "") or "").strip()
-                    if not ticker or ticker in seen_time_window_tickers or ticker not in btc1h_promoted:
+                    if not ticker or ticker in seen_time_window_tickers or ticker not in crypto_ladder_promoted:
                         continue
                     if bool(market.get("disabled")) or bool(market.get("is_disabled")):
                         continue
@@ -46736,17 +47092,32 @@ class KalshiSniperBot:
                         continue
                     time_window_markets.append(market)
                     seen_time_window_tickers.add(ticker)
-                    btc1h_reserved_added.append(ticker)
-                if btc1h_reserved_added:
+                    crypto_ladder_reserved_added.append(ticker)
+                if crypto_ladder_reserved_added:
                     print(
                         "[AION-BTC1H-RESERVED] "
                         + json.dumps(
                             {
                                 "source": "time_window_reservation",
-                                "lane": "BTC1H_LADDER",
-                                "reserved_count": len(btc1h_reserved_added),
-                                "tickers": btc1h_reserved_added[:8],
-                                "reason": "btc1h_cycle_promoted_market_kept_for_final_allocation",
+                                "lane": "CRYPTO_LADDER",
+                                "reserved_count": len(crypto_ladder_reserved_added),
+                                "tickers": crypto_ladder_reserved_added[:8],
+                                "reason": "crypto_ladder_promoted_market_kept_for_final_allocation",
+                                "final_decision": "reserve_execution_opportunity",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    print(
+                        "[AION-LANE-ALLOCATION] "
+                        + json.dumps(
+                            {
+                                "source": "time_window_reservation",
+                                "lane": "CRYPTO_LADDER",
+                                "reserved_count": len(crypto_ladder_reserved_added),
+                                "tickers": crypto_ladder_reserved_added[:8],
+                                "reason": "crypto_ladder_promoted_market_kept_for_final_allocation",
                                 "final_decision": "reserve_execution_opportunity",
                             },
                             sort_keys=True,
@@ -52243,7 +52614,8 @@ class KalshiSniperBot:
                 break
             if selected is not None and rank_position >= 12:
                 break
-            if selected_lane in {"BTC1H_LADDER", "SPORTS"} and any(lane in {"BTC1H_LADDER", "SPORTS"} and lane != selected_lane for lane in buy_lanes):
+            priority_lanes = {"CRYPTO_LADDER", "BTC1H_LADDER", "SPORTS"}
+            if selected_lane in priority_lanes and any(lane in priority_lanes and lane != selected_lane for lane in buy_lanes):
                 break
             continue
         self.last_dual_lane_buy_candidates = lane_buy_candidates
@@ -52265,6 +52637,8 @@ class KalshiSniperBot:
                                 "ticker": item.get("ticker"),
                                 "lane": item.get("lane"),
                                 "family": item.get("family"),
+                                "asset": (item.get("allocation") or {}).get("asset"),
+                                "timeframe": (item.get("allocation") or {}).get("timeframe"),
                                 "score": item.get("candidate_score"),
                                 "EV": (item.get("allocation") or {}).get("edge"),
                                 "spread": item.get("spread"),
@@ -52273,7 +52647,7 @@ class KalshiSniperBot:
                             }
                             for item in lane_buy_candidates[:4]
                         ],
-                        "final_decision": "dual_lane_candidates_available" if len({item.get("lane") for item in lane_buy_candidates if item.get("lane") in {"BTC1H_LADDER", "SPORTS"}}) >= 2 else "single_lane_selected",
+                        "final_decision": "dual_lane_candidates_available" if len({item.get("lane") for item in lane_buy_candidates if item.get("lane") in {"CRYPTO_LADDER", "BTC1H_LADDER", "SPORTS"}}) >= 2 else "single_lane_selected",
                     },
                     sort_keys=True,
                     default=str,
