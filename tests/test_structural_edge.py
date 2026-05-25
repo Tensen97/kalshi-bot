@@ -817,6 +817,173 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["submitted"])
         self.assertEqual(submitted, [(sports_q.ticker, 2, 0.48, "yes")])
 
+    def test_parallel_lane_submit_attempts_submit_crypto_and_sports_independently(self):
+        bot = self._make_bot()
+        submitted = []
+        crypto_q = SimpleNamespace(
+            ticker='KXBTC-26MAY2517-B74875',
+            selected_side='yes',
+            selected_price=0.28,
+            yes_bid=0.27,
+            yes_ask=0.28,
+            no_bid=0.72,
+            no_ask=0.73,
+            liquidity=180,
+        )
+        sports_q = SimpleNamespace(
+            ticker='KXNBA1HTOTAL-OKCSAS-1125',
+            selected_side='yes',
+            selected_price=0.48,
+            yes_bid=0.46,
+            yes_ask=0.48,
+            no_bid=0.52,
+            no_ask=0.54,
+            liquidity=95,
+        )
+        bot.last_dual_lane_buy_candidates = [
+            {
+                'ticker': crypto_q.ticker,
+                'lane': 'CRYPTO_LADDER',
+                'family': 'KXBTC',
+                'q': crypto_q,
+                'market': {'ticker': crypto_q.ticker, 'series_ticker': 'KXBTC'},
+                'allocation': {
+                    'lane': 'CRYPTO_LADDER',
+                    'allocation_score': 92.0,
+                    'edge': 0.021,
+                    'confidence': 0.82,
+                    'spread': 0.01,
+                    'liquidity': 180,
+                    'decision': 'RESERVE_CRYPTO_LADDER',
+                    'reason': 'strong_crypto_ladder',
+                },
+            },
+            {
+                'ticker': sports_q.ticker,
+                'lane': 'SPORTS',
+                'family': 'KXNBA1HTOTAL',
+                'q': sports_q,
+                'market': {'ticker': sports_q.ticker, 'series_ticker': 'KXNBA1HTOTAL'},
+                'allocation': {
+                    'lane': 'SPORTS',
+                    'allocation_score': 84.0,
+                    'edge': 0.016,
+                    'confidence': 0.74,
+                    'spread': 0.02,
+                    'liquidity': 95,
+                    'decision': 'ALLOW_STRONG_SPORT',
+                    'reason': 'strong_structured_sports_ladder',
+                },
+            },
+        ]
+        bot.already_holding = lambda ticker: False
+        bot.check_live_duplicate_position_api = lambda ticker: {'blocked': False}
+        bot.build_live_order_payload = lambda q, **kwargs: {
+            'ticker': q.ticker,
+            'side': 'yes',
+            'price': q.selected_price,
+            'count': 3,
+            'yes_price': int(q.selected_price * 100),
+        }
+        bot.submit_live_order = lambda q, lane=None, payload_override=None, **kwargs: submitted.append((q.ticker, lane, payload_override['count'])) or {
+            'submitted': True,
+            'reason': 'submitted',
+            'payload': dict(payload_override or {}),
+        }
+        bot.record_live_position = lambda q, size=None, entry_price=None, side=None: None
+
+        result = bot._execute_parallel_lane_submit_attempts(source='unit_test')
+
+        self.assertTrue(result['crypto_submitted'])
+        self.assertTrue(result['sports_submitted'])
+        self.assertEqual([item[0] for item in submitted], [crypto_q.ticker, sports_q.ticker])
+
+    def test_parallel_lane_submit_attempts_crypto_when_sports_primary_blocked(self):
+        bot = self._make_bot()
+        submitted = []
+        crypto_q = SimpleNamespace(
+            ticker='KXETH-26MAY2517-B3500',
+            selected_side='yes',
+            selected_price=0.31,
+            yes_bid=0.30,
+            yes_ask=0.31,
+            no_bid=0.69,
+            no_ask=0.70,
+            liquidity=140,
+        )
+        sports_q = SimpleNamespace(
+            ticker='KXMLBHR-PLAYER-3HR-MOONSHOT',
+            selected_side='yes',
+            selected_price=0.04,
+            yes_bid=0.01,
+            yes_ask=0.04,
+            no_bid=0.96,
+            no_ask=0.99,
+            liquidity=1,
+        )
+        bot.last_dual_lane_buy_candidates = [
+            {
+                'ticker': sports_q.ticker,
+                'lane': 'SPORTS',
+                'family': 'KXMLBHR',
+                'q': sports_q,
+                'market': {'ticker': sports_q.ticker, 'series_ticker': 'KXMLBHR'},
+                'allocation': {
+                    'lane': 'SPORTS',
+                    'allocation_score': 70.0,
+                    'edge': 0.0,
+                    'confidence': 0.2,
+                    'spread': 0.03,
+                    'liquidity': 1,
+                    'decision': 'SKIP_WEAK_SPORT',
+                    'final_quality_action': 'skip',
+                    'reason': 'trash_prop_weak_edge',
+                },
+            },
+            {
+                'ticker': crypto_q.ticker,
+                'lane': 'CRYPTO_LADDER',
+                'family': 'KXETH',
+                'q': crypto_q,
+                'market': {'ticker': crypto_q.ticker, 'series_ticker': 'KXETH'},
+                'allocation': {
+                    'lane': 'CRYPTO_LADDER',
+                    'allocation_score': 88.0,
+                    'edge': 0.018,
+                    'confidence': 0.79,
+                    'spread': 0.01,
+                    'liquidity': 140,
+                    'decision': 'RESERVE_CRYPTO_LADDER',
+                    'reason': 'strong_crypto_ladder',
+                },
+            },
+        ]
+        bot.already_holding = lambda ticker: False
+        bot.check_live_duplicate_position_api = lambda ticker: {'blocked': False}
+        bot.build_live_order_payload = lambda q, **kwargs: {
+            'ticker': q.ticker,
+            'side': 'yes',
+            'price': q.selected_price,
+            'count': 4,
+            'yes_price': int(q.selected_price * 100),
+        }
+        bot.submit_live_order = lambda q, lane=None, payload_override=None, **kwargs: submitted.append(q.ticker) or {
+            'submitted': True,
+            'reason': 'submitted',
+            'payload': dict(payload_override or {}),
+        }
+        bot.record_live_position = lambda q, size=None, entry_price=None, side=None: None
+
+        result = bot._execute_parallel_lane_submit_attempts(
+            primary_ticker=sports_q.ticker,
+            primary_lane='SPORTS',
+            primary_result={'submitted': False, 'reason': 'weak_sports_quality_demoted'},
+            source='unit_test_blocked_primary',
+        )
+
+        self.assertTrue(result['crypto_submitted'])
+        self.assertEqual(submitted, [crypto_q.ticker])
+
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {
             "ticker": "KXMLBSTRIKEOUT-TEST-65",

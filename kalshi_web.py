@@ -28525,12 +28525,83 @@ class KalshiSniperBot:
         )
         return final_ranked
 
-    def _execute_dual_lane_secondary_candidate(self, *, primary_ticker=None, primary_lane=None):
+    def _lane_submit_truth_payload(
+        self,
+        *,
+        candidate,
+        allocation,
+        result=None,
+        payload=None,
+        duplicate_guard=None,
+        submit_allowed=False,
+        reason=None,
+        source=None,
+    ):
+        allocation = allocation if isinstance(allocation, dict) else {}
+        candidate = candidate if isinstance(candidate, dict) else {}
+        result = result if isinstance(result, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        duplicate_guard = duplicate_guard if isinstance(duplicate_guard, dict) else {}
+        q = candidate.get("q")
+        ticker = str(candidate.get("ticker") or payload.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        lane = str(candidate.get("lane") or allocation.get("lane") or "").strip().upper()
+        selected_price = (
+            payload.get("price")
+            if payload.get("price") is not None
+            else allocation.get("selected_price")
+            if allocation.get("selected_price") is not None
+            else allocation.get("selected_price_dollars")
+        )
+        selected_side = (
+            payload.get("side")
+            or allocation.get("selected_side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        selected_price_float = self.to_float(selected_price, None)
+        daily_count = int(self.live_trade_count_today or 0)
+        max_daily = int(MAX_LIVE_TRADES_PER_DAY or 0)
+        duplicate_result = duplicate_guard.get("reason") or ("blocked" if duplicate_guard.get("blocked") else "pass")
+        return {
+            "source": source,
+            "ticker": ticker,
+            "lane": lane,
+            "family": candidate.get("family") or allocation.get("family"),
+            "EV": allocation.get("edge"),
+            "edge_after_cost": allocation.get("edge"),
+            "confidence": allocation.get("confidence"),
+            "profitability_score": allocation.get("confidence") or allocation.get("profitability_score"),
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "spread": allocation.get("spread") if allocation.get("spread") is not None else candidate.get("spread"),
+            "liquidity": allocation.get("liquidity"),
+            "top_size": allocation.get("liquidity_depth") or allocation.get("liquidity"),
+            "orderbook_ready": bool(payload) if "orderbook_ready" not in allocation else bool(allocation.get("orderbook_ready")),
+            "price_bounds_pass": bool(selected_price_float is not None and 0.0 < selected_price_float < 1.0),
+            "duplicate_guard": duplicate_result,
+            "exposure_daily_cap": "pass" if daily_count < max_daily else "blocked",
+            "daily_trade_count": daily_count,
+            "max_daily_trades": max_daily,
+            "submit_allowed": bool(submit_allowed),
+            "submitted": bool(result.get("submitted")),
+            "reason": reason or result.get("reason"),
+            "count": payload.get("count") or (result.get("payload") or {}).get("count"),
+        }
+
+    def _execute_dual_lane_secondary_candidate(self, *, primary_ticker=None, primary_lane=None, target_lane=None, source="parallel_lane_submit"):
         if not AION_DUAL_LANE_SECONDARY_ENABLED:
             return {"submitted": False, "reason": "dual_lane_secondary_disabled"}
         primary_ticker = str(primary_ticker or "").strip()
         primary_lane = str(primary_lane or "").strip().upper()
+        target_lane = str(target_lane or "").strip().upper()
+        crypto_lanes = {"CRYPTO_LADDER", "BTC1H_LADDER"}
+        target_lanes = set()
+        if target_lane in crypto_lanes:
+            target_lanes = set(crypto_lanes)
+        elif target_lane:
+            target_lanes = {target_lane}
         candidates = list(getattr(self, "last_dual_lane_buy_candidates", []) or [])
+        last_attempt_result = None
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
@@ -28541,9 +28612,35 @@ class KalshiSniperBot:
                 continue
             if lane not in {"CRYPTO_LADDER", "BTC1H_LADDER", "SPORTS"}:
                 continue
-            if primary_lane and lane == primary_lane:
+            if target_lanes and lane not in target_lanes:
                 continue
+            if not target_lanes and primary_lane and lane == primary_lane:
+                continue
+            winner_tag = "[AION-CRYPTO-LANE-WINNER]" if lane in crypto_lanes else "[AION-SPORTS-LANE-WINNER]"
+            print(
+                winner_tag
+                + " "
+                + json.dumps(
+                    self._lane_submit_truth_payload(
+                        candidate=candidate,
+                        allocation=allocation,
+                        source=source,
+                        reason="lane_winner_selected",
+                    ),
+                    sort_keys=True,
+                    default=str,
+                )
+            )
             if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
+                result = {"submitted": False, "reason": "weak_sports_quality_demoted"}
+                truth_payload = self._lane_submit_truth_payload(
+                    candidate=candidate,
+                    allocation=allocation,
+                    result=result,
+                    submit_allowed=False,
+                    reason=result.get("reason"),
+                    source=source,
+                )
                 print(
                     "[AION-FINAL-QUALITY-GATE] "
                     + json.dumps(
@@ -28566,10 +28663,18 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
+                print("[AION-PROMOTED-NOT-SUBMITTED] " + json.dumps(truth_payload, sort_keys=True, default=str))
+                print("[AION-PARALLEL-SUBMIT] " + json.dumps(truth_payload, sort_keys=True, default=str))
+                last_attempt_result = result
+                if target_lanes:
+                    return result
                 continue
             q = candidate.get("q")
             market = candidate.get("market") if isinstance(candidate.get("market"), dict) else {}
             family = str(candidate.get("family") or self.get_market_family(market or {"ticker": ticker}) or "UNKNOWN").strip().upper()
+            duplicate = {"blocked": False}
+            payload = None
+            attempt_tag = "[AION-CRYPTO-SUBMIT-ATTEMPT]" if lane in crypto_lanes else "[AION-SPORTS-SUBMIT-ATTEMPT]"
             if self.already_holding(ticker):
                 reason = "duplicate_position_guard"
                 result = {"submitted": False, "reason": reason}
@@ -28586,6 +28691,23 @@ class KalshiSniperBot:
                         selected_ticker=ticker,
                         selection_stage="dual_lane_secondary",
                         allow_orderbook_refresh=True,
+                    )
+                    print(
+                        attempt_tag
+                        + " "
+                        + json.dumps(
+                            self._lane_submit_truth_payload(
+                                candidate=candidate,
+                                allocation=allocation,
+                                payload=payload if isinstance(payload, dict) else {},
+                                duplicate_guard=duplicate,
+                                submit_allowed=bool(payload),
+                                reason="submit_live_order" if payload else "invalid_payload",
+                                source=source,
+                            ),
+                            sort_keys=True,
+                            default=str,
+                        )
                     )
                     result = self.submit_live_order(
                         q,
@@ -28621,7 +28743,26 @@ class KalshiSniperBot:
                             payload=submitted_payload,
                             family=family,
                         )
+            if not payload and not result.get("submitted"):
+                print(
+                    attempt_tag
+                    + " "
+                    + json.dumps(
+                        self._lane_submit_truth_payload(
+                            candidate=candidate,
+                            allocation=allocation,
+                            duplicate_guard=duplicate,
+                            submit_allowed=False,
+                            reason=result.get("reason"),
+                            source=source,
+                        ),
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             payload_for_log = result.get("payload") if isinstance(result, dict) else {}
+            if not payload_for_log and isinstance(payload, dict):
+                payload_for_log = payload
             log_payload = {
                 "lane": lane,
                 "ticker": ticker,
@@ -28640,11 +28781,76 @@ class KalshiSniperBot:
                 "count": (payload_for_log or {}).get("count"),
             }
             print("[AION-DUAL-LANE-EXECUTE] " + json.dumps(log_payload, sort_keys=True, default=str))
+            truth_payload = self._lane_submit_truth_payload(
+                candidate=candidate,
+                allocation=allocation,
+                result=result,
+                payload=(payload_for_log or {}),
+                duplicate_guard=duplicate,
+                submit_allowed=bool(result.get("submitted")),
+                reason="submitted" if result.get("submitted") else result.get("reason"),
+                source=source,
+            )
+            if not result.get("submitted"):
+                print("[AION-PROMOTED-NOT-SUBMITTED] " + json.dumps(truth_payload, sort_keys=True, default=str))
+            print("[AION-PARALLEL-SUBMIT] " + json.dumps(truth_payload, sort_keys=True, default=str))
             self.last_dual_lane_execution_summary = log_payload
+            last_attempt_result = result
             if result.get("submitted"):
                 return result
-        self.last_dual_lane_execution_summary = {"submitted": False, "reason": "no_secondary_lane_candidate"}
+            if target_lanes:
+                return result
+        self.last_dual_lane_execution_summary = last_attempt_result or {"submitted": False, "reason": "no_secondary_lane_candidate"}
         return self.last_dual_lane_execution_summary
+
+    def _execute_parallel_lane_submit_attempts(self, *, primary_ticker=None, primary_lane=None, primary_result=None, source="final_allocation"):
+        candidates = list(getattr(self, "last_dual_lane_buy_candidates", []) or [])
+        if not candidates:
+            summary = {"source": source, "submitted": False, "reason": "no_lane_candidates"}
+            print("[AION-FINAL-ALLOCATION-TRUTH] " + json.dumps(summary, sort_keys=True, default=str))
+            return summary
+        primary_ticker = str(primary_ticker or "").strip()
+        primary_lane = str(primary_lane or "").strip().upper()
+        primary_result = primary_result if isinstance(primary_result, dict) else {}
+        if primary_ticker and not primary_lane:
+            for lane_candidate in candidates:
+                if str((lane_candidate or {}).get("ticker") or "").strip() == primary_ticker:
+                    primary_lane = str((lane_candidate or {}).get("lane") or "").strip().upper()
+                    break
+        crypto_lanes = {"CRYPTO_LADDER", "BTC1H_LADDER"}
+        already_submitted = {
+            "CRYPTO_LADDER": bool(primary_result.get("submitted") and primary_lane in crypto_lanes),
+            "SPORTS": bool(primary_result.get("submitted") and primary_lane == "SPORTS"),
+        }
+        results = {}
+        for lane_name in ("CRYPTO_LADDER", "SPORTS"):
+            if already_submitted.get(lane_name):
+                results[lane_name] = {
+                    "submitted": True,
+                    "reason": "primary_lane_already_submitted",
+                    "ticker": primary_ticker,
+                }
+                continue
+            lane_result = self._execute_dual_lane_secondary_candidate(
+                primary_ticker=primary_ticker if primary_result.get("submitted") else None,
+                primary_lane=primary_lane if primary_result.get("submitted") else None,
+                target_lane=lane_name,
+                source=source,
+            )
+            results[lane_name] = lane_result if isinstance(lane_result, dict) else {"submitted": False, "reason": "unknown"}
+        summary = {
+            "source": source,
+            "primary_ticker": primary_ticker,
+            "primary_lane": primary_lane,
+            "primary_submitted": bool(primary_result.get("submitted")),
+            "crypto_submitted": bool((results.get("CRYPTO_LADDER") or {}).get("submitted")),
+            "sports_submitted": bool((results.get("SPORTS") or {}).get("submitted")),
+            "crypto_reason": (results.get("CRYPTO_LADDER") or {}).get("reason"),
+            "sports_reason": (results.get("SPORTS") or {}).get("reason"),
+            "results": results,
+        }
+        print("[AION-FINAL-ALLOCATION-TRUTH] " + json.dumps(summary, sort_keys=True, default=str))
+        return summary
 
     def _crypto_ladder_asset_symbol(self, *, family=None, ticker=None, market=None, q=None):
         market = market if isinstance(market, dict) else {}
@@ -64494,6 +64700,12 @@ class KalshiSniperBot:
                 )
                 execution_funnel["execution_blocked"] = 1
                 trade_readiness_trade_submitted = False
+                self._execute_parallel_lane_submit_attempts(
+                    primary_ticker=auto_live_ticker,
+                    primary_lane=final_lane_allocation.get("lane"),
+                    primary_result={"submitted": False, "reason": "weak_sports_quality_demoted"},
+                    source="final_submit_preflight_skip",
+                )
                 emit_full_select_cycle_timing()
                 return
             print(
@@ -64711,9 +64923,11 @@ class KalshiSniperBot:
                     if str(lane_candidate.get("ticker") or "").strip() == str(auto_live_ticker or "").strip():
                         primary_lane = lane_candidate.get("lane")
                         break
-                self._execute_dual_lane_secondary_candidate(
+                self._execute_parallel_lane_submit_attempts(
                     primary_ticker=auto_live_ticker,
                     primary_lane=primary_lane,
+                    primary_result=result,
+                    source="final_submit_after_primary_success",
                 )
             else:
                 execution_funnel["execution_blocked"] = 1
@@ -64783,6 +64997,17 @@ class KalshiSniperBot:
                 )
                 print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={result.get('reason')}")
                 self._log_live_execution_final_blocked(auto_live_ticker, result.get("reason"))
+                primary_lane = None
+                for lane_candidate in getattr(self, "last_dual_lane_buy_candidates", []) or []:
+                    if str(lane_candidate.get("ticker") or "").strip() == str(auto_live_ticker or "").strip():
+                        primary_lane = lane_candidate.get("lane")
+                        break
+                self._execute_parallel_lane_submit_attempts(
+                    primary_ticker=auto_live_ticker,
+                    primary_lane=primary_lane,
+                    primary_result=result,
+                    source="final_submit_after_primary_block",
+                )
             print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
             return
 
