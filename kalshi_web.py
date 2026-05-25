@@ -24098,6 +24098,8 @@ class KalshiSniperBot:
         ticker = market.get("ticker", "N/A")
         title = market.get("title") or market.get("subtitle") or "Untitled"
         family = self.get_market_family(market)
+        is_sports_family = self._is_sports_market_or_family(family)
+        is_crypto_ladder = self._is_crypto_ladder_market(family=family, ticker=ticker, market=market)
 
         def _normalize_price_like(value):
             numeric = self.to_float(value, None)
@@ -24118,7 +24120,7 @@ class KalshiSniperBot:
             orderbook_shape = "side_levels"
         elif market.get("yes_dollars") not in (None, "", [], {} ) or market.get("no_dollars") not in (None, "", [], {}):
             orderbook_shape = "root_dollars"
-        if self._is_sports_market_or_family(family):
+        if is_sports_family or is_crypto_ladder:
             try:
                 sports_quote_snapshot = self._extract_non_targeted_topbook_snapshot(market)
             except Exception as exc:
@@ -24543,6 +24545,8 @@ class KalshiSniperBot:
         except Exception:
             pass
 
+        selected_side = None
+        selected_price = None
         yes_top_size = self.to_float(
             sports_quote_snapshot.get("yes_top_size") if isinstance(sports_quote_snapshot, dict) else None,
             self.to_float(market.get("yes_top_size"), None),
@@ -24551,6 +24555,29 @@ class KalshiSniperBot:
             sports_quote_snapshot.get("no_top_size") if isinstance(sports_quote_snapshot, dict) else None,
             self.to_float(market.get("no_top_size"), None),
         )
+        if is_crypto_ladder:
+            crypto_quote_snapshot = self._crypto_ladder_quote_hydration_snapshot(
+                market=market,
+                family=family,
+                ticker=ticker,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+                topbook_snapshot=sports_quote_snapshot,
+                source="build_quote",
+                emit_log=True,
+            )
+            yes_top_size = self.to_float(crypto_quote_snapshot.get("yes_top_size"), yes_top_size)
+            no_top_size = self.to_float(crypto_quote_snapshot.get("no_top_size"), no_top_size)
+            liquidity = max(
+                self.to_float(liquidity, 0.0) or 0.0,
+                self.to_float(crypto_quote_snapshot.get("liquidity"), 0.0) or 0.0,
+                self.to_float(yes_top_size, 0.0) or 0.0,
+                self.to_float(no_top_size, 0.0) or 0.0,
+            )
+            selected_side = crypto_quote_snapshot.get("selected_side")
+            selected_price = crypto_quote_snapshot.get("selected_price")
         return Quote(
             ticker=ticker,
             title=title,
@@ -24563,6 +24590,8 @@ class KalshiSniperBot:
             liquidity=liquidity,
             yes_top_size=yes_top_size,
             no_top_size=no_top_size,
+            selected_side=selected_side,
+            selected_price=selected_price,
         )
 
     def _diagnose_quote_readiness_context(self, *, market=None, q=None, family=None, sports_context=None, source="unknown"):
@@ -28979,6 +29008,153 @@ class KalshiSniperBot:
         if "CRYPTO" in text or f"KX{asset}" in text or (asset == "XRP" and "KXXRP" in text):
             return True
         return any(term in text for term in ("PRICE", "ABOVE", "BELOW", "BETWEEN", "RANGE", "TARGET", "HIGH", "LOW"))
+
+    def _crypto_ladder_quote_hydration_snapshot(
+        self,
+        *,
+        market=None,
+        q=None,
+        family=None,
+        ticker=None,
+        yes_bid=None,
+        yes_ask=None,
+        no_bid=None,
+        no_ask=None,
+        topbook_snapshot=None,
+        source="crypto_quote_hydration",
+        emit_log=True,
+    ):
+        market = market if isinstance(market, dict) else {}
+        topbook_snapshot = topbook_snapshot if isinstance(topbook_snapshot, dict) else {}
+        ticker = str(ticker or market.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q)
+        if not self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q):
+            return {"is_crypto_ladder": False, "orderbook_ready": False, "reason": "not_crypto_ladder"}
+        asset = self._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market, q=q)
+        timeframe = self._crypto_ladder_timeframe(family=family, ticker=ticker, market=market, q=q)
+
+        def _price(*values):
+            for value in values:
+                numeric = self.to_float(value, None)
+                if numeric is None:
+                    continue
+                if 0.0 <= numeric <= 1.0:
+                    return round(float(numeric), 4)
+                if 1.0 < numeric <= 100.0:
+                    return round(float(numeric) / 100.0, 4)
+            return None
+
+        def _max_positive(*values):
+            positives = []
+            for value in values:
+                numeric = self.to_float(value, None)
+                if numeric is not None and numeric > 0.0:
+                    positives.append(float(numeric))
+            return max(positives) if positives else None
+
+        yes_bid_value = _price(yes_bid, getattr(q, "yes_bid", None), market.get("yes_bid_dollars"), market.get("yes_bid"))
+        yes_ask_value = _price(yes_ask, getattr(q, "yes_ask", None), market.get("yes_ask_dollars"), market.get("yes_ask"), topbook_snapshot.get("yes_top_price"))
+        no_bid_value = _price(no_bid, getattr(q, "no_bid", None), market.get("no_bid_dollars"), market.get("no_bid"))
+        no_ask_value = _price(no_ask, getattr(q, "no_ask", None), market.get("no_ask_dollars"), market.get("no_ask"), topbook_snapshot.get("no_top_price"))
+        try:
+            yes_bid_value, yes_ask_value, no_bid_value, no_ask_value = self._infer_missing_binary_quotes(yes_bid_value, yes_ask_value, no_bid_value, no_ask_value)
+        except Exception:
+            pass
+
+        direct_yes_executable_size = _max_positive(
+            market.get("yes_ask_size_fp"), market.get("yes_ask_size"), market.get("best_yes_ask_size"),
+            market.get("no_bid_size_fp"), market.get("no_bid_size"), market.get("best_no_bid_size"),
+        )
+        direct_no_executable_size = _max_positive(
+            market.get("no_ask_size_fp"), market.get("no_ask_size"), market.get("best_no_ask_size"),
+            market.get("yes_bid_size_fp"), market.get("yes_bid_size"), market.get("best_yes_bid_size"),
+        )
+        yes_top_size = direct_yes_executable_size or _max_positive(
+            topbook_snapshot.get("yes_top_size"), getattr(q, "yes_top_size", None), market.get("yes_top_size"),
+        )
+        no_top_size = direct_no_executable_size or _max_positive(
+            topbook_snapshot.get("no_top_size"), getattr(q, "no_top_size", None), market.get("no_top_size"),
+        )
+        reported_liquidity = self.to_float(getattr(q, "liquidity", None), self.to_float(market.get("liquidity_dollars", market.get("liquidity")), 0.0)) or 0.0
+        liquidity = max(reported_liquidity, yes_top_size or 0.0, no_top_size or 0.0)
+
+        direction_store = getattr(self, "live_direction_decisions_by_ticker", {}) or {}
+        direction_decision = {}
+        if isinstance(direction_store, dict):
+            normalized_ticker = self.normalize_phase55_ticker_key(ticker) if ticker else None
+            direction_decision = direction_store.get(ticker or "", {}) or direction_store.get(normalized_ticker or "", {}) or {}
+        selected_side = str(
+            direction_decision.get("intended_side") or getattr(q, "selected_side", None) or getattr(q, "side", None) or globals().get("DEFAULT_LIVE_ORDER_SIDE", "yes") or "yes"
+        ).strip().lower()
+        if selected_side not in {"yes", "no"}:
+            selected_side = "yes"
+
+        def _side_price(side):
+            return yes_ask_value if side == "yes" else no_ask_value
+
+        def _side_size(side):
+            return yes_top_size if side == "yes" else no_top_size
+
+        selected_price = _side_price(selected_side)
+        selected_size = _side_size(selected_side)
+        selected_price_cents = None
+        if selected_price is not None:
+            try:
+                selected_price_cents = int(round(float(selected_price) * 100.0))
+            except (TypeError, ValueError):
+                selected_price_cents = None
+        selected_price_valid = bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99)
+        if not selected_price_valid:
+            alternate_side = "no" if selected_side == "yes" else "yes"
+            alternate_price = _side_price(alternate_side)
+            alternate_size = _side_size(alternate_side)
+            alternate_cents = None
+            if alternate_price is not None:
+                try:
+                    alternate_cents = int(round(float(alternate_price) * 100.0))
+                except (TypeError, ValueError):
+                    alternate_cents = None
+            if alternate_cents is not None and 1 <= int(alternate_cents) <= 99:
+                selected_side = alternate_side
+                selected_price = alternate_price
+                selected_size = alternate_size
+                selected_price_cents = alternate_cents
+                selected_price_valid = True
+
+        spread = None
+        if yes_bid_value is not None and yes_ask_value is not None and yes_ask_value >= yes_bid_value:
+            spread = round(float(yes_ask_value) - float(yes_bid_value), 4)
+        elif no_bid_value is not None and no_ask_value is not None and no_ask_value >= no_bid_value:
+            spread = round(float(no_ask_value) - float(no_bid_value), 4)
+
+        selected_side_has_liquidity = bool((selected_size or 0.0) > 0.0 or liquidity > 0.0)
+        orderbook_ready = bool(selected_price_valid and selected_side in {"yes", "no"} and selected_side_has_liquidity)
+        if selected_price is None:
+            reason = "selected_price_missing"
+        elif not selected_price_valid:
+            reason = "selected_price_out_of_range"
+        elif not selected_side_has_liquidity:
+            reason = "selected_side_liquidity_missing"
+        else:
+            reason = "crypto_orderbook_ready"
+
+        payload = {
+            "ticker": ticker or None, "family": family, "asset": asset, "timeframe": timeframe, "side": selected_side,
+            "yes_bid": yes_bid_value, "yes_ask": yes_ask_value, "no_bid": no_bid_value, "no_ask": no_ask_value,
+            "yes_top_size": yes_top_size, "no_top_size": no_top_size, "selected_side": selected_side,
+            "selected_price": selected_price, "selected_price_cents": selected_price_cents, "selected_price_units": "dollars",
+            "selected_top_size": selected_size, "spread": spread, "liquidity": liquidity,
+            "orderbook_ready": bool(orderbook_ready), "reason": reason, "source": source,
+        }
+        if emit_log:
+            try:
+                print("[AION-LANE-ISOLATION] " + json.dumps({"ticker": ticker or None, "family": family, "lane": "CRYPTO_LADDER", "sports_filters_applied": False, "crypto_hydration_applied": True, "sports_candidate_mutated": False, "reason": "crypto_quote_hydration_is_lane_local", "source": source}, sort_keys=True, default=str))
+                print("[CRYPTO-QUOTE-HYDRATION] " + json.dumps(payload, sort_keys=True, default=str))
+                print("[CRYPTO-SELECTED-PRICE] " + json.dumps(payload, sort_keys=True, default=str))
+                print(("[CRYPTO-ORDERBOOK-READY] " if orderbook_ready else "[CRYPTO-ORDERBOOK-BLOCK] ") + json.dumps(payload, sort_keys=True, default=str))
+            except Exception:
+                pass
+        return payload
 
     def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
         return self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q)
@@ -37710,14 +37886,16 @@ class KalshiSniperBot:
         side = "no" if str(side).lower() == "no" else "yes"
         size_keys = (
             (
-                "yes_top_size", "best_yes_bid_size", "yes_bid_size", "best_yes_ask_size",
-                "yes_ask_size", "yes_size", "best_yes_size", "yes_contracts", "yes_quantity",
+                "yes_top_size", "best_yes_bid_size", "yes_bid_size", "yes_bid_size_fp", "best_yes_ask_size",
+                "yes_ask_size", "yes_ask_size_fp", "no_bid_size_fp", "best_no_bid_size", "no_bid_size",
+                "yes_size", "best_yes_size", "yes_contracts", "yes_quantity",
                 "yes_qty", "yes_contract_count", "yes_available", "bid_size", "bid_quantity", "bid_qty",
             )
             if side == "yes"
             else (
-                "no_top_size", "best_no_bid_size", "no_bid_size", "best_no_ask_size",
-                "no_ask_size", "no_size", "best_no_size", "no_contracts", "no_quantity",
+                "no_top_size", "best_no_bid_size", "no_bid_size", "no_bid_size_fp", "best_no_ask_size",
+                "no_ask_size", "no_ask_size_fp", "yes_bid_size_fp", "best_yes_bid_size", "yes_bid_size",
+                "no_size", "best_no_size", "no_contracts", "no_quantity",
                 "no_qty", "no_contract_count", "no_available", "ask_size", "ask_quantity", "ask_qty",
             )
         )
@@ -37931,10 +38109,13 @@ class KalshiSniperBot:
         yes_top_size = first_numeric(
             liquidity_priority.get("yes_top_size"),
             market.get("yes_top_size"),
+            market.get("yes_ask_size_fp"),
+            market.get("no_bid_size_fp"),
             yes_level_top.get("size"),
             self._extract_orderbook_side_size_hint(market, "yes"),
             market.get("best_yes_bid_size"),
             market.get("yes_bid_size"),
+            market.get("yes_bid_size_fp"),
             market.get("best_yes_ask_size"),
             market.get("yes_ask_size"),
             market.get("yes_size"),
@@ -37943,10 +38124,13 @@ class KalshiSniperBot:
         no_top_size = first_numeric(
             liquidity_priority.get("no_top_size"),
             market.get("no_top_size"),
+            market.get("no_ask_size_fp"),
+            market.get("yes_bid_size_fp"),
             no_level_top.get("size"),
             self._extract_orderbook_side_size_hint(market, "no"),
             market.get("best_no_bid_size"),
             market.get("no_bid_size"),
+            market.get("no_bid_size_fp"),
             market.get("best_no_ask_size"),
             market.get("no_ask_size"),
             market.get("no_size"),
@@ -55434,8 +55618,8 @@ class KalshiSniperBot:
         no_ask_value = self.to_float(no_ask, None)
         no_bid_value = self.to_float(no_bid, None)
         malformed_orderbook = bool(
-            (yes_ask_value is not None and (yes_ask_value <= 0.0 or yes_ask_value >= 1.0))
-            or (no_ask_value is not None and (no_ask_value <= 0.0 or no_ask_value >= 1.0))
+            (yes_ask_value is not None and (yes_ask_value <= 0.0 or yes_ask_value > 1.0))
+            or (no_ask_value is not None and (no_ask_value <= 0.0 or no_ask_value > 1.0))
         )
         if malformed_orderbook:
             bounds_pass = False
@@ -66160,6 +66344,12 @@ class KalshiSniperBot:
         raw_ticker = str(ticker or market_source.get("ticker") or candidate_source.get("ticker") or quote_diag.get("ticker") or "").strip()
         normalized_ticker = self.normalize_phase55_ticker_key(raw_ticker)
         family = self.get_market_family({"ticker": raw_ticker}) if raw_ticker else self.get_market_family(market_source) if market_source else "UNKNOWN"
+        is_crypto_ladder = self._is_crypto_ladder_market(
+            family=family,
+            ticker=raw_ticker,
+            market=market_source or market,
+            q=candidate,
+        )
         resolved_side = str(selected_side or "").strip().lower() or None
         effective_price_source = str(price_source or "ask").strip().lower() or "ask"
         if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() == "buy":
@@ -66600,11 +66790,114 @@ class KalshiSniperBot:
         )
         if selected_price_in_bounds and selected_price is None and selected_price_cents is not None:
             selected_price = round(int(selected_price_cents) / 100.0, 4)
+
+        crypto_hydration = {}
+        resolved_topbook_source = (
+            selected_source_dict
+            if isinstance(selected_source_dict, dict) and selected_source_dict
+            else market_source or candidate_source or quote_source
+        )
+        resolved_topbook_snapshot = {}
+        if isinstance(resolved_topbook_source, dict) and resolved_topbook_source:
+            try:
+                resolved_topbook_snapshot = self._extract_non_targeted_topbook_snapshot(resolved_topbook_source)
+            except Exception:
+                resolved_topbook_snapshot = {}
+        resolved_yes_top_size = self.to_float(
+            resolved_topbook_snapshot.get("yes_top_size"),
+            self.to_float(
+                quote_diag.get("yes_top_size"),
+                self.to_float(getattr(candidate, "yes_top_size", None), self._extract_orderbook_side_size_hint(resolved_topbook_source, "yes")),
+            ),
+        )
+        resolved_no_top_size = self.to_float(
+            resolved_topbook_snapshot.get("no_top_size"),
+            self.to_float(
+                quote_diag.get("no_top_size"),
+                self.to_float(getattr(candidate, "no_top_size", None), self._extract_orderbook_side_size_hint(resolved_topbook_source, "no")),
+            ),
+        )
+        if is_crypto_ladder:
+            crypto_hydration = self._crypto_ladder_quote_hydration_snapshot(
+                market=resolved_topbook_source or market_source or market,
+                q=candidate,
+                family=family,
+                ticker=raw_ticker,
+                yes_bid=yes_bid if yes_bid is not None else yes_bid_dollars,
+                yes_ask=yes_ask if yes_ask is not None else yes_ask_dollars,
+                no_bid=no_bid if no_bid is not None else no_bid_dollars,
+                no_ask=no_ask if no_ask is not None else no_ask_dollars,
+                topbook_snapshot=resolved_topbook_snapshot,
+                source=f"resolve_aion_orderbook_for_payload:{selection_stage or 'payload'}",
+                emit_log=True,
+            )
+            for key, target in (
+                ("yes_bid", "yes_bid"),
+                ("yes_ask", "yes_ask"),
+                ("no_bid", "no_bid"),
+                ("no_ask", "no_ask"),
+            ):
+                value = self.to_float(crypto_hydration.get(key), None)
+                if value is None:
+                    continue
+                if target == "yes_bid":
+                    yes_bid = yes_bid_dollars = value
+                elif target == "yes_ask":
+                    yes_ask = yes_ask_dollars = value
+                elif target == "no_bid":
+                    no_bid = no_bid_dollars = value
+                elif target == "no_ask":
+                    no_ask = no_ask_dollars = value
+            resolved_yes_top_size = self.to_float(crypto_hydration.get("yes_top_size"), resolved_yes_top_size)
+            resolved_no_top_size = self.to_float(crypto_hydration.get("no_top_size"), resolved_no_top_size)
+            crypto_selected_side = str(crypto_hydration.get("selected_side") or "").strip().lower()
+            crypto_selected_price = self.to_float(crypto_hydration.get("selected_price"), None)
+            if crypto_selected_side in {"yes", "no"}:
+                resolved_side = crypto_selected_side
+            if crypto_selected_price is not None and crypto_selected_price > 0.0:
+                selected_price_raw, selected_price_dollars, selected_price_cents, selected_price_block_reason = _normalize_selected_price_snapshot(crypto_selected_price)
+                if selected_price_dollars is not None:
+                    selected_price = selected_price_dollars
+                    selected_price_source = "crypto_quote_hydration"
+                    selected_price_in_bounds = bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99)
+            if bool(crypto_hydration.get("orderbook_ready")):
+                hydrated_source = {
+                    "ticker": raw_ticker or normalized_ticker,
+                    "family": family,
+                    "source_path": "crypto_quote_hydration",
+                    "topbook_snapshot_present": True,
+                    "normalized_orderbook_present": True,
+                    "topbook_depth_exists": True,
+                    "orderbook_exists": True,
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                    "no_bid": no_bid,
+                    "no_ask": no_ask,
+                    "yes_bid_dollars": yes_bid_dollars,
+                    "yes_ask_dollars": yes_ask_dollars,
+                    "no_bid_dollars": no_bid_dollars,
+                    "no_ask_dollars": no_ask_dollars,
+                    "yes_top_size": resolved_yes_top_size,
+                    "no_top_size": resolved_no_top_size,
+                    "selected_side": resolved_side,
+                    "selected_price": selected_price,
+                    "selected_price_cents": selected_price_cents,
+                }
+                if selected_source_dict is not None:
+                    selected_source_dict.update({key: value for key, value in hydrated_source.items() if value not in (None, "", [], {})})
+                else:
+                    selected_source_dict = hydrated_source
+                selected_source_label = "crypto_quote_hydration"
+                orderbook_keys = sorted(list(selected_source_dict.keys()))[:64]
+
         quote_diag_topbook_present = bool(
             quote_diag.get("topbook_snapshot_present")
             or quote_diag.get("normalized_orderbook_present")
             or quote_diag.get("topbook_depth_exists")
             or quote_diag.get("orderbook_exists")
+            or bool(crypto_hydration.get("orderbook_ready"))
+            or self.to_float(resolved_yes_top_size, 0.0) > 0.0
+            or self.to_float(resolved_no_top_size, 0.0) > 0.0
         )
         if selected_source_dict is None and quote_diag_topbook_present and selected_price_in_bounds:
             selected_source_dict = {
@@ -66715,16 +67008,20 @@ class KalshiSniperBot:
             and selected_price is not None
             and selected_price > 0.0
         )
+        selected_top_size = resolved_yes_top_size if resolved_side == "yes" else resolved_no_top_size if resolved_side == "no" else None
         selected_side_has_liquidity = bool(
             quote_diag.get("selected_side_has_liquidity")
             or quote_diag.get("depth_available")
             or quote_diag_topbook_present
             or selected_source_dict is not None
+            or self.to_float(selected_top_size, 0.0) > 0.0
             or any(
                 self.to_float(value, None) is not None and self.to_float(value, 0.0) > 0.0
                 for value in (yes_bid_dollars, yes_ask_dollars, no_bid_dollars, no_ask_dollars)
             )
         )
+        if is_crypto_ladder and selected_price_in_bounds and selected_side_has_liquidity and selected_source_dict is not None:
+            orderbook_ready = True
         depth_available = bool(
             quote_diag.get("depth_available")
             or quote_diag.get("topbook_depth_exists")
@@ -67103,8 +67400,18 @@ class KalshiSniperBot:
             "cache_age_seconds": round(cache_age_seconds, 2) if cache_age_seconds is not None else None,
             "topbook_snapshot_present": bool(quote_diag_topbook_present),
             "normalized_orderbook_present": bool(selected_source_dict is not None or yes_bid is not None or yes_ask is not None or no_bid is not None or no_ask is not None),
-            "topbook_depth_exists": bool(quote_diag_topbook_present),
+            "topbook_depth_exists": bool(quote_diag_topbook_present or self.to_float(resolved_yes_top_size, 0.0) > 0.0 or self.to_float(resolved_no_top_size, 0.0) > 0.0),
             "orderbook_exists": bool(selected_source_dict is not None or selected_price_in_bounds or quote_diag_topbook_present),
+            "yes_top_size": resolved_yes_top_size,
+            "no_top_size": resolved_no_top_size,
+            "selected_top_size": selected_top_size,
+            "liquidity_depth": max(
+                self.to_float(resolved_yes_top_size, 0.0) or 0.0,
+                self.to_float(resolved_no_top_size, 0.0) or 0.0,
+                self.to_float(quote_diag.get("liquidity_depth"), self.to_float(quote_diag.get("liquidity"), 0.0)) or 0.0,
+                self.to_float(crypto_hydration.get("liquidity"), 0.0) if isinstance(crypto_hydration, dict) else 0.0,
+            ),
+            "crypto_hydration": crypto_hydration if is_crypto_ladder else {},
             "orderbook_salvaged": bool(selected_source_label == "topbook_salvage"),
             "quote_ready": bool(quote_ready),
             "selected_side_has_price": bool(selected_side_has_price),

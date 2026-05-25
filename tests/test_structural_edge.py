@@ -984,6 +984,116 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result['crypto_submitted'])
         self.assertEqual(submitted, [crypto_q.ticker])
 
+    def test_crypto_quote_hydration_builds_selected_price_and_depth_from_fp_sizes(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXBTC-26MAY2517-B73875",
+            "series_ticker": "KXBTC",
+            "event_ticker": "KXBTC-26MAY2517",
+            "title": "Bitcoin above $73,875 at 5pm",
+            "yes_bid_dollars": 0.0,
+            "yes_ask_dollars": 0.01,
+            "no_bid_dollars": 0.99,
+            "no_ask_dollars": 1.0,
+            "yes_ask_size_fp": 272,
+            "no_bid_size_fp": 272,
+            "no_ask_size_fp": 309,
+            "yes_bid_size_fp": 309,
+        }
+
+        q = bot.build_quote(market)
+
+        self.assertEqual(q.selected_side, "yes")
+        self.assertEqual(q.selected_price, 0.01)
+        self.assertGreaterEqual(q.yes_top_size, 272)
+        self.assertGreaterEqual(q.liquidity, 272)
+
+        resolution = bot.resolve_aion_orderbook_for_payload(
+            q.ticker,
+            candidate=q,
+            market=market,
+            price_source="ask",
+            selected_side="yes",
+            allow_refresh=False,
+        )
+
+        self.assertTrue(resolution["orderbook_ready"])
+        self.assertEqual(resolution["selected_side"], "yes")
+        self.assertEqual(resolution["selected_price_cents"], 1)
+        self.assertTrue(resolution["selected_side_has_liquidity"])
+        self.assertGreaterEqual(resolution["yes_top_size"], 272)
+
+    def test_crypto_malformed_book_blocks_without_executable_price(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXBTC-26MAY2517-B73875",
+            "series_ticker": "KXBTC",
+            "event_ticker": "KXBTC-26MAY2517",
+            "title": "Bitcoin above $73,875 at 5pm",
+        }
+
+        resolution = bot.resolve_aion_orderbook_for_payload(
+            market["ticker"],
+            market=market,
+            price_source="ask",
+            selected_side="yes",
+            allow_refresh=False,
+        )
+
+        self.assertFalse(resolution["orderbook_ready"])
+        self.assertIn(
+            resolution["block_reason"],
+            {"orderbook_fetch_not_called", "selected_price_missing", "missing_price"},
+        )
+
+    def test_crypto_hydration_does_not_mutate_sports_candidate(self):
+        bot = self._make_bot()
+        sports_q = SimpleNamespace(
+            ticker="KXMLBSPREAD-SPORTS-TEST",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=18,
+            no_top_size=22,
+            liquidity=22,
+        )
+        sports_market = {
+            "ticker": sports_q.ticker,
+            "series_ticker": "KXMLBSPREAD",
+            "title": "MLB spread",
+            "yes_bid": 45,
+            "yes_ask": 47,
+            "no_bid": 53,
+            "no_ask": 55,
+        }
+        before = dict(vars(sports_q))
+
+        snapshot = bot._crypto_ladder_quote_hydration_snapshot(
+            market=sports_market,
+            q=sports_q,
+            family="KXMLBSPREAD",
+            ticker=sports_q.ticker,
+            emit_log=False,
+        )
+        bot._crypto_ladder_quote_hydration_snapshot(
+            market={
+                "ticker": "KXETH-26MAY2517-B3500",
+                "series_ticker": "KXETH",
+                "title": "Ethereum above $3,500 at 5pm",
+                "yes_ask_dollars": 0.31,
+                "yes_ask_size_fp": 140,
+            },
+            family="KXETH",
+            ticker="KXETH-26MAY2517-B3500",
+            emit_log=False,
+        )
+
+        self.assertFalse(snapshot["is_crypto_ladder"])
+        self.assertEqual(vars(sports_q), before)
+
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {
             "ticker": "KXMLBSTRIKEOUT-TEST-65",
