@@ -154,6 +154,21 @@ except Exception:
     strategy_formatting = None
 
 try:
+    from obsidian_exporter import (
+        append_session_intelligence as obsidian_append_session_intelligence,
+        ensure_obsidian_vault as obsidian_ensure_vault,
+        record_family_observation as obsidian_record_family_observation,
+        record_pattern_observation as obsidian_record_pattern_observation,
+        record_trade_outcome as obsidian_record_trade_outcome,
+    )
+except Exception:
+    obsidian_append_session_intelligence = None
+    obsidian_ensure_vault = None
+    obsidian_record_family_observation = None
+    obsidian_record_pattern_observation = None
+    obsidian_record_trade_outcome = None
+
+try:
     from kalshi_sniper.candidate_quality import (
         build_candidate_quality_summary as candidate_quality_build_candidate_quality_summary,
         build_expectancy_score as candidate_quality_build_expectancy_score,
@@ -5950,6 +5965,24 @@ class KalshiSniperBot:
             self._record_aion_distilled_memory_event(event_type, event)
             if event_type == "trade_closed":
                 self._record_sports_memory_trade_event(event)
+            try:
+                self._export_obsidian_learning_event(event_type, event)
+            except Exception as obsidian_exc:
+                try:
+                    print(
+                        "[OBSIDIAN-EXPORT-ERROR] "
+                        + json.dumps(
+                            {
+                                "action": "learning_archive_event",
+                                "event_type": event_type,
+                                "reason": obsidian_exc.__class__.__name__,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                except Exception:
+                    pass
             return {"ok": True, "path": str(archive_path), "event_type": event_type}
         except Exception as exc:
             try:
@@ -7934,10 +7967,263 @@ class KalshiSniperBot:
         if not record:
             return {"ok": False, "reason": "empty_record"}
         write_result = self.safe_memory_write(record)
+        try:
+            self._safe_obsidian_export(
+                obsidian_record_trade_outcome,
+                ticker=record.get("ticker"),
+                family=record.get("family"),
+                timestamp=record.get("timestamp"),
+                status="closed",
+                side=record.get("side"),
+                entry_price=record.get("entry_price"),
+                exit_price=record.get("exit_price"),
+                confidence=record.get("realm_x_adaptive_score") or record.get("realm_ix_awareness_score"),
+                ev=record.get("realm_xi_predictive_score"),
+                exit_reason=record.get("exit_reason"),
+                pnl=record.get("realized_pnl_delta"),
+                result=record.get("outcome"),
+                hold_time=record.get("hold_seconds"),
+                facts=record,
+            )
+        except Exception as obsidian_exc:
+            try:
+                print(
+                    "[OBSIDIAN-EXPORT-ERROR] "
+                    + json.dumps(
+                        {
+                            "action": "record_trade_memory",
+                            "ticker": record.get("ticker"),
+                            "family": record.get("family"),
+                            "reason": obsidian_exc.__class__.__name__,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         if write_result.get("ok"):
             self.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
             return write_result
         return write_result
+
+    def _safe_obsidian_export(self, export_fn, *args, **kwargs):
+        if not callable(export_fn):
+            return {"ok": False, "reason": "exporter_unavailable"}
+        try:
+            result = export_fn(*args, **kwargs)
+            return result if isinstance(result, dict) else {"ok": bool(result), "reason": "completed"}
+        except Exception as exc:
+            try:
+                print(
+                    "[OBSIDIAN-EXPORT-ERROR] "
+                    + json.dumps(
+                        {
+                            "action": getattr(export_fn, "__name__", "unknown"),
+                            "reason": exc.__class__.__name__,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+            return {"ok": False, "reason": exc.__class__.__name__}
+
+    def _export_obsidian_startup(self, *, live_mode=None, live_armed=None, live_env_confirmed=None, effective_dry_run=None):
+        facts = {
+            "live_mode": bool(live_mode),
+            "live_armed": bool(live_armed),
+            "live_env_confirmed": bool(live_env_confirmed),
+            "effective_dry_run": bool(effective_dry_run),
+            "configured_dry_run": bool(globals().get("DRY_RUN_LIVE_ORDERS", False)),
+            "max_live_trades_per_day": globals().get("MAX_LIVE_TRADES_PER_DAY"),
+            "max_simultaneous_live_positions": globals().get("MAX_SIMULTANEOUS_LIVE_POSITIONS"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._safe_obsidian_export(obsidian_ensure_vault)
+        return self._safe_obsidian_export(
+            obsidian_append_session_intelligence,
+            event_type="startup",
+            source="kalshi_web.main",
+            facts=facts,
+            related=["Kalshi Bot", "Startup", "Telemetry"],
+        )
+
+    def _export_obsidian_selected_candidate(
+        self,
+        *,
+        q=None,
+        market=None,
+        family=None,
+        score=None,
+        spread=None,
+        reason=None,
+        quality_snapshot=None,
+        ev_context=None,
+        expectancy_summary=None,
+        entry_timing_status=None,
+    ):
+        quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+        ev_context = ev_context if isinstance(ev_context, dict) else {}
+        expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        ticker = str(getattr(q, "ticker", "") or market.get("ticker") or "").strip()
+        family = str(family or market.get("family") or market.get("series_ticker") or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip().upper()
+        selected_side = (
+            quality_snapshot.get("selected_side")
+            or ev_context.get("selected_side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        selected_price = (
+            quality_snapshot.get("selected_price")
+            or ev_context.get("ev_selected_price")
+            or expectancy_summary.get("selected_price")
+            or expectancy_summary.get("selected_price_dollars")
+            or getattr(q, "selected_price", None)
+            or getattr(q, "yes_ask", None)
+        )
+        facts = {
+            "ticker": ticker,
+            "family": family,
+            "action": globals().get("DEFAULT_LIVE_ORDER_ACTION"),
+            "side": selected_side,
+            "price": selected_price,
+            "spread": spread if spread is not None else quality_snapshot.get("spread") or ev_context.get("spread"),
+            "liquidity": quality_snapshot.get("liquidity") or quality_snapshot.get("liquidity_depth") or getattr(q, "liquidity", None),
+            "score": score,
+            "confidence": quality_snapshot.get("candidate_score") or ev_context.get("confidence"),
+            "ev": ev_context.get("ev_edge") or ev_context.get("expected_roi") or quality_snapshot.get("edge_after_cost"),
+            "probability": ev_context.get("estimated_win_probability") or expectancy_summary.get("estimated_win_probability"),
+            "market_implied_probability": ev_context.get("market_implied_probability") or expectancy_summary.get("market_implied_probability"),
+            "entry_timing_status": entry_timing_status,
+            "reason": reason,
+            "yes_bid": getattr(q, "yes_bid", None),
+            "yes_ask": getattr(q, "yes_ask", None),
+            "no_bid": getattr(q, "no_bid", None),
+            "no_ask": getattr(q, "no_ask", None),
+            "yes_top_size": getattr(q, "yes_top_size", None) or market.get("yes_top_size"),
+            "no_top_size": getattr(q, "no_top_size", None) or market.get("no_top_size"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._safe_obsidian_export(
+            obsidian_append_session_intelligence,
+            event_type="selected_candidate",
+            source="sports.live_intelligence.find_best_live_ticker",
+            facts=facts,
+            related=["Candidate Selection", family, "Entry Timing", "Liquidity"],
+        )
+        return self._safe_obsidian_export(
+            obsidian_record_family_observation,
+            family=family,
+            facts=facts,
+            observation=None,
+            related=["Sports" if self.get_market_discovery_category(family) == "sports" else "Kalshi Bot", "Entry Timing", "Liquidity"],
+        )
+
+    def _export_obsidian_learning_event(self, event_type, event):
+        event_type = str(event_type or "").strip().lower()
+        event = event if isinstance(event, dict) else {}
+        if event_type not in {"trade_opened", "trade_closed"}:
+            return {"ok": False, "reason": "event_not_exported"}
+        ticker = str(event.get("ticker") or "").strip()
+        family = str(event.get("family") or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip().upper()
+        if event_type == "trade_closed":
+            result = self._safe_obsidian_export(
+                obsidian_record_trade_outcome,
+                ticker=ticker,
+                family=family,
+                timestamp=event.get("close_timestamp_utc") or event.get("timestamp_utc"),
+                status="closed",
+                action=event.get("action"),
+                side=event.get("side"),
+                price=event.get("price"),
+                entry_price=event.get("entry_price"),
+                exit_price=event.get("exit_price"),
+                confidence=event.get("original_confidence") or event.get("confidence"),
+                ev=event.get("original_ev_score") or event.get("ev_score"),
+                spread=event.get("spread"),
+                liquidity=event.get("liquidity_dollars"),
+                exit_reason=event.get("exit_reason"),
+                pnl=event.get("pnl_dollars") if event.get("pnl_dollars") is not None else event.get("realized_pnl"),
+                result=event.get("result"),
+                hold_time=event.get("hold_seconds"),
+                facts=event,
+            )
+            self._safe_obsidian_export(
+                obsidian_record_family_observation,
+                family=family,
+                facts={
+                    "ticker": ticker,
+                    "family": family,
+                    "exit_reason": event.get("exit_reason"),
+                    "pnl": event.get("pnl_dollars"),
+                    "result": event.get("result"),
+                    "hold_seconds": event.get("hold_seconds"),
+                    "timestamp": event.get("close_timestamp_utc") or event.get("timestamp_utc"),
+                },
+                related=[family, "Trade Outcomes", "Exit Logic"],
+            )
+            return result
+        return self._safe_obsidian_export(
+            obsidian_append_session_intelligence,
+            event_type="trade_opened",
+            source="aion_learning_archive",
+            facts={
+                "ticker": ticker,
+                "family": family,
+                "side": event.get("side"),
+                "price": event.get("price"),
+                "contracts": event.get("contracts"),
+                "confidence": event.get("confidence"),
+                "ev_score": event.get("ev_score"),
+                "spread": event.get("spread"),
+                "liquidity": event.get("liquidity_dollars"),
+                "timestamp": event.get("timestamp_utc"),
+            },
+            related=[family, "Execution"],
+        )
+
+    def _export_obsidian_microstructure_pattern(self, *, ticker=None, family=None, maker_payload=None, quote_payload=None, spread_payload=None, imbalance_payload=None, edge_payload=None, survivability_payload=None):
+        maker_payload = maker_payload if isinstance(maker_payload, dict) else {}
+        pattern_fields = {
+            "rapid_quote_move": bool(maker_payload.get("rapid_quote_move")),
+            "fake_liquidity": bool(maker_payload.get("fake_liquidity")),
+            "unstable_topbook": bool(maker_payload.get("unstable_topbook")),
+            "repeated_spread_widening": int(maker_payload.get("repeated_spread_widening", 0) or 0),
+            "aggressive_quote_fade": bool(maker_payload.get("aggressive_quote_fade")),
+        }
+        active_patterns = [
+            key
+            for key, value in pattern_fields.items()
+            if bool(value) and not (key == "repeated_spread_widening" and int(value or 0) <= 0)
+        ]
+        if not active_patterns:
+            return {"ok": False, "reason": "no_pattern"}
+        facts = {
+            "ticker": ticker or maker_payload.get("ticker"),
+            "family": family or maker_payload.get("family"),
+            **pattern_fields,
+            "market_maker_behavior_score": maker_payload.get("market_maker_behavior_score"),
+            "quote": quote_payload if isinstance(quote_payload, dict) else {},
+            "spread": spread_payload if isinstance(spread_payload, dict) else {},
+            "imbalance": imbalance_payload if isinstance(imbalance_payload, dict) else {},
+            "edge": edge_payload if isinstance(edge_payload, dict) else {},
+            "survivability": survivability_payload if isinstance(survivability_payload, dict) else {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        last_result = {"ok": False, "reason": "not_attempted"}
+        for pattern in active_patterns:
+            last_result = self._safe_obsidian_export(
+                obsidian_record_pattern_observation,
+                pattern=pattern,
+                ticker=ticker or maker_payload.get("ticker"),
+                family=family or maker_payload.get("family"),
+                facts=facts,
+                related=[family or maker_payload.get("family"), "Telemetry", "Liquidity"],
+            )
+        return last_result
 
     def compute_memory_score(self, memory_stats=None, weak_pattern=None, strong_pattern=None):
         memory_stats = memory_stats if isinstance(memory_stats, dict) else {}
@@ -16033,6 +16319,34 @@ class KalshiSniperBot:
             print("[LIVE-EDGE-DURABILITY] " + json.dumps(edge_payload, sort_keys=True, default=str))
             print("[LIVE-EXECUTION-SURVIVABILITY] " + json.dumps(survivability_payload, sort_keys=True, default=str))
             print("[LIVE-MARKET-MAKER-BEHAVIOR] " + json.dumps(maker_payload, sort_keys=True, default=str))
+            try:
+                self._export_obsidian_microstructure_pattern(
+                    ticker=ticker_key,
+                    family=family_key,
+                    maker_payload=maker_payload,
+                    quote_payload=quote_payload,
+                    spread_payload=spread_payload,
+                    imbalance_payload=imbalance_payload,
+                    edge_payload=edge_payload,
+                    survivability_payload=survivability_payload,
+                )
+            except Exception as obsidian_exc:
+                try:
+                    print(
+                        "[OBSIDIAN-EXPORT-ERROR] "
+                        + json.dumps(
+                            {
+                                "action": "microstructure_pattern",
+                                "ticker": ticker_key,
+                                "family": family_key,
+                                "reason": obsidian_exc.__class__.__name__,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                except Exception:
+                    pass
         last_family_emit = float(getattr(self, "live_microstructure_last_family_summary_ts", 0.0) or 0.0)
         should_emit_family = force or (now - last_family_emit >= 180.0)
         if should_emit_family:
@@ -53423,6 +53737,28 @@ def main():
             f"live_armed={'yes' if LIVE_ARMED else 'no'} live_env_confirmed={'yes' if LIVE_ENV_CONFIRMED else 'no'} "
             f"configured_dry_run={'yes' if DRY_RUN_LIVE_ORDERS else 'no'} effective_dry_run={'yes' if effective_live_dry_run else 'no'}"
         )
+    try:
+        bot._export_obsidian_startup(
+            live_mode=LIVE_MODE,
+            live_armed=LIVE_ARMED,
+            live_env_confirmed=LIVE_ENV_CONFIRMED,
+            effective_dry_run=effective_live_dry_run,
+        )
+    except Exception as obsidian_exc:
+        try:
+            print(
+                "[OBSIDIAN-EXPORT-ERROR] "
+                + json.dumps(
+                    {
+                        "action": "startup",
+                        "reason": obsidian_exc.__class__.__name__,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
     send_telegram_message("🚀 Kalshi bot started and running on server")
     print("[TELEGRAM] sent=startup")
     if LIVE_MODE and not bot.realm_ix_startup_alert_sent:

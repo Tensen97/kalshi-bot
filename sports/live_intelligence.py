@@ -18666,6 +18666,38 @@ def find_best_live_ticker(self, markets=None):
     )
     print(f"[LIVE-SELECT] chosen_ticker={q.ticker}")
     print(f"[LIVE-SELECT] reason={reason}")
+    try:
+        obsidian_export = getattr(self, "_export_obsidian_selected_candidate", None)
+        if callable(obsidian_export):
+            obsidian_export(
+                q=q,
+                market=selected_market,
+                family=family,
+                score=score,
+                spread=spread,
+                reason=reason,
+                quality_snapshot=selected_quality_snapshot,
+                ev_context=selected_ev_context,
+                expectancy_summary=selected_expectancy_for_ev,
+                entry_timing_status=entry_timing_cycle_stats,
+            )
+    except Exception as obsidian_exc:
+        try:
+            print(
+                "[OBSIDIAN-EXPORT-ERROR] "
+                + json.dumps(
+                    {
+                        "action": "selected_candidate",
+                        "ticker": getattr(q, "ticker", None),
+                        "family": family,
+                        "reason": obsidian_exc.__class__.__name__,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
     self._maybe_emit_trade_readiness_snapshot(
         trade_readiness_snapshot,
         no_trade=False,
