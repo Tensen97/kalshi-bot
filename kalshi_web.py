@@ -134,6 +134,11 @@ except Exception:
     sports_live_intelligence = None
 
 try:
+    from replay_backtest import record_replay_snapshot_from_context
+except Exception:
+    record_replay_snapshot_from_context = None
+
+try:
     from memory.aion_persistent_intelligence import AIONPersistentIntelligence
 except Exception:
     AIONPersistentIntelligence = None
@@ -24003,6 +24008,46 @@ class KalshiSniperBot:
         )
         return True
 
+    def _record_replay_market_snapshot(
+        self,
+        *,
+        market=None,
+        q=None,
+        quote_diag=None,
+        orderbook_resolution=None,
+        payload=None,
+        decision=None,
+        source="unknown",
+        extra=None,
+    ):
+        recorder = globals().get("record_replay_snapshot_from_context")
+        if recorder is None:
+            return False
+        try:
+            market_dict = market if isinstance(market, dict) else {}
+            ticker = str(
+                (payload or {}).get("ticker")
+                if isinstance(payload, dict)
+                else ""
+            ).strip() or str(market_dict.get("ticker") or getattr(q, "ticker", "") or "").strip()
+            family = self.get_market_family(market_dict if market_dict else {"ticker": ticker}) if ticker or market_dict else "UNKNOWN"
+            if not self._is_sports_market_or_family(family):
+                return False
+            return bool(
+                recorder(
+                    market=market_dict,
+                    q=q,
+                    quote_diag=quote_diag if isinstance(quote_diag, dict) else {},
+                    orderbook_resolution=orderbook_resolution if isinstance(orderbook_resolution, dict) else {},
+                    payload=payload if isinstance(payload, dict) else {},
+                    decision=decision if isinstance(decision, dict) else {},
+                    source=source,
+                    extra=extra if isinstance(extra, dict) else {},
+                )
+            )
+        except Exception:
+            return False
+
     def _filter_sports_only_markets(self, markets, *, source="sports_only_filter", force_log=False):
         markets = [market for market in (markets or []) if isinstance(market, dict)]
         if not self._sports_only_mode_enabled():
@@ -24057,6 +24102,17 @@ class KalshiSniperBot:
                     default=str,
                 )
             )
+        if globals().get("record_replay_snapshot_from_context") is not None:
+            try:
+                capture_limit = int(os.environ.get("AION_REPLAY_SNAPSHOT_CAPTURE_LIMIT", "40") or 40)
+            except Exception:
+                capture_limit = 40
+            for market in kept[: max(0, capture_limit)]:
+                self._record_replay_market_snapshot(
+                    market=market,
+                    source=f"{source}:sports_discovery",
+                    decision={"selected_decision": "OBSERVE"},
+                )
         return kept
 
     def _filter_sports_only_ranked_candidates(self, ranked, *, markets=None, source="sports_only_rank"):
@@ -51474,6 +51530,23 @@ class KalshiSniperBot:
             payload["orderbook_missing_reason"] = orderbook_resolution.get("orderbook_missing_reason")
             payload["orderbook_keys"] = orderbook_resolution.get("orderbook_keys")
             _emit_order_side_payload(payload)
+            self._record_replay_market_snapshot(
+                market=market if market else {"ticker": ticker, "series_ticker": family},
+                q=q,
+                quote_diag=quote_diag,
+                orderbook_resolution=orderbook_resolution,
+                payload=payload,
+                decision={
+                    "selected_decision": "BUY",
+                    "selected_side": intended_side,
+                    "selected_price": selected_price,
+                    "family": family,
+                    "ticker": ticker,
+                    "edge_after_cost": quote_diag.get("edge_after_cost", quote_diag.get("final_edge")),
+                    "fill_probability": quote_diag.get("fill_probability"),
+                },
+                source=selection_stage or "build_live_order_payload",
+            )
             return payload
         no_price = int(round(selected_price * 100)) if selected_price <= 1 else int(round(selected_price))
         payload["no_price"] = max(1, min(99, no_price))
@@ -51486,6 +51559,23 @@ class KalshiSniperBot:
         payload["orderbook_missing_reason"] = orderbook_resolution.get("orderbook_missing_reason")
         payload["orderbook_keys"] = orderbook_resolution.get("orderbook_keys")
         _emit_order_side_payload(payload)
+        self._record_replay_market_snapshot(
+            market=market if market else {"ticker": ticker, "series_ticker": family},
+            q=q,
+            quote_diag=quote_diag,
+            orderbook_resolution=orderbook_resolution,
+            payload=payload,
+            decision={
+                "selected_decision": "BUY",
+                "selected_side": intended_side,
+                "selected_price": selected_price,
+                "family": family,
+                "ticker": ticker,
+                "edge_after_cost": quote_diag.get("edge_after_cost", quote_diag.get("final_edge")),
+                "fill_probability": quote_diag.get("fill_probability"),
+            },
+            source=selection_stage or "build_live_order_payload",
+        )
         return payload
 
     def resolve_realm_vv_entry_engine(self, candidate, canonical_payload, orderbook_context, decision_context):
