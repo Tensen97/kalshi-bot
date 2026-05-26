@@ -2099,7 +2099,7 @@ AION_SPORTS_MIN_EDGE_AFTER_COST = _env_float("AION_SPORTS_MIN_EDGE_AFTER_COST", 
 AION_AGGRESSIVE_POSITIVE_EDGE_LANE_ENABLED = get_env_bool("AION_AGGRESSIVE_POSITIVE_EDGE_LANE_ENABLED", 1)
 AION_AGGRESSIVE_EDGE_FLOOR = _env_float("AION_AGGRESSIVE_EDGE_FLOOR", 0.002)
 AION_AGGRESSIVE_MAX_CONTRACTS = get_env_int("AION_AGGRESSIVE_MAX_CONTRACTS", 1)
-AION_KELLY_FRACTION = max(0.0, min(1.0, get_env_float("AION_KELLY_FRACTION", 0.25)))
+AION_KELLY_FRACTION = max(0.0, min(1.0, get_env_float("AION_KELLY_FRACTION", 0.50)))
 AION_KELLY_MAX_MULTIPLIER = max(1.0, get_env_float("AION_KELLY_MAX_MULTIPLIER", 1.75))
 AION_KELLY_MIN_EXPLORATION_SIZE = max(0, get_env_int("AION_KELLY_MIN_EXPLORATION_SIZE", 1))
 AION_AGGRESSIVE_MAX_TRADES_PER_DAY = get_env_int("AION_AGGRESSIVE_MAX_TRADES_PER_DAY", 15)
@@ -2137,6 +2137,9 @@ AION_WEAK_MAX_DOLLAR_EXPOSURE = get_env_float("AION_WEAK_MAX_DOLLAR_EXPOSURE", 3
 AION_PROMISING_MAX_DOLLAR_EXPOSURE = get_env_float("AION_PROMISING_MAX_DOLLAR_EXPOSURE", 10.0)
 AION_STRONG_MAX_DOLLAR_EXPOSURE = get_env_float("AION_STRONG_MAX_DOLLAR_EXPOSURE", 20.0)
 AION_ELITE_MAX_DOLLAR_EXPOSURE = get_env_float("AION_ELITE_MAX_DOLLAR_EXPOSURE", 30.0)
+AION_KELLY_MAX_DOLLARS_PER_TRADE = max(1.0, get_env_float("AION_KELLY_MAX_DOLLARS_PER_TRADE", AION_ELITE_MAX_DOLLAR_EXPOSURE))
+AION_KELLY_PERFORMANCE_MIN_MULTIPLIER = max(0.10, min(1.0, get_env_float("AION_KELLY_PERFORMANCE_MIN_MULTIPLIER", 0.60)))
+AION_KELLY_PERFORMANCE_MAX_MULTIPLIER = max(1.0, min(2.0, get_env_float("AION_KELLY_PERFORMANCE_MAX_MULTIPLIER", 1.25)))
 AION_ORDINARY_MAX_LIVE_ORDER_SIZE = get_env_int("AION_ORDINARY_MAX_LIVE_ORDER_SIZE", 15)
 AION_ELITE_MAX_LIVE_ORDER_SIZE = get_env_int("AION_ELITE_MAX_LIVE_ORDER_SIZE", 150)
 AION_DATA_COVERAGE_AUDIT_ENABLED = get_env_bool("AION_DATA_COVERAGE_AUDIT_ENABLED", 1)
@@ -2189,6 +2192,7 @@ REALM_XVIII_SHADOW_ONLY = (os.environ.get("REALM_XVIII_SHADOW_ONLY", "true") or 
 REALM_XVIII_STATE_FILE = runtime_env_path("REALM_XVIII_STATE_FILE", runtime_memory_file("realm_xviii_portfolio_brain.sqlite3"))
 REALM_XVIII_MAX_TOTAL_EXPOSURE_DOLLARS = _env_float("REALM_XVIII_MAX_TOTAL_EXPOSURE_DOLLARS", 25.0)
 REALM_XVIII_MAX_FAMILY_EXPOSURE_DOLLARS = _env_float("REALM_XVIII_MAX_FAMILY_EXPOSURE_DOLLARS", 10.0)
+AION_KELLY_MAX_FAMILY_EXPOSURE_DOLLARS = max(1.0, get_env_float("AION_KELLY_MAX_FAMILY_EXPOSURE_DOLLARS", REALM_XVIII_MAX_FAMILY_EXPOSURE_DOLLARS))
 REALM_XVIII_MAX_CORRELATED_EXPOSURE_DOLLARS = _env_float("REALM_XVIII_MAX_CORRELATED_EXPOSURE_DOLLARS", 15.0)
 REALM_XVIII_MAX_DAILY_RISK_DOLLARS = _env_float("REALM_XVIII_MAX_DAILY_RISK_DOLLARS", 10.0)
 REALM_XVIII_MIN_PORTFOLIO_HEALTH_SCORE = _env_float("REALM_XVIII_MIN_PORTFOLIO_HEALTH_SCORE", 0.60)
@@ -51323,11 +51327,69 @@ class KalshiSniperBot:
         )
         if intended_side not in ("yes", "no"):
             return None
+        sizing_context = {}
+        if isinstance(quote_diag, dict):
+            sizing_context.update(quote_diag)
+        if isinstance(orderbook_resolution, dict):
+            sizing_context.update(orderbook_resolution)
+        sizing_context.update(
+            {
+                "ticker": ticker,
+                "family": family,
+                "selected_side": intended_side,
+                "side": intended_side,
+                "selected_price": orderbook_resolution.get(
+                    "selected_price_dollars",
+                    orderbook_resolution.get(
+                        "chosen_price_dollars",
+                        orderbook_resolution.get("chosen_price", orderbook_resolution.get("selected_price")),
+                    ),
+                ),
+                "selected_price_dollars": orderbook_resolution.get(
+                    "selected_price_dollars",
+                    orderbook_resolution.get("chosen_price_dollars"),
+                ),
+                "selected_price_cents": orderbook_resolution.get(
+                    "selected_price_cents",
+                    orderbook_resolution.get("chosen_price_cents"),
+                ),
+                "yes_ask": orderbook_resolution.get("yes_ask"),
+                "yes_bid": orderbook_resolution.get("yes_bid"),
+                "no_ask": orderbook_resolution.get("no_ask"),
+                "no_bid": orderbook_resolution.get("no_bid"),
+            }
+        )
         requested_count = self._resolve_dynamic_live_entry_size(
             q,
             explicit_size=size,
+            payload=market,
+            ev_context=sizing_context,
             source="build_live_order_payload",
         )
+        if requested_count <= 0:
+            try:
+                last_kelly = getattr(self, "last_fractional_kelly_result", {}) or {}
+                print(
+                    "[AION-FINAL-REJECT] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": intended_side,
+                            "selected_price": sizing_context.get("selected_price") or sizing_context.get("selected_price_dollars"),
+                            "spread": sizing_context.get("spread"),
+                            "liquidity": sizing_context.get("liquidity") or sizing_context.get("liquidity_depth"),
+                            "volume": sizing_context.get("volume"),
+                            "rejection_reason": str(last_kelly.get("cap_reason") or last_kelly.get("reason") or "kelly_size_zero"),
+                            "responsible_subsystem": "kelly_sizing",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+            return None
         count = min(requested_count, MAX_LIVE_ORDER_SIZE)
         if count != requested_count:
             print(f"[LIVE-SAFETY] size clamped from {requested_count} to {count}")

@@ -355,17 +355,17 @@ def resolve_ev_contract_size(
                 setattr(q, field, value)
             except Exception:
                 pass
-    final_size = int(bot.to_float((kelly_result or {}).get("final_contract_size"), ev_adjusted_size) or ev_adjusted_size)
+    final_size = int(bot.to_float((kelly_result or {}).get("final_contract_size"), ev_adjusted_size) or 0)
     if final_size <= 0:
-        final_size = max(1, min(max_size, kelly_min_exploration_size or ev_adjusted_size or base_size))
-        bot.last_fractional_kelly_result["final_contract_size"] = int(final_size)
-        bot.last_fractional_kelly_result["kelly_multiplier"] = round(final_size / max(1, ev_adjusted_size), 4)
+        bot.last_fractional_kelly_result["final_contract_size"] = 0
+        bot.last_fractional_kelly_result["kelly_multiplier"] = 0.0
         bot.last_fractional_kelly_result["reason"] = str(
             bot.last_fractional_kelly_result.get("reason") or "kelly_zero"
-        ) + "_selected_flow_micro_fallback"
-        ev_context["kelly_contract_size"] = int(final_size)
-        ev_context["kelly_multiplier"] = bot.last_fractional_kelly_result["kelly_multiplier"]
+        )
+        ev_context["kelly_contract_size"] = 0
+        ev_context["kelly_multiplier"] = 0.0
         ev_context["kelly_reason"] = bot.last_fractional_kelly_result["reason"]
+        return 0
     return max(1, min(max_size, final_size))
 
 

@@ -10637,6 +10637,152 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
                 marker=("SPORTS-LADDER-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
                 cooldown_seconds=180.0,
             )
+
+    kelly_helper = globals().get("candidate_quality_calculate_fractional_kelly_size")
+    if callable(kelly_helper):
+        def _family_exposure_dollars():
+            exposure = 0.0
+            family_key = str(family_hint or context.get("family") or payload.get("family") or "").strip().upper()
+            if not family_key:
+                return exposure
+            for position in getattr(self, "live_positions", []) or []:
+                if not isinstance(position, dict):
+                    continue
+                pos_ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
+                try:
+                    pos_family = str(
+                        position.get("family")
+                        or position.get("series_ticker")
+                        or (self.get_market_family({"ticker": pos_ticker}) if pos_ticker else "")
+                        or ""
+                    ).strip().upper()
+                except Exception:
+                    pos_family = str(position.get("family") or position.get("series_ticker") or "").strip().upper()
+                if pos_family != family_key:
+                    continue
+                count_value = self.to_float(
+                    position.get("count")
+                    or position.get("contracts")
+                    or position.get("contract_count")
+                    or position.get("quantity")
+                    or position.get("qty"),
+                    0.0,
+                ) or 0.0
+                price_value = _contract_price(
+                    position.get("entry_price")
+                    or position.get("price")
+                    or position.get("selected_price")
+                    or position.get("selected_price_dollars")
+                    or selected_price
+                )
+                if count_value > 0.0 and price_value is not None:
+                    exposure += float(count_value) * float(price_value)
+            return max(0.0, exposure)
+
+        edge_after_cost = self.to_float(
+            context.get("sports_probability_edge_after_cost")
+            if context.get("sports_probability_edge_after_cost") is not None
+            else context.get("edge_after_cost")
+            if context.get("edge_after_cost") is not None
+            else context.get("ev_edge")
+            if context.get("ev_edge") is not None
+            else context.get("expected_roi"),
+            None,
+        )
+        if estimated_probability is None and selected_price is not None and edge_after_cost is not None:
+            estimated_probability = max(0.01, min(0.99, float(selected_price) + float(edge_after_cost)))
+        if market_probability is None and selected_price is not None:
+            market_probability = float(selected_price)
+        try:
+            family_stats = self._get_family_profit_memory_stats(family_hint, refresh=False) if family_hint else {}
+        except Exception:
+            family_stats = {}
+        try:
+            bankroll_value = self._get_fractional_kelly_bankroll()
+        except Exception:
+            bankroll_value = None
+        daily_loss_cap_hit = bool(
+            (self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) or 0.0) <= -float(MAX_DAILY_LOSS or 0.0)
+            or (self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) or 0.0) <= -float(MAX_DAILY_LOSS or 0.0)
+        )
+        kelly_candidate = dict(context)
+        kelly_candidate.update(
+            {
+                "ticker": ticker_hint or context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                "family": family_hint or context.get("family") or payload.get("family") or getattr(q, "family", None),
+                "selected_side": side or context.get("selected_side") or payload.get("side"),
+                "selected_price": selected_price,
+                "selected_price_dollars": selected_price,
+                "estimated_win_probability": estimated_probability,
+                "market_implied_probability": market_probability,
+                "ev_edge": edge_after_cost if edge_after_cost is not None else ev_edge,
+                "expected_roi": expected_roi,
+                "kelly_fraction_config": globals().get("AION_KELLY_FRACTION", 0.50),
+                "kelly_max_multiplier": globals().get("AION_KELLY_MAX_MULTIPLIER", 1.75),
+                "elite_edge_kelly_max_multiplier": context.get("elite_edge_kelly_max_multiplier"),
+                "kelly_min_exploration_size": globals().get("AION_KELLY_MIN_EXPLORATION_SIZE", 1),
+                "max_dollars_per_trade": globals().get("AION_KELLY_MAX_DOLLARS_PER_TRADE", globals().get("AION_ELITE_MAX_DOLLAR_EXPOSURE", 30.0)),
+                "max_family_exposure_dollars": globals().get("AION_KELLY_MAX_FAMILY_EXPOSURE_DOLLARS", globals().get("REALM_XVIII_MAX_FAMILY_EXPOSURE_DOLLARS", 10.0)),
+                "current_family_exposure_dollars": _family_exposure_dollars(),
+                "family_performance_stats": family_stats if isinstance(family_stats, dict) else {},
+                "available_balance": bankroll_value,
+                "daily_loss_cap_hit": daily_loss_cap_hit,
+            }
+        )
+        kelly_result = kelly_helper(kelly_candidate, bankroll_value, chosen, hard_max)
+        if isinstance(kelly_result, dict):
+            kelly_size = int(self.to_float(kelly_result.get("final_contract_size"), chosen) or 0)
+            chosen = max(0, min(hard_max, kelly_size))
+            chosen_label = str(kelly_result.get("reason") or "fractional_kelly_binary")
+            for field in (
+                "kelly_fraction",
+                "kelly_multiplier",
+                "kelly_contract_size",
+                "kelly_reason",
+                "kelly_cap_reason",
+                "kelly_performance_multiplier",
+            ):
+                if field in kelly_candidate:
+                    context[field] = kelly_candidate.get(field)
+                    try:
+                        setattr(q, field, kelly_candidate.get(field))
+                    except Exception:
+                        pass
+            context["kelly_sizing_result"] = dict(kelly_result)
+            try:
+                self.last_fractional_kelly_result = dict(kelly_result)
+            except Exception:
+                pass
+            try:
+                print(
+                    "[AION-KELLY-SIZE] "
+                    + json.dumps(
+                        {
+                            "ticker": kelly_candidate.get("ticker"),
+                            "family": kelly_candidate.get("family"),
+                            "selected_side": kelly_candidate.get("selected_side"),
+                            "probability": kelly_result.get("estimated_win_probability"),
+                            "price": kelly_result.get("price"),
+                            "raw_kelly": kelly_result.get("raw_kelly_fraction"),
+                            "fractional_kelly": kelly_result.get("fractional_kelly_fraction"),
+                            "performance_adjusted_fractional_kelly": kelly_result.get("performance_adjusted_fractional_kelly_fraction"),
+                            "performance_multiplier": kelly_result.get("performance_multiplier"),
+                            "raw_contracts": kelly_result.get("raw_kelly_contracts"),
+                            "final_contracts": int(chosen),
+                            "cap_reason": kelly_result.get("cap_reason"),
+                            "max_contracts_per_trade": kelly_result.get("max_contracts_per_trade"),
+                            "max_dollars_per_trade": kelly_result.get("max_dollars_per_trade"),
+                            "max_family_exposure_dollars": kelly_result.get("max_family_exposure_dollars"),
+                            "current_family_exposure_dollars": kelly_result.get("current_family_exposure_dollars"),
+                            "reason": kelly_result.get("reason"),
+                            "source": source or "dynamic_live_entry_size",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
     original = self.to_float(explicit_size, None)
     if original is None:
         original = self.to_float(payload.get("count"), None)

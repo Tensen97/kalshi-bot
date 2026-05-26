@@ -3801,7 +3801,11 @@ class StructuralEdgeTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(resolved, 1)
+        self.assertEqual(resolved, 0)
+        self.assertEqual(
+            getattr(bot, "last_fractional_kelly_result", {}).get("cap_reason"),
+            "nonpositive_edge",
+        )
 
     def test_dynamic_entry_size_keeps_weak_context_as_probe(self):
         bot = self._make_bot()

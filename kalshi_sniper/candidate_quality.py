@@ -1075,7 +1075,7 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
 
     kelly_fraction_config = to_float(candidate.get("kelly_fraction_config"), None)
     if kelly_fraction_config is None:
-        kelly_fraction_config = _kelly_env_float("AION_KELLY_FRACTION", 0.25, 0.0, 1.0)
+        kelly_fraction_config = _kelly_env_float("AION_KELLY_FRACTION", 0.50, 0.0, 1.0)
     else:
         kelly_fraction_config = max(0.0, min(1.0, float(kelly_fraction_config)))
 
@@ -1139,7 +1139,84 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
         payout = None if price is None else max(0.01, 1.0 - price)
     else:
         payout = _ev_price(raw_payout, None)
-    bankroll_value = to_float(bankroll, None)
+    bankroll_value = to_float(
+        _ev_first(
+            candidate,
+            "available_balance",
+            "available_bankroll",
+            "kelly_bankroll",
+            "bankroll",
+            "cash_balance",
+        ),
+        None,
+    )
+    if bankroll_value is None:
+        bankroll_value = to_float(bankroll, None)
+    max_dollars_per_trade = to_float(
+        _ev_first(candidate, "max_dollars_per_trade", "kelly_max_dollars_per_trade"),
+        None,
+    )
+    if max_dollars_per_trade is None:
+        max_dollars_per_trade = _kelly_env_float("AION_KELLY_MAX_DOLLARS_PER_TRADE", 30.0, 1.0, None)
+    max_family_exposure = to_float(
+        _ev_first(candidate, "max_family_exposure_dollars", "kelly_max_family_exposure_dollars"),
+        None,
+    )
+    if max_family_exposure is None:
+        max_family_exposure = _kelly_env_float("AION_KELLY_MAX_FAMILY_EXPOSURE_DOLLARS", 10.0, 1.0, None)
+    current_family_exposure = max(
+        0.0,
+        to_float(_ev_first(candidate, "current_family_exposure_dollars", "family_exposure_dollars"), 0.0) or 0.0,
+    )
+    daily_loss_cap_hit = bool(candidate.get("daily_loss_cap_hit") or candidate.get("hard_daily_loss_cap_hit"))
+    performance_min = _kelly_env_float("AION_KELLY_PERFORMANCE_MIN_MULTIPLIER", 0.60, 0.10, 1.0)
+    performance_max = _kelly_env_float("AION_KELLY_PERFORMANCE_MAX_MULTIPLIER", 1.25, 1.0, 2.0)
+
+    def _performance_multiplier():
+        explicit = to_float(
+            _ev_first(candidate, "kelly_performance_multiplier", "family_performance_size_multiplier"),
+            None,
+        )
+        if explicit is not None and explicit > 0.0:
+            return max(performance_min, min(performance_max, float(explicit))), "explicit"
+        stats = _ev_first(candidate, "family_performance_stats", "family_profit_memory_stats")
+        if not isinstance(stats, dict):
+            return 1.0, "no_family_stats"
+        trade_count = int(to_float(stats.get("trade_count"), 0) or 0)
+        if trade_count < 3:
+            return 1.0, "sample_too_small"
+        family_pnl = to_float(stats.get("family_pnl"), 0.0) or 0.0
+        recent_pnl = to_float(stats.get("recent_pnl"), 0.0) or 0.0
+        win_rate = to_float(stats.get("win_rate"), None)
+        wins = int(to_float(stats.get("wins"), 0) or 0)
+        losses = int(to_float(stats.get("losses"), 0) or 0)
+        multiplier = 1.0
+        reasons = []
+        if family_pnl > 0.0:
+            multiplier += min(0.10, family_pnl * 0.02)
+            reasons.append("profitable_family")
+        elif family_pnl < 0.0:
+            multiplier -= min(0.18, abs(family_pnl) * 0.035)
+            reasons.append("losing_family")
+        if recent_pnl > 0.0:
+            multiplier += min(0.06, recent_pnl * 0.025)
+            reasons.append("recent_positive")
+        elif recent_pnl < 0.0:
+            multiplier -= min(0.12, abs(recent_pnl) * 0.04)
+            reasons.append("recent_negative")
+        if win_rate is not None:
+            if win_rate >= 0.60:
+                multiplier += min(0.08, (win_rate - 0.55) * 0.35)
+                reasons.append("stable_win_rate")
+            elif win_rate <= 0.44:
+                multiplier -= min(0.14, (0.50 - win_rate) * 0.35)
+                reasons.append("weak_win_rate")
+        if losses > wins and trade_count >= 4:
+            multiplier -= min(0.10, (losses - wins) / max(trade_count, 1) * 0.18)
+            reasons.append("loss_heavy_variance")
+        return max(performance_min, min(performance_max, multiplier)), "+".join(reasons) or "neutral"
+
+    performance_multiplier, performance_reason = _performance_multiplier()
 
     result = {
         "estimated_win_probability": None if probability is None else round(probability, 6),
@@ -1147,8 +1224,16 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
         "payout": None if payout is None else round(payout, 6),
         "raw_kelly_fraction": None,
         "fractional_kelly_fraction": None,
+        "performance_multiplier": round(performance_multiplier, 4),
+        "performance_reason": performance_reason,
         "kelly_multiplier": 1.0,
         "final_contract_size": int(fallback_size),
+        "max_contracts_per_trade": int(hard_max_contracts),
+        "max_dollars_per_trade": round(float(max_dollars_per_trade), 4),
+        "max_family_exposure_dollars": round(float(max_family_exposure), 4),
+        "current_family_exposure_dollars": round(float(current_family_exposure), 4),
+        "cap_reason": None,
+        "cap_reasons": [],
         "reason": "fallback_existing_size",
         "ELITE_EDGE_CONFIDENCE": round(elite_edge_confidence, 4),
         "elite_kelly_max_multiplier": round(max_multiplier, 4),
@@ -1198,29 +1283,18 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
         )
         return result
 
-    q_probability = 1.0 - probability
-    raw_kelly_fraction = ((b * probability) - q_probability) / b
+    raw_kelly_fraction = (probability - price) / max(0.000001, 1.0 - price)
     positive_kelly_fraction = max(0.0, raw_kelly_fraction)
     fractional_kelly_fraction = positive_kelly_fraction * kelly_fraction_config
     result["raw_kelly_fraction"] = round(raw_kelly_fraction, 6)
     result["fractional_kelly_fraction"] = round(fractional_kelly_fraction, 6)
 
-    ev_tier = str(_ev_first(candidate, "ev_tier") or "C").strip().upper() or "C"
-    selected_for_dispatch = bool(candidate.get("selected_for_dispatch") or candidate.get("kelly_selected_for_dispatch"))
     if raw_kelly_fraction <= 0.0:
-        if ev_tier in {"B", "C"}:
-            final_size = max(min_exploration_size, 1)
-            reason = "exploration_micro_nonpositive_kelly"
-        elif selected_for_dispatch and min_exploration_size > 0:
-            final_size = min_exploration_size
-            reason = "selected_micro_nonpositive_kelly"
-        else:
-            final_size = 0
-            reason = "zero_nonpositive_kelly"
-        final_size = max(0, min(hard_max_contracts, int(final_size)))
-        result["kelly_multiplier"] = round((final_size / base_contracts) if base_contracts > 0 else 0.0, 4)
-        result["final_contract_size"] = int(final_size)
-        result["reason"] = reason
+        result["kelly_multiplier"] = 0.0
+        result["final_contract_size"] = 0
+        result["reason"] = "zero_nonpositive_kelly"
+        result["cap_reason"] = "nonpositive_edge"
+        result["cap_reasons"] = ["nonpositive_edge"]
         candidate.update(
             {
                 "kelly_fraction": result["fractional_kelly_fraction"],
@@ -1243,51 +1317,50 @@ def calculate_fractional_kelly_size(candidate: Dict[str, Any], bankroll: Any, ba
         )
         return result
 
-    kelly_contracts = int((bankroll_value * fractional_kelly_fraction) / price)
+    adjusted_fractional_kelly_fraction = fractional_kelly_fraction * performance_multiplier
+    result["performance_adjusted_fractional_kelly_fraction"] = round(adjusted_fractional_kelly_fraction, 6)
+    kelly_contracts = int((bankroll_value * adjusted_fractional_kelly_fraction) / price)
     raw_multiplier = (kelly_contracts / base_contracts) if base_contracts > 0 else 0.0
-    if ev_tier == "S":
-        tier_cap = max_multiplier
-        bounded_multiplier = max(1.0, min(tier_cap, raw_multiplier))
-        min_size = max(1, min_exploration_size)
-    elif ev_tier == "A":
-        tier_cap = max_multiplier if elite_edge_confidence >= 60.0 else min(max_multiplier, 4.0)
-        bounded_multiplier = max(0.50, min(tier_cap, raw_multiplier))
-        min_size = max(1, min_exploration_size)
-    elif ev_tier == "B":
-        tier_cap = min(max_multiplier, 0.75)
-        bounded_multiplier = max(0.10, min(tier_cap, raw_multiplier))
-        min_size = max(1, min_exploration_size)
-    elif ev_tier == "C":
-        tier_cap = min(max_multiplier, 0.35)
-        bounded_multiplier = max(0.05, min(tier_cap, raw_multiplier))
-        min_size = max(1, min_exploration_size)
-    else:
-        tier_cap = min(max_multiplier, 0.20)
-        if not selected_for_dispatch:
-            bounded_multiplier = 0.0
-            min_size = 0
-        else:
-            bounded_multiplier = max(0.0, min(tier_cap, raw_multiplier))
-            min_size = min_exploration_size
-
-    requested_size = int(base_contracts * bounded_multiplier)
-    if bounded_multiplier > 0.0 and requested_size <= 0:
-        requested_size = min_size
-    if ev_tier in {"B", "C"} and requested_size <= 0:
-        requested_size = min_size
-    final_size = max(0, min(hard_max_contracts, requested_size))
-    if final_size <= 0 and selected_for_dispatch and min_exploration_size > 0 and ev_tier != "D":
-        final_size = min(hard_max_contracts, min_exploration_size)
+    cap_reasons = []
+    multiplier_cap_contracts = max(1, int(round(base_contracts * max_multiplier)))
+    cap_limit = min(hard_max_contracts, multiplier_cap_contracts)
+    if cap_limit < kelly_contracts:
+        cap_reasons.append("max_contracts_per_trade")
+    if max_dollars_per_trade is not None and max_dollars_per_trade > 0.0:
+        dollar_cap_contracts = int(float(max_dollars_per_trade) / float(price))
+        cap_limit = min(cap_limit, max(0, dollar_cap_contracts))
+        if dollar_cap_contracts < kelly_contracts:
+            cap_reasons.append("max_dollars_per_trade")
+    if max_family_exposure is not None and max_family_exposure > 0.0:
+        remaining_family_dollars = max(0.0, float(max_family_exposure) - float(current_family_exposure))
+        family_cap_contracts = int(remaining_family_dollars / float(price))
+        cap_limit = min(cap_limit, max(0, family_cap_contracts))
+        if family_cap_contracts < kelly_contracts:
+            cap_reasons.append("max_family_exposure")
+    if daily_loss_cap_hit:
+        cap_limit = 0
+        cap_reasons.append("hard_daily_loss_cap")
+    requested_size = int(max(0, kelly_contracts))
+    final_size = max(0, min(cap_limit, requested_size))
+    if final_size <= 0 and adjusted_fractional_kelly_fraction > 0.0 and cap_limit > 0:
+        final_size = min(cap_limit, max(1, int(min_exploration_size or 1)))
+        cap_reasons.append("minimum_positive_edge_contract")
 
     result["kelly_multiplier"] = round((final_size / base_contracts) if base_contracts > 0 else 0.0, 4)
     result["final_contract_size"] = int(final_size)
-    result["reason"] = f"fractional_kelly_{ev_tier.lower()}"
+    result["raw_kelly_contracts"] = int(max(0, kelly_contracts))
+    result["raw_kelly_multiplier"] = round(raw_multiplier, 4)
+    result["cap_reason"] = "+".join(dict.fromkeys(cap_reasons)) if cap_reasons else None
+    result["cap_reasons"] = list(dict.fromkeys(cap_reasons))
+    result["reason"] = "fractional_kelly_binary"
     candidate.update(
         {
             "kelly_fraction": result["fractional_kelly_fraction"],
             "kelly_multiplier": result["kelly_multiplier"],
             "kelly_contract_size": result["final_contract_size"],
             "kelly_reason": result["reason"],
+            "kelly_cap_reason": result["cap_reason"],
+            "kelly_performance_multiplier": result["performance_multiplier"],
             "ELITE_EDGE_CONFIDENCE": result["ELITE_EDGE_CONFIDENCE"],
             "elite_kelly_max_multiplier": result["elite_kelly_max_multiplier"],
         }
