@@ -20,6 +20,8 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.game_thesis_log_markers = {}
         bot.sports_ladder_log_markers = {}
         bot.sports_regime_log_markers = {}
+        bot.sports_graph_log_markers = {}
+        bot.last_sports_graph_contexts = {}
         bot.last_sports_ladder_plan = {}
         bot.last_sports_ladder_execution_summary = {}
         bot.sports_momentum_state = {}
@@ -1382,6 +1384,261 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(ranked[0][1].ticker, sports_q.ticker)
         self.assertEqual(expectancy[crypto_q.ticker]["lane_allocation"]["decision"], "SPORTS_ONLY_CRYPTO_BLOCK")
         self.assertNotIn("game_thesis_context", expectancy[crypto_q.ticker]["lane_allocation"])
+
+    def test_sports_graph_groups_same_game_tags_lag_and_boosts_related_market(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        first_half = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-OKCSAS-1135",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.45,
+            yes_bid=0.43,
+            yes_ask=0.45,
+            no_bid=0.55,
+            no_ask=0.57,
+            liquidity=220,
+        )
+        full_game = SimpleNamespace(
+            ticker="KXNBATOTAL-OKCSAS-2245",
+            family="KXNBATOTAL",
+            selected_side="yes",
+            selected_price=0.48,
+            yes_bid=0.46,
+            yes_ask=0.48,
+            no_bid=0.52,
+            no_ask=0.54,
+            liquidity=190,
+        )
+        markets = [
+            {"ticker": first_half.ticker, "series_ticker": first_half.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA Thunder vs Spurs 1H total over 113.5"},
+            {"ticker": full_game.ticker, "series_ticker": full_game.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA Thunder vs Spurs game total over 224.5"},
+        ]
+        expectancy = {
+            first_half.ticker: {
+                "q": first_half,
+                "family": first_half.family,
+                "spread": 0.02,
+                "raw_score": 88.0,
+                "adjusted_score": 88.0,
+                "expectancy_summary": {"final_edge": 0.040, "selected_side": "yes", "selected_price": 0.45, "expectancy_score": 0.94},
+                "quality_snapshot": {"selected_price": 0.45, "liquidity_depth": 220, "spread": 0.02},
+                "sports_edge_context": {"boost": 6.0, "tags": ["SPORTS_GOOD_BOOK", "STRUCTURED_LADDER"]},
+                "ev_context": {"ev_edge": 0.040},
+            },
+            full_game.ticker: {
+                "q": full_game,
+                "family": full_game.family,
+                "spread": 0.02,
+                "raw_score": 66.0,
+                "adjusted_score": 66.0,
+                "expectancy_summary": {"final_edge": 0.026, "selected_side": "yes", "selected_price": 0.48, "expectancy_score": 0.76},
+                "quality_snapshot": {"selected_price": 0.48, "liquidity_depth": 190, "spread": 0.02},
+                "sports_edge_context": {"boost": 3.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.026},
+            },
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked = bot._apply_dual_lane_allocation_ranking(
+                [(88.0, first_half, 0.02, first_half.family), (66.0, full_game, 0.02, full_game.family)],
+                markets,
+                expectancy_summary_by_ticker=expectancy,
+                source="unit_test_sports_graph_lag",
+            )
+
+        full_allocation = expectancy[full_game.ticker]["lane_allocation"]
+        self.assertEqual(len(ranked), 2)
+        self.assertEqual(full_allocation["sports_graph_game_id"], "nba:kxnba_okcsas")
+        self.assertGreater(full_allocation["sports_graph_rank_adjustment"], 0.0)
+        self.assertTrue(full_allocation["sports_graph_lag_detected"])
+        self.assertIn("high_scoring", full_allocation["sports_graph_direction"])
+        self.assertTrue(
+            {"1H-to-full-game continuation", "scoring-aligned", "pace-aligned"}.intersection(
+                set(full_allocation["sports_graph_relationship_types"])
+            )
+        )
+        self.assertGreaterEqual(getattr(full_game, "sports_graph_size_multiplier"), 1.0)
+
+    def test_sports_graph_conflict_deprioritizes_without_blocking_candidate(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        over_q = SimpleNamespace(ticker="KXNBATOTAL-OKCSAS-2245-O", family="KXNBATOTAL", selected_side="yes", selected_price=0.49, liquidity=150)
+        under_q = SimpleNamespace(ticker="KXNBATOTAL-OKCSAS-2245-U", family="KXNBATOTAL", selected_side="yes", selected_price=0.48, liquidity=150)
+        markets = [
+            {"ticker": over_q.ticker, "series_ticker": over_q.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA Thunder vs Spurs game total over 224.5"},
+            {"ticker": under_q.ticker, "series_ticker": under_q.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA Thunder vs Spurs game total under 224.5"},
+        ]
+        expectancy = {}
+        for q, raw_score, edge in ((over_q, 72.0, 0.024), (under_q, 70.0, 0.023)):
+            expectancy[q.ticker] = {
+                "q": q,
+                "family": q.family,
+                "spread": 0.02,
+                "raw_score": raw_score,
+                "adjusted_score": raw_score,
+                "expectancy_summary": {"final_edge": edge, "selected_side": "yes", "selected_price": q.selected_price, "expectancy_score": 0.76},
+                "quality_snapshot": {"selected_price": q.selected_price, "liquidity_depth": q.liquidity, "spread": 0.02},
+                "sports_edge_context": {"boost": 2.5, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": edge},
+            }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked = bot._apply_dual_lane_allocation_ranking(
+                [(72.0, over_q, 0.02, over_q.family), (70.0, under_q, 0.02, under_q.family)],
+                markets,
+                expectancy_summary_by_ticker=expectancy,
+                source="unit_test_sports_graph_conflict",
+            )
+
+        under_allocation = expectancy[under_q.ticker]["lane_allocation"]
+        self.assertEqual(len(ranked), 2)
+        self.assertGreater(under_allocation["sports_graph_conflict_count"], 0)
+        self.assertLess(under_allocation["sports_graph_rank_adjustment"], 0.0)
+        self.assertNotEqual(under_allocation.get("final_quality_action"), "skip")
+        self.assertIn(under_q.ticker, [row[1].ticker for row in ranked])
+
+    def test_sports_graph_ignores_crypto_and_non_sports_candidates(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        crypto_q = SimpleNamespace(ticker="KXBTC15M-26MAY250715-UP", family="KXBTC15M", selected_side="yes", selected_price=0.40, liquidity=500)
+        sports_q = SimpleNamespace(ticker="KXNBA1HTOTAL-OKCSAS-1135", family="KXNBA1HTOTAL", selected_side="yes", selected_price=0.46, liquidity=130)
+        macro_q = SimpleNamespace(ticker="KXFEDDECISION-26MAY-CUT", family="KXFEDDECISION", selected_side="yes", selected_price=0.35, liquidity=200)
+        expectancy = {
+            crypto_q.ticker: {"q": crypto_q, "family": crypto_q.family, "spread": 0.01, "raw_score": 99.0, "adjusted_score": 99.0},
+            macro_q.ticker: {"q": macro_q, "family": macro_q.family, "spread": 0.01, "raw_score": 95.0, "adjusted_score": 95.0},
+            sports_q.ticker: {
+                "q": sports_q,
+                "family": sports_q.family,
+                "spread": 0.02,
+                "raw_score": 74.0,
+                "adjusted_score": 74.0,
+                "expectancy_summary": {"final_edge": 0.028, "selected_side": "yes", "selected_price": 0.46, "expectancy_score": 0.78},
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 130, "spread": 0.02},
+                "sports_edge_context": {"boost": 3.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.028},
+            },
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked = bot._apply_dual_lane_allocation_ranking(
+                [
+                    (99.0, crypto_q, 0.01, crypto_q.family),
+                    (95.0, macro_q, 0.01, macro_q.family),
+                    (74.0, sports_q, 0.02, sports_q.family),
+                ],
+                [
+                    {"ticker": crypto_q.ticker, "series_ticker": crypto_q.family, "title": "Bitcoin up in 15 minutes"},
+                    {"ticker": macro_q.ticker, "series_ticker": macro_q.family, "title": "Fed decision"},
+                    {"ticker": sports_q.ticker, "series_ticker": sports_q.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA Thunder vs Spurs 1H total over 113.5"},
+                ],
+                expectancy_summary_by_ticker=expectancy,
+                source="unit_test_sports_graph_sports_only",
+            )
+
+        self.assertEqual([row[1].ticker for row in ranked], [sports_q.ticker])
+        self.assertNotIn("sports_graph_context", expectancy[crypto_q.ticker]["lane_allocation"])
+        self.assertNotIn("sports_graph_context", expectancy[macro_q.ticker]["lane_allocation"])
+        self.assertEqual(expectancy[crypto_q.ticker]["lane_allocation"]["decision"], "SPORTS_ONLY_CRYPTO_BLOCK")
+        self.assertEqual(expectancy[macro_q.ticker]["lane_allocation"]["decision"], "SPORTS_ONLY_NONSPORTS_BLOCK")
+
+    def test_sports_ladder_consumes_relationship_graph_scores(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        game_context = {
+            "game_id": "basketball:kxnba_okcsas",
+            "thesis_type": "high_scoring_environment",
+            "thesis_confidence": 82.0,
+            "strong": True,
+            "primary_candidate": "KXNBATOTAL-OKCSAS-LAG",
+        }
+        lag_q = SimpleNamespace(ticker="KXNBATOTAL-OKCSAS-LAG", family="KXNBATOTAL", selected_side="yes", selected_price=0.47)
+        plain_q = SimpleNamespace(ticker="KXNBA1HTOTAL-OKCSAS-1135", family="KXNBA1HTOTAL", selected_side="yes", selected_price=0.46)
+
+        def candidate(q, unified_score, graph_adjustment=0.0, lag=False):
+            return {
+                "ticker": q.ticker,
+                "family": q.family,
+                "lane": "SPORTS",
+                "q": q,
+                "market": {"ticker": q.ticker, "series_ticker": q.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA total over"},
+                "allocation": {
+                    "lane": "SPORTS",
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "allocation_score": unified_score,
+                    "unified_opportunity_score": unified_score,
+                    "edge": 0.030,
+                    "spread": 0.02,
+                    "liquidity": 150,
+                    "decision": "ALLOW_STRONG_SPORT",
+                    "game_id": game_context["game_id"],
+                    "game_thesis_type": game_context["thesis_type"],
+                    "game_thesis_confidence": game_context["thesis_confidence"],
+                    "game_thesis_context": dict(game_context),
+                    "game_thesis_signal": {"thesis_weights": {"high_scoring_environment": 0.94}},
+                    "sports_graph_role": "total",
+                    "sports_graph_direction": "high_scoring",
+                    "sports_graph_relationship_types": ["1H-to-full-game continuation"],
+                    "sports_graph_rank_adjustment": graph_adjustment,
+                    "sports_graph_lag_detected": lag,
+                    "sports_graph_conflict_count": 0,
+                    "sports_graph_alignment_count": 1,
+                },
+            }
+
+        bot.last_dual_lane_buy_candidates = [
+            candidate(lag_q, 70.0, graph_adjustment=4.0, lag=True),
+            candidate(plain_q, 72.0, graph_adjustment=0.0, lag=False),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            plan = bot._build_sports_ladder_plan(bot.last_dual_lane_buy_candidates, source="unit_test_ladder_graph")
+
+        self.assertEqual(plan["primary_candidate"], lag_q.ticker)
+        self.assertTrue(plan["legs"][0]["sports_graph_lag_detected"])
+        self.assertGreater(plan["legs"][0]["sports_graph_component"], 0.0)
+
+    def test_sports_graph_dynamic_size_adjustment_is_controlled(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBATOTAL-OKCSAS-LAG",
+            family="KXNBATOTAL",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            liquidity=140,
+            orderbook_ready=True,
+            quote_ready=True,
+            sports_graph_size_multiplier=1.10,
+            sports_graph_role="total",
+            sports_graph_direction="high_scoring",
+            sports_graph_lag_detected=True,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            resolved = bot._resolve_dynamic_live_entry_size(
+                q,
+                explicit_size=4,
+                payload={
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "count": 4,
+                    "selected_side": "yes",
+                    "selected_price": 0.47,
+                    "sports_graph_size_multiplier": 1.10,
+                    "sports_graph_role": "total",
+                    "sports_graph_lag_detected": True,
+                },
+                ev_context={"ticker": q.ticker, "family": q.family, "ev_tier": "B"},
+                source="unit_test_sports_graph_size",
+            )
+
+        self.assertGreaterEqual(resolved, 4)
+        self.assertLessEqual(resolved, kw.MAX_LIVE_ORDER_SIZE)
 
     def test_game_thesis_dynamic_size_adjustment_is_controlled(self):
         bot = self._make_bot()

@@ -324,6 +324,11 @@ _TELEMETRY_CRITICAL_TAGS = {
     "SPORTS-AGGRESSION",
     "SPORTS-REGIME-SIZE",
     "SPORTS-MOMENTUM-SKIP",
+    "SPORTS-GRAPH",
+    "SPORTS-RELATION",
+    "SPORTS-LAG",
+    "SPORTS-GRAPH-BOOST",
+    "SPORTS-GRAPH-CONFLICT",
     "GAME-THESIS",
     "GAME-CONVICTION",
     "GAME-BOOST",
@@ -2034,6 +2039,12 @@ AION_SPORTS_REGIME_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_REGIME_MAX_RANK
 AION_SPORTS_REGIME_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_REGIME_MIN_SIZE_MULTIPLIER", 0.70)
 AION_SPORTS_REGIME_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_REGIME_MAX_SIZE_MULTIPLIER", 1.16)
 AION_SPORTS_REGIME_LOG_COOLDOWN_SECONDS = get_env_float("AION_SPORTS_REGIME_LOG_COOLDOWN_SECONDS", 180.0)
+AION_SPORTS_GRAPH_ENABLED = get_env_bool("AION_SPORTS_GRAPH_ENABLED", 1)
+AION_SPORTS_GRAPH_MAX_RANK_BOOST = get_env_float("AION_SPORTS_GRAPH_MAX_RANK_BOOST", 5.0)
+AION_SPORTS_GRAPH_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_GRAPH_MAX_RANK_PENALTY", 3.0)
+AION_SPORTS_GRAPH_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_GRAPH_MIN_SIZE_MULTIPLIER", 0.94)
+AION_SPORTS_GRAPH_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_GRAPH_MAX_SIZE_MULTIPLIER", 1.12)
+AION_SPORTS_GRAPH_LOG_COOLDOWN_SECONDS = get_env_float("AION_SPORTS_GRAPH_LOG_COOLDOWN_SECONDS", 180.0)
 AION_GAME_THESIS_ENABLED = get_env_bool("AION_GAME_THESIS_ENABLED", 1)
 AION_GAME_THESIS_MIN_ALIGNED = get_env_int("AION_GAME_THESIS_MIN_ALIGNED", 2)
 AION_GAME_THESIS_STRONG_SCORE = get_env_float("AION_GAME_THESIS_STRONG_SCORE", 68.0)
@@ -2477,6 +2488,8 @@ class KalshiSniperBot:
         self.game_thesis_log_markers = {}
         self.sports_ladder_log_markers = {}
         self.sports_regime_log_markers = {}
+        self.sports_graph_log_markers = {}
+        self.last_sports_graph_contexts = {}
         self.last_sports_ladder_plan = {}
         self.last_sports_ladder_execution_summary = {}
         print(
@@ -9255,6 +9268,8 @@ class KalshiSniperBot:
             sports_memory_dimensions = sports_memory_dimensions if isinstance(sports_memory_dimensions, dict) else {}
             game_thesis_context = self._learning_archive_value(sources, "game_thesis_context")
             game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
+            sports_graph_context = self._learning_archive_value(sources, "sports_graph_context")
+            sports_graph_context = sports_graph_context if isinstance(sports_graph_context, dict) else {}
             sports_ladder_context = self._learning_archive_value(sources, "sports_ladder_context")
             sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
             price = self._learning_archive_float(
@@ -9329,6 +9344,24 @@ class KalshiSniperBot:
                     self._learning_archive_value(sources, "game_thesis_size_multiplier")
                     or game_thesis_context.get("applied_size_multiplier")
                     or game_thesis_context.get("size_multiplier")
+                ),
+                "sports_graph_context": sports_graph_context,
+                "sports_graph_game_id": self._learning_archive_value(sources, "sports_graph_game_id") or sports_graph_context.get("game_id"),
+                "sports_graph_role": self._learning_archive_value(sources, "sports_graph_role") or sports_graph_context.get("role"),
+                "sports_graph_direction": self._learning_archive_value(sources, "sports_graph_direction") or sports_graph_context.get("direction"),
+                "sports_graph_relationship_types": self._learning_archive_value(sources, "sports_graph_relationship_types") or sports_graph_context.get("relationship_types"),
+                "sports_graph_lag_detected": bool(self._learning_archive_value(sources, "sports_graph_lag_detected") or sports_graph_context.get("lag_detected")),
+                "sports_graph_rank_adjustment": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_graph_rank_adjustment")
+                    or sports_graph_context.get("rank_adjustment")
+                ),
+                "sports_graph_size_multiplier": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_graph_size_multiplier")
+                    or sports_graph_context.get("size_multiplier")
+                ),
+                "sports_graph_conflict_count": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_graph_conflict_count")
+                    or sports_graph_context.get("conflict_count")
                 ),
                 "sports_ladder_context": sports_ladder_context,
                 "sports_ladder_plan_id": self._learning_archive_value(sources, "sports_ladder_plan_id") or sports_ladder_context.get("plan_id"),
@@ -11231,6 +11264,599 @@ class KalshiSniperBot:
             updated.append((allocation, rank_index, candidate))
         return updated
 
+    def _emit_sports_graph_log(self, tag, payload, marker=None, cooldown_seconds=None):
+        tag = str(tag or "SPORTS-GRAPH").strip().upper()
+        payload = payload if isinstance(payload, dict) else {}
+        markers = getattr(self, "sports_graph_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self.sports_graph_log_markers = markers
+        cooldown_seconds = (
+            AION_SPORTS_GRAPH_LOG_COOLDOWN_SECONDS
+            if cooldown_seconds is None
+            else float(cooldown_seconds or 0.0)
+        )
+        marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+        now_ts = time.time()
+        if marker_key is not None:
+            previous_ts = self.to_float(markers.get(marker_key), 0.0) or 0.0
+            if now_ts - previous_ts < cooldown_seconds:
+                return
+            markers[marker_key] = now_ts
+            if len(markers) > 1200:
+                cutoff = now_ts - 7200.0
+                self.sports_graph_log_markers = {
+                    key: value for key, value in markers.items()
+                    if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"[{tag}] " + json.dumps({"reason": "sports_graph_log_failed"}))
+
+    def _sports_graph_market_role(self, *, family=None, ticker=None, market=None, q=None, text=None):
+        market = market if isinstance(market, dict) else {}
+        family = str(family or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        raw_text = str(text or self._quality_market_text(family=family, ticker=ticker, market=market, q=q) or "").upper()
+        combined = " ".join(part for part in (family, str(ticker or "").upper(), raw_text) if part)
+        if "TEAM TOTAL" in combined or "TEAMTOTAL" in combined or "TEAM-TOTAL" in combined:
+            return "team_total"
+        if any(token in combined for token in ("PLAYER", "BATTER", "PITCHER", "HITTER", "POINTS", "ASSISTS", "REBOUNDS", "HITS", "RBI", "STRIKEOUT", "HOMER", "HOME RUN", "TOTAL BASE")):
+            return "player_related"
+        period = self._sports_memory_period_bucket(family=family, ticker=ticker, title=combined)
+        if "SPREAD" in combined or "HANDICAP" in combined:
+            return "1h_spread" if period == "1h" else "spread"
+        if "TOTAL" in combined or "OVER" in combined or "UNDER" in combined:
+            return "1h_total" if period == "1h" else "total"
+        if "MONEYLINE" in combined or " WINNER" in combined or " TO WIN" in combined or "ML" in family:
+            return "winner"
+        if "LIVE" in combined or "IN-GAME" in combined or "INGAME" in combined:
+            return "live_continuation"
+        return "unknown"
+
+    def _sports_graph_direction(self, *, family=None, ticker=None, market=None, q=None, allocation=None, signal=None, role=None, text=None):
+        allocation = allocation if isinstance(allocation, dict) else {}
+        signal = signal if isinstance(signal, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        family = str(family or allocation.get("family") or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        role = str(role or "").strip().lower()
+        raw_text = str(text or self._quality_market_text(family=family, ticker=ticker, market=market, q=q) or "").upper()
+        side = self._normalize_live_side(allocation.get("selected_side") or signal.get("selected_side") or getattr(q, "selected_side", None) or getattr(q, "side", None))
+        selected_price = self._sports_memory_price(allocation.get("selected_price") or signal.get("selected_price") or getattr(q, "selected_price", None))
+        thesis_type = str(allocation.get("game_thesis_type") or signal.get("primary_thesis") or "").strip().lower()
+        if role in {"total", "1h_total", "team_total", "player_related", "live_continuation"}:
+            over_text = "OVER" in raw_text and "UNDER" not in raw_text
+            under_text = "UNDER" in raw_text and "OVER" not in raw_text
+            if (over_text and side == "yes") or (under_text and side == "no"):
+                return "high_scoring"
+            if (under_text and side == "yes") or (over_text and side == "no"):
+                return "low_scoring"
+            if "high_scoring" in thesis_type:
+                return "high_scoring"
+            if "low_scoring" in thesis_type:
+                return "low_scoring"
+            if side == "yes" and role in {"team_total", "player_related"}:
+                return "high_scoring"
+            if side == "no" and role in {"team_total", "player_related"}:
+                return "low_scoring"
+        if role in {"winner", "spread", "1h_spread"}:
+            if "favorite_dominance" in thesis_type:
+                return "favorite"
+            if "underdog_pressure" in thesis_type:
+                return "underdog"
+            if side == "no":
+                return "underdog"
+            if selected_price is not None:
+                if selected_price >= 0.56:
+                    return "favorite"
+                if selected_price <= 0.43:
+                    return "underdog"
+            if side == "yes":
+                return "favorite"
+        return "unknown"
+
+    def _sports_graph_relation_type(self, left=None, right=None):
+        left = left if isinstance(left, dict) else {}
+        right = right if isinstance(right, dict) else {}
+        left_role = str(left.get("role") or "").strip().lower()
+        right_role = str(right.get("role") or "").strip().lower()
+        left_direction = str(left.get("direction") or "unknown").strip().lower()
+        right_direction = str(right.get("direction") or "unknown").strip().lower()
+        left_period = str(left.get("period") or "").strip().lower()
+        right_period = str(right.get("period") or "").strip().lower()
+        scoring = {"high_scoring", "low_scoring"}
+        dominance = {"favorite", "underdog"}
+        if left_direction in scoring and right_direction in scoring:
+            if left_direction != right_direction:
+                return "opposite-side conflict"
+            if {left_period, right_period} == {"1h", "full_game"}:
+                return "1H-to-full-game continuation"
+            if left_role != right_role:
+                return "pace-aligned"
+            return "scoring-aligned"
+        if left_direction in dominance and right_direction in dominance:
+            if left_direction != right_direction:
+                return "opposite-side conflict"
+            if {left_period, right_period} == {"1h", "full_game"}:
+                return "1H-to-full-game continuation"
+            return "favorite-dominance aligned" if left_direction == "favorite" else "underdog-pressure aligned"
+        if left_direction == right_direction and left_direction != "unknown":
+            return "same-side aligned"
+        if "live" in left_role or "live" in right_role or "live" in {left_period, right_period}:
+            return "live-market lag"
+        return "weak/unknown relationship"
+
+    def _sports_graph_signal_from_allocation(self, allocation=None, *, candidate=None, market=None, item=None):
+        allocation = allocation if isinstance(allocation, dict) else {}
+        item = item if isinstance(item, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        q = item.get("q")
+        if q is None and isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
+            q = candidate[1]
+        ticker = str(allocation.get("ticker") or getattr(q, "ticker", "") or market.get("ticker") or "").strip()
+        family = str(allocation.get("family") or item.get("family") or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        if str(allocation.get("lane") or "").strip().upper() != "SPORTS" or not ticker:
+            return None
+        if not self._is_sports_only_allowed_candidate(family=family, ticker=ticker, market=market, q=q, lane="SPORTS"):
+            return None
+        thesis_signal = allocation.get("game_thesis_signal") if isinstance(allocation.get("game_thesis_signal"), dict) else {}
+        if not thesis_signal:
+            try:
+                thesis_signal = self._game_thesis_candidate_signal(allocation, item=item, market=market) or {}
+            except Exception:
+                thesis_signal = {}
+        game_context = allocation.get("game_thesis_context") if isinstance(allocation.get("game_thesis_context"), dict) else {}
+        game_id = str(
+            allocation.get("game_id")
+            or thesis_signal.get("game_id")
+            or game_context.get("game_id")
+            or self._game_thesis_game_id(market=market, q=q, allocation=allocation, family=family, ticker=ticker)
+            or ""
+        ).strip()
+        if not game_id:
+            return None
+        text = self._quality_market_text(family=family, ticker=ticker, market=market, q=q)
+        period = str(thesis_signal.get("period") or self._sports_memory_period_bucket(family=family, ticker=ticker, title=text) or "unknown").strip().lower()
+        if "LIVE" in str(text or "").upper() or "IN-GAME" in str(text or "").upper() or "INGAME" in str(text or "").upper():
+            period = "live"
+        role = self._sports_graph_market_role(family=family, ticker=ticker, market=market, q=q, text=text)
+        direction = self._sports_graph_direction(
+            family=family,
+            ticker=ticker,
+            market=market,
+            q=q,
+            allocation=allocation,
+            signal=thesis_signal,
+            role=role,
+            text=text,
+        )
+        selected_price = self._sports_memory_price(allocation.get("selected_price") or thesis_signal.get("selected_price") or getattr(q, "selected_price", None))
+        spread = self.to_float(allocation.get("spread"), None)
+        liquidity = self.to_float(allocation.get("liquidity"), 0.0) or 0.0
+        unified_score = self.to_float(
+            allocation.get("unified_opportunity_score"),
+            self.to_float((allocation.get("unified_opportunity") or {}).get("unified_score") if isinstance(allocation.get("unified_opportunity"), dict) else None, allocation.get("allocation_score")),
+        ) or 0.0
+        allocation_score = self.to_float(allocation.get("allocation_score"), unified_score) or 0.0
+        return {
+            "ticker": ticker,
+            "family": family,
+            "game_id": game_id,
+            "role": role,
+            "period": period,
+            "direction": direction,
+            "selected_side": self._normalize_live_side(allocation.get("selected_side") or thesis_signal.get("selected_side") or getattr(q, "selected_side", None)),
+            "selected_price": selected_price,
+            "spread": spread,
+            "liquidity": liquidity,
+            "unified_score": round(unified_score, 4),
+            "allocation_score": round(allocation_score, 4),
+            "edge": self.to_float(allocation.get("edge"), self.to_float(thesis_signal.get("edge"), 0.0)) or 0.0,
+            "book_quality": self._sports_ladder_book_quality(allocation),
+            "thesis_type": allocation.get("game_thesis_type") or game_context.get("thesis_type") or thesis_signal.get("primary_thesis"),
+            "thesis_confidence": self.to_float(allocation.get("game_thesis_confidence"), self.to_float(game_context.get("thesis_confidence"), 0.0)) or 0.0,
+            "thesis_weights": thesis_signal.get("thesis_weights") or game_context.get("candidate_thesis_weights") or {},
+        }
+
+    def _build_sports_market_relationship_graph(self, decorated=None, *, market_lookup=None, expectancy_summary_by_ticker=None, thesis_contexts=None, source="ranking"):
+        if not AION_SPORTS_GRAPH_ENABLED:
+            return {}
+        market_lookup = market_lookup if isinstance(market_lookup, dict) else {}
+        expectancy_summary_by_ticker = expectancy_summary_by_ticker if isinstance(expectancy_summary_by_ticker, dict) else {}
+        thesis_contexts = thesis_contexts if isinstance(thesis_contexts, dict) else {}
+        groups = {}
+        for allocation, _rank_index, candidate in decorated or []:
+            allocation = allocation if isinstance(allocation, dict) else {}
+            ticker = str(allocation.get("ticker") or "").strip()
+            market = market_lookup.get(ticker, {})
+            item = expectancy_summary_by_ticker.get(ticker) if isinstance(expectancy_summary_by_ticker.get(ticker), dict) else {}
+            if not item and isinstance(candidate, (list, tuple)) and len(candidate) >= 4:
+                item = {"raw_score": candidate[0], "q": candidate[1], "spread": candidate[2], "family": candidate[3]}
+            signal = self._sports_graph_signal_from_allocation(allocation, candidate=candidate, market=market, item=item)
+            if not signal:
+                continue
+            allocation["sports_graph_signal"] = signal
+            groups.setdefault(signal.get("game_id"), []).append({"allocation": allocation, "candidate": candidate, "signal": signal})
+        contexts = {}
+        aligned_types = {
+            "same-side aligned",
+            "scoring-aligned",
+            "pace-aligned",
+            "favorite-dominance aligned",
+            "underdog-pressure aligned",
+            "1H-to-full-game continuation",
+            "live-market lag",
+        }
+        marker_bucket = int(time.time() // max(30, int(AION_SPORTS_GRAPH_LOG_COOLDOWN_SECONDS or 180)))
+        for game_id, rows in groups.items():
+            if not game_id or not rows:
+                continue
+            game_context = thesis_contexts.get(game_id) if isinstance(thesis_contexts.get(game_id), dict) else {}
+            relationships = []
+            by_ticker = {str((row.get("signal") or {}).get("ticker") or "").strip(): row for row in rows}
+            for left_index, left_row in enumerate(rows):
+                left_signal = left_row.get("signal") or {}
+                for right_row in rows[left_index + 1:]:
+                    right_signal = right_row.get("signal") or {}
+                    relation_type = self._sports_graph_relation_type(left_signal, right_signal)
+                    relationship = {
+                        "left": left_signal.get("ticker"),
+                        "right": right_signal.get("ticker"),
+                        "relationship_type": relation_type,
+                        "left_role": left_signal.get("role"),
+                        "right_role": right_signal.get("role"),
+                        "left_direction": left_signal.get("direction"),
+                        "right_direction": right_signal.get("direction"),
+                    }
+                    relationships.append(relationship)
+                    if relation_type != "weak/unknown relationship":
+                        self._emit_sports_graph_log(
+                            "SPORTS-RELATION",
+                            {
+                                "source": source,
+                                "game_id": game_id,
+                                "left": relationship.get("left"),
+                                "right": relationship.get("right"),
+                                "relationship_type": relation_type,
+                                "left_role": relationship.get("left_role"),
+                                "right_role": relationship.get("right_role"),
+                                "left_direction": relationship.get("left_direction"),
+                                "right_direction": relationship.get("right_direction"),
+                            },
+                            marker=("SPORTS-RELATION", source, game_id, relationship.get("left"), relationship.get("right"), relation_type, marker_bucket),
+                        )
+            candidate_signals = {}
+            for row in rows:
+                signal = row.get("signal") or {}
+                ticker = str(signal.get("ticker") or "").strip()
+                if not ticker:
+                    continue
+                related = [
+                    relationship for relationship in relationships
+                    if relationship.get("left") == ticker or relationship.get("right") == ticker
+                ]
+                aligned = [relationship for relationship in related if relationship.get("relationship_type") in aligned_types]
+                conflicts = [relationship for relationship in related if relationship.get("relationship_type") == "opposite-side conflict"]
+                continuation_count = sum(1 for relationship in aligned if relationship.get("relationship_type") in {"1H-to-full-game continuation", "live-market lag"})
+                peer_scores = []
+                best_peer = None
+                for relationship in aligned:
+                    peer_ticker = relationship.get("right") if relationship.get("left") == ticker else relationship.get("left")
+                    peer_row = by_ticker.get(str(peer_ticker or "").strip())
+                    peer_signal = peer_row.get("signal") if isinstance(peer_row, dict) else {}
+                    peer_score = max(
+                        self.to_float(peer_signal.get("unified_score"), 0.0) or 0.0,
+                        self.to_float(peer_signal.get("allocation_score"), 0.0) or 0.0,
+                    )
+                    peer_scores.append(peer_score)
+                    best_peer_current_score = max(
+                        self.to_float((best_peer or {}).get("unified_score"), 0.0) or 0.0,
+                        self.to_float((best_peer or {}).get("allocation_score"), 0.0) or 0.0,
+                    )
+                    if best_peer is None or peer_score > best_peer_current_score:
+                        best_peer = peer_signal
+                own_score = max(
+                    self.to_float(signal.get("unified_score"), 0.0) or 0.0,
+                    self.to_float(signal.get("allocation_score"), 0.0) or 0.0,
+                )
+                best_peer_score = max(peer_scores) if peer_scores else 0.0
+                score_gap = max(0.0, best_peer_score - own_score)
+                spread = self.to_float(signal.get("spread"), None)
+                liquidity = self.to_float(signal.get("liquidity"), 0.0) or 0.0
+                selected_price = self.to_float(signal.get("selected_price"), None)
+                thesis_confidence = max(
+                    self.to_float(signal.get("thesis_confidence"), 0.0) or 0.0,
+                    self.to_float(game_context.get("thesis_confidence"), 0.0) or 0.0,
+                )
+                tradeable = bool(
+                    own_score >= 45.0
+                    and (spread is None or spread <= 0.12)
+                    and liquidity >= 1.0
+                    and (selected_price is None or 0.08 <= selected_price <= 0.92)
+                )
+                lag_detected = bool(
+                    aligned
+                    and score_gap >= 4.0
+                    and tradeable
+                    and (thesis_confidence >= float(AION_GAME_THESIS_STRONG_SCORE) - 3.0 or best_peer_score >= 68.0)
+                )
+                lag_boost = 0.0
+                if lag_detected:
+                    lag_boost = min(
+                        2.4,
+                        max(
+                            0.65,
+                            score_gap * 0.08
+                            + max(0.0, thesis_confidence - 66.0) * 0.025
+                            + min(0.60, len(aligned) * 0.18),
+                        ),
+                    )
+                thesis_bonus = 0.0
+                thesis_type = str(game_context.get("thesis_type") or signal.get("thesis_type") or "").strip().lower()
+                if related and thesis_type and thesis_type != "weak_no_thesis":
+                    weight = self.to_float((signal.get("thesis_weights") or {}).get(thesis_type), 0.0) or 0.0
+                    if weight > 0.0 and thesis_confidence >= 58.0:
+                        thesis_bonus = min(0.85, weight * max(0.15, thesis_confidence / 100.0))
+                relationship_score = (
+                    len(aligned) * 0.65
+                    + continuation_count * 0.35
+                    + lag_boost
+                    + thesis_bonus
+                    - len(conflicts) * 0.70
+                )
+                if conflicts and not aligned:
+                    relationship_score -= 0.45
+                max_boost = float(AION_SPORTS_GRAPH_MAX_RANK_BOOST or 0.0)
+                max_penalty = float(AION_SPORTS_GRAPH_MAX_RANK_PENALTY or 0.0)
+                if relationship_score >= 0.05:
+                    rank_adjustment = min(max_boost, relationship_score)
+                elif relationship_score <= -0.05:
+                    rank_adjustment = -min(max_penalty, abs(relationship_score))
+                else:
+                    rank_adjustment = 0.0
+                if rank_adjustment > 0.0:
+                    size_multiplier = min(float(AION_SPORTS_GRAPH_MAX_SIZE_MULTIPLIER), 1.0 + min(0.12, rank_adjustment * 0.020))
+                elif rank_adjustment < 0.0:
+                    size_multiplier = max(float(AION_SPORTS_GRAPH_MIN_SIZE_MULTIPLIER), 1.0 + rank_adjustment * 0.018)
+                else:
+                    size_multiplier = 1.0
+                relation_types = sorted({relationship.get("relationship_type") for relationship in related if relationship.get("relationship_type")})
+                candidate_graph = {
+                    "game_id": game_id,
+                    "ticker": ticker,
+                    "family": signal.get("family"),
+                    "role": signal.get("role"),
+                    "period": signal.get("period"),
+                    "direction": signal.get("direction"),
+                    "relationship_types": relation_types,
+                    "alignment_count": len(aligned),
+                    "conflict_count": len(conflicts),
+                    "continuation_count": continuation_count,
+                    "lag_detected": lag_detected,
+                    "lag_peer": (best_peer or {}).get("ticker"),
+                    "lag_score_gap": round(score_gap, 4),
+                    "relationship_score": round(relationship_score, 4),
+                    "rank_adjustment": round(rank_adjustment, 4),
+                    "size_multiplier": round(size_multiplier, 4),
+                    "related_candidates": [
+                        relationship.get("right") if relationship.get("left") == ticker else relationship.get("left")
+                        for relationship in related
+                    ][:10],
+                    "reason": "lagging_related_market" if lag_detected else "relationship_alignment" if rank_adjustment > 0.0 else "relationship_conflict" if rank_adjustment < 0.0 else "relationship_neutral",
+                }
+                candidate_signals[ticker] = candidate_graph
+                if lag_detected:
+                    self._emit_sports_graph_log(
+                        "SPORTS-LAG",
+                        {
+                            "source": source,
+                            "game_id": game_id,
+                            "ticker": ticker,
+                            "role": signal.get("role"),
+                            "direction": signal.get("direction"),
+                            "lag_peer": candidate_graph.get("lag_peer"),
+                            "score_gap": candidate_graph.get("lag_score_gap"),
+                            "rank_adjustment": candidate_graph.get("rank_adjustment"),
+                            "relationship_types": relation_types[:4],
+                            "reason": "related_market_moved_first",
+                        },
+                        marker=("SPORTS-LAG", source, ticker, candidate_graph.get("lag_peer"), marker_bucket),
+                    )
+            ranked_candidates = sorted(candidate_signals.values(), key=lambda item: self.to_float(item.get("rank_adjustment"), 0.0) or 0.0, reverse=True)
+            contexts[game_id] = {
+                "game_id": game_id,
+                "candidate_count": len(rows),
+                "relationship_count": len(relationships),
+                "relationships": relationships[:40],
+                "candidate_signals": candidate_signals,
+                "primary_candidate": ranked_candidates[0].get("ticker") if ranked_candidates else None,
+                "lagging_candidates": [item.get("ticker") for item in ranked_candidates if item.get("lag_detected")],
+                "conflict_candidates": [item.get("ticker") for item in ranked_candidates if self.to_float(item.get("conflict_count"), 0.0) > 0.0],
+                "thesis_type": game_context.get("thesis_type"),
+                "thesis_confidence": game_context.get("thesis_confidence"),
+                "reason": "sports_relationship_graph_built",
+            }
+            if len(rows) >= 2:
+                self._emit_sports_graph_log(
+                    "SPORTS-GRAPH",
+                    {
+                        "source": source,
+                        "game_id": game_id,
+                        "candidate_count": len(rows),
+                        "relationship_count": len(relationships),
+                        "primary_candidate": contexts[game_id].get("primary_candidate"),
+                        "lagging_candidates": contexts[game_id].get("lagging_candidates")[:5],
+                        "conflict_candidates": contexts[game_id].get("conflict_candidates")[:5],
+                        "thesis_type": contexts[game_id].get("thesis_type"),
+                        "thesis_confidence": contexts[game_id].get("thesis_confidence"),
+                        "reason": "same_game_relationships_mapped",
+                    },
+                    marker=("SPORTS-GRAPH", source, game_id, marker_bucket),
+                )
+        return contexts
+
+    def _apply_sports_graph_to_allocations(self, decorated=None, graph_contexts=None, *, source="ranking"):
+        if not AION_SPORTS_GRAPH_ENABLED:
+            return decorated or []
+        graph_contexts = graph_contexts if isinstance(graph_contexts, dict) else {}
+        updated = []
+        marker_bucket = int(time.time() // max(30, int(AION_SPORTS_GRAPH_LOG_COOLDOWN_SECONDS or 180)))
+        for allocation, rank_index, candidate in decorated or []:
+            allocation = allocation if isinstance(allocation, dict) else {}
+            q = candidate[1] if isinstance(candidate, (list, tuple)) and len(candidate) >= 2 else None
+            if str(allocation.get("lane") or "").strip().upper() != "SPORTS":
+                updated.append((allocation, rank_index, candidate))
+                continue
+            game_id = str(allocation.get("game_id") or (allocation.get("sports_graph_signal") or {}).get("game_id") or "").strip()
+            ticker = str(allocation.get("ticker") or getattr(q, "ticker", "") or "").strip()
+            context = graph_contexts.get(game_id) if game_id else None
+            graph_signal = None
+            if isinstance(context, dict):
+                candidate_signals = context.get("candidate_signals") if isinstance(context.get("candidate_signals"), dict) else {}
+                graph_signal = candidate_signals.get(ticker)
+            if not isinstance(graph_signal, dict):
+                updated.append((allocation, rank_index, candidate))
+                continue
+            rank_adjustment = self.to_float(graph_signal.get("rank_adjustment"), 0.0) or 0.0
+            size_multiplier = self.to_float(graph_signal.get("size_multiplier"), 1.0) or 1.0
+            if abs(rank_adjustment) >= 0.0001:
+                current_allocation_score = self.to_float(allocation.get("allocation_score"), self.to_float(allocation.get("pre_lane_score"), 0.0)) or 0.0
+                current_adjustment = self.to_float(allocation.get("allocation_adjustment"), 0.0) or 0.0
+                current_unified = self.to_float(allocation.get("unified_opportunity_score"), None)
+                allocation["allocation_adjustment"] = round(current_adjustment + rank_adjustment, 4)
+                allocation["allocation_score"] = round(current_allocation_score + rank_adjustment, 4)
+                if current_unified is not None:
+                    allocation["unified_opportunity_score"] = round(max(0.0, min(100.0, current_unified + rank_adjustment)), 4)
+            unified_context = allocation.get("unified_opportunity") if isinstance(allocation.get("unified_opportunity"), dict) else {}
+            if unified_context:
+                if allocation.get("unified_opportunity_score") is not None:
+                    unified_context["unified_score"] = allocation.get("unified_opportunity_score")
+                base_size = self.to_float(unified_context.get("size_multiplier"), self.to_float(allocation.get("unified_size_multiplier"), 1.0)) or 1.0
+                if abs(size_multiplier - 1.0) >= 0.0001:
+                    unified_context["size_multiplier"] = round(max(0.35, min(1.75, base_size * size_multiplier)), 4)
+                reason = str(unified_context.get("reason") or "")
+                graph_reason = None
+                if graph_signal.get("lag_detected"):
+                    graph_reason = "sports_graph_lag"
+                elif rank_adjustment > 0.0:
+                    graph_reason = "sports_graph_relationship"
+                elif rank_adjustment < 0.0:
+                    graph_reason = "sports_graph_conflict"
+                if graph_reason and graph_reason not in reason:
+                    unified_context["reason"] = "+".join(part for part in (reason, graph_reason) if part)
+                for key in (
+                    "sports_graph_rank_adjustment",
+                    "sports_graph_size_multiplier",
+                    "sports_graph_role",
+                    "sports_graph_direction",
+                    "sports_graph_relationship_types",
+                    "sports_graph_lag_detected",
+                    "sports_graph_conflict_count",
+                    "sports_graph_alignment_count",
+                ):
+                    field_name = key.replace("sports_graph_", "")
+                    unified_context[key] = graph_signal.get(field_name)
+                allocation["unified_opportunity"] = unified_context
+                allocation["unified_size_multiplier"] = unified_context.get("size_multiplier")
+            else:
+                allocation["unified_size_multiplier"] = round(size_multiplier, 4)
+            sports_graph_context = {
+                "game_id": game_id,
+                "ticker": ticker,
+                "role": graph_signal.get("role"),
+                "period": graph_signal.get("period"),
+                "direction": graph_signal.get("direction"),
+                "relationship_types": graph_signal.get("relationship_types"),
+                "alignment_count": graph_signal.get("alignment_count"),
+                "conflict_count": graph_signal.get("conflict_count"),
+                "lag_detected": graph_signal.get("lag_detected"),
+                "lag_peer": graph_signal.get("lag_peer"),
+                "lag_score_gap": graph_signal.get("lag_score_gap"),
+                "rank_adjustment": graph_signal.get("rank_adjustment"),
+                "size_multiplier": graph_signal.get("size_multiplier"),
+                "related_candidates": graph_signal.get("related_candidates"),
+                "reason": graph_signal.get("reason"),
+            }
+            allocation["sports_graph_context"] = sports_graph_context
+            allocation["sports_graph_game_id"] = game_id
+            allocation["sports_graph_role"] = graph_signal.get("role")
+            allocation["sports_graph_direction"] = graph_signal.get("direction")
+            allocation["sports_graph_relationship_types"] = graph_signal.get("relationship_types")
+            allocation["sports_graph_lag_detected"] = bool(graph_signal.get("lag_detected"))
+            allocation["sports_graph_rank_adjustment"] = round(rank_adjustment, 4)
+            allocation["sports_graph_size_multiplier"] = round(size_multiplier, 4)
+            allocation["sports_graph_conflict_count"] = int(self.to_float(graph_signal.get("conflict_count"), 0.0) or 0)
+            allocation["sports_graph_alignment_count"] = int(self.to_float(graph_signal.get("alignment_count"), 0.0) or 0)
+            if q is not None:
+                for attr_name, attr_value in (
+                    ("sports_graph_context", allocation.get("sports_graph_context")),
+                    ("sports_graph_game_id", allocation.get("sports_graph_game_id")),
+                    ("sports_graph_role", allocation.get("sports_graph_role")),
+                    ("sports_graph_direction", allocation.get("sports_graph_direction")),
+                    ("sports_graph_relationship_types", allocation.get("sports_graph_relationship_types")),
+                    ("sports_graph_lag_detected", allocation.get("sports_graph_lag_detected")),
+                    ("sports_graph_rank_adjustment", allocation.get("sports_graph_rank_adjustment")),
+                    ("sports_graph_size_multiplier", allocation.get("sports_graph_size_multiplier")),
+                    ("sports_graph_conflict_count", allocation.get("sports_graph_conflict_count")),
+                    ("sports_graph_alignment_count", allocation.get("sports_graph_alignment_count")),
+                    ("unified_opportunity_score", allocation.get("unified_opportunity_score")),
+                    ("unified_size_multiplier", allocation.get("unified_size_multiplier")),
+                ):
+                    try:
+                        if attr_value is not None:
+                            setattr(q, attr_name, attr_value)
+                    except Exception:
+                        pass
+            if rank_adjustment > 0.0:
+                self._emit_sports_graph_log(
+                    "SPORTS-GRAPH-BOOST",
+                    {
+                        "source": source,
+                        "game_id": game_id,
+                        "ticker": ticker,
+                        "family": allocation.get("family"),
+                        "role": graph_signal.get("role"),
+                        "direction": graph_signal.get("direction"),
+                        "relationship_types": graph_signal.get("relationship_types")[:5],
+                        "lag_detected": bool(graph_signal.get("lag_detected")),
+                        "ranking_boost": round(rank_adjustment, 4),
+                        "size_multiplier": round(size_multiplier, 4),
+                        "final_allocation_score": allocation.get("allocation_score"),
+                        "final_unified_score": allocation.get("unified_opportunity_score"),
+                        "reason": graph_signal.get("reason"),
+                    },
+                    marker=("SPORTS-GRAPH-BOOST", source, ticker, marker_bucket),
+                )
+            elif rank_adjustment < 0.0:
+                self._emit_sports_graph_log(
+                    "SPORTS-GRAPH-CONFLICT",
+                    {
+                        "source": source,
+                        "game_id": game_id,
+                        "ticker": ticker,
+                        "family": allocation.get("family"),
+                        "role": graph_signal.get("role"),
+                        "direction": graph_signal.get("direction"),
+                        "relationship_types": graph_signal.get("relationship_types")[:5],
+                        "conflict_count": graph_signal.get("conflict_count"),
+                        "ranking_reduction": round(abs(rank_adjustment), 4),
+                        "size_multiplier": round(size_multiplier, 4),
+                        "final_allocation_score": allocation.get("allocation_score"),
+                        "final_unified_score": allocation.get("unified_opportunity_score"),
+                        "reason": graph_signal.get("reason"),
+                    },
+                    marker=("SPORTS-GRAPH-CONFLICT", source, ticker, marker_bucket),
+                )
+            if isinstance(candidate, (list, tuple)) and len(candidate) >= 4:
+                candidate = (
+                    allocation.get("allocation_score", candidate[0]),
+                    candidate[1],
+                    candidate[2],
+                    candidate[3],
+                )
+            updated.append((allocation, rank_index, candidate))
+        return updated
+
     def _emit_sports_ladder_log(self, tag, payload, marker=None, cooldown_seconds=None):
         tag = str(tag or "SPORTS-LADDER").strip().upper()
         payload = payload if isinstance(payload, dict) else {}
@@ -11455,6 +12081,11 @@ class KalshiSniperBot:
                 0.0,
                 self.to_float(allocation.get("family_profit_memory_adjustment"), 0.0) or 0.0,
             )
+            graph_adjustment = self.to_float(allocation.get("sports_graph_rank_adjustment"), 0.0) or 0.0
+            graph_lag = bool(allocation.get("sports_graph_lag_detected"))
+            graph_conflicts = int(self.to_float(allocation.get("sports_graph_conflict_count"), 0.0) or 0)
+            graph_alignment = int(self.to_float(allocation.get("sports_graph_alignment_count"), 0.0) or 0)
+            graph_component = max(-2.5, min(4.0, graph_adjustment * 0.80 + (1.0 if graph_lag else 0.0) + min(1.0, graph_alignment * 0.20) - min(2.0, graph_conflicts * 0.55)))
             time_bonus = 0.0
             minutes = self.to_float(allocation.get("time_to_event_minutes"), allocation.get("time_to_expiry_minutes"))
             if minutes is not None:
@@ -11473,6 +12104,7 @@ class KalshiSniperBot:
                     + book_quality * 8.0
                     + min(6.0, memory_strength)
                     + min(4.0, family_strength)
+                    + graph_component
                     + time_bonus,
                 ),
                 4,
@@ -11496,6 +12128,14 @@ class KalshiSniperBot:
                     "book_quality": round(book_quality, 4),
                     "unified_score": round(unified_score, 4),
                     "allocation_score": round(allocation_score, 4),
+                    "sports_graph_role": allocation.get("sports_graph_role"),
+                    "sports_graph_direction": allocation.get("sports_graph_direction"),
+                    "sports_graph_relationship_types": allocation.get("sports_graph_relationship_types") or [],
+                    "sports_graph_rank_adjustment": round(graph_adjustment, 4),
+                    "sports_graph_lag_detected": graph_lag,
+                    "sports_graph_conflict_count": graph_conflicts,
+                    "sports_graph_alignment_count": graph_alignment,
+                    "sports_graph_component": round(graph_component, 4),
                     "ladder_score": ladder_score,
                 }
             )
@@ -11581,6 +12221,9 @@ class KalshiSniperBot:
                     "ticker": leg.get("ticker"),
                     "role": leg.get("role"),
                     "leg_type": leg.get("leg_type"),
+                    "sports_graph_role": leg.get("sports_graph_role"),
+                    "sports_graph_lag_detected": leg.get("sports_graph_lag_detected"),
+                    "sports_graph_rank_adjustment": leg.get("sports_graph_rank_adjustment"),
                     "ladder_score": leg.get("ladder_score"),
                     "size_cap": leg.get("size_cap"),
                 }
@@ -11602,6 +12245,10 @@ class KalshiSniperBot:
                         "ticker": leg.get("ticker"),
                         "role": leg.get("role"),
                         "leg_type": leg.get("leg_type"),
+                        "sports_graph_role": leg.get("sports_graph_role"),
+                        "sports_graph_lag_detected": leg.get("sports_graph_lag_detected"),
+                        "sports_graph_rank_adjustment": leg.get("sports_graph_rank_adjustment"),
+                        "sports_graph_relationship_types": (leg.get("sports_graph_relationship_types") or [])[:5],
                         "ladder_score": leg.get("ladder_score"),
                         "size_cap": leg.get("size_cap"),
                     }
@@ -11636,6 +12283,13 @@ class KalshiSniperBot:
             "max_game_contracts": plan.get("max_game_contracts"),
             "size_cap": leg.get("size_cap"),
             "size_multiplier": leg.get("size_multiplier"),
+            "sports_graph_role": leg.get("sports_graph_role") or allocation.get("sports_graph_role"),
+            "sports_graph_direction": leg.get("sports_graph_direction") or allocation.get("sports_graph_direction"),
+            "sports_graph_relationship_types": leg.get("sports_graph_relationship_types") or allocation.get("sports_graph_relationship_types") or [],
+            "sports_graph_rank_adjustment": leg.get("sports_graph_rank_adjustment") if leg.get("sports_graph_rank_adjustment") is not None else allocation.get("sports_graph_rank_adjustment"),
+            "sports_graph_lag_detected": bool(leg.get("sports_graph_lag_detected") or allocation.get("sports_graph_lag_detected")),
+            "sports_graph_conflict_count": leg.get("sports_graph_conflict_count") if leg.get("sports_graph_conflict_count") is not None else allocation.get("sports_graph_conflict_count"),
+            "sports_graph_alignment_count": leg.get("sports_graph_alignment_count") if leg.get("sports_graph_alignment_count") is not None else allocation.get("sports_graph_alignment_count"),
         }
         for attr_name, attr_value in (
             ("sports_ladder_context", context),
@@ -11648,6 +12302,16 @@ class KalshiSniperBot:
             ("sports_ladder_size_multiplier", leg.get("size_multiplier")),
             ("sports_ladder_size_cap", leg.get("size_cap")),
             ("sports_ladder_game_exposure_cap", plan.get("max_game_contracts")),
+            ("sports_graph_context", allocation.get("sports_graph_context")),
+            ("sports_graph_game_id", allocation.get("sports_graph_game_id") or plan.get("game_id")),
+            ("sports_graph_role", context.get("sports_graph_role")),
+            ("sports_graph_direction", context.get("sports_graph_direction")),
+            ("sports_graph_relationship_types", context.get("sports_graph_relationship_types")),
+            ("sports_graph_rank_adjustment", context.get("sports_graph_rank_adjustment")),
+            ("sports_graph_size_multiplier", allocation.get("sports_graph_size_multiplier")),
+            ("sports_graph_lag_detected", context.get("sports_graph_lag_detected")),
+            ("sports_graph_conflict_count", context.get("sports_graph_conflict_count")),
+            ("sports_graph_alignment_count", context.get("sports_graph_alignment_count")),
             ("game_id", plan.get("game_id")),
             ("game_thesis_type", plan.get("thesis_type")),
             ("game_thesis_confidence", plan.get("thesis_confidence")),
@@ -11805,6 +12469,10 @@ class KalshiSniperBot:
                     "family": family,
                     "role": leg.get("role"),
                     "leg_type": leg.get("leg_type"),
+                    "sports_graph_role": leg.get("sports_graph_role"),
+                    "sports_graph_lag_detected": leg.get("sports_graph_lag_detected"),
+                    "sports_graph_rank_adjustment": leg.get("sports_graph_rank_adjustment"),
+                    "sports_graph_relationship_types": (leg.get("sports_graph_relationship_types") or [])[:5],
                     "ladder_score": leg.get("ladder_score"),
                     "alignment": leg.get("alignment"),
                     "planned_size": planned_size,
@@ -11874,6 +12542,16 @@ class KalshiSniperBot:
                 "sports_ladder_leg_type",
                 "sports_ladder_size_cap",
                 "sports_ladder_game_exposure_cap",
+                "sports_graph_context",
+                "sports_graph_game_id",
+                "sports_graph_role",
+                "sports_graph_direction",
+                "sports_graph_relationship_types",
+                "sports_graph_lag_detected",
+                "sports_graph_rank_adjustment",
+                "sports_graph_size_multiplier",
+                "sports_graph_conflict_count",
+                "sports_graph_alignment_count",
                 "game_id",
                 "game_thesis_type",
                 "game_thesis_confidence",
@@ -14527,6 +15205,8 @@ class KalshiSniperBot:
         game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
         sports_regime_context = getattr(q, "sports_regime_context", None) or {}
         sports_regime_context = sports_regime_context if isinstance(sports_regime_context, dict) else {}
+        sports_graph_context = getattr(q, "sports_graph_context", None) or {}
+        sports_graph_context = sports_graph_context if isinstance(sports_graph_context, dict) else {}
         volatility_index = None
         if last_price is not None and mid_price is not None:
             volatility_index = round(abs(last_price - mid_price) / max(spread or 0.01, 0.01), 4)
@@ -14592,6 +15272,16 @@ class KalshiSniperBot:
             "sports_regime_rank_adjustment": getattr(q, "sports_regime_rank_adjustment", None) or sports_regime_context.get("rank_adjustment"),
             "sports_regime_size_multiplier": getattr(q, "sports_regime_size_multiplier", None) or sports_regime_context.get("size_multiplier"),
             "sports_regime_aggression_multiplier": getattr(q, "sports_regime_aggression_multiplier", None) or sports_regime_context.get("aggression_multiplier"),
+            "sports_graph_context": sports_graph_context,
+            "sports_graph_game_id": getattr(q, "sports_graph_game_id", None) or sports_graph_context.get("game_id"),
+            "sports_graph_role": getattr(q, "sports_graph_role", None) or sports_graph_context.get("role"),
+            "sports_graph_direction": getattr(q, "sports_graph_direction", None) or sports_graph_context.get("direction"),
+            "sports_graph_relationship_types": getattr(q, "sports_graph_relationship_types", None) or sports_graph_context.get("relationship_types"),
+            "sports_graph_lag_detected": getattr(q, "sports_graph_lag_detected", None) or sports_graph_context.get("lag_detected"),
+            "sports_graph_rank_adjustment": getattr(q, "sports_graph_rank_adjustment", None) or sports_graph_context.get("rank_adjustment"),
+            "sports_graph_size_multiplier": getattr(q, "sports_graph_size_multiplier", None) or sports_graph_context.get("size_multiplier"),
+            "sports_graph_conflict_count": getattr(q, "sports_graph_conflict_count", None) or sports_graph_context.get("conflict_count"),
+            "sports_graph_alignment_count": getattr(q, "sports_graph_alignment_count", None) or sports_graph_context.get("alignment_count"),
             "sports_ladder_context": sports_ladder_context,
             "sports_ladder_plan_id": getattr(q, "sports_ladder_plan_id", None) or sports_ladder_context.get("plan_id"),
             "sports_ladder_role": getattr(q, "sports_ladder_role", None) or sports_ladder_context.get("role"),
@@ -32546,6 +33236,25 @@ class KalshiSniperBot:
             allocation.get("sports_momentum_score"),
             self.to_float(sports_regime_context.get("selected_momentum_score"), 0.0),
         ) or 0.0
+        sports_graph_context = allocation.get("sports_graph_context") if isinstance(allocation.get("sports_graph_context"), dict) else {}
+        sports_graph_rank_adjustment = self.to_float(
+            allocation.get("sports_graph_rank_adjustment"),
+            self.to_float(sports_graph_context.get("rank_adjustment"), 0.0),
+        ) or 0.0
+        sports_graph_size_multiplier = self.to_float(
+            allocation.get("sports_graph_size_multiplier"),
+            self.to_float(sports_graph_context.get("size_multiplier"), 1.0),
+        ) or 1.0
+        sports_graph_role = str(allocation.get("sports_graph_role") or sports_graph_context.get("role") or "").strip().lower()
+        sports_graph_direction = str(allocation.get("sports_graph_direction") or sports_graph_context.get("direction") or "").strip().lower()
+        sports_graph_relationship_types = (
+            allocation.get("sports_graph_relationship_types")
+            if isinstance(allocation.get("sports_graph_relationship_types"), list)
+            else sports_graph_context.get("relationship_types") if isinstance(sports_graph_context.get("relationship_types"), list) else []
+        )
+        sports_graph_lag_detected = bool(allocation.get("sports_graph_lag_detected") or sports_graph_context.get("lag_detected"))
+        sports_graph_conflict_count = int(self.to_float(allocation.get("sports_graph_conflict_count"), self.to_float(sports_graph_context.get("conflict_count"), 0.0)) or 0)
+        sports_graph_alignment_count = int(self.to_float(allocation.get("sports_graph_alignment_count"), self.to_float(sports_graph_context.get("alignment_count"), 0.0)) or 0)
         distance_class = str(
             allocation.get("crypto_distance_class")
             or ev_context.get("crypto_distance_class")
@@ -32592,6 +33301,7 @@ class KalshiSniperBot:
             lane_component += min(22.0, sports_conviction_score * 0.22)
         sports_live_memory_component = sports_memory_rank_adjustment if lane == "SPORTS" else 0.0
         sports_live_regime_component = sports_regime_rank_adjustment if lane == "SPORTS" else 0.0
+        sports_live_graph_component = sports_graph_rank_adjustment if lane == "SPORTS" else 0.0
         memory_component = max(
             -10.0,
             min(
@@ -32604,6 +33314,7 @@ class KalshiSniperBot:
             ),
         )
         regime_component = max(-6.0, min(8.0, sports_live_regime_component))
+        graph_component = max(-5.0, min(7.0, sports_live_graph_component))
         confidence_component = min(8.0, confidence * 0.08)
         target_component = 0.0
         if distance_class in {"near_range", "near", "in_range"}:
@@ -32620,7 +33331,7 @@ class KalshiSniperBot:
         duration = self._build_capital_duration_context(lane=lane, allocation=allocation, item=item, market=market)
         capital_lock_penalty = self.to_float(duration.get("capital_lock_penalty"), 0.0) or 0.0
         turnover_boost = self.to_float(duration.get("capital_turnover_boost"), 0.0) or 0.0
-        unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
+        unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
         if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
             unified_score -= 30.0
         unified_score = round(max(0.0, min(100.0, unified_score)), 4)
@@ -32682,6 +33393,29 @@ class KalshiSniperBot:
                     marker=("SPORTS-REGIME-SIZE-UNIFIED", source, ticker, int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
+        if lane == "SPORTS" and sports_graph_size_multiplier > 0.0:
+            pre_graph_size_multiplier = size_multiplier
+            size_multiplier = max(0.35, min(1.65, size_multiplier * sports_graph_size_multiplier))
+            if abs(sports_graph_size_multiplier - 1.0) >= 0.01:
+                self._emit_sports_graph_log(
+                    "SPORTS-GRAPH-BOOST" if sports_graph_size_multiplier >= 1.0 else "SPORTS-GRAPH-CONFLICT",
+                    {
+                        "source": source,
+                        "ticker": ticker,
+                        "family": family,
+                        "unified_score": unified_score,
+                        "base_size_multiplier": round(pre_graph_size_multiplier, 4),
+                        "sports_graph_size_multiplier": round(sports_graph_size_multiplier, 4),
+                        "final_size_multiplier": round(size_multiplier, 4),
+                        "role": sports_graph_role or None,
+                        "direction": sports_graph_direction or None,
+                        "lag_detected": sports_graph_lag_detected,
+                        "conflict_count": sports_graph_conflict_count,
+                        "reason": sports_graph_context.get("reason") or "sports_graph_size_adaptation",
+                    },
+                    marker=("SPORTS-GRAPH-SIZE-UNIFIED", source, ticker, int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         reasons = []
         if edge > 0.0:
             reasons.append("positive_edge")
@@ -32693,6 +33427,8 @@ class KalshiSniperBot:
             reasons.append(f"sports_memory_{sports_memory_regime}")
         if lane == "SPORTS" and sports_regime_context.get("has_signal"):
             reasons.append(f"sports_regime_{sports_regime}_{sports_momentum_classification}")
+        if lane == "SPORTS" and sports_graph_context:
+            reasons.append("sports_graph_lag" if sports_graph_lag_detected else "sports_graph_relationship")
         if duration.get("fast_turnover_boost"):
             reasons.append("fast_turnover")
         if duration.get("near_live_boost"):
@@ -32730,6 +33466,15 @@ class KalshiSniperBot:
             "sports_momentum_classification": sports_momentum_classification if lane == "SPORTS" else None,
             "sports_momentum_score": round(sports_momentum_score, 4) if lane == "SPORTS" else None,
             "sports_regime_context": sports_regime_context if lane == "SPORTS" else {},
+            "sports_graph_rank_adjustment": round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
+            "sports_graph_size_multiplier": round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None,
+            "sports_graph_role": sports_graph_role if lane == "SPORTS" else None,
+            "sports_graph_direction": sports_graph_direction if lane == "SPORTS" else None,
+            "sports_graph_relationship_types": sports_graph_relationship_types if lane == "SPORTS" else [],
+            "sports_graph_lag_detected": sports_graph_lag_detected if lane == "SPORTS" else False,
+            "sports_graph_conflict_count": sports_graph_conflict_count if lane == "SPORTS" else 0,
+            "sports_graph_alignment_count": sports_graph_alignment_count if lane == "SPORTS" else 0,
+            "sports_graph_context": sports_graph_context if lane == "SPORTS" else {},
             "confidence": round(confidence, 4),
             "payout_multiple": self._safe_round(payout_multiple, 4, None),
             "target_reachability": distance_class or None,
@@ -32768,6 +33513,15 @@ class KalshiSniperBot:
                 ("sports_regime_type", sports_regime_type if lane == "SPORTS" else None),
                 ("sports_momentum_classification", sports_momentum_classification if lane == "SPORTS" else None),
                 ("sports_momentum_score", round(sports_momentum_score, 4) if lane == "SPORTS" else None),
+                ("sports_graph_context", sports_graph_context if lane == "SPORTS" else None),
+                ("sports_graph_rank_adjustment", round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else None),
+                ("sports_graph_size_multiplier", round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None),
+                ("sports_graph_role", sports_graph_role if lane == "SPORTS" else None),
+                ("sports_graph_direction", sports_graph_direction if lane == "SPORTS" else None),
+                ("sports_graph_relationship_types", sports_graph_relationship_types if lane == "SPORTS" else None),
+                ("sports_graph_lag_detected", sports_graph_lag_detected if lane == "SPORTS" else None),
+                ("sports_graph_conflict_count", sports_graph_conflict_count if lane == "SPORTS" else None),
+                ("sports_graph_alignment_count", sports_graph_alignment_count if lane == "SPORTS" else None),
             ):
                 try:
                     if attr_value is not None:
@@ -32809,6 +33563,13 @@ class KalshiSniperBot:
             "sports_momentum_score": context.get("sports_momentum_score"),
             "sports_regime_rank_adjustment": context.get("sports_regime_rank_adjustment"),
             "sports_regime_size_multiplier": context.get("sports_regime_size_multiplier"),
+            "sports_graph_role": context.get("sports_graph_role"),
+            "sports_graph_direction": context.get("sports_graph_direction"),
+            "sports_graph_relationship_types": context.get("sports_graph_relationship_types"),
+            "sports_graph_lag_detected": context.get("sports_graph_lag_detected"),
+            "sports_graph_rank_adjustment": context.get("sports_graph_rank_adjustment"),
+            "sports_graph_size_multiplier": context.get("sports_graph_size_multiplier"),
+            "sports_graph_conflict_count": context.get("sports_graph_conflict_count"),
             "game_id": allocation.get("game_id") or context.get("game_id"),
             "game_thesis_type": allocation.get("game_thesis_type") or context.get("game_thesis_type"),
             "game_thesis_confidence": allocation.get("game_thesis_confidence") or context.get("game_thesis_confidence"),
@@ -33078,7 +33839,20 @@ class KalshiSniperBot:
             game_thesis_contexts,
             source=source,
         )
+        sports_graph_contexts = self._build_sports_market_relationship_graph(
+            decorated,
+            market_lookup=market_lookup,
+            expectancy_summary_by_ticker=expectancy_summary_by_ticker,
+            thesis_contexts=game_thesis_contexts,
+            source=source,
+        )
+        decorated = self._apply_sports_graph_to_allocations(
+            decorated,
+            sports_graph_contexts,
+            source=source,
+        )
         self.last_game_thesis_contexts = game_thesis_contexts
+        self.last_sports_graph_contexts = sports_graph_contexts
         for allocation, _rank_index, _candidate in decorated:
             ticker = str(allocation.get("ticker") or "").strip()
             if ticker and isinstance(expectancy_summary_by_ticker.get(ticker), dict):
@@ -33086,6 +33860,7 @@ class KalshiSniperBot:
                 expectancy_summary_by_ticker[ticker]["allocation_score"] = allocation.get("allocation_score")
                 expectancy_summary_by_ticker[ticker]["unified_opportunity_score"] = allocation.get("unified_opportunity_score")
                 expectancy_summary_by_ticker[ticker]["game_thesis_context"] = allocation.get("game_thesis_context")
+                expectancy_summary_by_ticker[ticker]["sports_graph_context"] = allocation.get("sports_graph_context")
         decorated.sort(
             key=lambda row: (
                 1 if row[0].get("decision") != "SKIP_WEAK_SPORT" else 0,
@@ -33107,6 +33882,12 @@ class KalshiSniperBot:
             "strong_sports_count": len(strong_sports),
             "game_thesis_count": len(game_thesis_contexts),
             "strong_game_thesis_count": sum(1 for context in game_thesis_contexts.values() if isinstance(context, dict) and context.get("strong")),
+            "sports_graph_game_count": len(sports_graph_contexts),
+            "sports_graph_lag_count": sum(
+                len((context or {}).get("lagging_candidates") or [])
+                for context in sports_graph_contexts.values()
+                if isinstance(context, dict)
+            ),
             "top_lane": decorated[0][0].get("lane") if decorated else None,
             "top_ticker": decorated[0][0].get("ticker") if decorated else None,
             "top_score": decorated[0][0].get("allocation_score") if decorated else None,
@@ -33151,6 +33932,13 @@ class KalshiSniperBot:
                         "sports_memory_regime": allocation.get("sports_memory_regime"),
                         "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
                         "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
+                        "sports_graph_role": allocation.get("sports_graph_role"),
+                        "sports_graph_direction": allocation.get("sports_graph_direction"),
+                        "sports_graph_relationship_types": allocation.get("sports_graph_relationship_types"),
+                        "sports_graph_lag_detected": allocation.get("sports_graph_lag_detected"),
+                        "sports_graph_rank_adjustment": allocation.get("sports_graph_rank_adjustment"),
+                        "sports_graph_size_multiplier": allocation.get("sports_graph_size_multiplier"),
+                        "sports_graph_conflict_count": allocation.get("sports_graph_conflict_count"),
                         "game_id": allocation.get("game_id"),
                         "game_thesis_type": allocation.get("game_thesis_type"),
                         "game_thesis_confidence": allocation.get("game_thesis_confidence"),
@@ -33184,6 +33972,13 @@ class KalshiSniperBot:
                 "sports_memory_regime": allocation.get("sports_memory_regime"),
                 "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
                 "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
+                "sports_graph_role": allocation.get("sports_graph_role"),
+                "sports_graph_direction": allocation.get("sports_graph_direction"),
+                "sports_graph_relationship_types": allocation.get("sports_graph_relationship_types"),
+                "sports_graph_lag_detected": allocation.get("sports_graph_lag_detected"),
+                "sports_graph_rank_adjustment": allocation.get("sports_graph_rank_adjustment"),
+                "sports_graph_size_multiplier": allocation.get("sports_graph_size_multiplier"),
+                "sports_graph_conflict_count": allocation.get("sports_graph_conflict_count"),
                 "game_id": allocation.get("game_id"),
                 "game_thesis_type": allocation.get("game_thesis_type"),
                 "game_thesis_confidence": allocation.get("game_thesis_confidence"),
@@ -33291,6 +34086,11 @@ class KalshiSniperBot:
                         "sports_memory_regime": allocation.get("sports_memory_regime"),
                         "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
                         "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
+                        "sports_graph_role": allocation.get("sports_graph_role"),
+                        "sports_graph_direction": allocation.get("sports_graph_direction"),
+                        "sports_graph_lag_detected": allocation.get("sports_graph_lag_detected"),
+                        "sports_graph_rank_adjustment": allocation.get("sports_graph_rank_adjustment"),
+                        "sports_graph_size_multiplier": allocation.get("sports_graph_size_multiplier"),
                         "game_id": allocation.get("game_id"),
                         "game_thesis_type": allocation.get("game_thesis_type"),
                         "game_thesis_confidence": allocation.get("game_thesis_confidence"),
@@ -33327,6 +34127,9 @@ class KalshiSniperBot:
                             "game_thesis_type": allocation.get("game_thesis_type"),
                             "game_thesis_confidence": allocation.get("game_thesis_confidence"),
                             "game_thesis_rank_boost": allocation.get("game_thesis_rank_boost"),
+                            "sports_graph_role": allocation.get("sports_graph_role"),
+                            "sports_graph_lag_detected": allocation.get("sports_graph_lag_detected"),
+                            "sports_graph_rank_adjustment": allocation.get("sports_graph_rank_adjustment"),
                         }
                         for allocation, _index, _candidate in decorated[:5]
                     ],
@@ -33356,6 +34159,29 @@ class KalshiSniperBot:
                         "reason": "final_selected_candidate_game_context",
                     },
                     marker=("GAME-SELECT", source, top_allocation.get("ticker"), int(time.time() // 180)),
+                )
+            if top_allocation.get("sports_graph_context") and (
+                abs(self.to_float(top_allocation.get("sports_graph_rank_adjustment"), 0.0) or 0.0) >= 0.05
+                or top_allocation.get("sports_graph_lag_detected")
+                or self.to_float(top_allocation.get("sports_graph_conflict_count"), 0.0) > 0.0
+            ):
+                self._emit_sports_graph_log(
+                    "SPORTS-GRAPH-BOOST",
+                    {
+                        "source": source,
+                        "ticker": top_allocation.get("ticker"),
+                        "family": top_allocation.get("family"),
+                        "game_id": top_allocation.get("game_id") or top_allocation.get("sports_graph_game_id"),
+                        "role": top_allocation.get("sports_graph_role"),
+                        "direction": top_allocation.get("sports_graph_direction"),
+                        "relationship_types": (top_allocation.get("sports_graph_relationship_types") or [])[:5],
+                        "lag_detected": top_allocation.get("sports_graph_lag_detected"),
+                        "ranking_boost": top_allocation.get("sports_graph_rank_adjustment"),
+                        "size_multiplier": top_allocation.get("sports_graph_size_multiplier"),
+                        "unified_score": top_allocation.get("unified_opportunity_score"),
+                        "reason": "final_selected_candidate_relationship_graph",
+                    },
+                    marker=("SPORTS-GRAPH-SELECT", source, top_allocation.get("ticker"), int(time.time() // 180)),
                 )
         return final_ranked
 
@@ -33574,6 +34400,16 @@ class KalshiSniperBot:
                     ("sports_regime_rank_adjustment", allocation.get("sports_regime_rank_adjustment") or unified_context.get("sports_regime_rank_adjustment")),
                     ("sports_regime_size_multiplier", allocation.get("sports_regime_size_multiplier") or unified_context.get("sports_regime_size_multiplier")),
                     ("sports_regime_aggression_multiplier", allocation.get("sports_regime_aggression_multiplier") or unified_context.get("sports_regime_aggression_multiplier")),
+                    ("sports_graph_context", allocation.get("sports_graph_context") or unified_context.get("sports_graph_context")),
+                    ("sports_graph_game_id", allocation.get("sports_graph_game_id") or allocation.get("game_id")),
+                    ("sports_graph_role", allocation.get("sports_graph_role") or unified_context.get("sports_graph_role")),
+                    ("sports_graph_direction", allocation.get("sports_graph_direction") or unified_context.get("sports_graph_direction")),
+                    ("sports_graph_relationship_types", allocation.get("sports_graph_relationship_types") or unified_context.get("sports_graph_relationship_types")),
+                    ("sports_graph_lag_detected", allocation.get("sports_graph_lag_detected") or unified_context.get("sports_graph_lag_detected")),
+                    ("sports_graph_rank_adjustment", allocation.get("sports_graph_rank_adjustment") or unified_context.get("sports_graph_rank_adjustment")),
+                    ("sports_graph_size_multiplier", allocation.get("sports_graph_size_multiplier") or unified_context.get("sports_graph_size_multiplier")),
+                    ("sports_graph_conflict_count", allocation.get("sports_graph_conflict_count") or unified_context.get("sports_graph_conflict_count")),
+                    ("sports_graph_alignment_count", allocation.get("sports_graph_alignment_count") or unified_context.get("sports_graph_alignment_count")),
                     ("game_thesis_context", allocation.get("game_thesis_context")),
                     ("game_id", allocation.get("game_id")),
                     ("game_thesis_type", allocation.get("game_thesis_type")),
@@ -38258,6 +39094,16 @@ class KalshiSniperBot:
             "sports_regime_rank_adjustment",
             "sports_regime_size_multiplier",
             "sports_regime_aggression_multiplier",
+            "sports_graph_context",
+            "sports_graph_game_id",
+            "sports_graph_role",
+            "sports_graph_direction",
+            "sports_graph_relationship_types",
+            "sports_graph_lag_detected",
+            "sports_graph_rank_adjustment",
+            "sports_graph_size_multiplier",
+            "sports_graph_conflict_count",
+            "sports_graph_alignment_count",
             "game_thesis_context",
             "game_id",
             "game_thesis_type",
@@ -38587,6 +39433,43 @@ class KalshiSniperBot:
                     marker=("SPORTS-REGIME-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
+        sports_graph_multiplier = self.to_float(
+            context.get("sports_graph_size_multiplier"),
+            self.to_float(payload.get("sports_graph_size_multiplier"), None),
+        )
+        if (
+            sports_graph_multiplier is not None
+            and sports_graph_multiplier > 0.0
+            and abs(sports_graph_multiplier - 1.0) >= 0.01
+            and unified_multiplier is None
+        ):
+            before_graph_size = chosen
+            graph_multiplier = max(
+                float(AION_SPORTS_GRAPH_MIN_SIZE_MULTIPLIER),
+                min(float(AION_SPORTS_GRAPH_MAX_SIZE_MULTIPLIER), float(sports_graph_multiplier)),
+            )
+            chosen = max(1, min(hard_max, int(round(chosen * graph_multiplier))))
+            if chosen != before_graph_size:
+                chosen_label = "sports_graph_size_adjustment"
+                context["sports_graph_size_multiplier_applied"] = round(graph_multiplier, 4)
+                self._emit_sports_graph_log(
+                    "SPORTS-GRAPH-BOOST" if graph_multiplier >= 1.0 else "SPORTS-GRAPH-CONFLICT",
+                    {
+                        "source": source or "dynamic_live_entry_size",
+                        "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                        "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                        "requested_size": before_graph_size,
+                        "adjusted_size": chosen,
+                        "sports_graph_size_multiplier": round(graph_multiplier, 4),
+                        "role": context.get("sports_graph_role") or payload.get("sports_graph_role"),
+                        "direction": context.get("sports_graph_direction") or payload.get("sports_graph_direction"),
+                        "lag_detected": context.get("sports_graph_lag_detected") or payload.get("sports_graph_lag_detected"),
+                        "conflict_count": context.get("sports_graph_conflict_count") or payload.get("sports_graph_conflict_count"),
+                        "reason": "sports_graph_dynamic_size_adjustment",
+                    },
+                    marker=("SPORTS-GRAPH-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         game_thesis_multiplier = self.to_float(
             context.get("game_thesis_size_multiplier"),
             self.to_float(payload.get("game_thesis_size_multiplier"), None),
@@ -38673,6 +39556,9 @@ class KalshiSniperBot:
                             "conviction_size_multiplier": context.get("conviction_size_multiplier"),
                             "sports_memory_size_multiplier": context.get("sports_memory_size_multiplier"),
                             "sports_memory_regime": context.get("sports_memory_regime"),
+                            "sports_graph_role": context.get("sports_graph_role"),
+                            "sports_graph_lag_detected": context.get("sports_graph_lag_detected"),
+                            "sports_graph_size_multiplier": context.get("sports_graph_size_multiplier"),
                             "game_thesis_type": context.get("game_thesis_type"),
                             "game_thesis_confidence": context.get("game_thesis_confidence"),
                             "game_thesis_size_multiplier": context.get("game_thesis_size_multiplier"),
@@ -66428,6 +67314,8 @@ class KalshiSniperBot:
         sports_regime_context = sports_regime_context if isinstance(sports_regime_context, dict) else {}
         sports_ladder_context = getattr(q, "sports_ladder_context", None) or {}
         sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
+        sports_graph_context = getattr(q, "sports_graph_context", None) or {}
+        sports_graph_context = sports_graph_context if isinstance(sports_graph_context, dict) else {}
         elite_context = getattr(q, "elite_public_signal_context", None) or {}
         elite_context = elite_context if isinstance(elite_context, dict) else {}
         entry_context = {
@@ -66450,6 +67338,16 @@ class KalshiSniperBot:
             "sports_regime_rank_adjustment": getattr(q, "sports_regime_rank_adjustment", None) or sports_regime_context.get("rank_adjustment"),
             "sports_regime_size_multiplier": getattr(q, "sports_regime_size_multiplier", None) or sports_regime_context.get("size_multiplier"),
             "sports_regime_aggression_multiplier": getattr(q, "sports_regime_aggression_multiplier", None) or sports_regime_context.get("aggression_multiplier"),
+            "sports_graph_context": sports_graph_context,
+            "sports_graph_game_id": getattr(q, "sports_graph_game_id", None) or sports_graph_context.get("game_id"),
+            "sports_graph_role": getattr(q, "sports_graph_role", None) or sports_graph_context.get("role"),
+            "sports_graph_direction": getattr(q, "sports_graph_direction", None) or sports_graph_context.get("direction"),
+            "sports_graph_relationship_types": getattr(q, "sports_graph_relationship_types", None) or sports_graph_context.get("relationship_types"),
+            "sports_graph_lag_detected": getattr(q, "sports_graph_lag_detected", None) or sports_graph_context.get("lag_detected"),
+            "sports_graph_rank_adjustment": getattr(q, "sports_graph_rank_adjustment", None) or sports_graph_context.get("rank_adjustment"),
+            "sports_graph_size_multiplier": getattr(q, "sports_graph_size_multiplier", None) or sports_graph_context.get("size_multiplier"),
+            "sports_graph_conflict_count": getattr(q, "sports_graph_conflict_count", None) or sports_graph_context.get("conflict_count"),
+            "sports_graph_alignment_count": getattr(q, "sports_graph_alignment_count", None) or sports_graph_context.get("alignment_count"),
             "game_thesis_context": game_thesis_context,
             "game_id": getattr(q, "game_id", None) or game_thesis_context.get("game_id"),
             "game_thesis_type": getattr(q, "game_thesis_type", None) or game_thesis_context.get("thesis_type"),
