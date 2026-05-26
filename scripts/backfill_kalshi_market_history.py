@@ -87,11 +87,6 @@ PRIORITY_FAMILIES: tuple[dict[str, Any], ...] = (
         "series_tickers": ("KXPLAYERPROP", "KXSPORTSCOMBO", "KXSPORTSPARLAY"),
         "tokens": ("PROP",),
     },
-    {
-        "name": "btc_crypto_short_duration",
-        "series_tickers": ("KXBTC15M", "KXETH15M", "KXCRYPTO"),
-        "tokens": ("BTC", "CRYPTO"),
-    },
 )
 
 
@@ -363,8 +358,6 @@ def category_for_market(market: dict[str, Any], family: str | None) -> str | Non
     family_upper = (family or "").upper()
     ticker_upper = str(market.get("ticker") or "").upper()
     text = f"{family_upper} {ticker_upper}"
-    if any(prefix in text for prefix in ("KXBTC", "KXETH", "KXXRP", "CRYPTO", "BTC", "ETH")):
-        return "crypto"
     if any(
         prefix in text
         for prefix in (

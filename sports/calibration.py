@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import re
 from math import exp
 
 from risk.helpers import bounded_delta, clamp, safe_float, safe_ratio
@@ -24,6 +25,91 @@ SPORTS_FAMILIES = {
     "KXNFLTOTAL",
 }
 STRONG_SPORTS_FAMILY_PREFIXES = ("KXNBA", "KXMLB", "KXNFL")
+CRYPTO_FAMILY_PREFIXES = ("KXBTC", "KXETH", "KXSOL", "KXXRP", "KXDOGE", "KXHYPE", "KXBNB", "KXCRYPTO")
+CRYPTO_TEXT_TOKENS = (
+    "CRYPTO",
+    "BITCOIN",
+    "BTC",
+    "ETHEREUM",
+    "ETH",
+    "SOLANA",
+    "SOL",
+    "DOGECOIN",
+    "DOGE",
+    "RIPPLE",
+    "XRP",
+    "HYPERLIQUID",
+    "HYPE",
+    "BINANCE",
+    "BNB",
+)
+NON_SPORTS_BLOCK_REASONS = {
+    "crypto": "sports_only_crypto_execution_disabled",
+    "weather": "sports_only_weather_execution_disabled",
+    "macro": "sports_only_non_sports_execution_disabled",
+    "finance": "sports_only_non_sports_execution_disabled",
+    "politics": "sports_only_non_sports_execution_disabled",
+    "other": "sports_only_non_sports_execution_disabled",
+}
+
+
+def _sports_only_market_text(*, family=None, ticker=None, market=None, q=None):
+    market = market if isinstance(market, dict) else {}
+    return " ".join(
+        str(value or "")
+        for value in (
+            family,
+            ticker,
+            market.get("ticker"),
+            market.get("series_ticker"),
+            market.get("event_ticker"),
+            market.get("title"),
+            market.get("subtitle"),
+            market.get("event_title"),
+            market.get("rules_primary"),
+            market.get("rules_secondary"),
+            getattr(q, "ticker", None),
+            getattr(q, "title", None),
+            getattr(q, "market_title", None),
+        )
+        if str(value or "").strip()
+    ).upper()
+
+
+def is_crypto_market_text(*, family=None, ticker=None, market=None, q=None, lane=None):
+    lane = str(lane or "").strip().upper()
+    if lane in {"CRYPTO", "CRYPTO_LADDER", "BTC1H_LADDER"}:
+        return True
+    family = str(family or getattr(q, "family", "") or "").strip().upper()
+    ticker = str(ticker or getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip().upper()
+    if family.startswith(CRYPTO_FAMILY_PREFIXES) or ticker.startswith(CRYPTO_FAMILY_PREFIXES):
+        return True
+    text = _sports_only_market_text(family=family, ticker=ticker, market=market, q=q)
+    return any(re.search(rf"\b{re.escape(token)}\b", text) for token in CRYPTO_TEXT_TOKENS)
+
+
+def sports_only_block_reason(*, family=None, ticker=None, market=None, q=None, lane=None, category=None):
+    if is_crypto_market_text(family=family, ticker=ticker, market=market, q=q, lane=lane):
+        return NON_SPORTS_BLOCK_REASONS["crypto"]
+    category = str(category or (market or {}).get("category") or (market or {}).get("market_category") or "").strip().lower()
+    return NON_SPORTS_BLOCK_REASONS.get(category, NON_SPORTS_BLOCK_REASONS["other"])
+
+
+def is_sports_only_allowed_candidate(*, family=None, ticker=None, market=None, q=None, lane=None):
+    lane = str(lane or "").strip().upper()
+    if lane in {"CRYPTO", "CRYPTO_LADDER", "BTC1H_LADDER"}:
+        return False
+    if lane == "SPORTS":
+        return True
+    market = market if isinstance(market, dict) else {}
+    family = str(family or getattr(q, "family", "") or market.get("series_ticker") or "").strip().upper()
+    ticker = str(ticker or getattr(q, "ticker", "") or market.get("ticker") or "").strip().upper()
+    if is_crypto_market_text(family=family, ticker=ticker, market=market, q=q, lane=lane):
+        return False
+    if is_sports_family(family, ticker=ticker):
+        return True
+    category = str(market.get("category") or market.get("market_category") or "").strip().lower()
+    return category == "sports"
 
 
 def _sports_family_positive_bias(

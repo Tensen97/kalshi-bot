@@ -31,8 +31,6 @@ def _category_for_family(family):
     family = str(family or "").strip().upper()
     if family.startswith(SPORTS_PREFIXES):
         return "sports"
-    if family.startswith("KXBTC") or "CRYPTO" in family:
-        return "crypto"
     return "unknown"
 
 

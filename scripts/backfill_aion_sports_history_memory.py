@@ -40,12 +40,7 @@ from scripts.backfill_kalshi_market_history import (  # noqa: E402
 
 MAX_DAYS_BACK = 730
 SPORTS_STATUS_ORDER = tuple(status for status in MARKET_STATUSES if status in {"settled", "closed", "resolved"})
-SPORTS_FAMILY_NAMES = tuple(
-    spec
-    for spec in PRIORITY_FAMILIES
-    if "btc" not in str(spec.get("name", "")).lower()
-    and "crypto" not in str(spec.get("name", "")).lower()
-)
+SPORTS_FAMILY_NAMES = tuple(PRIORITY_FAMILIES)
 
 
 def utc_now_iso() -> str:
