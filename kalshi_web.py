@@ -324,6 +324,11 @@ _TELEMETRY_CRITICAL_TAGS = {
     "GAME-CONVICTION",
     "GAME-BOOST",
     "GAME-SELECT",
+    "SPORTS-LADDER",
+    "SPORTS-LADDER-LEG",
+    "SPORTS-LADDER-SIZE",
+    "SPORTS-LADDER-SUBMIT",
+    "SPORTS-LADDER-SKIP",
     "AION-CRYPTO-EXECUTION-BLOCK",
     "AION-SPORTS-ONLY-ALLOW",
     "AION-CRYPTO-LANE-WINNER",
@@ -2025,6 +2030,16 @@ AION_GAME_THESIS_STRONG_SCORE = get_env_float("AION_GAME_THESIS_STRONG_SCORE", 6
 AION_GAME_THESIS_MAX_RANK_BOOST = get_env_float("AION_GAME_THESIS_MAX_RANK_BOOST", 7.0)
 AION_GAME_THESIS_MAX_SIZE_MULTIPLIER = get_env_float("AION_GAME_THESIS_MAX_SIZE_MULTIPLIER", 1.18)
 AION_GAME_THESIS_LOG_COOLDOWN_SECONDS = get_env_float("AION_GAME_THESIS_LOG_COOLDOWN_SECONDS", 180.0)
+AION_SPORTS_LADDER_ENABLED = get_env_bool("AION_SPORTS_LADDER_ENABLED", 1)
+AION_SPORTS_LADDER_MIN_CONFIDENCE = get_env_float("AION_SPORTS_LADDER_MIN_CONFIDENCE", 70.0)
+AION_SPORTS_LADDER_MAX_LEGS = get_env_int("AION_SPORTS_LADDER_MAX_LEGS", 3)
+AION_SPORTS_LADDER_MAX_SECONDARY_LEGS = get_env_int("AION_SPORTS_LADDER_MAX_SECONDARY_LEGS", 2)
+AION_SPORTS_LADDER_MAX_GAME_CONTRACTS = get_env_int("AION_SPORTS_LADDER_MAX_GAME_CONTRACTS", 6)
+AION_SPORTS_LADDER_PRIMARY_SIZE_CAP = get_env_int("AION_SPORTS_LADDER_PRIMARY_SIZE_CAP", 3)
+AION_SPORTS_LADDER_SECONDARY_SIZE_CAP = get_env_int("AION_SPORTS_LADDER_SECONDARY_SIZE_CAP", 2)
+AION_SPORTS_LADDER_DERIVATIVE_SIZE_CAP = get_env_int("AION_SPORTS_LADDER_DERIVATIVE_SIZE_CAP", 1)
+AION_SPORTS_LADDER_MIN_LEG_SCORE = get_env_float("AION_SPORTS_LADDER_MIN_LEG_SCORE", 52.0)
+AION_SPORTS_LADDER_LOG_COOLDOWN_SECONDS = get_env_float("AION_SPORTS_LADDER_LOG_COOLDOWN_SECONDS", 180.0)
 AION_DUAL_LANE_SECONDARY_ENABLED = get_env_bool("AION_DUAL_LANE_SECONDARY_ENABLED", 1)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -2075,6 +2090,9 @@ QUALITY_EXPANSION_PREFERRED_FAMILY_PREFIXES = (
 )
 MAX_PREFILTER_POOL = 80
 MAX_STRICT_VALIDATION_POOL = 40
+AION_SPORTS_ONLY_PREFILTER_POOL = get_env_int("AION_SPORTS_ONLY_PREFILTER_POOL", 24)
+AION_SPORTS_ONLY_STRICT_VALIDATION_POOL = get_env_int("AION_SPORTS_ONLY_STRICT_VALIDATION_POOL", 12)
+AION_SPORTS_ONLY_ADAPTIVE_PROBE_POOL = get_env_int("AION_SPORTS_ONLY_ADAPTIVE_PROBE_POOL", 4)
 MIN_MINUTES_TO_EVENT = 5
 MAX_MINUTES_TO_EVENT = 480
 TIME_WINDOW_EXTENSION_MINUTES = 60
@@ -2447,6 +2465,9 @@ class KalshiSniperBot:
         self.aion_sports_memory_state = None
         self.sports_memory_log_markers = {}
         self.game_thesis_log_markers = {}
+        self.sports_ladder_log_markers = {}
+        self.last_sports_ladder_plan = {}
+        self.last_sports_ladder_execution_summary = {}
         print(
             "[SPORTS-MEMORY] "
             + json.dumps(
@@ -9223,6 +9244,8 @@ class KalshiSniperBot:
             sports_memory_dimensions = sports_memory_dimensions if isinstance(sports_memory_dimensions, dict) else {}
             game_thesis_context = self._learning_archive_value(sources, "game_thesis_context")
             game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
+            sports_ladder_context = self._learning_archive_value(sources, "sports_ladder_context")
+            sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
             price = self._learning_archive_float(
                 self._learning_archive_value(
                     sources,
@@ -9295,6 +9318,18 @@ class KalshiSniperBot:
                     self._learning_archive_value(sources, "game_thesis_size_multiplier")
                     or game_thesis_context.get("applied_size_multiplier")
                     or game_thesis_context.get("size_multiplier")
+                ),
+                "sports_ladder_context": sports_ladder_context,
+                "sports_ladder_plan_id": self._learning_archive_value(sources, "sports_ladder_plan_id") or sports_ladder_context.get("plan_id"),
+                "sports_ladder_role": self._learning_archive_value(sources, "sports_ladder_role") or sports_ladder_context.get("role"),
+                "sports_ladder_leg_type": self._learning_archive_value(sources, "sports_ladder_leg_type") or sports_ladder_context.get("leg_type"),
+                "sports_ladder_score": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ladder_score")
+                    or sports_ladder_context.get("ladder_score")
+                ),
+                "sports_ladder_size_cap": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ladder_size_cap")
+                    or sports_ladder_context.get("size_cap")
                 ),
             }
             if event_type in {"candidate_seen", "trade_opened"}:
@@ -10674,6 +10709,731 @@ class KalshiSniperBot:
                 )
             updated.append((allocation, rank_index, candidate))
         return updated
+
+    def _emit_sports_ladder_log(self, tag, payload, marker=None, cooldown_seconds=None):
+        tag = str(tag or "SPORTS-LADDER").strip().upper()
+        payload = payload if isinstance(payload, dict) else {}
+        markers = getattr(self, "sports_ladder_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self.sports_ladder_log_markers = markers
+        cooldown_seconds = (
+            AION_SPORTS_LADDER_LOG_COOLDOWN_SECONDS
+            if cooldown_seconds is None
+            else float(cooldown_seconds or 0.0)
+        )
+        marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+        now_ts = time.time()
+        if marker_key is not None:
+            previous_ts = self.to_float(markers.get(marker_key), 0.0) or 0.0
+            if now_ts - previous_ts < cooldown_seconds:
+                return
+            markers[marker_key] = now_ts
+            if len(markers) > 1200:
+                cutoff = now_ts - 7200.0
+                self.sports_ladder_log_markers = {
+                    key: value for key, value in markers.items()
+                    if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"[{tag}] " + json.dumps({"reason": "sports_ladder_log_failed"}))
+
+    def _sports_ladder_leg_type(self, *, family=None, ticker=None, market=None, q=None):
+        market = market if isinstance(market, dict) else {}
+        family = str(family or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        text = self._quality_market_text(family=family, ticker=ticker, market=market, q=q)
+        period = self._sports_memory_period_bucket(family=family, ticker=ticker, title=text)
+        live_text = "LIVE" in text or "IN-GAME" in text or "INGAME" in text
+        if "TOTAL" in family or "TOTAL" in text or "OVER" in text or "UNDER" in text:
+            return "1h_total" if period == "1h" else "total"
+        if "SPREAD" in family or "SPREAD" in text:
+            return "1h_spread" if period == "1h" else "spread"
+        if "MONEYLINE" in family or "WINNER" in text or " TO WIN" in text:
+            return "moneyline"
+        if any(token in family for token in ("PLAYER", "HIT", "HR", "RBI", "STRIKEOUT", "TB", "HOMER")):
+            return "player_related"
+        if live_text:
+            return "live_continuation"
+        return "sports_related"
+
+    def _sports_ladder_alignment_score(self, *, thesis_type=None, leg_type=None, signal=None, allocation=None):
+        thesis_type = str(thesis_type or "").strip().lower()
+        leg_type = str(leg_type or "").strip().lower()
+        signal = signal if isinstance(signal, dict) else {}
+        allocation = allocation if isinstance(allocation, dict) else {}
+        weight = self.to_float((signal.get("thesis_weights") or {}).get(thesis_type), None)
+        if weight is None:
+            weight = self.to_float(((allocation.get("game_thesis_context") or {}).get("candidate_thesis_weights") or {}).get(thesis_type), None)
+        if weight is not None and weight > 0.0:
+            return max(0.0, min(1.0, float(weight)))
+        mapping = {
+            "favorite_dominance": {
+                "moneyline": 0.92,
+                "spread": 0.90,
+                "1h_spread": 0.72,
+                "total": 0.42,
+                "1h_total": 0.38,
+                "player_related": 0.32,
+                "live_continuation": 0.58,
+            },
+            "underdog_pressure": {
+                "moneyline": 0.86,
+                "spread": 0.88,
+                "1h_spread": 0.72,
+                "total": 0.38,
+                "1h_total": 0.36,
+                "player_related": 0.28,
+                "live_continuation": 0.56,
+            },
+            "high_scoring_environment": {
+                "total": 0.94,
+                "1h_total": 0.86,
+                "player_related": 0.55,
+                "spread": 0.34,
+                "1h_spread": 0.32,
+                "moneyline": 0.24,
+                "live_continuation": 0.62,
+            },
+            "low_scoring_environment": {
+                "total": 0.94,
+                "1h_total": 0.84,
+                "spread": 0.34,
+                "1h_spread": 0.32,
+                "moneyline": 0.24,
+                "player_related": 0.18,
+                "live_continuation": 0.56,
+            },
+            "1h_momentum": {
+                "1h_total": 0.90,
+                "1h_spread": 0.88,
+                "total": 0.52,
+                "spread": 0.50,
+                "moneyline": 0.38,
+                "live_continuation": 0.68,
+            },
+            "full_game_continuation": {
+                "total": 0.76,
+                "spread": 0.72,
+                "moneyline": 0.64,
+                "1h_total": 0.42,
+                "1h_spread": 0.42,
+                "live_continuation": 0.70,
+            },
+            "volatile_choppy_game": {
+                "total": 0.48,
+                "1h_total": 0.46,
+                "spread": 0.36,
+                "1h_spread": 0.36,
+                "moneyline": 0.28,
+                "live_continuation": 0.42,
+            },
+        }
+        return mapping.get(thesis_type, {}).get(leg_type, 0.0)
+
+    def _sports_ladder_book_quality(self, allocation=None):
+        allocation = allocation if isinstance(allocation, dict) else {}
+        spread = self.to_float(allocation.get("spread"), None)
+        liquidity = self.to_float(allocation.get("liquidity"), 0.0) or 0.0
+        quality = 0.52
+        if spread is None:
+            quality = 0.56 if liquidity >= 30.0 else 0.42
+        elif spread <= 0.025:
+            quality = 1.0
+        elif spread <= 0.05:
+            quality = 0.82
+        elif spread <= 0.08:
+            quality = 0.62
+        elif spread <= 0.12:
+            quality = 0.38
+        else:
+            quality = 0.18
+        if liquidity >= 120.0:
+            quality = min(1.0, quality + 0.10)
+        elif liquidity < 10.0:
+            quality = max(0.0, quality - 0.15)
+        return quality
+
+    def _sports_ladder_existing_game_exposure(self, game_id=None):
+        game_id = str(game_id or "").strip()
+        if not game_id:
+            return 0
+        total = 0
+        for position in getattr(self, "live_positions", []) or []:
+            if not isinstance(position, dict):
+                continue
+            if str(position.get("status", "open") or "open").strip().lower() != "open":
+                continue
+            entry_context = position.get("entry_context") if isinstance(position.get("entry_context"), dict) else {}
+            position_game_id = str(
+                position.get("game_id")
+                or entry_context.get("game_id")
+                or ((entry_context.get("game_thesis_context") or {}).get("game_id") if isinstance(entry_context.get("game_thesis_context"), dict) else "")
+                or ""
+            ).strip()
+            if position_game_id != game_id:
+                continue
+            size = self.to_float(
+                position.get("count"),
+                self.to_float(position.get("contracts"), self.to_float(position.get("size"), 1.0)),
+            ) or 1.0
+            total += max(1, int(round(size)))
+        return int(total)
+
+    def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, source="sports_ladder"):
+        if not AION_SPORTS_LADDER_ENABLED:
+            return {"enabled": False, "reason": "sports_ladder_disabled"}
+        candidates = [item for item in (candidates or []) if isinstance(item, dict)]
+        primary_ticker = str(primary_ticker or "").strip()
+        grouped = {}
+        for candidate in candidates:
+            allocation = candidate.get("allocation") if isinstance(candidate.get("allocation"), dict) else {}
+            q = candidate.get("q")
+            ticker = str(candidate.get("ticker") or allocation.get("ticker") or getattr(q, "ticker", "") or "").strip()
+            family = str(candidate.get("family") or allocation.get("family") or "").strip().upper()
+            market = candidate.get("market") if isinstance(candidate.get("market"), dict) else {}
+            lane = str(candidate.get("lane") or allocation.get("lane") or "").strip().upper()
+            if lane != "SPORTS" or not ticker:
+                continue
+            if not self._is_sports_only_allowed_candidate(family=family, ticker=ticker, market=market, q=q, lane="SPORTS"):
+                continue
+            if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
+                continue
+            game_context = allocation.get("game_thesis_context") if isinstance(allocation.get("game_thesis_context"), dict) else {}
+            game_id = str(allocation.get("game_id") or game_context.get("game_id") or getattr(q, "game_id", "") or "").strip()
+            thesis_type = str(allocation.get("game_thesis_type") or game_context.get("thesis_type") or getattr(q, "game_thesis_type", "") or "").strip().lower()
+            confidence = self.to_float(
+                allocation.get("game_thesis_confidence"),
+                self.to_float(game_context.get("thesis_confidence"), self.to_float(getattr(q, "game_thesis_confidence", None), 0.0)),
+            ) or 0.0
+            if not game_id or not thesis_type or thesis_type == "weak_no_thesis":
+                continue
+            if confidence < max(float(AION_GAME_THESIS_STRONG_SCORE), float(AION_SPORTS_LADDER_MIN_CONFIDENCE)):
+                continue
+            signal = allocation.get("game_thesis_signal") if isinstance(allocation.get("game_thesis_signal"), dict) else {}
+            leg_type = self._sports_ladder_leg_type(family=family, ticker=ticker, market=market, q=q)
+            alignment = self._sports_ladder_alignment_score(
+                thesis_type=thesis_type,
+                leg_type=leg_type,
+                signal=signal,
+                allocation=allocation,
+            )
+            if alignment <= 0.0:
+                continue
+            unified_score = self._candidate_unified_score(candidate)
+            allocation_score = self.to_float(allocation.get("allocation_score"), self.to_float(candidate.get("score"), 0.0)) or 0.0
+            if unified_score < float(AION_SPORTS_LADDER_MIN_LEG_SCORE) and ticker != game_context.get("primary_candidate"):
+                continue
+            book_quality = self._sports_ladder_book_quality(allocation)
+            memory_strength = max(
+                0.0,
+                self.to_float(allocation.get("sports_memory_rank_adjustment"), 0.0) or 0.0,
+            )
+            family_strength = max(
+                0.0,
+                self.to_float(allocation.get("family_profit_memory_adjustment"), 0.0) or 0.0,
+            )
+            time_bonus = 0.0
+            minutes = self.to_float(allocation.get("time_to_event_minutes"), allocation.get("time_to_expiry_minutes"))
+            if minutes is not None:
+                if minutes <= 30.0:
+                    time_bonus = 5.0
+                elif minutes <= 90.0:
+                    time_bonus = 2.0
+                elif minutes > 240.0:
+                    time_bonus = -4.0
+            ladder_score = round(
+                min(
+                    100.0,
+                    unified_score * 0.45
+                    + allocation_score * 0.25
+                    + alignment * 15.0
+                    + book_quality * 8.0
+                    + min(6.0, memory_strength)
+                    + min(4.0, family_strength)
+                    + time_bonus,
+                ),
+                4,
+            )
+            grouped.setdefault(game_id, {
+                "game_id": game_id,
+                "thesis_type": thesis_type,
+                "thesis_confidence": confidence,
+                "context": game_context,
+                "rows": [],
+            })["rows"].append(
+                {
+                    "candidate": candidate,
+                    "allocation": allocation,
+                    "ticker": ticker,
+                    "family": family,
+                    "q": q,
+                    "market": market,
+                    "leg_type": leg_type,
+                    "alignment": round(alignment, 4),
+                    "book_quality": round(book_quality, 4),
+                    "unified_score": round(unified_score, 4),
+                    "allocation_score": round(allocation_score, 4),
+                    "ladder_score": ladder_score,
+                }
+            )
+        if not grouped:
+            return {"enabled": True, "reason": "no_strong_sports_game_thesis"}
+        selected_group = None
+        if primary_ticker:
+            for group in grouped.values():
+                if any(row.get("ticker") == primary_ticker for row in group.get("rows") or []):
+                    selected_group = group
+                    break
+        if selected_group is None:
+            selected_group = max(
+                grouped.values(),
+                key=lambda group: (
+                    self.to_float(group.get("thesis_confidence"), 0.0) or 0.0,
+                    max(self.to_float((row or {}).get("ladder_score"), 0.0) or 0.0 for row in group.get("rows") or [{}]),
+                ),
+            )
+        rows = sorted(selected_group.get("rows") or [], key=lambda row: row.get("ladder_score", 0.0), reverse=True)
+        if not rows:
+            return {"enabled": True, "reason": "no_ladder_rows"}
+        context = selected_group.get("context") if isinstance(selected_group.get("context"), dict) else {}
+        primary_candidate = str(context.get("primary_candidate") or "").strip()
+        primary_row = None
+        for row in rows:
+            if primary_ticker and row.get("ticker") == primary_ticker:
+                primary_row = row
+                break
+        if primary_row is None and primary_candidate:
+            primary_row = next((row for row in rows if row.get("ticker") == primary_candidate), None)
+        if primary_row is None:
+            primary_row = rows[0]
+        ordered = [primary_row] + [row for row in rows if row.get("ticker") != primary_row.get("ticker")]
+        max_legs = max(1, int(AION_SPORTS_LADDER_MAX_LEGS or 1))
+        max_secondaries = max(0, int(AION_SPORTS_LADDER_MAX_SECONDARY_LEGS or 0))
+        selected_rows = ordered[: max_legs]
+        if len(selected_rows) > 1:
+            selected_rows = selected_rows[: 1 + max_secondaries]
+        plan_id = re.sub(r"[^A-Za-z0-9:_-]+", "_", f"{selected_group.get('game_id')}:{selected_group.get('thesis_type')}")[:120]
+        legs = []
+        for index, row in enumerate(selected_rows, start=1):
+            role = "primary" if index == 1 else "secondary"
+            if role != "primary" and row.get("leg_type") in {"player_related", "sports_related"}:
+                role = "derivative"
+            if role != "primary" and row.get("leg_type") == "live_continuation":
+                role = "live_confirmation"
+            if role == "primary":
+                size_cap = max(1, int(AION_SPORTS_LADDER_PRIMARY_SIZE_CAP or 1))
+                size_multiplier = 1.0
+            elif role == "secondary":
+                size_cap = max(1, int(AION_SPORTS_LADDER_SECONDARY_SIZE_CAP or 1))
+                size_multiplier = 0.65
+            else:
+                size_cap = max(1, int(AION_SPORTS_LADDER_DERIVATIVE_SIZE_CAP or 1))
+                size_multiplier = 0.40
+            legs.append({
+                **row,
+                "role": role,
+                "leg_rank": index,
+                "size_cap": min(size_cap, int(MAX_LIVE_ORDER_SIZE or size_cap)),
+                "size_multiplier": round(size_multiplier, 4),
+            })
+        plan = {
+            "enabled": True,
+            "plan_id": plan_id,
+            "game_id": selected_group.get("game_id"),
+            "thesis_type": selected_group.get("thesis_type"),
+            "thesis_confidence": round(self.to_float(selected_group.get("thesis_confidence"), 0.0) or 0.0, 4),
+            "primary_candidate": legs[0].get("ticker") if legs else None,
+            "secondary_candidates": [leg.get("ticker") for leg in legs[1:]],
+            "related_candidates": [row.get("ticker") for row in rows],
+            "max_game_contracts": int(AION_SPORTS_LADDER_MAX_GAME_CONTRACTS or 1),
+            "legs": legs,
+            "reason": "strong_game_thesis_ladder",
+        }
+        self.last_sports_ladder_plan = {
+            key: value for key, value in plan.items()
+            if key != "legs"
+        } | {
+            "legs": [
+                {
+                    "ticker": leg.get("ticker"),
+                    "role": leg.get("role"),
+                    "leg_type": leg.get("leg_type"),
+                    "ladder_score": leg.get("ladder_score"),
+                    "size_cap": leg.get("size_cap"),
+                }
+                for leg in legs
+            ]
+        }
+        self._emit_sports_ladder_log(
+            "SPORTS-LADDER",
+            {
+                "source": source,
+                "plan_id": plan.get("plan_id"),
+                "game_id": plan.get("game_id"),
+                "thesis_type": plan.get("thesis_type"),
+                "thesis_confidence": plan.get("thesis_confidence"),
+                "primary_candidate": plan.get("primary_candidate"),
+                "secondary_candidates": plan.get("secondary_candidates"),
+                "selected_legs": [
+                    {
+                        "ticker": leg.get("ticker"),
+                        "role": leg.get("role"),
+                        "leg_type": leg.get("leg_type"),
+                        "ladder_score": leg.get("ladder_score"),
+                        "size_cap": leg.get("size_cap"),
+                    }
+                    for leg in legs
+                ],
+                "max_game_contracts": plan.get("max_game_contracts"),
+                "reason": plan.get("reason"),
+            },
+            marker=("SPORTS-LADDER", source, plan.get("plan_id"), int(time.time() // 180)),
+        )
+        return plan
+
+    def _apply_sports_ladder_leg_metadata(self, q=None, allocation=None, leg=None, plan=None):
+        if q is None:
+            return
+        allocation = allocation if isinstance(allocation, dict) else {}
+        leg = leg if isinstance(leg, dict) else {}
+        plan = plan if isinstance(plan, dict) else {}
+        context = {
+            "plan_id": plan.get("plan_id"),
+            "game_id": plan.get("game_id"),
+            "thesis_type": plan.get("thesis_type"),
+            "thesis_confidence": plan.get("thesis_confidence"),
+            "role": leg.get("role"),
+            "leg_rank": leg.get("leg_rank"),
+            "leg_type": leg.get("leg_type"),
+            "ladder_score": leg.get("ladder_score"),
+            "alignment": leg.get("alignment"),
+            "primary_candidate": plan.get("primary_candidate"),
+            "secondary_candidates": plan.get("secondary_candidates"),
+            "related_candidates": plan.get("related_candidates"),
+            "max_game_contracts": plan.get("max_game_contracts"),
+            "size_cap": leg.get("size_cap"),
+            "size_multiplier": leg.get("size_multiplier"),
+        }
+        for attr_name, attr_value in (
+            ("sports_ladder_context", context),
+            ("sports_ladder_plan_id", plan.get("plan_id")),
+            ("sports_ladder_role", leg.get("role")),
+            ("sports_ladder_leg_rank", leg.get("leg_rank")),
+            ("sports_ladder_leg_type", leg.get("leg_type")),
+            ("sports_ladder_score", leg.get("ladder_score")),
+            ("sports_ladder_alignment", leg.get("alignment")),
+            ("sports_ladder_size_multiplier", leg.get("size_multiplier")),
+            ("sports_ladder_size_cap", leg.get("size_cap")),
+            ("sports_ladder_game_exposure_cap", plan.get("max_game_contracts")),
+            ("game_id", plan.get("game_id")),
+            ("game_thesis_type", plan.get("thesis_type")),
+            ("game_thesis_confidence", plan.get("thesis_confidence")),
+            ("game_primary_candidate", plan.get("primary_candidate")),
+            ("game_secondary_candidates", plan.get("secondary_candidates")),
+            ("game_related_candidates", plan.get("related_candidates")),
+        ):
+            try:
+                if attr_value is not None:
+                    setattr(q, attr_name, attr_value)
+            except Exception:
+                pass
+
+    def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result=None, source="sports_ladder"):
+        if not AION_SPORTS_LADDER_ENABLED:
+            return {"submitted": False, "reason": "sports_ladder_disabled"}
+        candidates = list(getattr(self, "last_dual_lane_buy_candidates", []) or [])
+        plan = self._build_sports_ladder_plan(candidates, primary_ticker=primary_ticker, source=source)
+        if not isinstance(plan, dict) or not plan.get("legs"):
+            self.last_sports_ladder_execution_summary = plan if isinstance(plan, dict) else {"submitted": False, "reason": "no_ladder_plan"}
+            return self.last_sports_ladder_execution_summary
+        primary_ticker = str(primary_ticker or "").strip()
+        primary_submitted = bool((primary_result or {}).get("submitted")) if isinstance(primary_result, dict) else False
+        game_id = str(plan.get("game_id") or "").strip()
+        game_exposure_cap = max(1, int(plan.get("max_game_contracts") or AION_SPORTS_LADDER_MAX_GAME_CONTRACTS or 1))
+        existing_exposure = self._sports_ladder_existing_game_exposure(game_id)
+        remaining_game_capacity = max(0, game_exposure_cap - existing_exposure)
+        submitted = []
+        skipped = []
+        if remaining_game_capacity <= 0:
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-SKIP",
+                {
+                    "source": source,
+                    "plan_id": plan.get("plan_id"),
+                    "game_id": game_id,
+                    "thesis_type": plan.get("thesis_type"),
+                    "thesis_confidence": plan.get("thesis_confidence"),
+                    "existing_game_exposure": existing_exposure,
+                    "max_game_contracts": game_exposure_cap,
+                    "reason": "game_exposure_cap_reached",
+                },
+                marker=("SPORTS-LADDER-SKIP", source, plan.get("plan_id"), "cap", int(time.time() // 180)),
+            )
+            return {"submitted": False, "reason": "game_exposure_cap_reached", "plan": self.last_sports_ladder_plan}
+        for leg in plan.get("legs") or []:
+            ticker = str(leg.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            allocation = leg.get("allocation") if isinstance(leg.get("allocation"), dict) else {}
+            candidate = leg.get("candidate") if isinstance(leg.get("candidate"), dict) else {}
+            q = leg.get("q") or candidate.get("q")
+            market = leg.get("market") if isinstance(leg.get("market"), dict) else {}
+            family = str(leg.get("family") or candidate.get("family") or allocation.get("family") or "").strip().upper()
+            if ticker == primary_ticker and primary_submitted:
+                skipped.append({"ticker": ticker, "reason": "primary_leg_already_submitted"})
+                continue
+            if ticker == primary_ticker and primary_ticker and not primary_submitted:
+                skipped.append({"ticker": ticker, "reason": "primary_leg_failed_continue_ladder"})
+                self._emit_sports_ladder_log(
+                    "SPORTS-LADDER-SKIP",
+                    {
+                        "source": source,
+                        "plan_id": plan.get("plan_id"),
+                        "game_id": game_id,
+                        "ticker": ticker,
+                        "role": leg.get("role"),
+                        "reason": "primary_leg_failed_continue_ladder",
+                    },
+                    marker=("SPORTS-LADDER-SKIP", source, ticker, "primary_failed", int(time.time() // 180)),
+                )
+                continue
+            if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
+                skipped.append({"ticker": ticker, "reason": "weak_ladder_leg"})
+                continue
+            if self._sports_only_execution_blocked(
+                family=family,
+                ticker=ticker,
+                market=market,
+                q=q,
+                lane="SPORTS",
+                reason=self._sports_only_block_reason(family=family, ticker=ticker, market=market, q=q, lane="SPORTS"),
+                source=source,
+            ):
+                skipped.append({"ticker": ticker, "reason": "sports_only_non_sports_block"})
+                continue
+            if self.already_holding(ticker):
+                skipped.append({"ticker": ticker, "reason": "duplicate_position_guard"})
+                self._emit_sports_ladder_log(
+                    "SPORTS-LADDER-SKIP",
+                    {"source": source, "plan_id": plan.get("plan_id"), "game_id": game_id, "ticker": ticker, "reason": "duplicate_position_guard"},
+                    marker=("SPORTS-LADDER-SKIP", source, ticker, "duplicate", int(time.time() // 180)),
+                )
+                continue
+            duplicate = self.check_live_duplicate_position_api(ticker)
+            if duplicate.get("blocked"):
+                reason = duplicate.get("reason") or "duplicate_position_guard"
+                skipped.append({"ticker": ticker, "reason": reason})
+                self._emit_sports_ladder_log(
+                    "SPORTS-LADDER-SKIP",
+                    {"source": source, "plan_id": plan.get("plan_id"), "game_id": game_id, "ticker": ticker, "reason": reason},
+                    marker=("SPORTS-LADDER-SKIP", source, ticker, reason, int(time.time() // 180)),
+                )
+                continue
+            if int(self.live_trade_count_today or 0) >= int(MAX_LIVE_TRADES_PER_DAY or 0):
+                skipped.append({"ticker": ticker, "reason": "daily_trade_cap"})
+                break
+            daily_loss_blocked = bool(
+                getattr(self, "trading_halted", False)
+                or self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS
+                or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS
+            )
+            if daily_loss_blocked:
+                skipped.append({"ticker": ticker, "reason": "daily_loss_guard"})
+                self._emit_sports_ladder_log(
+                    "SPORTS-LADDER-SKIP",
+                    {
+                        "source": source,
+                        "plan_id": plan.get("plan_id"),
+                        "game_id": game_id,
+                        "ticker": ticker,
+                        "reason": "daily_loss_guard",
+                        "trading_halted": bool(getattr(self, "trading_halted", False)),
+                        "realized_pnl": self.to_float(getattr(self, "realized_pnl", 0.0), 0.0),
+                        "live_realized_pnl_today": self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0),
+                    },
+                    marker=("SPORTS-LADDER-SKIP", source, ticker, "daily_loss_guard", int(time.time() // 180)),
+                )
+                break
+            risk_checker = getattr(self, "can_open_new_position", None)
+            if callable(risk_checker):
+                try:
+                    allowed, risk_reason = risk_checker(q)
+                except Exception:
+                    allowed, risk_reason = True, None
+                if not allowed:
+                    skipped.append({"ticker": ticker, "reason": risk_reason or "risk_guard"})
+                    self._emit_sports_ladder_log(
+                        "SPORTS-LADDER-SKIP",
+                        {"source": source, "plan_id": plan.get("plan_id"), "game_id": game_id, "ticker": ticker, "reason": risk_reason or "risk_guard"},
+                        marker=("SPORTS-LADDER-SKIP", source, ticker, risk_reason or "risk_guard", int(time.time() // 180)),
+                    )
+                    continue
+            planned_size = max(1, min(int(leg.get("size_cap") or 1), remaining_game_capacity, int(MAX_LIVE_ORDER_SIZE or 1)))
+            self._apply_sports_ladder_leg_metadata(q=q, allocation=allocation, leg={**leg, "size_cap": planned_size}, plan=plan)
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-LEG",
+                {
+                    "source": source,
+                    "plan_id": plan.get("plan_id"),
+                    "game_id": game_id,
+                    "thesis_type": plan.get("thesis_type"),
+                    "thesis_confidence": plan.get("thesis_confidence"),
+                    "ticker": ticker,
+                    "family": family,
+                    "role": leg.get("role"),
+                    "leg_type": leg.get("leg_type"),
+                    "ladder_score": leg.get("ladder_score"),
+                    "alignment": leg.get("alignment"),
+                    "planned_size": planned_size,
+                    "remaining_game_capacity": remaining_game_capacity,
+                    "reason": "ladder_leg_selected",
+                },
+                marker=("SPORTS-LADDER-LEG", source, ticker, int(time.time() // 180)),
+            )
+            payload = self.build_live_order_payload(
+                q,
+                size=planned_size,
+                market=market,
+                selected_ticker=ticker,
+                selection_stage="sports_ladder",
+                allow_orderbook_refresh=True,
+            )
+            if not isinstance(payload, dict):
+                skipped.append({"ticker": ticker, "reason": "selected_price_missing_or_invalid_payload"})
+                self._emit_sports_ladder_log(
+                    "SPORTS-LADDER-SKIP",
+                    {
+                        "source": source,
+                        "plan_id": plan.get("plan_id"),
+                        "game_id": game_id,
+                        "ticker": ticker,
+                        "role": leg.get("role"),
+                        "reason": "selected_price_missing_or_invalid_payload",
+                    },
+                    marker=("SPORTS-LADDER-SKIP", source, ticker, "invalid_payload", int(time.time() // 180)),
+                )
+                continue
+            payload["count"] = max(1, min(planned_size, int(round(self.to_float(payload.get("count"), planned_size) or planned_size))))
+            payload["sports_ladder_context"] = getattr(q, "sports_ladder_context", None)
+            payload["sports_ladder_plan_id"] = plan.get("plan_id")
+            payload["sports_ladder_role"] = leg.get("role")
+            payload["sports_ladder_leg_type"] = leg.get("leg_type")
+            payload["sports_ladder_size_cap"] = planned_size
+            payload["sports_ladder_game_exposure_cap"] = game_exposure_cap
+            entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+            for field in (
+                "sports_ladder_context",
+                "sports_ladder_plan_id",
+                "sports_ladder_role",
+                "sports_ladder_leg_type",
+                "sports_ladder_size_cap",
+                "sports_ladder_game_exposure_cap",
+                "game_id",
+                "game_thesis_type",
+                "game_thesis_confidence",
+            ):
+                value = payload.get(field)
+                if value is None and q is not None:
+                    value = getattr(q, field, None)
+                if value is not None:
+                    entry_context.setdefault(field, value)
+            payload["entry_context"] = entry_context
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-SIZE",
+                {
+                    "source": source,
+                    "plan_id": plan.get("plan_id"),
+                    "game_id": game_id,
+                    "ticker": ticker,
+                    "role": leg.get("role"),
+                    "requested_size": planned_size,
+                    "payload_count": payload.get("count"),
+                    "max_game_contracts": game_exposure_cap,
+                    "existing_game_exposure": existing_exposure,
+                    "remaining_game_capacity": remaining_game_capacity,
+                    "reason": "coordinated_ladder_sizing",
+                },
+                marker=("SPORTS-LADDER-SIZE", source, ticker, int(time.time() // 180)),
+            )
+            result = self.submit_live_order(
+                q,
+                size=planned_size,
+                lane="sports_ladder",
+                payload_override=payload,
+            )
+            if not isinstance(result, dict):
+                result = {"submitted": False, "reason": "submit_error"}
+            submitted_payload = result.get("payload") if isinstance(result, dict) else {}
+            if not isinstance(submitted_payload, dict) or not submitted_payload:
+                submitted_payload = payload
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-SUBMIT",
+                {
+                    "source": source,
+                    "plan_id": plan.get("plan_id"),
+                    "game_id": game_id,
+                    "thesis_type": plan.get("thesis_type"),
+                    "thesis_confidence": plan.get("thesis_confidence"),
+                    "ticker": ticker,
+                    "family": family,
+                    "role": leg.get("role"),
+                    "leg_type": leg.get("leg_type"),
+                    "side": submitted_payload.get("side"),
+                    "price": submitted_payload.get("price"),
+                    "count": submitted_payload.get("count"),
+                    "submitted": bool(result.get("submitted")) if isinstance(result, dict) else False,
+                    "reason": result.get("reason") if isinstance(result, dict) else "submit_error",
+                },
+                marker=("SPORTS-LADDER-SUBMIT", source, ticker, int(time.time() // 180)),
+            )
+            if result.get("submitted"):
+                self.record_live_position(
+                    q,
+                    size=submitted_payload.get("count"),
+                    entry_price=submitted_payload.get("price"),
+                    side=submitted_payload.get("side"),
+                )
+                print(
+                    "[POSITION-OPEN] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": submitted_payload.get("side"),
+                            "price": submitted_payload.get("price"),
+                            "count": submitted_payload.get("count"),
+                            "game_id": game_id,
+                            "sports_ladder_role": leg.get("role"),
+                            "subsystem": "kalshi_web.sports_ladder",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                actual_count = max(1, int(round(self.to_float(submitted_payload.get("count"), planned_size) or planned_size)))
+                remaining_game_capacity = max(0, remaining_game_capacity - actual_count)
+                submitted.append({"ticker": ticker, "count": actual_count, "role": leg.get("role")})
+                if remaining_game_capacity <= 0:
+                    break
+            else:
+                skipped.append({"ticker": ticker, "reason": result.get("reason") if isinstance(result, dict) else "submit_error"})
+                continue
+        summary = {
+            "submitted": bool(submitted),
+            "reason": "sports_ladder_submitted" if submitted else "no_ladder_legs_submitted",
+            "plan_id": plan.get("plan_id"),
+            "game_id": game_id,
+            "thesis_type": plan.get("thesis_type"),
+            "thesis_confidence": plan.get("thesis_confidence"),
+            "submitted_legs": submitted,
+            "skipped_legs": skipped,
+            "max_game_contracts": game_exposure_cap,
+            "existing_game_exposure": existing_exposure,
+        }
+        self.last_sports_ladder_execution_summary = summary
+        return summary
 
     def recent_submitted_order_for_ticker(self, ticker, window_seconds=None):
         ticker = str(ticker or "").strip()
@@ -13209,6 +13969,10 @@ class KalshiSniperBot:
         sports_edge_context = sports_edge_context if isinstance(sports_edge_context, dict) else {}
         sports_tags_raw = getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None) or sports_edge_context.get("tags") or []
         sports_tags = [str(tag).strip() for tag in sports_tags_raw if str(tag or "").strip()] if isinstance(sports_tags_raw, (list, tuple, set)) else []
+        sports_ladder_context = getattr(q, "sports_ladder_context", None) or {}
+        sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
+        game_thesis_context = getattr(q, "game_thesis_context", None) or {}
+        game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
         volatility_index = None
         if last_price is not None and mid_price is not None:
             volatility_index = round(abs(last_price - mid_price) / max(spread or 0.01, 0.01), 4)
@@ -13263,6 +14027,14 @@ class KalshiSniperBot:
             "sports_score_at_entry": self._safe_round(sports_edge_context.get("score_at_entry"), 4, None),
             "sports_implied_probability": self._safe_round(sports_edge_context.get("implied_probability"), 4, None),
             "sports_payout_multiple": self._safe_round(sports_edge_context.get("payout_multiple"), 4, None),
+            "game_id": getattr(q, "game_id", None) or game_thesis_context.get("game_id") or sports_ladder_context.get("game_id"),
+            "game_thesis_type": getattr(q, "game_thesis_type", None) or game_thesis_context.get("thesis_type") or sports_ladder_context.get("thesis_type"),
+            "game_thesis_confidence": getattr(q, "game_thesis_confidence", None) or game_thesis_context.get("thesis_confidence") or sports_ladder_context.get("thesis_confidence"),
+            "sports_ladder_context": sports_ladder_context,
+            "sports_ladder_plan_id": getattr(q, "sports_ladder_plan_id", None) or sports_ladder_context.get("plan_id"),
+            "sports_ladder_role": getattr(q, "sports_ladder_role", None) or sports_ladder_context.get("role"),
+            "sports_ladder_leg_type": getattr(q, "sports_ladder_leg_type", None) or sports_ladder_context.get("leg_type"),
+            "sports_ladder_size_cap": getattr(q, "sports_ladder_size_cap", None) or sports_ladder_context.get("size_cap"),
             "source": source,
         }
 
@@ -32354,11 +33126,20 @@ class KalshiSniperBot:
         )
         if self._sports_only_mode_enabled() and "CRYPTO_LADDER" not in lane_order:
             results["CRYPTO_LADDER"] = {"submitted": False, "reason": "sports_only_crypto_execution_disabled"}
+        sports_ladder_result = self._execute_sports_ladder_attempts(
+            primary_ticker=primary_ticker,
+            primary_result=primary_result,
+            source=source,
+        )
+        if isinstance(sports_ladder_result, dict):
+            results["SPORTS_LADDER"] = sports_ladder_result
+            if sports_ladder_result.get("submitted"):
+                already_submitted["SPORTS"] = True
         for lane_name in lane_order:
             if already_submitted.get(lane_name):
                 results[lane_name] = {
                     "submitted": True,
-                    "reason": "primary_lane_already_submitted",
+                    "reason": "sports_ladder_already_submitted" if lane_name == "SPORTS" and (results.get("SPORTS_LADDER") or {}).get("submitted") else "primary_lane_already_submitted",
                     "ticker": primary_ticker,
                 }
                 continue
@@ -32375,9 +33156,10 @@ class KalshiSniperBot:
             "primary_lane": primary_lane,
             "primary_submitted": bool(primary_result.get("submitted")),
             "crypto_submitted": bool((results.get("CRYPTO_LADDER") or {}).get("submitted")),
-            "sports_submitted": bool((results.get("SPORTS") or {}).get("submitted")),
+            "sports_submitted": bool((results.get("SPORTS") or {}).get("submitted") or (results.get("SPORTS_LADDER") or {}).get("submitted")),
             "crypto_reason": (results.get("CRYPTO_LADDER") or {}).get("reason"),
             "sports_reason": (results.get("SPORTS") or {}).get("reason"),
+            "sports_ladder_reason": (results.get("SPORTS_LADDER") or {}).get("reason"),
             "results": results,
         }
         print("[AION-FINAL-ALLOCATION-TRUTH] " + json.dumps(summary, sort_keys=True, default=str))
@@ -36784,6 +37566,16 @@ class KalshiSniperBot:
             "game_thesis_rank_boost",
             "game_thesis_size_multiplier",
             "game_thesis_aggression_multiplier",
+            "sports_ladder_context",
+            "sports_ladder_plan_id",
+            "sports_ladder_role",
+            "sports_ladder_leg_rank",
+            "sports_ladder_leg_type",
+            "sports_ladder_score",
+            "sports_ladder_alignment",
+            "sports_ladder_size_multiplier",
+            "sports_ladder_size_cap",
+            "sports_ladder_game_exposure_cap",
             "unified_opportunity_score",
             "unified_size_multiplier",
             "capital_duration_size_multiplier",
@@ -36830,6 +37622,7 @@ class KalshiSniperBot:
             "cross_market_size_multiplier",
             "sports_conviction_size_multiplier",
             "game_thesis_size_multiplier",
+            "sports_ladder_size_multiplier",
             "unified_size_multiplier",
             "capital_duration_size_multiplier",
         ):
@@ -37092,6 +37885,34 @@ class KalshiSniperBot:
                     marker=("GAME-BOOST-SIZING", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
+        sports_ladder_cap = self.to_float(
+            context.get("sports_ladder_size_cap"),
+            self.to_float(payload.get("sports_ladder_size_cap"), None),
+        )
+        if sports_ladder_cap is not None and sports_ladder_cap > 0:
+            cap_value = max(1, min(hard_max, int(round(sports_ladder_cap))))
+            if chosen > cap_value:
+                before_ladder_size = chosen
+                chosen = cap_value
+                chosen_label = "sports_ladder_size_cap"
+                context["sports_ladder_size_cap_applied"] = int(cap_value)
+                self._emit_sports_ladder_log(
+                    "SPORTS-LADDER-SIZE",
+                    {
+                        "source": source or "dynamic_live_entry_size",
+                        "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                        "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                        "game_id": context.get("game_id") or payload.get("game_id"),
+                        "plan_id": context.get("sports_ladder_plan_id") or payload.get("sports_ladder_plan_id"),
+                        "role": context.get("sports_ladder_role") or payload.get("sports_ladder_role"),
+                        "requested_size": before_ladder_size,
+                        "adjusted_size": chosen,
+                        "size_cap": int(cap_value),
+                        "reason": "sports_ladder_coordinated_size_cap",
+                    },
+                    marker=("SPORTS-LADDER-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         original = self.to_float(explicit_size, None)
         if original is None:
             original = self.to_float(payload.get("count"), None)
@@ -37120,6 +37941,8 @@ class KalshiSniperBot:
                             "game_thesis_type": context.get("game_thesis_type"),
                             "game_thesis_confidence": context.get("game_thesis_confidence"),
                             "game_thesis_size_multiplier": context.get("game_thesis_size_multiplier"),
+                            "sports_ladder_role": context.get("sports_ladder_role"),
+                            "sports_ladder_size_cap": context.get("sports_ladder_size_cap"),
                             "elite_size_quality": quality_context,
                         },
                         sort_keys=True,
@@ -46291,20 +47114,26 @@ class KalshiSniperBot:
         return self._evaluate_targeted_orderbook_gate(market, spread)
 
     def get_market_liquidity_priority(self, market, q=None):
-        if q is None:
-            canonical_tradeability = self.resolve_canonical_tradeability(market, context={"source": "get_market_liquidity_priority", "allow_refresh": True})
-            q = type("_AIONCanonicalQuoteProxy", (), {})()
-            for _key, _value in {
-                "ticker": canonical_tradeability.get("ticker"),
-                "yes_bid": canonical_tradeability.get("yes_bid"),
-                "yes_ask": canonical_tradeability.get("yes_ask"),
-                "no_bid": canonical_tradeability.get("no_bid"),
-                "no_ask": canonical_tradeability.get("no_ask"),
-                "volume": self.to_float((market or {}).get("volume_fp", (market or {}).get("volume")), 0.0) or 0.0,
-                "liquidity": self.to_float((market or {}).get("liquidity_dollars", (market or {}).get("liquidity")), 0.0) or 0.0,
-            }.items():
-                setattr(q, _key, _value)
         family = self.get_market_family(market)
+        if q is None:
+            if self._sports_only_mode_enabled() and self._is_sports_market_or_family(family):
+                try:
+                    q = self.build_quote(market)
+                except Exception:
+                    q = None
+            if q is None:
+                canonical_tradeability = self.resolve_canonical_tradeability(market, context={"source": "get_market_liquidity_priority", "allow_refresh": True})
+                q = type("_AIONCanonicalQuoteProxy", (), {})()
+                for _key, _value in {
+                    "ticker": canonical_tradeability.get("ticker"),
+                    "yes_bid": canonical_tradeability.get("yes_bid"),
+                    "yes_ask": canonical_tradeability.get("yes_ask"),
+                    "no_bid": canonical_tradeability.get("no_bid"),
+                    "no_ask": canonical_tradeability.get("no_ask"),
+                    "volume": self.to_float((market or {}).get("volume_fp", (market or {}).get("volume")), 0.0) or 0.0,
+                    "liquidity": self.to_float((market or {}).get("liquidity_dollars", (market or {}).get("liquidity")), 0.0) or 0.0,
+                }.items():
+                    setattr(q, _key, _value)
         volume = getattr(q, "volume", 0.0) or 0.0
         liquidity = getattr(q, "liquidity", 0.0) or 0.0
         quote_values = self.get_market_quote_values(market)
@@ -53510,6 +54339,42 @@ class KalshiSniperBot:
         )
 
         prefilter_pool = []
+        effective_prefilter_pool_cap = int(MAX_PREFILTER_POOL)
+        effective_strict_validation_pool_cap = int(MAX_STRICT_VALIDATION_POOL)
+        effective_adaptive_probe_pool_cap = len(family_adaptive_probe_pool)
+        if self._sports_only_mode_enabled():
+            effective_prefilter_pool_cap = max(
+                6,
+                min(int(MAX_PREFILTER_POOL), int(AION_SPORTS_ONLY_PREFILTER_POOL or MAX_PREFILTER_POOL)),
+            )
+            effective_strict_validation_pool_cap = max(
+                4,
+                min(int(MAX_STRICT_VALIDATION_POOL), int(AION_SPORTS_ONLY_STRICT_VALIDATION_POOL or MAX_STRICT_VALIDATION_POOL)),
+            )
+            effective_adaptive_probe_pool_cap = max(
+                0,
+                min(len(family_adaptive_probe_pool), int(AION_SPORTS_ONLY_ADAPTIVE_PROBE_POOL or 0)),
+            )
+            print(
+                "[AION-SPORTS-ONLY-RANK] "
+                + json.dumps(
+                    {
+                        "source": "live_selector_budget",
+                        "reason": "sports_only_execution_budget",
+                        "prefilter_cap": effective_prefilter_pool_cap,
+                        "strict_validation_cap": effective_strict_validation_pool_cap,
+                        "adaptive_probe_cap": effective_adaptive_probe_pool_cap,
+                        "safety_gates_preserved": [
+                            "duplicate_position_guard",
+                            "max_sizing",
+                            "daily_loss_cap",
+                            "valid_orderbook_payload",
+                        ],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         strict_entry_family_counts = {}
         prefilter_failure_summary = {
             "candidates_entering_prefilter": 0,
@@ -54320,7 +55185,7 @@ class KalshiSniperBot:
                         preferred_pass_survivors += 1
                     runtime_stats = self.live_family_runtime_stats.setdefault(family, {})
                     runtime_stats["prefilter_survivors"] = runtime_stats.get("prefilter_survivors", 0) + 1
-                if len(prefilter_pool) >= MAX_PREFILTER_POOL:
+                if len(prefilter_pool) >= effective_prefilter_pool_cap:
                     break
             print(
                 f"[LIVE-SELECT-DEBUG] phase_survivors phase={phase_name} "
@@ -54349,7 +55214,7 @@ class KalshiSniperBot:
             if prefilter_pool and not (phase_name == "preferred" and expand_to_additional_families):
                 break
 
-        prefilter_pool = sorted(prefilter_pool, key=lambda item: item[0]["score"], reverse=True)[:MAX_PREFILTER_POOL]
+        prefilter_pool = sorted(prefilter_pool, key=lambda item: item[0]["score"], reverse=True)[:effective_prefilter_pool_cap]
         if prefilter_pool:
             best_prescore, best_market = prefilter_pool[0]
             trade_readiness_best_prefilter_candidate = {
@@ -54598,7 +55463,10 @@ class KalshiSniperBot:
         candidates = []
         final_family_counts = {}
         strict_reject_reason_counts = {}
-        strict_pool = prefilter_pool[:MAX_STRICT_VALIDATION_POOL] + family_adaptive_probe_pool
+        strict_pool = (
+            prefilter_pool[:effective_strict_validation_pool_cap]
+            + family_adaptive_probe_pool[:effective_adaptive_probe_pool_cap]
+        )
         prefilter_survivors_total = sum(prefilter_survivor_family_counts.values())
         targeted_prefilter_survivors_total_handoff = sum(
             count for family, count in prefilter_survivor_family_counts.items()
@@ -54622,7 +55490,7 @@ class KalshiSniperBot:
         }
         print(
             f"[LIVE-SELECT-COUNT] stage=pre_strict_validation before={len(prefilter_pool) + len(family_adaptive_probe_pool)} "
-            f"after={len(strict_pool)} filtered={max(0, len(prefilter_pool) - MAX_STRICT_VALIDATION_POOL)}"
+            f"after={len(strict_pool)} filtered={max(0, len(prefilter_pool) - effective_strict_validation_pool_cap)}"
         )
         print(
             f"[LIVE-SELECT-STRICT-HANDOFF] prefilter_survivors_total={prefilter_survivors_total} "
@@ -54718,7 +55586,7 @@ class KalshiSniperBot:
         else:
             print("[LIVE-ENTRY-TIMING-SHADOW-SUMMARY] shadow_candidates_seen=0")
         strict_pool_target_count = len(strict_pool)
-        strict_pool_overflow = prefilter_pool[MAX_STRICT_VALIDATION_POOL:]
+        strict_pool_overflow = prefilter_pool[effective_strict_validation_pool_cap:]
         strict_pool_initial_family_counts = {}
         for prescore, _market in strict_pool:
             family = prescore.get("family")
@@ -54968,7 +55836,7 @@ class KalshiSniperBot:
                     exclusion_reason = "cycle_missing_quote_family_suppressed"
                 elif family in suppressed_families:
                     exclusion_reason = "cycle_dead_book_family_suppressed"
-                elif index >= MAX_STRICT_VALIDATION_POOL:
+                elif index >= effective_strict_validation_pool_cap:
                     exclusion_reason = "strict_pool_cap_not_backfilled"
                 else:
                     exclusion_reason = "unknown_after_prefilter"
@@ -64500,6 +65368,12 @@ class KalshiSniperBot:
                     "game_thesis_confidence": entry_context.get("game_thesis_confidence") if isinstance(entry_context, dict) else None,
                     "game_thesis_rank_boost": entry_context.get("game_thesis_rank_boost") if isinstance(entry_context, dict) else None,
                     "game_thesis_size_multiplier": entry_context.get("game_thesis_size_multiplier") if isinstance(entry_context, dict) else None,
+                    "sports_ladder_context": entry_context.get("sports_ladder_context") if isinstance(entry_context, dict) else {},
+                    "sports_ladder_plan_id": entry_context.get("sports_ladder_plan_id") if isinstance(entry_context, dict) else None,
+                    "sports_ladder_role": entry_context.get("sports_ladder_role") if isinstance(entry_context, dict) else None,
+                    "sports_ladder_leg_type": entry_context.get("sports_ladder_leg_type") if isinstance(entry_context, dict) else None,
+                    "sports_ladder_score": entry_context.get("sports_ladder_score") if isinstance(entry_context, dict) else None,
+                    "sports_ladder_size_cap": entry_context.get("sports_ladder_size_cap") if isinstance(entry_context, dict) else None,
                     "sports_edge_context": entry_context.get("sports_edge_context") if isinstance(entry_context, dict) else {},
                     "sports_tags": entry_context.get("sports_tags") if isinstance(entry_context, dict) else [],
                     "exit_reason": "position_reconcile_closed",
@@ -64809,6 +65683,8 @@ class KalshiSniperBot:
         sports_memory_dimensions = sports_memory_dimensions if isinstance(sports_memory_dimensions, dict) else {}
         game_thesis_context = getattr(q, "game_thesis_context", None) or {}
         game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
+        sports_ladder_context = getattr(q, "sports_ladder_context", None) or {}
+        sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
         elite_context = getattr(q, "elite_public_signal_context", None) or {}
         elite_context = elite_context if isinstance(elite_context, dict) else {}
         entry_context = {
@@ -64832,6 +65708,15 @@ class KalshiSniperBot:
             "game_related_candidates": getattr(q, "game_related_candidates", None) or game_thesis_context.get("related_candidates"),
             "game_primary_candidate": getattr(q, "game_primary_candidate", None) or game_thesis_context.get("primary_candidate"),
             "game_secondary_candidates": getattr(q, "game_secondary_candidates", None) or game_thesis_context.get("secondary_candidates"),
+            "sports_ladder_context": sports_ladder_context,
+            "sports_ladder_plan_id": getattr(q, "sports_ladder_plan_id", None) or sports_ladder_context.get("plan_id"),
+            "sports_ladder_role": getattr(q, "sports_ladder_role", None) or sports_ladder_context.get("role"),
+            "sports_ladder_leg_rank": getattr(q, "sports_ladder_leg_rank", None) or sports_ladder_context.get("leg_rank"),
+            "sports_ladder_leg_type": getattr(q, "sports_ladder_leg_type", None) or sports_ladder_context.get("leg_type"),
+            "sports_ladder_score": getattr(q, "sports_ladder_score", None) or sports_ladder_context.get("ladder_score"),
+            "sports_ladder_alignment": getattr(q, "sports_ladder_alignment", None) or sports_ladder_context.get("alignment"),
+            "sports_ladder_size_cap": getattr(q, "sports_ladder_size_cap", None) or sports_ladder_context.get("size_cap"),
+            "sports_ladder_game_exposure_cap": getattr(q, "sports_ladder_game_exposure_cap", None) or sports_ladder_context.get("max_game_contracts"),
             "elite_public_signal_context": elite_context,
             "elite_signal_used": bool(elite_context.get("matched") or getattr(q, "elite_signal_used", False)),
             "elite_trader_handle": getattr(q, "elite_trader_handle", None) or ((elite_context.get("signal") or {}).get("trader_handle") if isinstance(elite_context.get("signal"), dict) else None),
@@ -64881,6 +65766,12 @@ class KalshiSniperBot:
                 "game_related_candidates": entry_context.get("game_related_candidates"),
                 "game_primary_candidate": entry_context.get("game_primary_candidate"),
                 "game_secondary_candidates": entry_context.get("game_secondary_candidates"),
+                "sports_ladder_context": sports_ladder_context,
+                "sports_ladder_plan_id": entry_context.get("sports_ladder_plan_id"),
+                "sports_ladder_role": entry_context.get("sports_ladder_role"),
+                "sports_ladder_leg_type": entry_context.get("sports_ladder_leg_type"),
+                "sports_ladder_score": entry_context.get("sports_ladder_score"),
+                "sports_ladder_size_cap": entry_context.get("sports_ladder_size_cap"),
                 "elite_public_signal_context": elite_context,
                 "elite_signal_used": bool(entry_context.get("elite_signal_used")),
                 "elite_trader_handle": entry_context.get("elite_trader_handle"),
