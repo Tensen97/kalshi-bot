@@ -329,6 +329,11 @@ _TELEMETRY_CRITICAL_TAGS = {
     "SPORTS-LAG",
     "SPORTS-GRAPH-BOOST",
     "SPORTS-GRAPH-CONFLICT",
+    "SPORTS-SPREAD",
+    "SPORTS-SPREAD-ADAPT",
+    "SPORTS-SPREAD-SKIP",
+    "SPORTS-SPREAD-PASS",
+    "SPORTS-SPREAD-EXECUTE",
     "GAME-THESIS",
     "GAME-CONVICTION",
     "GAME-BOOST",
@@ -2045,6 +2050,11 @@ AION_SPORTS_GRAPH_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_GRAPH_MAX_RANK_P
 AION_SPORTS_GRAPH_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_GRAPH_MIN_SIZE_MULTIPLIER", 0.94)
 AION_SPORTS_GRAPH_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_GRAPH_MAX_SIZE_MULTIPLIER", 1.12)
 AION_SPORTS_GRAPH_LOG_COOLDOWN_SECONDS = get_env_float("AION_SPORTS_GRAPH_LOG_COOLDOWN_SECONDS", 180.0)
+AION_SPORTS_SPREAD_LOG_COOLDOWN_SECONDS = get_env_float("AION_SPORTS_SPREAD_LOG_COOLDOWN_SECONDS", 180.0)
+AION_SPORTS_SPREAD_PREFILTER_MAX_EXECUTABLE = get_env_float("AION_SPORTS_SPREAD_PREFILTER_MAX_EXECUTABLE", 0.42)
+AION_SPORTS_SPREAD_PREFILTER_ABSURD = get_env_float("AION_SPORTS_SPREAD_PREFILTER_ABSURD", 0.66)
+AION_SPORTS_SPREAD_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_SPREAD_MAX_RANK_PENALTY", 8.0)
+AION_SPORTS_SPREAD_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_SPREAD_MIN_SIZE_MULTIPLIER", 0.55)
 AION_GAME_THESIS_ENABLED = get_env_bool("AION_GAME_THESIS_ENABLED", 1)
 AION_GAME_THESIS_MIN_ALIGNED = get_env_int("AION_GAME_THESIS_MIN_ALIGNED", 2)
 AION_GAME_THESIS_STRONG_SCORE = get_env_float("AION_GAME_THESIS_STRONG_SCORE", 68.0)
@@ -2489,6 +2499,7 @@ class KalshiSniperBot:
         self.sports_ladder_log_markers = {}
         self.sports_regime_log_markers = {}
         self.sports_graph_log_markers = {}
+        self.sports_spread_log_markers = {}
         self.last_sports_graph_contexts = {}
         self.last_sports_ladder_plan = {}
         self.last_sports_ladder_execution_summary = {}
@@ -8589,6 +8600,369 @@ class KalshiSniperBot:
             },
         }
 
+    def _emit_sports_spread_log(self, tag, payload, marker=None, cooldown_seconds=None):
+        tag = str(tag or "SPORTS-SPREAD").strip().upper()
+        payload = payload if isinstance(payload, dict) else {}
+        markers = getattr(self, "sports_spread_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self.sports_spread_log_markers = markers
+        cooldown_seconds = (
+            AION_SPORTS_SPREAD_LOG_COOLDOWN_SECONDS
+            if cooldown_seconds is None
+            else float(cooldown_seconds or 0.0)
+        )
+        marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+        now_ts = time.time()
+        if marker_key is not None:
+            previous_ts = self.to_float(markers.get(marker_key), 0.0) or 0.0
+            if now_ts - previous_ts < cooldown_seconds:
+                return
+            markers[marker_key] = now_ts
+            if len(markers) > 1200:
+                cutoff = now_ts - 7200.0
+                self.sports_spread_log_markers = {
+                    key: value for key, value in markers.items()
+                    if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"[{tag}] " + json.dumps({"reason": "sports_spread_log_failed"}))
+
+    def _sports_spread_price_value(self, value):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        if 1.0 < numeric <= 100.0:
+            numeric = numeric / 100.0
+        return numeric
+
+    def _sports_spread_value(self, value):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        if 1.0 < numeric <= 100.0:
+            numeric = numeric / 100.0
+        return numeric
+
+    def _sports_adaptive_spread_decision(
+        self,
+        market=None,
+        *,
+        q=None,
+        family=None,
+        spread=None,
+        liquidity=None,
+        liquidity_priority=None,
+        quote_diag=None,
+        context="sports_spread",
+        emit_log=True,
+    ):
+        market = market if isinstance(market, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        family = str(family or self.get_market_family(market) or getattr(q, "family", "") or "").strip().upper()
+        ticker = str(market.get("ticker") or getattr(q, "ticker", "") or quote_diag.get("ticker") or "").strip()
+        if not self.is_sports_family(family, ticker=ticker) or family == "KXBTC15M":
+            return {
+                "allowed": False,
+                "hard_reject": True,
+                "reason": "non_sports_strict_spread_policy",
+                "family": family,
+                "ticker": ticker or None,
+                "spread": self._safe_round(self._sports_spread_value(spread), 4, None),
+                "strict_threshold": round(MAX_ENTRY_SPREAD, 4),
+                "threshold_used": round(MAX_ENTRY_SPREAD, 4),
+                "rank_adjustment": 0.0,
+                "size_multiplier": 1.0,
+            }
+        liquidity_priority = liquidity_priority if isinstance(liquidity_priority, dict) else {}
+        if not liquidity_priority:
+            try:
+                liquidity_priority = self.get_market_liquidity_priority(market)
+            except Exception:
+                liquidity_priority = {}
+
+        def _pick(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        yes_bid = self._sports_spread_price_value(_pick(quote_diag.get("yes_bid_dollars"), quote_diag.get("yes_bid"), market.get("yes_bid_dollars"), market.get("yes_bid"), getattr(q, "yes_bid", None)))
+        yes_ask = self._sports_spread_price_value(_pick(quote_diag.get("yes_ask_dollars"), quote_diag.get("yes_ask"), market.get("yes_ask_dollars"), market.get("yes_ask"), getattr(q, "yes_ask", None)))
+        no_bid = self._sports_spread_price_value(_pick(quote_diag.get("no_bid_dollars"), quote_diag.get("no_bid"), market.get("no_bid_dollars"), market.get("no_bid"), getattr(q, "no_bid", None)))
+        no_ask = self._sports_spread_price_value(_pick(quote_diag.get("no_ask_dollars"), quote_diag.get("no_ask"), market.get("no_ask_dollars"), market.get("no_ask"), getattr(q, "no_ask", None)))
+        spread_value = self._sports_spread_value(spread)
+        if spread_value is None:
+            side_spreads = []
+            if yes_bid is not None and yes_ask is not None:
+                side_spreads.append(yes_ask - yes_bid)
+            if no_bid is not None and no_ask is not None:
+                side_spreads.append(no_ask - no_bid)
+            side_spreads = [value for value in side_spreads if value is not None]
+            spread_value = min(side_spreads) if side_spreads else None
+        yes_top = self.to_float(
+            quote_diag.get("yes_top_size"),
+            self.to_float(liquidity_priority.get("yes_top_size"), self.to_float(market.get("yes_top_size"), self.to_float(market.get("yes_ask_size_fp"), self.to_float(market.get("yes_bid_size_fp"), 0.0)))),
+        ) or 0.0
+        no_top = self.to_float(
+            quote_diag.get("no_top_size"),
+            self.to_float(liquidity_priority.get("no_top_size"), self.to_float(market.get("no_top_size"), self.to_float(market.get("no_ask_size_fp"), self.to_float(market.get("no_bid_size_fp"), 0.0)))),
+        ) or 0.0
+        top_depth = max(0.0, yes_top) + max(0.0, no_top)
+        max_top = max(max(0.0, yes_top), max(0.0, no_top))
+        liquidity_value = self.to_float(
+            liquidity,
+            self.to_float(
+                liquidity_priority.get("liquidity_final"),
+                self.to_float(market.get("liquidity_dollars", market.get("liquidity")), self.to_float(getattr(q, "liquidity", None), 0.0)),
+            ),
+        ) or 0.0
+        volume = self.to_float(market.get("volume_fp", market.get("volume")), self.to_float(getattr(q, "volume", None), 0.0)) or 0.0
+        open_interest = self.to_float(market.get("open_interest_fp", market.get("open_interest")), 0.0) or 0.0
+        minutes_to_event = self.get_minutes_to_event(market)
+        strict_info = {"adaptive_threshold": float(MAX_ENTRY_SPREAD)}
+        strict_threshold = float(MAX_ENTRY_SPREAD)
+        if spread_value is not None and spread_value > float(MAX_ENTRY_SPREAD):
+            threshold_market = dict(market)
+            if ticker:
+                threshold_market.setdefault("ticker", ticker)
+            if family:
+                threshold_market.setdefault("series_ticker", family)
+            if yes_bid is not None:
+                threshold_market["yes_bid"] = yes_bid
+            if yes_ask is not None:
+                threshold_market["yes_ask"] = yes_ask
+            if no_bid is not None:
+                threshold_market["no_bid"] = no_bid
+            if no_ask is not None:
+                threshold_market["no_ask"] = no_ask
+            if yes_top > 0.0:
+                threshold_market.setdefault("yes_top_size", yes_top)
+            if no_top > 0.0:
+                threshold_market.setdefault("no_top_size", no_top)
+            selected_price_hint = self._sports_spread_price_value(
+                _pick(
+                    quote_diag.get("selected_price_dollars"),
+                    quote_diag.get("selected_price"),
+                    market.get("selected_price_dollars"),
+                    market.get("selected_price"),
+                    getattr(q, "selected_price", None),
+                    yes_ask,
+                    no_ask,
+                )
+            )
+            if selected_price_hint is not None:
+                threshold_market.setdefault("selected_price", selected_price_hint)
+            selected_side_hint = str(_pick(quote_diag.get("selected_side"), market.get("selected_side"), getattr(q, "selected_side", None)) or "").strip().lower()
+            if selected_side_hint in {"yes", "no"}:
+                threshold_market.setdefault("selected_side", selected_side_hint)
+            try:
+                strict_info = self._get_sports_adaptive_spread_threshold(
+                    threshold_market,
+                    spread=spread_value,
+                    liquidity=liquidity_value,
+                    yes_top_size=yes_top,
+                    no_top_size=no_top,
+                    context=f"{context}:strict",
+                    quote_diag=quote_diag,
+                    resolve_effective_liquidity=False,
+                ) or strict_info
+                strict_threshold = max(
+                    float(MAX_ENTRY_SPREAD),
+                    self.to_float(strict_info.get("adaptive_threshold"), MAX_ENTRY_SPREAD) or MAX_ENTRY_SPREAD,
+                )
+            except Exception:
+                strict_info = {"adaptive_threshold": float(MAX_ENTRY_SPREAD)}
+                strict_threshold = float(MAX_ENTRY_SPREAD)
+        market_type = self._classify_sports_liquidity_market_type(
+            family=family,
+            ticker=ticker,
+            title=market.get("title") or market.get("market_title") or getattr(q, "title", None),
+        )
+        type_thresholds = self._sports_liquidity_relaxation_thresholds(market_type)
+        family_cap = self.to_float(type_thresholds.get("spread_cap"), AION_SPORTS_MAX_SPREAD_SOFT) or AION_SPORTS_MAX_SPREAD_SOFT
+        thesis_confidence = max(
+            self.to_float(quote_diag.get("game_thesis_confidence"), 0.0) or 0.0,
+            self.to_float(quote_diag.get("thesis_confidence"), 0.0) or 0.0,
+            self.to_float(market.get("game_thesis_confidence"), 0.0) or 0.0,
+        )
+        sports_memory_rank = self.to_float(quote_diag.get("sports_memory_rank_adjustment"), self.to_float(market.get("sports_memory_rank_adjustment"), 0.0)) or 0.0
+        sports_memory_size = self.to_float(quote_diag.get("sports_memory_size_multiplier"), self.to_float(market.get("sports_memory_size_multiplier"), 1.0)) or 1.0
+        sports_regime = str(quote_diag.get("sports_regime") or market.get("sports_regime") or "").strip().lower()
+        sports_momentum_class = str(quote_diag.get("sports_momentum_classification") or market.get("sports_momentum_classification") or "").strip().lower()
+        ladder_role = str(quote_diag.get("sports_ladder_role") or market.get("sports_ladder_role") or "").strip().lower()
+        edge_value = max(
+            self.to_float(quote_diag.get("edge_after_cost"), 0.0) or 0.0,
+            self.to_float(quote_diag.get("sports_edge_after_cost"), 0.0) or 0.0,
+            self.to_float(market.get("edge_after_cost"), 0.0) or 0.0,
+            self.to_float(market.get("sports_edge_after_cost"), 0.0) or 0.0,
+        )
+        adaptive_bonus = 0.0
+        adaptive_reasons = []
+        if max_top >= 1.0 or top_depth >= 2.0:
+            adaptive_bonus += 0.035
+            adaptive_reasons.append("topbook_depth_present")
+        if top_depth >= 20.0 or liquidity_value >= 40.0:
+            adaptive_bonus += 0.035
+            adaptive_reasons.append("healthy_sports_depth")
+        if volume > 0.0 or open_interest > 0.0:
+            adaptive_bonus += 0.025
+            adaptive_reasons.append("activity_or_open_interest")
+        if minutes_to_event is not None and 0.0 <= minutes_to_event <= self.get_effective_max_minutes_to_event():
+            adaptive_bonus += 0.025
+            adaptive_reasons.append("event_in_trade_window")
+        if thesis_confidence >= 70.0:
+            adaptive_bonus += 0.055
+            adaptive_reasons.append("strong_game_thesis")
+        elif thesis_confidence >= 58.0:
+            adaptive_bonus += 0.035
+            adaptive_reasons.append("moderate_game_thesis")
+        if ladder_role == "primary":
+            adaptive_bonus += 0.04
+            adaptive_reasons.append("primary_ladder_leg")
+        elif ladder_role in {"secondary", "live"}:
+            adaptive_bonus += 0.02
+            adaptive_reasons.append("aligned_ladder_leg")
+        if sports_regime in {"favorable", "hot"} or sports_momentum_class in {"strong_positive", "moderate_positive"}:
+            adaptive_bonus += 0.03
+            adaptive_reasons.append("favorable_sports_regime")
+        if sports_memory_rank > 0.0 or sports_memory_size > 1.01:
+            adaptive_bonus += 0.025
+            adaptive_reasons.append("positive_sports_memory")
+        if edge_value > 0.0:
+            adaptive_bonus += min(0.06, max(0.02, edge_value * 2.0))
+            adaptive_reasons.append("positive_edge")
+        executable_cap = min(
+            max(float(AION_SPORTS_SPREAD_PREFILTER_MAX_EXECUTABLE), float(AION_SPORTS_MAX_SPREAD_SOFT)),
+            max(float(AION_SPORTS_MAX_SPREAD_SOFT), family_cap + adaptive_bonus),
+            float(AION_SPORTS_SPREAD_PREFILTER_ABSURD),
+        )
+        adaptive_limit = max(strict_threshold, executable_cap)
+        absurd_limit = max(adaptive_limit, min(float(AION_SPORTS_SPREAD_PREFILTER_ABSURD), max(family_cap, float(AION_SPORTS_MAX_SPREAD_HARD))))
+        quote_complete = bool(
+            yes_bid is not None and yes_ask is not None
+            and no_bid is not None and no_ask is not None
+        )
+        selected_price_ready = any(
+            price is not None and KALSHI_CONTRACT_MIN_PRICE <= price <= KALSHI_CONTRACT_MAX_PRICE
+            for price in (yes_ask, no_ask, quote_diag.get("selected_price"), quote_diag.get("selected_price_dollars"))
+        )
+        boundary_book = bool(
+            (
+                yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None
+                and yes_bid <= 0.0 and yes_ask <= 0.0 and no_bid >= 1.0 and no_ask >= 1.0
+            )
+            or (
+                yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None
+                and no_bid <= 0.0 and no_ask <= 0.0 and yes_bid >= 1.0 and yes_ask >= 1.0
+            )
+        )
+        book_signal = bool(
+            top_depth > 0.0
+            or quote_complete
+            or volume > 0.0
+            or open_interest > 0.0
+            or liquidity_value > 0.0
+        )
+        hard_reject = False
+        if spread_value is None:
+            hard_reject = True
+            reason = "spread_missing"
+        elif spread_value < 0.0:
+            hard_reject = True
+            reason = "negative_or_crossed_spread"
+        elif spread_value > absurd_limit:
+            hard_reject = True
+            reason = "spread_absurd_unusable"
+        elif boundary_book:
+            hard_reject = True
+            reason = "boundary_price_book"
+        elif not selected_price_ready:
+            hard_reject = True
+            reason = "selected_price_missing_or_invalid"
+        elif not book_signal:
+            hard_reject = True
+            reason = "no_book_or_activity_signal"
+        elif spread_value <= strict_threshold:
+            reason = "strict_spread_pass"
+        elif spread_value <= adaptive_limit:
+            reason = "adaptive_wide_spread_tolerance"
+        else:
+            hard_reject = True
+            reason = "spread_above_adaptive_tolerance"
+        allowed = bool(not hard_reject)
+        excess_ratio = 0.0
+        if spread_value is not None and adaptive_limit > strict_threshold:
+            excess_ratio = self._clamp((spread_value - strict_threshold) / max(adaptive_limit - strict_threshold, 0.0001), 0.0, 1.0)
+        rank_adjustment = 0.0
+        size_multiplier = 1.0
+        if allowed and spread_value is not None and spread_value > strict_threshold:
+            conviction_relief = 0.0
+            if thesis_confidence >= 70.0 or ladder_role == "primary":
+                conviction_relief += 1.2
+            if edge_value > 0.0:
+                conviction_relief += 0.8
+            if sports_regime in {"favorable", "hot"} or sports_momentum_class in {"strong_positive", "moderate_positive"}:
+                conviction_relief += 0.6
+            raw_penalty = 2.0 + excess_ratio * float(AION_SPORTS_SPREAD_MAX_RANK_PENALTY)
+            rank_adjustment = -round(max(0.75, raw_penalty - conviction_relief), 4)
+            size_multiplier = max(float(AION_SPORTS_SPREAD_MIN_SIZE_MULTIPLIER), min(1.0, 1.0 - excess_ratio * 0.35 + conviction_relief * 0.025))
+        result = {
+            "allowed": allowed,
+            "hard_reject": bool(hard_reject),
+            "reason": reason,
+            "adaptive_reasons": adaptive_reasons or ["sports_family_wide_spread_tolerance"],
+            "family": family,
+            "ticker": ticker or None,
+            "market_type": market_type,
+            "spread": round(spread_value, 4) if spread_value is not None else None,
+            "strict_threshold": round(strict_threshold, 4),
+            "threshold_before": round(float(MAX_ENTRY_SPREAD), 4),
+            "threshold_used": round(adaptive_limit, 4),
+            "absurd_threshold": round(absurd_limit, 4),
+            "rank_adjustment": round(rank_adjustment, 4),
+            "size_multiplier": round(size_multiplier, 4),
+            "liquidity": round(liquidity_value, 4),
+            "top_depth": round(top_depth, 4),
+            "yes_top_size": round(yes_top, 4),
+            "no_top_size": round(no_top, 4),
+            "quote_complete": bool(quote_complete),
+            "selected_price_ready": bool(selected_price_ready),
+            "book_signal": bool(book_signal),
+            "game_thesis_confidence": round(thesis_confidence, 4),
+            "sports_regime": sports_regime or None,
+            "sports_momentum_classification": sports_momentum_class or None,
+            "sports_memory_rank_adjustment": round(sports_memory_rank, 4),
+            "sports_memory_size_multiplier": round(sports_memory_size, 4),
+            "sports_ladder_role": ladder_role or None,
+            "edge_after_cost": round(edge_value, 6),
+            "context": context,
+        }
+        if emit_log:
+            marker_bucket = int(time.time() // max(30, int(AION_SPORTS_SPREAD_LOG_COOLDOWN_SECONDS or 180)))
+            tag = "SPORTS-SPREAD-PASS"
+            if not allowed:
+                tag = "SPORTS-SPREAD-SKIP"
+            elif spread_value is not None and spread_value > strict_threshold:
+                tag = "SPORTS-SPREAD-ADAPT"
+            self._emit_sports_spread_log(
+                tag,
+                result,
+                marker=(tag, context, ticker or family, reason, marker_bucket),
+            )
+            if tag == "SPORTS-SPREAD-ADAPT":
+                self._emit_sports_spread_log(
+                    "SPORTS-SPREAD",
+                    result,
+                    marker=("SPORTS-SPREAD", context, ticker or family, marker_bucket),
+                )
+        return result
+
     def _infer_missing_binary_quotes(self, yes_bid, yes_ask, no_bid, no_ask):
         if no_bid is None and yes_ask is not None:
             no_bid = max(0.0, 1.0 - float(yes_ask))
@@ -10594,6 +10968,9 @@ class KalshiSniperBot:
                 "sports_regime_rank_adjustment",
                 "sports_regime_size_multiplier",
                 "sports_regime_aggression_multiplier",
+                "sports_spread_context",
+                "sports_spread_rank_adjustment",
+                "sports_spread_size_multiplier",
             ):
                 try:
                     setattr(q, attr_name, context.get(attr_name))
@@ -32742,6 +33119,32 @@ class KalshiSniperBot:
             sports_conviction_size_multiplier = min(1.55, max(1.10, 1.0 + (sports_conviction_score - 60.0) / 100.0))
         elif sports_weak_prop_reject:
             sports_conviction_size_multiplier = 0.50
+        sports_spread_context = item.get("sports_spread_context") if isinstance(item.get("sports_spread_context"), dict) else {}
+        if not sports_spread_context and isinstance((market or {}).get("_sports_spread_context"), dict):
+            sports_spread_context = dict((market or {}).get("_sports_spread_context") or {})
+        if not sports_spread_context:
+            sports_spread_context = self._sports_adaptive_spread_decision(
+                market,
+                q=q,
+                family=family,
+                spread=spread,
+                liquidity=liquidity,
+                quote_diag={
+                    "selected_side": selected_side,
+                    "selected_price": selected_price,
+                    "game_thesis_confidence": item.get("game_thesis_confidence") or expectancy_summary.get("game_thesis_confidence"),
+                    "sports_memory_rank_adjustment": item.get("sports_memory_rank_adjustment") or expectancy_summary.get("sports_memory_rank_adjustment"),
+                    "sports_memory_size_multiplier": item.get("sports_memory_size_multiplier") or expectancy_summary.get("sports_memory_size_multiplier"),
+                    "sports_regime": item.get("sports_regime") or expectancy_summary.get("sports_regime"),
+                    "sports_momentum_classification": item.get("sports_momentum_classification") or expectancy_summary.get("sports_momentum_classification"),
+                    "sports_ladder_role": item.get("sports_ladder_role") or expectancy_summary.get("sports_ladder_role"),
+                    "edge_after_cost": final_edge,
+                },
+                context="sports_lane_quality",
+                emit_log=False,
+            )
+        sports_spread_rank_adjustment = self.to_float(sports_spread_context.get("rank_adjustment"), 0.0) if sports_spread_context.get("allowed") else 0.0
+        sports_spread_size_multiplier = self.to_float(sports_spread_context.get("size_multiplier"), 1.0) if sports_spread_context.get("allowed") else 1.0
         weak_reasons = []
         if final_edge <= 0.0:
             weak_reasons.append("no_positive_edge")
@@ -32806,6 +33209,9 @@ class KalshiSniperBot:
             adjustment = 0.0
             decision = "ALLOW_SPORT"
             reason = "sports_quality_neutral"
+        if sports_spread_rank_adjustment < 0.0:
+            adjustment += sports_spread_rank_adjustment
+            reason = f"{reason}+adaptive_wide_spread_penalty" if reason else "adaptive_wide_spread_penalty"
         conviction_payload = {
             "ticker": ticker,
             "family": family,
@@ -32823,6 +33229,9 @@ class KalshiSniperBot:
             "ultra_longshot": ultra_longshot,
             "sports_conviction_score": sports_conviction_score,
             "sports_conviction_size_multiplier": round(sports_conviction_size_multiplier, 4),
+            "sports_spread_rank_adjustment": round(sports_spread_rank_adjustment, 4),
+            "sports_spread_size_multiplier": round(sports_spread_size_multiplier, 4),
+            "sports_spread_threshold": sports_spread_context.get("threshold_used"),
             "decision": decision,
             "reason": reason,
         }
@@ -32854,6 +33263,9 @@ class KalshiSniperBot:
             "sports_high_conviction": sports_high_conviction,
             "sports_weak_prop_reject": sports_weak_prop_reject,
             "sports_conviction_size_multiplier": round(sports_conviction_size_multiplier, 4),
+            "sports_spread_context": sports_spread_context,
+            "sports_spread_rank_adjustment": round(sports_spread_rank_adjustment, 4),
+            "sports_spread_size_multiplier": round(sports_spread_size_multiplier, 4),
             "strong": strong,
             "allocation_adjustment": round(adjustment, 4),
             "decision": decision,
@@ -33236,6 +33648,15 @@ class KalshiSniperBot:
             allocation.get("sports_momentum_score"),
             self.to_float(sports_regime_context.get("selected_momentum_score"), 0.0),
         ) or 0.0
+        sports_spread_context = allocation.get("sports_spread_context") if isinstance(allocation.get("sports_spread_context"), dict) else {}
+        sports_spread_rank_adjustment = self.to_float(
+            allocation.get("sports_spread_rank_adjustment"),
+            self.to_float(sports_spread_context.get("rank_adjustment"), 0.0),
+        ) or 0.0
+        sports_spread_size_multiplier = self.to_float(
+            allocation.get("sports_spread_size_multiplier"),
+            self.to_float(sports_spread_context.get("size_multiplier"), 1.0),
+        ) or 1.0
         sports_graph_context = allocation.get("sports_graph_context") if isinstance(allocation.get("sports_graph_context"), dict) else {}
         sports_graph_rank_adjustment = self.to_float(
             allocation.get("sports_graph_rank_adjustment"),
@@ -33301,6 +33722,7 @@ class KalshiSniperBot:
             lane_component += min(22.0, sports_conviction_score * 0.22)
         sports_live_memory_component = sports_memory_rank_adjustment if lane == "SPORTS" else 0.0
         sports_live_regime_component = sports_regime_rank_adjustment if lane == "SPORTS" else 0.0
+        sports_live_spread_component = sports_spread_rank_adjustment if lane == "SPORTS" else 0.0
         sports_live_graph_component = sports_graph_rank_adjustment if lane == "SPORTS" else 0.0
         memory_component = max(
             -10.0,
@@ -33314,6 +33736,7 @@ class KalshiSniperBot:
             ),
         )
         regime_component = max(-6.0, min(8.0, sports_live_regime_component))
+        sports_spread_component = max(-8.0, min(1.0, sports_live_spread_component))
         graph_component = max(-5.0, min(7.0, sports_live_graph_component))
         confidence_component = min(8.0, confidence * 0.08)
         target_component = 0.0
@@ -33331,7 +33754,7 @@ class KalshiSniperBot:
         duration = self._build_capital_duration_context(lane=lane, allocation=allocation, item=item, market=market)
         capital_lock_penalty = self.to_float(duration.get("capital_lock_penalty"), 0.0) or 0.0
         turnover_boost = self.to_float(duration.get("capital_turnover_boost"), 0.0) or 0.0
-        unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
+        unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
         if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
             unified_score -= 30.0
         unified_score = round(max(0.0, min(100.0, unified_score)), 4)
@@ -33393,6 +33816,28 @@ class KalshiSniperBot:
                     marker=("SPORTS-REGIME-SIZE-UNIFIED", source, ticker, int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
+        if lane == "SPORTS" and sports_spread_size_multiplier > 0.0:
+            pre_spread_size_multiplier = size_multiplier
+            size_multiplier = max(0.35, min(1.65, size_multiplier * sports_spread_size_multiplier))
+            if abs(sports_spread_size_multiplier - 1.0) >= 0.01:
+                self._emit_sports_spread_log(
+                    "SPORTS-SPREAD-EXECUTE",
+                    {
+                        "source": source,
+                        "ticker": ticker,
+                        "family": family,
+                        "unified_score": unified_score,
+                        "spread": self._safe_round(spread, 4, None),
+                        "threshold_used": sports_spread_context.get("threshold_used"),
+                        "base_size_multiplier": round(pre_spread_size_multiplier, 4),
+                        "sports_spread_size_multiplier": round(sports_spread_size_multiplier, 4),
+                        "final_size_multiplier": round(size_multiplier, 4),
+                        "rank_adjustment": round(sports_spread_rank_adjustment, 4),
+                        "reason": sports_spread_context.get("reason") or "sports_spread_size_adaptation",
+                    },
+                    marker=("SPORTS-SPREAD-SIZE-UNIFIED", source, ticker, int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         if lane == "SPORTS" and sports_graph_size_multiplier > 0.0:
             pre_graph_size_multiplier = size_multiplier
             size_multiplier = max(0.35, min(1.65, size_multiplier * sports_graph_size_multiplier))
@@ -33427,6 +33872,8 @@ class KalshiSniperBot:
             reasons.append(f"sports_memory_{sports_memory_regime}")
         if lane == "SPORTS" and sports_regime_context.get("has_signal"):
             reasons.append(f"sports_regime_{sports_regime}_{sports_momentum_classification}")
+        if lane == "SPORTS" and sports_spread_context and sports_spread_rank_adjustment < 0.0:
+            reasons.append("sports_spread_adaptive_penalty")
         if lane == "SPORTS" and sports_graph_context:
             reasons.append("sports_graph_lag" if sports_graph_lag_detected else "sports_graph_relationship")
         if duration.get("fast_turnover_boost"):
@@ -33466,6 +33913,9 @@ class KalshiSniperBot:
             "sports_momentum_classification": sports_momentum_classification if lane == "SPORTS" else None,
             "sports_momentum_score": round(sports_momentum_score, 4) if lane == "SPORTS" else None,
             "sports_regime_context": sports_regime_context if lane == "SPORTS" else {},
+            "sports_spread_rank_adjustment": round(sports_spread_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
+            "sports_spread_size_multiplier": round(sports_spread_size_multiplier, 4) if lane == "SPORTS" else None,
+            "sports_spread_context": sports_spread_context if lane == "SPORTS" else {},
             "sports_graph_rank_adjustment": round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
             "sports_graph_size_multiplier": round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None,
             "sports_graph_role": sports_graph_role if lane == "SPORTS" else None,
@@ -33513,6 +33963,9 @@ class KalshiSniperBot:
                 ("sports_regime_type", sports_regime_type if lane == "SPORTS" else None),
                 ("sports_momentum_classification", sports_momentum_classification if lane == "SPORTS" else None),
                 ("sports_momentum_score", round(sports_momentum_score, 4) if lane == "SPORTS" else None),
+                ("sports_spread_context", sports_spread_context if lane == "SPORTS" else None),
+                ("sports_spread_rank_adjustment", round(sports_spread_rank_adjustment, 4) if lane == "SPORTS" else None),
+                ("sports_spread_size_multiplier", round(sports_spread_size_multiplier, 4) if lane == "SPORTS" else None),
                 ("sports_graph_context", sports_graph_context if lane == "SPORTS" else None),
                 ("sports_graph_rank_adjustment", round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else None),
                 ("sports_graph_size_multiplier", round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None),
@@ -33563,6 +34016,9 @@ class KalshiSniperBot:
             "sports_momentum_score": context.get("sports_momentum_score"),
             "sports_regime_rank_adjustment": context.get("sports_regime_rank_adjustment"),
             "sports_regime_size_multiplier": context.get("sports_regime_size_multiplier"),
+            "sports_spread_rank_adjustment": context.get("sports_spread_rank_adjustment"),
+            "sports_spread_size_multiplier": context.get("sports_spread_size_multiplier"),
+            "sports_spread_threshold": (context.get("sports_spread_context") or {}).get("threshold_used") if isinstance(context.get("sports_spread_context"), dict) else None,
             "sports_graph_role": context.get("sports_graph_role"),
             "sports_graph_direction": context.get("sports_graph_direction"),
             "sports_graph_relationship_types": context.get("sports_graph_relationship_types"),
@@ -39094,6 +39550,9 @@ class KalshiSniperBot:
             "sports_regime_rank_adjustment",
             "sports_regime_size_multiplier",
             "sports_regime_aggression_multiplier",
+            "sports_spread_context",
+            "sports_spread_rank_adjustment",
+            "sports_spread_size_multiplier",
             "sports_graph_context",
             "sports_graph_game_id",
             "sports_graph_role",
@@ -39431,6 +39890,42 @@ class KalshiSniperBot:
                         "reason": "sports_regime_dynamic_size_adjustment",
                     },
                     marker=("SPORTS-REGIME-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
+        sports_spread_multiplier = self.to_float(
+            context.get("sports_spread_size_multiplier"),
+            self.to_float(payload.get("sports_spread_size_multiplier"), None),
+        )
+        if (
+            sports_spread_multiplier is not None
+            and sports_spread_multiplier > 0.0
+            and abs(sports_spread_multiplier - 1.0) >= 0.01
+            and unified_multiplier is None
+        ):
+            before_spread_size = chosen
+            spread_multiplier = max(
+                float(AION_SPORTS_SPREAD_MIN_SIZE_MULTIPLIER),
+                min(1.0, float(sports_spread_multiplier)),
+            )
+            chosen = max(1, min(hard_max, int(round(chosen * spread_multiplier))))
+            if chosen != before_spread_size:
+                chosen_label = "sports_spread_size_adjustment"
+                context["sports_spread_size_multiplier_applied"] = round(spread_multiplier, 4)
+                self._emit_sports_spread_log(
+                    "SPORTS-SPREAD-EXECUTE",
+                    {
+                        "source": source or "dynamic_live_entry_size",
+                        "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                        "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                        "requested_size": before_spread_size,
+                        "adjusted_size": chosen,
+                        "sports_spread_size_multiplier": round(spread_multiplier, 4),
+                        "spread": context.get("spread") or payload.get("spread"),
+                        "threshold_used": (context.get("sports_spread_context") or {}).get("threshold_used") if isinstance(context.get("sports_spread_context"), dict) else None,
+                        "rank_adjustment": context.get("sports_spread_rank_adjustment") or payload.get("sports_spread_rank_adjustment"),
+                        "reason": "sports_spread_dynamic_size_adjustment",
+                    },
+                    marker=("SPORTS-SPREAD-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
         sports_graph_multiplier = self.to_float(
@@ -49136,6 +49631,23 @@ class KalshiSniperBot:
         if spread is None or spread < 0:
             return False, "invalid_spread", metrics
         near_miss_margin = round(MAX_ENTRY_SPREAD * 0.1, 4)
+        if self._is_sports_market_or_family(self.get_market_family(market)) and original_reason == "wide_spread":
+            sports_spread_decision = self._sports_adaptive_spread_decision(
+                market,
+                spread=spread,
+                liquidity_priority=liquidity_priority,
+                quote_diag={
+                    "selected_side": "yes",
+                    "selected_price": yes_ask,
+                },
+                context="broad_prefilter_grace",
+                emit_log=False,
+            )
+            metrics["sports_spread_decision"] = sports_spread_decision
+            spread_threshold = self.to_float(sports_spread_decision.get("threshold_used"), spread_threshold)
+            metrics["spread_threshold"] = round(spread_threshold, 4)
+            if sports_spread_decision.get("allowed"):
+                return True, "sports_adaptive_spread_tolerance", metrics
         grace_spread_limit = spread_threshold
         if spread > grace_spread_limit:
             if spread <= grace_spread_limit + near_miss_margin:
@@ -49193,6 +49705,21 @@ class KalshiSniperBot:
         max_top_size = max(yes_top_size, no_top_size)
         top_book_state = liquidity_priority.get("top_book_state") or "unknown"
         topbook_snapshot = liquidity_priority.get("topbook_snapshot") or {}
+        sports_spread_decision = None
+        if original_reason == "wide_spread" and family != "KXBTC15M" and self.get_market_discovery_category(market) == "sports":
+            sports_spread_decision = self._sports_adaptive_spread_decision(
+                market,
+                family=family,
+                spread=spread,
+                liquidity=liquidity,
+                liquidity_priority=liquidity_priority,
+                quote_diag={
+                    "selected_side": "yes",
+                    "selected_price": yes_ask,
+                },
+                context="adaptive_prefilter",
+                emit_log=False,
+            )
         orderbook_present = False
         if self.is_targeted_series_market(market):
             orderbook_present = bool(self.targeted_orderbook_cache.get(ticker, {}).get("orderbook_source"))
@@ -49218,6 +49745,9 @@ class KalshiSniperBot:
             adaptive_reason = "both_sizes_zero"
         elif top_book_state not in ("both_non_zero", "one_non_zero"):
             adaptive_reason = f"top_book_state_{top_book_state}"
+        elif original_reason == "wide_spread" and sports_spread_decision and sports_spread_decision.get("allowed"):
+            adaptive_allowed = True
+            adaptive_reason = sports_spread_decision.get("reason") or "sports_spread_tolerance_applied"
         elif spread is None or spread < 0 or spread > adjusted_thresholds["max_spread"]:
             adaptive_reason = "spread_above_adaptive_limit"
         elif max_top_size < adjusted_thresholds["min_top_size"]:
@@ -49375,7 +49905,20 @@ class KalshiSniperBot:
                 or market_quality.get("both_sides_quoted")
                 or market_quality.get("recent_activity")
             )
-            activation_spread_ok = bool(spread is None or (0.0 <= spread <= AION_SPORTS_MAX_SPREAD_SOFT))
+            activation_spread_decision = self._sports_adaptive_spread_decision(
+                market,
+                q=q,
+                family=family,
+                spread=spread,
+                liquidity_priority=liquidity_priority,
+                quote_diag={
+                    "selected_side": getattr(q, "selected_side", None),
+                    "selected_price": getattr(q, "selected_price", None) or yes_ask or no_ask,
+                },
+                context="activation_status",
+                emit_log=False,
+            )
+            activation_spread_ok = bool(spread is None or activation_spread_decision.get("allowed"))
             sports_activation_override = bool(
                 family_survivors > 0
                 and activation_price_ready
@@ -50043,6 +50586,11 @@ class KalshiSniperBot:
                 yes_ask = self.to_float(market.get("yes_ask_dollars", market.get("yes_ask")))
                 no_bid = self.to_float(market.get("no_bid_dollars", market.get("no_bid")))
                 no_ask = self.to_float(market.get("no_ask_dollars", market.get("no_ask")))
+                if self._is_sports_market_or_family(family):
+                    yes_bid = self._sports_spread_price_value(yes_bid)
+                    yes_ask = self._sports_spread_price_value(yes_ask)
+                    no_bid = self._sports_spread_price_value(no_bid)
+                    no_ask = self._sports_spread_price_value(no_ask)
                 volume = self.to_float(market.get("volume_fp", market.get("volume")), 0.0)
                 liquidity = self.to_float(market.get("liquidity_dollars"), 0.0)
                 min_liquidity = self.get_market_min_entry_liquidity(market)
@@ -50090,7 +50638,23 @@ class KalshiSniperBot:
                 )
                 if spread >= 0 and spread <= min(MAX_ENTRY_SPREAD / 2.0, adaptive_spread_limit):
                     narrow_spread += 1
-                if spread < 0 or (spread > adaptive_spread_limit and not sports_topbook_executable):
+                sports_family_rank_spread = None
+                if self._is_sports_market_or_family(family) and spread > adaptive_spread_limit:
+                    sports_family_rank_spread = self._sports_adaptive_spread_decision(
+                        market,
+                        family=family,
+                        spread=spread,
+                        liquidity=liquidity,
+                        liquidity_priority=liquidity_priority,
+                        quote_diag={"selected_side": "yes", "selected_price": yes_ask},
+                        context="family_rank",
+                        emit_log=False,
+                    )
+                if spread < 0 or (
+                    spread > adaptive_spread_limit
+                    and not sports_topbook_executable
+                    and not bool(sports_family_rank_spread and sports_family_rank_spread.get("allowed"))
+                ):
                     wide_spread += 1
                     continue
                 liquidity_fix = self._resolve_effective_liquidity_signal(
@@ -50449,6 +51013,10 @@ class KalshiSniperBot:
             yes_ask = yes_ask if yes_ask is not None else (continuity_q.yes_ask if continuity_q.yes_ask > 0 else None)
             no_bid = no_bid if no_bid is not None else (continuity_q.no_bid if continuity_q.no_bid > 0 else None)
             no_ask = no_ask if no_ask is not None else (continuity_q.no_ask if continuity_q.no_ask > 0 else None)
+            yes_bid = self._sports_spread_price_value(yes_bid)
+            yes_ask = self._sports_spread_price_value(yes_ask)
+            no_bid = self._sports_spread_price_value(no_bid)
+            no_ask = self._sports_spread_price_value(no_ask)
         yes_bid_num = self.to_float(yes_bid, None)
         yes_ask_num = self.to_float(yes_ask, None)
         no_bid_num = self.to_float(no_bid, None)
@@ -50486,16 +51054,53 @@ class KalshiSniperBot:
                 return True, None, family
             return False, "missing_quotes", family
         spread = yes_ask - yes_bid
-        adaptive_spread_limit = self._get_sports_adaptive_spread_threshold(
-            market,
-            spread=spread,
-            liquidity=liquidity,
-            context="coarse_prefilter",
-        ).get("adaptive_threshold", MAX_ENTRY_SPREAD) if self._is_sports_market_or_family(family) and series_ticker != "KXBTC15M" else MAX_ENTRY_SPREAD
+        sports_spread_decision = None
+        if self._is_sports_market_or_family(family) and series_ticker != "KXBTC15M":
+            liquidity_priority_for_spread = self.get_market_liquidity_priority(market)
+            sports_spread_decision = self._sports_adaptive_spread_decision(
+                market,
+                family=family,
+                spread=spread,
+                liquidity=liquidity,
+                liquidity_priority=liquidity_priority_for_spread,
+                quote_diag={
+                    "selected_side": "yes",
+                    "selected_price": yes_ask,
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                    "no_bid": no_bid,
+                    "no_ask": no_ask,
+                },
+                context="coarse_prefilter",
+            )
+            market["_sports_spread_context"] = sports_spread_decision
+            adaptive_spread_limit = self.to_float(
+                sports_spread_decision.get("strict_threshold"),
+                self.to_float(sports_spread_decision.get("threshold_used"), MAX_ENTRY_SPREAD),
+            )
+        else:
+            adaptive_spread_limit = MAX_ENTRY_SPREAD
         if spread < 0 or spread > adaptive_spread_limit:
+            if sports_spread_decision and sports_spread_decision.get("allowed"):
+                self._emit_sports_spread_log(
+                    "SPORTS-SPREAD-PASS",
+                    {
+                        **sports_spread_decision,
+                        "reason": "prefilter_wide_spread_converted_to_rank_penalty",
+                        "old_hard_limit": round(float(MAX_ENTRY_SPREAD), 4),
+                    },
+                    marker=("SPORTS-SPREAD-PASS-PREFILTER", ticker, int(time.time() // 180)),
+                )
+                return True, None, family
             adaptive_allowed, _adaptive_reason = self._evaluate_adaptive_prefilter(market, "wide_spread")
             if adaptive_allowed:
                 return True, None, family
+            if sports_spread_decision:
+                self._emit_sports_spread_log(
+                    "SPORTS-SPREAD-SKIP",
+                    sports_spread_decision,
+                    marker=("SPORTS-SPREAD-SKIP-PREFILTER", ticker, sports_spread_decision.get("reason"), int(time.time() // 180)),
+                )
             return False, "wide_spread", family
         liquidity_priority = self.get_market_liquidity_priority(market)
         liquidity_fix = self._resolve_effective_liquidity_signal(
@@ -50822,6 +51427,32 @@ class KalshiSniperBot:
             log=True,
         ) if market_category == "sports" else {"boost": 0.0, "tags": []}
         sports_edge_rank_boost = self.to_float(sports_edge_rank_context.get("boost"), 0.0) if isinstance(sports_edge_rank_context, dict) else 0.0
+        sports_spread_context = {}
+        sports_spread_rank_adjustment = 0.0
+        if market_category == "sports":
+            cached_spread_context = market.get("_sports_spread_context") if isinstance(market.get("_sports_spread_context"), dict) else {}
+            sports_spread_context = cached_spread_context or self._sports_adaptive_spread_decision(
+                market,
+                q=quote_payload,
+                family=family,
+                spread=spread,
+                liquidity=liquidity,
+                liquidity_priority=liquidity_priority,
+                context="presolve_rank",
+                emit_log=False,
+            )
+            if sports_spread_context.get("allowed"):
+                sports_spread_rank_adjustment = self.to_float(sports_spread_context.get("rank_adjustment"), 0.0) or 0.0
+                if abs(sports_spread_rank_adjustment) >= 0.01:
+                    self._emit_sports_spread_log(
+                        "SPORTS-SPREAD-ADAPT",
+                        {
+                            **sports_spread_context,
+                            "score_effect": round(sports_spread_rank_adjustment, 4),
+                            "reason": "presolve_rank_penalty_not_prefilter_block",
+                        },
+                        marker=("SPORTS-SPREAD-PRESOLVE", ticker, int(time.time() // 180)),
+                    )
         liquidity_priority_profile = self._compute_liquidity_priority_score(
             market,
             q=quote_payload,
@@ -50937,6 +51568,7 @@ class KalshiSniperBot:
             + sports_priority_component
             + sports_edge_component
             + sports_edge_rank_boost
+            + sports_spread_rank_adjustment
             + elite_signal_component
         )
         selector_score_before = round(score, 4)
@@ -51041,6 +51673,7 @@ class KalshiSniperBot:
                 "sports_priority": round(sports_priority_component, 4),
                 "sports_edge": round(sports_edge_component, 4),
                 "sports_edge_rank_boost": round(sports_edge_rank_boost, 4),
+                "sports_spread": round(sports_spread_rank_adjustment, 4),
                 "elite_public_signal": round(elite_signal_component, 4),
                 "liquidity_priority_boost": round(liquidity_priority_boost, 4),
             },
@@ -51048,6 +51681,7 @@ class KalshiSniperBot:
             "sports_priority_profile": sports_priority_profile,
             "sports_edge_profile": sports_edge,
             "sports_edge_context": sports_edge_rank_context,
+            "sports_spread_context": sports_spread_context,
             "liquidity_priority_profile": liquidity_priority_profile,
             "market_priority_profile": market_priority_profile,
             "selector_score_before": selector_score_before,
@@ -67312,6 +67946,8 @@ class KalshiSniperBot:
         game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
         sports_regime_context = getattr(q, "sports_regime_context", None) or {}
         sports_regime_context = sports_regime_context if isinstance(sports_regime_context, dict) else {}
+        sports_spread_context = getattr(q, "sports_spread_context", None) or {}
+        sports_spread_context = sports_spread_context if isinstance(sports_spread_context, dict) else {}
         sports_ladder_context = getattr(q, "sports_ladder_context", None) or {}
         sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
         sports_graph_context = getattr(q, "sports_graph_context", None) or {}
@@ -67338,6 +67974,10 @@ class KalshiSniperBot:
             "sports_regime_rank_adjustment": getattr(q, "sports_regime_rank_adjustment", None) or sports_regime_context.get("rank_adjustment"),
             "sports_regime_size_multiplier": getattr(q, "sports_regime_size_multiplier", None) or sports_regime_context.get("size_multiplier"),
             "sports_regime_aggression_multiplier": getattr(q, "sports_regime_aggression_multiplier", None) or sports_regime_context.get("aggression_multiplier"),
+            "sports_spread_context": sports_spread_context,
+            "sports_spread_rank_adjustment": getattr(q, "sports_spread_rank_adjustment", None) or sports_spread_context.get("rank_adjustment"),
+            "sports_spread_size_multiplier": getattr(q, "sports_spread_size_multiplier", None) or sports_spread_context.get("size_multiplier"),
+            "sports_spread_threshold": sports_spread_context.get("threshold_used"),
             "sports_graph_context": sports_graph_context,
             "sports_graph_game_id": getattr(q, "sports_graph_game_id", None) or sports_graph_context.get("game_id"),
             "sports_graph_role": getattr(q, "sports_graph_role", None) or sports_graph_context.get("role"),

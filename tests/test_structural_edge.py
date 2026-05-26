@@ -21,6 +21,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.sports_ladder_log_markers = {}
         bot.sports_regime_log_markers = {}
         bot.sports_graph_log_markers = {}
+        bot.sports_spread_log_markers = {}
         bot.last_sports_graph_contexts = {}
         bot.last_sports_ladder_plan = {}
         bot.last_sports_ladder_execution_summary = {}
@@ -4175,6 +4176,174 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertFalse(result["armed"])
         self.assertIn("no_prefilter_survivors", result["denied_reasons"])
+
+    def test_sports_wide_spread_prefilter_converts_to_adaptive_pass(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA1HTOTAL-WIDE-TEST",
+            "series_ticker": "KXNBA1HTOTAL",
+            "status": "open",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 0.40,
+            "yes_ask": 0.58,
+            "no_bid": 0.42,
+            "no_ask": 0.60,
+            "volume": 12,
+            "open_interest": 80,
+            "liquidity_dollars": 30,
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 6,
+            "no_top_size": 6,
+            "both_sides_quoted": True,
+            "liquidity_final": 30,
+        }
+        bot.build_quote = lambda market_arg: SimpleNamespace(
+            ticker=market["ticker"],
+            yes_bid=0.40,
+            yes_ask=0.58,
+            no_bid=0.42,
+            no_ask=0.60,
+            liquidity=30,
+            volume=12,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allowed, reason, family = bot.coarse_prefilter(market)
+
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+        self.assertEqual(family, "KXNBA1HTOTAL")
+        self.assertIn("_sports_spread_context", market)
+        self.assertEqual(market["_sports_spread_context"]["threshold_before"], kw.MAX_ENTRY_SPREAD)
+        self.assertGreater(market["_sports_spread_context"]["threshold_used"], kw.MAX_ENTRY_SPREAD)
+        self.assertLess(market["_sports_spread_context"]["size_multiplier"], 1.0)
+
+    def test_sports_absurd_spread_still_rejected_as_bad_book(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA1HTOTAL-BROKEN-TEST",
+            "series_ticker": "KXNBA1HTOTAL",
+            "status": "open",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 0.08,
+            "yes_ask": 0.82,
+            "no_bid": 0.18,
+            "no_ask": 0.92,
+            "volume": 10,
+            "open_interest": 60,
+            "liquidity_dollars": 30,
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 8,
+            "no_top_size": 8,
+            "both_sides_quoted": True,
+            "liquidity_final": 30,
+        }
+        bot.build_quote = lambda market_arg: SimpleNamespace(
+            ticker=market["ticker"],
+            yes_bid=0.08,
+            yes_ask=0.82,
+            no_bid=0.18,
+            no_ask=0.92,
+            liquidity=30,
+            volume=10,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allowed, reason, _family = bot.coarse_prefilter(market)
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "wide_spread")
+        self.assertEqual(market["_sports_spread_context"]["reason"], "spread_absurd_unusable")
+
+    def test_non_sports_wide_spread_remains_strict(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXFEDRATE-WIDE-TEST",
+            "series_ticker": "KXFEDRATE",
+            "status": "open",
+            "yes_bid": 0.40,
+            "yes_ask": 0.58,
+            "no_bid": 0.42,
+            "no_ask": 0.60,
+            "volume": 100,
+            "liquidity_dollars": 100,
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 10,
+            "no_top_size": 10,
+            "both_sides_quoted": True,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allowed, reason, _family = bot.coarse_prefilter(market)
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "wide_spread")
+
+    def test_sports_wide_spread_reduces_ranking_and_size_without_blocking(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-WIDE-RANK",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.58,
+            yes_bid=0.40,
+            yes_ask=0.58,
+            no_bid=0.42,
+            no_ask=0.60,
+            liquidity=40,
+            volume=20,
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": q.family,
+            "status": "open",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 0.40,
+            "yes_ask": 0.58,
+            "no_bid": 0.42,
+            "no_ask": 0.60,
+            "volume": 20,
+            "liquidity_dollars": 40,
+            "open_interest": 100,
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 8,
+            "no_top_size": 8,
+            "both_sides_quoted": True,
+            "liquidity_final": 40,
+        }
+        item = {
+            "q": q,
+            "family": q.family,
+            "spread": 0.18,
+            "raw_score": 82.0,
+            "adjusted_score": 82.0,
+            "expectancy_summary": {
+                "final_edge": 0.025,
+                "edge_after_cost": 0.025,
+                "expectancy_score": 0.72,
+                "sports_edge_after_cost": 0.025,
+            },
+            "sports_edge_context": {"boost": 4.0, "tags": ["SPORTS_GOOD_BOOK"]},
+            "quality_snapshot": {"selected_price": 0.58, "liquidity_depth": 40, "spread": 0.18, "confidence_score": 0.72},
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allocation = bot._build_lane_allocation_context(item, market=market)
+            context = bot._build_unified_opportunity_context(item, market=market, allocation=allocation, source="unit_test_spread")
+
+        self.assertEqual(allocation["lane"], "SPORTS")
+        self.assertLess(allocation["sports_spread_rank_adjustment"], 0.0)
+        self.assertLess(allocation["sports_spread_size_multiplier"], 1.0)
+        self.assertLess(context["sports_spread_size_multiplier"], 1.0)
+        self.assertGreater(context["unified_score"], 0.0)
 
     def test_crypto_eligibility_helper_does_not_apply_to_sports_candidate(self):
         bot = self._make_bot()
