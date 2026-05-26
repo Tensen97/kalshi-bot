@@ -316,6 +316,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-SPORTS-ONLY-DISCOVERY",
     "AION-SPORTS-ONLY-RANK",
     "AION-SPORTS-ONLY-SUBMIT",
+    "SPORTS-MEMORY",
+    "SPORTS-REGIME",
+    "SPORTS-ADAPT",
+    "SPORTS-SIZING",
     "AION-CRYPTO-EXECUTION-BLOCK",
     "AION-SPORTS-ONLY-ALLOW",
     "AION-CRYPTO-LANE-WINNER",
@@ -2004,6 +2008,13 @@ AION_SPORTS_TRASH_PROP_SKIP_PENALTY = get_env_float("AION_SPORTS_TRASH_PROP_SKIP
 AION_SPORTS_TRASH_EXCEPTION_EDGE = get_env_float("AION_SPORTS_TRASH_EXCEPTION_EDGE", 0.020)
 AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE = get_env_float("AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE", 0.70)
 AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY = get_env_float("AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY", 80.0)
+AION_SPORTS_MEMORY_ENABLED = get_env_bool("AION_SPORTS_MEMORY_ENABLED", 1)
+AION_SPORTS_MEMORY_MAX_RECORDS = get_env_int("AION_SPORTS_MEMORY_MAX_RECORDS", 600)
+AION_SPORTS_MEMORY_MIN_EFFECT_SAMPLES = get_env_int("AION_SPORTS_MEMORY_MIN_EFFECT_SAMPLES", 3)
+AION_SPORTS_MEMORY_MAX_RANK_BOOST = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_BOOST", 5.5)
+AION_SPORTS_MEMORY_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_PENALTY", 4.0)
+AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER", 0.82)
+AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER", 1.22)
 AION_DUAL_LANE_SECONDARY_ENABLED = get_env_bool("AION_DUAL_LANE_SECONDARY_ENABLED", 1)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -2080,6 +2091,7 @@ if not callable(globals().get("runtime_env_path")):
         return fallback if fallback is not None else _Path("/tmp") / str(_name)
 TRADE_LOG_CSV = runtime_state_file("kalshi_trade_log.csv")
 LIVE_POSITION_STATE_FILE = runtime_state_file("live_position_state.json")
+AION_SPORTS_MEMORY_FILE = runtime_memory_file("aion_adaptive_sports_memory.json")
 MARKET_PERSONALITY_PROFILE_FILE = runtime_state_file("market_personality_profiles.json")
 STATUS_EVERY_N_CYCLES = 1
 SHOW_TOP_CANDIDATES = 3
@@ -2421,6 +2433,22 @@ class KalshiSniperBot:
         self.last_dual_lane_buy_candidates = []
         self.last_dual_lane_execution_summary = {}
         self.sports_only_log_markers = {}
+        self.aion_sports_memory_file = str(AION_SPORTS_MEMORY_FILE)
+        self.aion_sports_memory_state = None
+        self.sports_memory_log_markers = {}
+        print(
+            "[SPORTS-MEMORY] "
+            + json.dumps(
+                {
+                    "enabled": bool(AION_SPORTS_MEMORY_ENABLED),
+                    "path": self.aion_sports_memory_file,
+                    "mode": "adaptive_live_sports_memory",
+                    "effect": "rank_aggression_sizing_only_no_hard_block",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         if AION_SPORTS_ONLY_MODE:
             self._emit_sports_only_execution_log(
                 "AION-SPORTS-ONLY-MODE",
@@ -2496,6 +2524,7 @@ class KalshiSniperBot:
         try:
             runtime_paths_payload = verify_runtime_paths(extra_paths=[
                 LIVE_POSITION_STATE_FILE,
+                AION_SPORTS_MEMORY_FILE,
                 SERAPH_MEMORY_SQLITE_PATH,
                 REALM_XV_SNAPSHOT_FILE,
                 REALM_XVI_STATE_FILE,
@@ -9174,6 +9203,13 @@ class KalshiSniperBot:
                 self._learning_archive_value(sources, "sports_edge_boost", "sports_edge_rank_boost", "sports_edge_score_boost")
                 or sports_context.get("boost")
             )
+            sports_memory_context = self._learning_archive_value(sources, "sports_memory_context")
+            sports_memory_context = sports_memory_context if isinstance(sports_memory_context, dict) else {}
+            sports_memory_dimensions = (
+                self._learning_archive_value(sources, "sports_memory_dimensions")
+                or sports_memory_context.get("dimensions")
+            )
+            sports_memory_dimensions = sports_memory_dimensions if isinstance(sports_memory_dimensions, dict) else {}
             price = self._learning_archive_float(
                 self._learning_archive_value(
                     sources,
@@ -9218,6 +9254,17 @@ class KalshiSniperBot:
                 "elite_signal_used": elite_signal_used,
                 "elite_trader_handle": elite_trader_handle,
                 "elite_boost_used": elite_boost_used,
+                "sports_memory_context": sports_memory_context,
+                "sports_memory_dimensions": sports_memory_dimensions,
+                "sports_memory_regime": self._learning_archive_value(sources, "sports_memory_regime") or sports_memory_context.get("regime"),
+                "sports_memory_rank_adjustment": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_memory_rank_adjustment")
+                    or sports_memory_context.get("rank_adjustment")
+                ),
+                "sports_memory_size_multiplier": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_memory_size_multiplier")
+                    or sports_memory_context.get("size_multiplier")
+                ),
             }
             if event_type in {"candidate_seen", "trade_opened"}:
                 event.update(
@@ -9379,6 +9426,8 @@ class KalshiSniperBot:
                     )
                 )
             self._record_aion_distilled_memory_event(event_type, event)
+            if event_type == "trade_closed":
+                self._record_sports_memory_trade_event(event)
             return {"ok": True, "path": str(archive_path), "event_type": event_type}
         except Exception as exc:
             try:
@@ -9393,6 +9442,761 @@ class KalshiSniperBot:
             except Exception:
                 pass
             return {"ok": False, "reason": exc.__class__.__name__}
+
+    def _sports_memory_path(self):
+        return str(getattr(self, "aion_sports_memory_file", None) or AION_SPORTS_MEMORY_FILE)
+
+    def _sports_memory_default_state(self):
+        return {"version": 1, "updated_at": None, "records": []}
+
+    def _load_sports_memory_state(self, *, force=False):
+        path = self._sports_memory_path()
+        cached = getattr(self, "aion_sports_memory_state", None)
+        if (
+            not force
+            and isinstance(cached, dict)
+            and getattr(self, "aion_sports_memory_loaded_path", None) == path
+        ):
+            return cached
+        state = self._sports_memory_default_state()
+        try:
+            loaded = self._load_json_file(path, default=state)
+            if isinstance(loaded, dict):
+                state.update(loaded)
+        except Exception:
+            state = self._sports_memory_default_state()
+        records = state.get("records")
+        if not isinstance(records, list):
+            records = []
+        state["records"] = [
+            record for record in records
+            if isinstance(record, dict) and str(record.get("ticker") or "").strip()
+        ][-max(1, int(AION_SPORTS_MEMORY_MAX_RECORDS or 600)):]
+        self.aion_sports_memory_state = state
+        self.aion_sports_memory_loaded_path = path
+        return state
+
+    def _save_sports_memory_state(self, state=None):
+        state = state if isinstance(state, dict) else self._load_sports_memory_state()
+        state["version"] = 1
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        records = state.get("records") if isinstance(state.get("records"), list) else []
+        state["records"] = records[-max(1, int(AION_SPORTS_MEMORY_MAX_RECORDS or 600)):]
+        self.aion_sports_memory_state = state
+        self.aion_sports_memory_loaded_path = self._sports_memory_path()
+        return self._save_json_file(self._sports_memory_path(), state)
+
+    def _emit_sports_memory_log(self, tag, payload, marker=None, cooldown_seconds=300.0):
+        tag = str(tag or "SPORTS-MEMORY").strip().upper()
+        payload = payload if isinstance(payload, dict) else {}
+        markers = getattr(self, "sports_memory_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self.sports_memory_log_markers = markers
+        now_ts = time.time()
+        marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+        if marker_key is not None:
+            previous_ts = self.to_float(markers.get(marker_key), 0.0) or 0.0
+            if now_ts - previous_ts < float(cooldown_seconds or 0.0):
+                return
+            markers[marker_key] = now_ts
+            if len(markers) > 1500:
+                cutoff = now_ts - 7200.0
+                self.sports_memory_log_markers = {
+                    key: value for key, value in markers.items()
+                    if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"[{tag}] " + json.dumps({"reason": "sports_memory_log_failed"}))
+
+    def _sports_memory_read_value(self, sources, *names):
+        for source in sources or []:
+            if source is None:
+                continue
+            for name in names:
+                if isinstance(source, dict):
+                    value = source.get(name)
+                else:
+                    value = getattr(source, name, None)
+                if value not in (None, "", [], {}):
+                    return value
+        return None
+
+    def _sports_memory_price(self, value):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        if 1.0 < numeric <= 100.0:
+            numeric = numeric / 100.0
+        return round(float(numeric), 6) if 0.0 < float(numeric) < 1.0 else None
+
+    def _sports_memory_sport_type(self, family=None, ticker=None, title=None):
+        text = " ".join(str(value or "").upper() for value in (family, ticker, title) if str(value or "").strip())
+        family = str(family or "").upper()
+        if family.startswith("KXWNBA") or "WNBA" in text:
+            return "wnba"
+        if family.startswith("KXNBA") or " NBA" in f" {text}":
+            return "nba"
+        if family.startswith("KXMLB") or " MLB" in f" {text}" or "BASEBALL" in text:
+            return "mlb"
+        if family.startswith("KXNFL") or " NFL" in f" {text}":
+            return "nfl"
+        if family.startswith("KXNHL") or " NHL" in f" {text}" or "HOCKEY" in text:
+            return "nhl"
+        if family.startswith(("KXNCAAB", "KXCBB")) or "NCAAB" in text or "COLLEGE BASKETBALL" in text:
+            return "ncaab"
+        if family.startswith(("KXNCAAF", "KXCFB")) or "NCAAF" in text or "COLLEGE FOOTBALL" in text:
+            return "ncaaf"
+        if family.startswith(("KXATP", "KXWTA", "KXITF", "KXTENNIS")) or "TENNIS" in text:
+            return "tennis"
+        if family.startswith("KXGOLF") or "GOLF" in text:
+            return "golf"
+        if family.startswith(("KXEPL", "KXSOCCER")) or "SOCCER" in text or "EPL" in text:
+            return "soccer"
+        if family.startswith(("KXUFC", "KXMMA")) or "UFC" in text or "MMA" in text:
+            return "mma"
+        if family.startswith("KXBOX") or "BOXING" in text:
+            return "boxing"
+        return "sports"
+
+    def _sports_memory_setup_type(self, family=None, ticker=None, title=None, sports_tags=None):
+        text = " ".join(str(value or "").upper() for value in (family, ticker, title) if str(value or "").strip())
+        tags = {str(tag or "").strip().upper() for tag in (sports_tags or []) if str(tag or "").strip()}
+        if "1H" in text or "FIRST HALF" in text:
+            period = "1h_"
+        else:
+            period = ""
+        if "TOTAL" in text or "OVER" in text or "UNDER" in text:
+            return f"{period}total"
+        if "SPREAD" in text:
+            return f"{period}spread"
+        if "MONEYLINE" in text or "WINNER" in text or " TO WIN" in text:
+            return f"{period}moneyline"
+        if any(token in text for token in ("HOME RUN", "HOMER", " HR", "KXMLBHR")):
+            return "player_prop_hr"
+        if any(token in text for token in ("HIT", "RBI", "STRIKEOUT", "TOTAL BASE", "PLAYER PROP", "KXMLBTB", "KXMLBHIT")):
+            return "player_prop"
+        if any(tag.startswith("STRUCTURED") or "LADDER" in tag for tag in tags):
+            return f"{period}ladder"
+        return f"{period}sports_market" if period else "sports_market"
+
+    def _sports_memory_period_bucket(self, family=None, ticker=None, title=None):
+        text = " ".join(str(value or "").upper() for value in (family, ticker, title) if str(value or "").strip())
+        if any(token in text for token in ("1H", "FIRST HALF", "FIRST-HALF")):
+            return "1h"
+        if any(token in text for token in ("1Q", "FIRST QUARTER")):
+            return "1q"
+        if any(token in text for token in ("2H", "SECOND HALF")):
+            return "2h"
+        return "full_game"
+
+    def _sports_memory_team_key(self, ticker=None, market=None, title=None):
+        market = market if isinstance(market, dict) else {}
+        raw = str(market.get("event_ticker") or "").strip()
+        if not raw:
+            parts = str(ticker or "").strip().split("-")
+            if len(parts) >= 2:
+                raw = parts[1]
+        if not raw:
+            raw = str(title or "").strip()
+        raw = re.sub(r"[^A-Za-z0-9]+", "_", raw.lower()).strip("_")
+        return raw[:48] if raw else "unknown"
+
+    def _sports_memory_price_bucket(self, price):
+        price = self._sports_memory_price(price)
+        if price is None:
+            return "unknown"
+        if price <= 0.20:
+            return "longshot"
+        if price <= 0.40:
+            return "underdog"
+        if price <= 0.60:
+            return "balanced"
+        if price <= 0.80:
+            return "favorite"
+        return "heavy_favorite"
+
+    def _sports_memory_tte_bucket(self, minutes):
+        minutes = self.to_float(minutes, None)
+        if minutes is None:
+            return "unknown"
+        if minutes <= 0.0:
+            return "in_game_or_settling"
+        if minutes <= 30.0:
+            return "live_window"
+        if minutes <= 90.0:
+            return "same_window"
+        if minutes <= 180.0:
+            return "near_future"
+        return "future"
+
+    def _sports_memory_volatility_regime(self, spread=None, liquidity=None, explicit=None):
+        explicit = str(explicit or "").strip().lower()
+        if explicit:
+            return explicit[:40]
+        spread = self.to_float(spread, None)
+        liquidity = self.to_float(liquidity, None)
+        if spread is not None and spread >= 0.12:
+            return "unstable_wide_spread"
+        if spread is not None and spread <= 0.025 and (liquidity is None or liquidity >= 40.0):
+            return "stable_tight_book"
+        if liquidity is not None and liquidity < 10.0:
+            return "thin_unstable"
+        if spread is not None and spread >= 0.06:
+            return "active_wide"
+        return "normal"
+
+    def _build_sports_memory_dimensions(self, *, item=None, market=None, q=None, allocation=None, payload=None, event=None, position=None):
+        item = item if isinstance(item, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        allocation = allocation if isinstance(allocation, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        event = event if isinstance(event, dict) else {}
+        position = position if isinstance(position, dict) else {}
+        entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+        if not entry_context and isinstance(position.get("entry_context"), dict):
+            entry_context = position.get("entry_context")
+        expectancy_summary = item.get("expectancy_summary") if isinstance(item.get("expectancy_summary"), dict) else {}
+        quality_snapshot = item.get("quality_snapshot") if isinstance(item.get("quality_snapshot"), dict) else {}
+        sports_context = (
+            item.get("sports_edge_context")
+            if isinstance(item.get("sports_edge_context"), dict)
+            else payload.get("sports_edge_context")
+            if isinstance(payload.get("sports_edge_context"), dict)
+            else entry_context.get("sports_edge_context")
+            if isinstance(entry_context.get("sports_edge_context"), dict)
+            else event.get("sports_edge_context")
+            if isinstance(event.get("sports_edge_context"), dict)
+            else getattr(q, "sports_edge_context", None)
+            if q is not None
+            else {}
+        )
+        sports_context = sports_context if isinstance(sports_context, dict) else {}
+        sources = [event, payload, allocation, item, expectancy_summary, quality_snapshot, position, entry_context, sports_context, market, q]
+        ticker = str(self._sports_memory_read_value(sources, "ticker", "market_ticker") or "").strip()
+        family = str(
+            self._sports_memory_read_value(sources, "family")
+            or (self.get_market_family(market or {"ticker": ticker}) if ticker else "")
+            or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")
+            or "UNKNOWN"
+        ).strip().upper()
+        title = str(self._sports_memory_read_value(sources, "market_title", "title", "event_title") or "").strip()
+        side = self._normalize_live_side(
+            self._sports_memory_read_value(sources, "selected_side", "side", "outcome_side")
+        )
+        selected_price = self._sports_memory_price(
+            self._sports_memory_read_value(sources, "selected_price", "selected_price_dollars", "price", "entry_price")
+        )
+        spread = self.to_float(self._sports_memory_read_value(sources, "spread", "spread_cents"), None)
+        if spread is not None and spread > 1.0 and spread <= 100.0:
+            spread = spread / 100.0
+        liquidity = self.to_float(
+            self._sports_memory_read_value(sources, "liquidity", "liquidity_depth", "liquidity_dollars"),
+            None,
+        )
+        minutes = self.to_float(
+            self._sports_memory_read_value(sources, "time_to_event_minutes", "minutes_to_event", "time_to_expiry_minutes"),
+            None,
+        )
+        if minutes is None and (market or q is not None):
+            try:
+                minutes = self._opportunity_minutes_from_market(market, q=q)
+            except Exception:
+                minutes = None
+        sports_tags_raw = (
+            self._sports_memory_read_value(sources, "sports_tags", "sports_edge_tags")
+            or sports_context.get("tags")
+            or []
+        )
+        if isinstance(sports_tags_raw, str):
+            sports_tags = [tag.strip() for tag in sports_tags_raw.replace(";", ",").split(",") if tag.strip()]
+        elif isinstance(sports_tags_raw, (list, tuple, set)):
+            sports_tags = [str(tag).strip() for tag in sports_tags_raw if str(tag or "").strip()]
+        else:
+            sports_tags = []
+        sport = str(self._sports_memory_read_value(sources, "sport", "sport_type") or "").strip().lower()
+        if not sport:
+            sport = self._sports_memory_sport_type(family=family, ticker=ticker, title=title)
+        setup_type = str(self._sports_memory_read_value(sources, "setup_type") or "").strip().lower()
+        if not setup_type:
+            setup_type = self._sports_memory_setup_type(family=family, ticker=ticker, title=title, sports_tags=sports_tags)
+        period = str(self._sports_memory_read_value(sources, "period", "game_period") or "").strip().lower()
+        if not period:
+            period = self._sports_memory_period_bucket(family=family, ticker=ticker, title=title)
+        spread_range = str(self._sports_memory_read_value(sources, "spread_range", "spread_bucket") or "").strip().lower()
+        if not spread_range:
+            spread_range = self._spread_bucket(spread)
+        tte_bucket = str(self._sports_memory_read_value(sources, "time_to_expiration_bucket", "tte_bucket") or "").strip().lower()
+        if not tte_bucket:
+            tte_bucket = self._sports_memory_tte_bucket(minutes)
+        volatility_regime = self._sports_memory_volatility_regime(
+            spread=spread,
+            liquidity=liquidity,
+            explicit=self._sports_memory_read_value(sources, "volatility_regime", "volatility_bucket"),
+        )
+        price_bucket = self._sports_memory_price_bucket(selected_price)
+        team_key = self._sports_memory_team_key(ticker=ticker, market=market, title=title)
+        entry_structure = str(
+            self._sports_memory_read_value(sources, "entry_structure")
+            or f"{period}:{setup_type}:{side or 'unknown_side'}:{price_bucket}"
+        ).strip().lower()
+        return {
+            "ticker": ticker,
+            "family": family or "UNKNOWN",
+            "category": self.get_market_discovery_category(market if market else (family or ticker or "")),
+            "sport": sport or "sports",
+            "market_family": family or "UNKNOWN",
+            "team": team_key,
+            "setup_type": setup_type or "sports_market",
+            "entry_structure": entry_structure,
+            "spread_range": spread_range or "unknown",
+            "time_to_expiration_bucket": tte_bucket or "unknown",
+            "volatility_regime": volatility_regime or "normal",
+            "period": period or "full_game",
+            "side": side,
+            "price_bucket": price_bucket,
+            "selected_price": selected_price,
+            "spread": self._safe_round(spread, 4, None),
+            "liquidity": self._safe_round(liquidity, 4, None),
+            "sports_tags": sports_tags[:12],
+        }
+
+    def _sports_memory_basic_stats(self, records):
+        records = [
+            record for record in (records or [])
+            if isinstance(record, dict) and self.to_float(record.get("pnl_dollars"), None) is not None
+        ]
+        trades = len(records)
+        if not trades:
+            return {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": None,
+                "pnl_dollars": 0.0,
+                "recent_roi": 0.0,
+                "avg_hold_seconds": None,
+                "avg_slippage": None,
+                "avg_spread": None,
+                "avg_confidence_error": None,
+                "streak": 0,
+            }
+        wins = sum(1 for record in records if self.to_float(record.get("pnl_dollars"), 0.0) > 0.0)
+        losses = sum(1 for record in records if self.to_float(record.get("pnl_dollars"), 0.0) < 0.0)
+        pnl = sum(self.to_float(record.get("pnl_dollars"), 0.0) or 0.0 for record in records)
+        notional = sum(max(0.0, self.to_float(record.get("notional_dollars"), 0.0) or 0.0) for record in records)
+
+        def _avg(field):
+            values = [self.to_float(record.get(field), None) for record in records]
+            values = [value for value in values if value is not None]
+            return round(sum(values) / float(len(values)), 6) if values else None
+
+        streak = 0
+        for record in reversed(records):
+            record_pnl = self.to_float(record.get("pnl_dollars"), 0.0) or 0.0
+            if record_pnl == 0.0:
+                break
+            direction = 1 if record_pnl > 0.0 else -1
+            if streak and (streak > 0) != (direction > 0):
+                break
+            streak += direction
+        return {
+            "trades": trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / float(trades), 6),
+            "pnl_dollars": round(pnl, 6),
+            "recent_roi": round(pnl / max(notional, 0.01), 6),
+            "avg_hold_seconds": _avg("hold_seconds"),
+            "avg_slippage": _avg("slippage"),
+            "avg_spread": _avg("spread"),
+            "avg_confidence_error": _avg("confidence_error"),
+            "streak": streak,
+        }
+
+    def _sports_memory_window_stats(self, records):
+        records = [
+            record for record in (records or [])
+            if isinstance(record, dict) and self.to_float(record.get("pnl_dollars"), None) is not None
+        ]
+        return {
+            "short": self._sports_memory_basic_stats(records[-20:]),
+            "medium": self._sports_memory_basic_stats(records[-80:]),
+            "long": self._sports_memory_basic_stats(records[-240:]),
+        }
+
+    def _sports_memory_component_strength(self, stats):
+        stats = stats if isinstance(stats, dict) else {}
+
+        def _window_strength(window):
+            window = window if isinstance(window, dict) else {}
+            trades = int(window.get("trades") or 0)
+            if trades < max(1, int(AION_SPORTS_MEMORY_MIN_EFFECT_SAMPLES or 3)):
+                return 0.0
+            win_rate = self.to_float(window.get("win_rate"), 0.5)
+            roi = max(-0.75, min(0.75, self.to_float(window.get("recent_roi"), 0.0) or 0.0))
+            avg_pnl = (self.to_float(window.get("pnl_dollars"), 0.0) or 0.0) / max(1, trades)
+            streak = max(-6.0, min(6.0, self.to_float(window.get("streak"), 0.0) or 0.0))
+            confidence_error = self.to_float(window.get("avg_confidence_error"), None)
+            calibration = 0.0
+            if confidence_error is not None:
+                calibration = max(-0.12, min(0.12, (0.35 - confidence_error) * 0.30))
+            reliability = min(1.0, math.sqrt(trades / 18.0))
+            raw = (
+                (win_rate - 0.50) * 1.80
+                + roi * 1.35
+                + max(-0.25, min(0.25, avg_pnl * 0.08))
+                + max(-0.22, min(0.22, streak * 0.045))
+                + calibration
+            )
+            return max(-1.0, min(1.0, raw * reliability))
+
+        short_strength = _window_strength(stats.get("short"))
+        medium_strength = _window_strength(stats.get("medium"))
+        long_strength = _window_strength(stats.get("long"))
+        strength = (short_strength * 0.55) + (medium_strength * 0.30) + (long_strength * 0.15)
+        return round(max(-1.0, min(1.0, strength)), 6)
+
+    def _sports_memory_matching_records(self, records, component, value):
+        value = str(value or "").strip().lower()
+        if not value or value == "unknown":
+            return []
+        matches = []
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            dimensions = record.get("dimensions") if isinstance(record.get("dimensions"), dict) else {}
+            record_value = str(dimensions.get(component) or record.get(component) or "").strip().lower()
+            if record_value and record_value == value:
+                matches.append(record)
+        return matches
+
+    def _get_sports_memory_signal(self, *, item=None, market=None, q=None, allocation=None, payload=None, event=None, dimensions=None, source="ranking", log=True):
+        neutral = {
+            "enabled": bool(AION_SPORTS_MEMORY_ENABLED),
+            "has_signal": False,
+            "rank_adjustment": 0.0,
+            "confidence_adjustment": 0.0,
+            "aggression_multiplier": 1.0,
+            "size_multiplier": 1.0,
+            "regime": "neutral",
+            "sample_count": 0,
+            "components": [],
+            "reason": "sports_memory_no_signal",
+        }
+        if not AION_SPORTS_MEMORY_ENABLED:
+            neutral["reason"] = "sports_memory_disabled"
+            return neutral
+        dimensions = dimensions if isinstance(dimensions, dict) else self._build_sports_memory_dimensions(
+            item=item,
+            market=market,
+            q=q,
+            allocation=allocation,
+            payload=payload,
+            event=event,
+        )
+        if self.get_market_discovery_category(dimensions.get("family") or dimensions.get("ticker") or "") != "sports":
+            neutral["reason"] = "non_sports_memory_ignored"
+            neutral["dimensions"] = dimensions
+            return neutral
+        state = self._load_sports_memory_state()
+        records = state.get("records") if isinstance(state.get("records"), list) else []
+        component_plan = (
+            ("family", dimensions.get("family"), 0.30),
+            ("entry_structure", dimensions.get("entry_structure"), 0.24),
+            ("setup_type", dimensions.get("setup_type"), 0.18),
+            ("sport", dimensions.get("sport"), 0.12),
+            ("period", dimensions.get("period"), 0.07),
+            ("spread_range", dimensions.get("spread_range"), 0.04),
+            ("time_to_expiration_bucket", dimensions.get("time_to_expiration_bucket"), 0.03),
+            ("volatility_regime", dimensions.get("volatility_regime"), 0.02),
+            ("team", dimensions.get("team"), 0.04),
+        )
+        components = []
+        weighted_strength = 0.0
+        total_weight = 0.0
+        sample_count = 0
+        min_samples = max(1, int(AION_SPORTS_MEMORY_MIN_EFFECT_SAMPLES or 3))
+        for component, value, weight in component_plan:
+            matches = self._sports_memory_matching_records(records, component, value)
+            stats = self._sports_memory_window_stats(matches)
+            trades = int((stats.get("long") or {}).get("trades") or 0)
+            if trades <= 0:
+                continue
+            strength = self._sports_memory_component_strength(stats)
+            component_payload = {
+                "component": component,
+                "value": value,
+                "trades": trades,
+                "short_trades": int((stats.get("short") or {}).get("trades") or 0),
+                "win_rate": (stats.get("short") or {}).get("win_rate"),
+                "recent_roi": (stats.get("short") or {}).get("recent_roi"),
+                "pnl_dollars": (stats.get("short") or {}).get("pnl_dollars"),
+                "streak": (stats.get("short") or {}).get("streak"),
+                "strength": strength,
+            }
+            components.append(component_payload)
+            sample_count = max(sample_count, trades)
+            if trades >= min_samples:
+                weighted_strength += strength * float(weight)
+                total_weight += float(weight)
+        if total_weight <= 0.0:
+            neutral.update(
+                {
+                    "dimensions": dimensions,
+                    "sample_count": sample_count,
+                    "components": components[:6],
+                    "reason": "sports_memory_insufficient_samples",
+                }
+            )
+            return neutral
+        memory_strength = max(-1.0, min(1.0, weighted_strength / total_weight))
+        rank_adjustment = (
+            memory_strength * float(AION_SPORTS_MEMORY_MAX_RANK_BOOST)
+            if memory_strength >= 0.0
+            else memory_strength * float(AION_SPORTS_MEMORY_MAX_RANK_PENALTY)
+        )
+        size_multiplier = max(
+            float(AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER),
+            min(float(AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER), 1.0 + (memory_strength * 0.20)),
+        )
+        aggression_multiplier = max(0.88, min(1.14, 1.0 + (memory_strength * 0.12)))
+        regime = "hot" if memory_strength >= 0.18 else "cold" if memory_strength <= -0.18 else "neutral"
+        reason = (
+            "sports_memory_hot_structure"
+            if regime == "hot"
+            else "sports_memory_cold_structure"
+            if regime == "cold"
+            else "sports_memory_mixed_structure"
+        )
+        signal = {
+            "enabled": True,
+            "has_signal": True,
+            "dimensions": dimensions,
+            "memory_strength": round(memory_strength, 6),
+            "rank_adjustment": round(rank_adjustment, 4),
+            "confidence_adjustment": round(memory_strength * 4.0, 4),
+            "aggression_multiplier": round(aggression_multiplier, 4),
+            "size_multiplier": round(size_multiplier, 4),
+            "regime": regime,
+            "sample_count": sample_count,
+            "components": sorted(components, key=lambda row: abs(self.to_float(row.get("strength"), 0.0)), reverse=True)[:6],
+            "reason": reason,
+        }
+        if log:
+            ticker = dimensions.get("ticker")
+            family = dimensions.get("family")
+            marker_bucket = int(time.time() // 300)
+            regime_tag = "SPORTS-REGIME" if regime in {"hot", "cold"} else "SPORTS-MEMORY"
+            self._emit_sports_memory_log(
+                regime_tag,
+                {
+                    "source": source,
+                    "ticker": ticker,
+                    "family": family,
+                    "sport": dimensions.get("sport"),
+                    "setup_type": dimensions.get("setup_type"),
+                    "entry_structure": dimensions.get("entry_structure"),
+                    "regime": regime,
+                    "memory_strength": signal.get("memory_strength"),
+                    "rank_adjustment": signal.get("rank_adjustment"),
+                    "size_multiplier": signal.get("size_multiplier"),
+                    "sample_count": sample_count,
+                    "top_components": signal.get("components"),
+                    "reason": reason,
+                },
+                marker=(regime_tag, source, ticker or family, dimensions.get("entry_structure"), marker_bucket),
+                cooldown_seconds=240.0,
+            )
+        return signal
+
+    def _apply_sports_memory_to_allocation(self, context, *, item=None, market=None, q=None, source="lane_allocation"):
+        context = context if isinstance(context, dict) else {}
+        if str(context.get("lane") or "").strip().upper() != "SPORTS":
+            return context
+        signal = self._get_sports_memory_signal(
+            item=item,
+            market=market,
+            q=q,
+            allocation=context,
+            source=source,
+            log=True,
+        )
+        rank_adjustment = self.to_float(signal.get("rank_adjustment"), 0.0) or 0.0
+        base_adjustment = self.to_float(context.get("allocation_adjustment"), 0.0) or 0.0
+        context["allocation_adjustment"] = round(base_adjustment + rank_adjustment, 4)
+        context["sports_memory_context"] = signal
+        context["sports_memory_dimensions"] = signal.get("dimensions")
+        context["sports_memory_rank_adjustment"] = round(rank_adjustment, 4)
+        context["sports_memory_confidence_adjustment"] = signal.get("confidence_adjustment")
+        context["sports_memory_size_multiplier"] = signal.get("size_multiplier", 1.0)
+        context["sports_memory_aggression_multiplier"] = signal.get("aggression_multiplier", 1.0)
+        context["sports_memory_regime"] = signal.get("regime")
+        if q is not None:
+            for attr_name in (
+                "sports_memory_context",
+                "sports_memory_dimensions",
+                "sports_memory_rank_adjustment",
+                "sports_memory_confidence_adjustment",
+                "sports_memory_size_multiplier",
+                "sports_memory_aggression_multiplier",
+                "sports_memory_regime",
+            ):
+                try:
+                    setattr(q, attr_name, context.get(attr_name))
+                except Exception:
+                    pass
+        if signal.get("has_signal") and abs(rank_adjustment) >= 0.05:
+            self._emit_sports_memory_log(
+                "SPORTS-ADAPT",
+                {
+                    "source": source,
+                    "ticker": context.get("ticker"),
+                    "family": context.get("family"),
+                    "base_allocation_adjustment": round(base_adjustment, 4),
+                    "memory_rank_adjustment": round(rank_adjustment, 4),
+                    "final_allocation_adjustment": context.get("allocation_adjustment"),
+                    "aggression_multiplier": context.get("sports_memory_aggression_multiplier"),
+                    "size_multiplier": context.get("sports_memory_size_multiplier"),
+                    "regime": context.get("sports_memory_regime"),
+                    "reason": signal.get("reason"),
+                },
+                marker=("SPORTS-ADAPT", source, context.get("ticker"), int(time.time() // 180)),
+                cooldown_seconds=180.0,
+            )
+        return context
+
+    def _sports_memory_observation_from_event(self, event):
+        event = event if isinstance(event, dict) else {}
+        if str(event.get("event_type") or "").strip().lower() != "trade_closed":
+            return None
+        dimensions = self._build_sports_memory_dimensions(event=event, payload=event)
+        if self.get_market_discovery_category(dimensions.get("family") or dimensions.get("ticker") or "") != "sports":
+            return None
+        ticker = str(event.get("ticker") or dimensions.get("ticker") or "").strip()
+        if not ticker:
+            return None
+        entry_price = self._sports_memory_price(event.get("entry_price") or event.get("avg_price"))
+        exit_price = self._sports_memory_price(event.get("exit_price") or event.get("price") or event.get("current_price"))
+        contracts = self.to_float(event.get("contracts") or event.get("position_size") or event.get("count"), None)
+        pnl = self.to_float(event.get("pnl_dollars") or event.get("realized_pnl") or event.get("realized_pnl_delta"), None)
+        if pnl is None and entry_price is not None and exit_price is not None and contracts is not None:
+            pnl = round((exit_price - entry_price) * float(contracts), 6)
+        notional = None
+        if entry_price is not None and contracts is not None:
+            notional = round(max(0.0, entry_price * abs(float(contracts))), 6)
+        roi = round(pnl / max(notional or 0.0, 0.01), 6) if pnl is not None else None
+        won = event.get("won")
+        if not isinstance(won, bool) and pnl is not None:
+            won = bool(pnl > 0.0)
+        confidence = self.to_float(event.get("original_confidence") or event.get("confidence") or event.get("sports_score_at_entry"), None)
+        if confidence is not None and confidence > 1.0:
+            confidence = confidence / 100.0
+        confidence_error = None
+        if confidence is not None and isinstance(won, bool):
+            confidence_error = round(abs(float(confidence) - (1.0 if won else 0.0)), 6)
+        slippage = self.to_float(event.get("slippage"), None)
+        expected_entry = self._sports_memory_price(event.get("expected_entry_price") or event.get("selected_price"))
+        if slippage is None and expected_entry is not None and entry_price is not None:
+            slippage = abs(entry_price - expected_entry)
+        close_ts = str(event.get("close_timestamp_utc") or event.get("timestamp_utc") or "").strip()
+        trade_id = str(
+            event.get("sports_memory_trade_id")
+            or event.get("order_id")
+            or f"{ticker}|{event.get('entry_ts')}|{close_ts}|{event.get('exit_reason')}|{pnl}"
+        ).strip()
+        return {
+            "id": hashlib.sha256(trade_id.encode("utf-8")).hexdigest()[:24],
+            "ticker": ticker,
+            "family": dimensions.get("family"),
+            "timestamp_utc": event.get("timestamp_utc") or datetime.now(timezone.utc).isoformat(),
+            "close_timestamp_utc": close_ts or None,
+            "dimensions": dimensions,
+            "sport": dimensions.get("sport"),
+            "setup_type": dimensions.get("setup_type"),
+            "entry_structure": dimensions.get("entry_structure"),
+            "side": dimensions.get("side") or event.get("side"),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "contracts": contracts,
+            "notional_dollars": notional,
+            "pnl_dollars": round(pnl, 6) if pnl is not None else None,
+            "roi": roi,
+            "won": won if isinstance(won, bool) else None,
+            "hold_seconds": self.to_float(event.get("hold_seconds"), None),
+            "slippage": self._safe_round(slippage, 6, None),
+            "spread": self._safe_round(dimensions.get("spread"), 4, None),
+            "spread_quality": self._safe_round(1.0 - min(max(self.to_float(dimensions.get("spread"), 0.0) or 0.0, 0.0), 0.20) / 0.20, 6, None),
+            "confidence": self._safe_round(confidence, 6, None),
+            "confidence_error": confidence_error,
+            "exit_reason": event.get("exit_reason"),
+            "result": event.get("result"),
+        }
+
+    def _record_sports_memory_trade_event(self, event):
+        if not AION_SPORTS_MEMORY_ENABLED:
+            return {"ok": False, "reason": "sports_memory_disabled"}
+        observation = self._sports_memory_observation_from_event(event)
+        if not observation:
+            return {"ok": False, "reason": "not_sports_trade_closed"}
+        state = self._load_sports_memory_state()
+        records = state.get("records") if isinstance(state.get("records"), list) else []
+        record_ids = {str(record.get("id") or "") for record in records if isinstance(record, dict)}
+        if observation.get("id") in record_ids:
+            return {"ok": True, "skipped": True, "reason": "duplicate_sports_memory_record"}
+        records.append(observation)
+        state["records"] = records[-max(1, int(AION_SPORTS_MEMORY_MAX_RECORDS or 600)):]
+        saved = self._save_sports_memory_state(state)
+        signal = self._get_sports_memory_signal(
+            dimensions=observation.get("dimensions"),
+            source="trade_closed",
+            log=False,
+        )
+        self._emit_sports_memory_log(
+            "SPORTS-MEMORY",
+            {
+                "ticker": observation.get("ticker"),
+                "family": observation.get("family"),
+                "sport": observation.get("sport"),
+                "setup_type": observation.get("setup_type"),
+                "entry_structure": observation.get("entry_structure"),
+                "result": observation.get("result"),
+                "won": observation.get("won"),
+                "pnl_dollars": observation.get("pnl_dollars"),
+                "roi": observation.get("roi"),
+                "hold_seconds": observation.get("hold_seconds"),
+                "records": len(state.get("records") or []),
+                "regime": signal.get("regime"),
+                "rank_adjustment": signal.get("rank_adjustment"),
+                "size_multiplier": signal.get("size_multiplier"),
+                "saved": bool(saved),
+                "reason": "trade_closed_memory_update",
+            },
+            marker=("SPORTS-MEMORY-UPDATE", observation.get("id")),
+            cooldown_seconds=0.0,
+        )
+        if signal.get("regime") in {"hot", "cold"}:
+            self._emit_sports_memory_log(
+                "SPORTS-REGIME",
+                {
+                    "ticker": observation.get("ticker"),
+                    "family": observation.get("family"),
+                    "sport": observation.get("sport"),
+                    "setup_type": observation.get("setup_type"),
+                    "entry_structure": observation.get("entry_structure"),
+                    "regime": signal.get("regime"),
+                    "memory_strength": signal.get("memory_strength"),
+                    "sample_count": signal.get("sample_count"),
+                    "rank_adjustment": signal.get("rank_adjustment"),
+                    "size_multiplier": signal.get("size_multiplier"),
+                    "reason": signal.get("reason"),
+                },
+                marker=("SPORTS-REGIME-UPDATE", observation.get("family"), observation.get("entry_structure"), int(time.time() // 180)),
+                cooldown_seconds=120.0,
+            )
+        return {"ok": True, "saved": bool(saved), "record": observation, "signal": signal}
 
     def recent_submitted_order_for_ticker(self, ticker, window_seconds=None):
         ticker = str(ticker or "").strip()
@@ -29595,12 +30399,27 @@ class KalshiSniperBot:
             q=q,
             source="lane_allocation",
         )
+        if context.get("lane") == "SPORTS":
+            context = self._apply_sports_memory_to_allocation(
+                context,
+                item=item,
+                market=market,
+                q=q,
+                source="lane_allocation",
+            )
         if q is not None and context.get("lane") == "SPORTS":
             for attr_name in (
                 "sports_conviction_score",
                 "sports_high_conviction",
                 "sports_weak_prop_reject",
                 "sports_conviction_size_multiplier",
+                "sports_memory_context",
+                "sports_memory_dimensions",
+                "sports_memory_rank_adjustment",
+                "sports_memory_confidence_adjustment",
+                "sports_memory_size_multiplier",
+                "sports_memory_aggression_multiplier",
+                "sports_memory_regime",
             ):
                 try:
                     setattr(q, attr_name, context.get(attr_name))
@@ -29857,6 +30676,22 @@ class KalshiSniperBot:
         family_adjustment = self.to_float(allocation.get("family_profit_memory_adjustment"), self.to_float(item.get("family_profit_memory_adjustment"), 0.0)) or 0.0
         family_pnl = self.to_float(allocation.get("family_pnl"), 0.0) or 0.0
         loss_streak = self.to_float(allocation.get("loss_streak"), 0.0) or 0.0
+        sports_memory_context = allocation.get("sports_memory_context") if isinstance(allocation.get("sports_memory_context"), dict) else {}
+        sports_memory_rank_adjustment = self.to_float(
+            allocation.get("sports_memory_rank_adjustment"),
+            self.to_float(sports_memory_context.get("rank_adjustment"), 0.0),
+        ) or 0.0
+        sports_memory_size_multiplier = self.to_float(
+            allocation.get("sports_memory_size_multiplier"),
+            self.to_float(sports_memory_context.get("size_multiplier"), 1.0),
+        ) or 1.0
+        sports_memory_aggression_multiplier = self.to_float(
+            allocation.get("sports_memory_aggression_multiplier"),
+            self.to_float(sports_memory_context.get("aggression_multiplier"), 1.0),
+        ) or 1.0
+        sports_memory_regime = str(
+            allocation.get("sports_memory_regime") or sports_memory_context.get("regime") or "neutral"
+        ).strip().lower() or "neutral"
         distance_class = str(
             allocation.get("crypto_distance_class")
             or ev_context.get("crypto_distance_class")
@@ -29901,7 +30736,18 @@ class KalshiSniperBot:
             lane_component += min(10.0, repricing_velocity * 0.10)
         elif lane == "SPORTS":
             lane_component += min(22.0, sports_conviction_score * 0.22)
-        memory_component = max(-8.0, min(10.0, historical_boost * 1.3 + family_adjustment * 2.0 + max(0.0, family_pnl) * 0.30 - max(0.0, loss_streak - 1.0) * 1.5))
+        sports_live_memory_component = sports_memory_rank_adjustment if lane == "SPORTS" else 0.0
+        memory_component = max(
+            -10.0,
+            min(
+                12.0,
+                historical_boost * 1.3
+                + family_adjustment * 2.0
+                + max(0.0, family_pnl) * 0.30
+                - max(0.0, loss_streak - 1.0) * 1.5
+                + sports_live_memory_component,
+            ),
+        )
         confidence_component = min(8.0, confidence * 0.08)
         target_component = 0.0
         if distance_class in {"near_range", "near", "in_range"}:
@@ -29937,6 +30783,27 @@ class KalshiSniperBot:
             size_multiplier = min(size_multiplier, 0.55)
         elif capital_lock_penalty >= 10.0:
             size_multiplier = min(size_multiplier, 0.75)
+        if lane == "SPORTS" and sports_memory_size_multiplier > 0.0:
+            pre_memory_size_multiplier = size_multiplier
+            size_multiplier = max(0.35, min(1.65, size_multiplier * sports_memory_size_multiplier))
+            if abs(sports_memory_size_multiplier - 1.0) >= 0.01:
+                self._emit_sports_memory_log(
+                    "SPORTS-SIZING",
+                    {
+                        "source": source,
+                        "ticker": ticker,
+                        "family": family,
+                        "unified_score": unified_score,
+                        "base_size_multiplier": round(pre_memory_size_multiplier, 4),
+                        "sports_memory_size_multiplier": round(sports_memory_size_multiplier, 4),
+                        "final_size_multiplier": round(size_multiplier, 4),
+                        "aggression_multiplier": round(sports_memory_aggression_multiplier, 4),
+                        "regime": sports_memory_regime,
+                        "reason": sports_memory_context.get("reason") or "sports_memory_size_adaptation",
+                    },
+                    marker=("SPORTS-SIZING", source, ticker, int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         reasons = []
         if edge > 0.0:
             reasons.append("positive_edge")
@@ -29944,6 +30811,8 @@ class KalshiSniperBot:
             reasons.append("crypto_momentum")
         if lane == "SPORTS" and sports_conviction_score >= 62.0:
             reasons.append("sports_conviction")
+        if lane == "SPORTS" and sports_memory_context.get("has_signal"):
+            reasons.append(f"sports_memory_{sports_memory_regime}")
         if duration.get("fast_turnover_boost"):
             reasons.append("fast_turnover")
         if duration.get("near_live_boost"):
@@ -29968,6 +30837,11 @@ class KalshiSniperBot:
             "conviction_score": round(sports_conviction_score, 4),
             "historical_boost": round(historical_boost, 4),
             "family_memory": round(family_adjustment, 4),
+            "sports_memory_rank_adjustment": round(sports_memory_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
+            "sports_memory_size_multiplier": round(sports_memory_size_multiplier, 4) if lane == "SPORTS" else None,
+            "sports_memory_aggression_multiplier": round(sports_memory_aggression_multiplier, 4) if lane == "SPORTS" else None,
+            "sports_memory_regime": sports_memory_regime if lane == "SPORTS" else None,
+            "sports_memory_context": sports_memory_context if lane == "SPORTS" else {},
             "confidence": round(confidence, 4),
             "payout_multiple": self._safe_round(payout_multiple, 4, None),
             "target_reachability": distance_class or None,
@@ -29993,9 +30867,15 @@ class KalshiSniperBot:
                 ("capital_lock_penalty", round(capital_lock_penalty, 4)),
                 ("time_to_event_minutes", duration.get("time_to_event_minutes")),
                 ("time_to_expiry_minutes", duration.get("time_to_expiry_minutes")),
+                ("sports_memory_context", sports_memory_context if lane == "SPORTS" else None),
+                ("sports_memory_rank_adjustment", round(sports_memory_rank_adjustment, 4) if lane == "SPORTS" else None),
+                ("sports_memory_size_multiplier", round(sports_memory_size_multiplier, 4) if lane == "SPORTS" else None),
+                ("sports_memory_aggression_multiplier", round(sports_memory_aggression_multiplier, 4) if lane == "SPORTS" else None),
+                ("sports_memory_regime", sports_memory_regime if lane == "SPORTS" else None),
             ):
                 try:
-                    setattr(q, attr_name, attr_value)
+                    if attr_value is not None:
+                        setattr(q, attr_name, attr_value)
                 except Exception:
                     pass
         return context
@@ -30024,6 +30904,9 @@ class KalshiSniperBot:
             "capital_lock_penalty": context.get("capital_lock_penalty"),
             "unified_score": context.get("unified_score"),
             "size_multiplier": context.get("size_multiplier"),
+            "sports_memory_regime": context.get("sports_memory_regime"),
+            "sports_memory_rank_adjustment": context.get("sports_memory_rank_adjustment"),
+            "sports_memory_size_multiplier": context.get("sports_memory_size_multiplier"),
             "reason": context.get("reason"),
         }
         print("[AION-UNIFIED-OPPORTUNITY-SCORE] " + json.dumps(payload, sort_keys=True, default=str))
@@ -30259,6 +31142,11 @@ class KalshiSniperBot:
             allocation["capital_lock_penalty"] = unified_context.get("capital_lock_penalty")
             allocation["time_to_event_minutes"] = unified_context.get("time_to_event_minutes")
             allocation["time_to_expiry_minutes"] = unified_context.get("time_to_expiry_minutes")
+            if lane == "SPORTS":
+                allocation["sports_memory_context"] = allocation.get("sports_memory_context") or unified_context.get("sports_memory_context")
+                allocation["sports_memory_rank_adjustment"] = allocation.get("sports_memory_rank_adjustment", unified_context.get("sports_memory_rank_adjustment"))
+                allocation["sports_memory_size_multiplier"] = allocation.get("sports_memory_size_multiplier", unified_context.get("sports_memory_size_multiplier"))
+                allocation["sports_memory_regime"] = allocation.get("sports_memory_regime", unified_context.get("sports_memory_regime"))
             item["lane_allocation"] = allocation
             item["allocation_score"] = allocation.get("allocation_score")
             item["unified_opportunity_score"] = allocation.get("unified_opportunity_score")
@@ -30330,6 +31218,9 @@ class KalshiSniperBot:
                         "structured_ladder_boost": allocation.get("structured_ladder_boost"),
                         "sports_conviction_score": allocation.get("sports_conviction_score"),
                         "sports_conviction_size_multiplier": allocation.get("sports_conviction_size_multiplier"),
+                        "sports_memory_regime": allocation.get("sports_memory_regime"),
+                        "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
+                        "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
                         "trash_patterns": allocation.get("trash_prop_patterns"),
                         "final_quality_action": allocation.get("final_quality_action"),
                         "final_quality_reason": allocation.get("final_quality_reason"),
@@ -30355,6 +31246,9 @@ class KalshiSniperBot:
                 "structured_ladder_boost": allocation.get("structured_ladder_boost"),
                 "sports_conviction_score": allocation.get("sports_conviction_score"),
                 "sports_conviction_size_multiplier": allocation.get("sports_conviction_size_multiplier"),
+                "sports_memory_regime": allocation.get("sports_memory_regime"),
+                "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
+                "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
                 "final_action": allocation.get("final_quality_action"),
                 "reason": allocation.get("final_quality_reason"),
                 "final_decision": allocation.get("decision"),
@@ -30454,6 +31348,9 @@ class KalshiSniperBot:
                         "trash_prop_penalty": allocation.get("trash_prop_penalty"),
                         "sports_conviction_score": allocation.get("sports_conviction_score"),
                         "sports_conviction_size_multiplier": allocation.get("sports_conviction_size_multiplier"),
+                        "sports_memory_regime": allocation.get("sports_memory_regime"),
+                        "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
+                        "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
                         "sports_quality_reason": allocation.get("final_quality_reason") or allocation.get("reason"),
                         "final_action": allocation.get("final_quality_action"),
                         "final_decision": allocation.get("decision"),
@@ -30693,6 +31590,12 @@ class KalshiSniperBot:
                     ("capital_lock_penalty", allocation.get("capital_lock_penalty") or unified_context.get("capital_lock_penalty")),
                     ("time_to_event_minutes", allocation.get("time_to_event_minutes") or unified_context.get("time_to_event_minutes")),
                     ("time_to_expiry_minutes", allocation.get("time_to_expiry_minutes") or unified_context.get("time_to_expiry_minutes")),
+                    ("sports_memory_context", allocation.get("sports_memory_context") or unified_context.get("sports_memory_context")),
+                    ("sports_memory_dimensions", allocation.get("sports_memory_dimensions") or (allocation.get("sports_memory_context") or {}).get("dimensions")),
+                    ("sports_memory_rank_adjustment", allocation.get("sports_memory_rank_adjustment") or unified_context.get("sports_memory_rank_adjustment")),
+                    ("sports_memory_size_multiplier", allocation.get("sports_memory_size_multiplier") or unified_context.get("sports_memory_size_multiplier")),
+                    ("sports_memory_aggression_multiplier", allocation.get("sports_memory_aggression_multiplier") or unified_context.get("sports_memory_aggression_multiplier")),
+                    ("sports_memory_regime", allocation.get("sports_memory_regime") or unified_context.get("sports_memory_regime")),
                 ):
                     if attr_value is not None:
                         try:
@@ -35314,6 +36217,11 @@ class KalshiSniperBot:
             "sports_conviction_score",
             "sports_high_conviction",
             "sports_conviction_size_multiplier",
+            "sports_memory_context",
+            "sports_memory_rank_adjustment",
+            "sports_memory_size_multiplier",
+            "sports_memory_aggression_multiplier",
+            "sports_memory_regime",
             "unified_opportunity_score",
             "unified_size_multiplier",
             "capital_duration_size_multiplier",
@@ -35554,6 +36462,40 @@ class KalshiSniperBot:
             chosen = max(1, min(hard_max, int(round(chosen * unified_multiplier))))
             chosen_label = "unified_opportunity_size_down"
             context["unified_size_multiplier_applied"] = round(unified_multiplier, 4)
+        sports_memory_multiplier = self.to_float(
+            context.get("sports_memory_size_multiplier"),
+            self.to_float(payload.get("sports_memory_size_multiplier"), None),
+        )
+        if (
+            sports_memory_multiplier is not None
+            and sports_memory_multiplier > 0.0
+            and abs(sports_memory_multiplier - 1.0) >= 0.01
+            and unified_multiplier is None
+        ):
+            before_memory_size = chosen
+            memory_multiplier = max(
+                float(AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER),
+                min(float(AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER), float(sports_memory_multiplier)),
+            )
+            chosen = max(1, min(hard_max, int(round(chosen * memory_multiplier))))
+            if chosen != before_memory_size:
+                chosen_label = "sports_memory_size_adjustment"
+                context["sports_memory_size_multiplier_applied"] = round(memory_multiplier, 4)
+                self._emit_sports_memory_log(
+                    "SPORTS-SIZING",
+                    {
+                        "source": source or "dynamic_live_entry_size",
+                        "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                        "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                        "requested_size": before_memory_size,
+                        "adjusted_size": chosen,
+                        "sports_memory_size_multiplier": round(memory_multiplier, 4),
+                        "regime": context.get("sports_memory_regime") or payload.get("sports_memory_regime"),
+                        "reason": "sports_memory_dynamic_size_adjustment",
+                    },
+                    marker=("SPORTS-SIZING-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         original = self.to_float(explicit_size, None)
         if original is None:
             original = self.to_float(payload.get("count"), None)
@@ -35577,6 +36519,8 @@ class KalshiSniperBot:
                             "CROSS_MARKET_EDGE_SCORE": context.get("CROSS_MARKET_EDGE_SCORE"),
                             "ELITE_EDGE_CONFIDENCE": elite_confidence,
                             "conviction_size_multiplier": context.get("conviction_size_multiplier"),
+                            "sports_memory_size_multiplier": context.get("sports_memory_size_multiplier"),
+                            "sports_memory_regime": context.get("sports_memory_regime"),
                             "elite_size_quality": quality_context,
                         },
                         sort_keys=True,
@@ -62911,12 +63855,48 @@ class KalshiSniperBot:
             if not ticker or ticker in active_tickers or not isinstance(entry, dict):
                 continue
             closed_summary = normalized_by_ticker.get(ticker, {})
+            entry_context = entry.get("entry_context") if isinstance(entry.get("entry_context"), dict) else {}
+            entry_price = self._sports_memory_price(entry.get("entry_price") or entry.get("avg_price"))
+            exit_price = self._sports_memory_price(
+                entry.get("exit_price")
+                or entry.get("exit_pending_price")
+                or closed_summary.get("avg_price")
+                or closed_summary.get("exit_price")
+            )
+            count = self.to_float(entry.get("count") or closed_summary.get("count"), None)
+            realized_pnl = self.to_float(
+                entry.get("realized_pnl")
+                or entry.get("pnl_dollars")
+                or entry.get("unrealized_pnl_at_exit"),
+                None,
+            )
+            if realized_pnl is None and entry_price is not None and exit_price is not None and count is not None:
+                realized_pnl = round((exit_price - entry_price) * abs(float(count)), 6)
+            hold_seconds = self.to_float(entry.get("hold_seconds"), None)
+            if hold_seconds is None and self.to_float(entry.get("entry_ts"), None) is not None:
+                hold_seconds = round(max(0.0, time.time() - float(entry.get("entry_ts"))), 3)
             self.append_aion_learning_archive_event(
                 "trade_closed",
                 position={**entry, **closed_summary, "ticker": ticker},
                 extra={
                     "ticker": ticker,
                     "family": entry.get("family") or self.get_market_family({"ticker": ticker}),
+                    "side": entry.get("side") or closed_summary.get("side"),
+                    "price": exit_price,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "contracts": count,
+                    "count": count,
+                    "pnl_dollars": realized_pnl,
+                    "realized_pnl": realized_pnl,
+                    "hold_seconds": hold_seconds,
+                    "sports_memory_context": entry_context.get("sports_memory_context") if isinstance(entry_context, dict) else {},
+                    "sports_memory_dimensions": entry_context.get("sports_memory_dimensions") if isinstance(entry_context, dict) else {},
+                    "sports_memory_regime": entry_context.get("sports_memory_regime") if isinstance(entry_context, dict) else None,
+                    "sports_memory_rank_adjustment": entry_context.get("sports_memory_rank_adjustment") if isinstance(entry_context, dict) else None,
+                    "sports_memory_size_multiplier": entry_context.get("sports_memory_size_multiplier") if isinstance(entry_context, dict) else None,
+                    "sports_edge_context": entry_context.get("sports_edge_context") if isinstance(entry_context, dict) else {},
+                    "sports_tags": entry_context.get("sports_tags") if isinstance(entry_context, dict) else [],
                     "exit_reason": "position_reconcile_closed",
                     "result": closed_summary.get("status") or "closed",
                     "close_timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -63038,7 +64018,7 @@ class KalshiSniperBot:
             max_live_order_size=MAX_LIVE_ORDER_SIZE,
         )
 
-    def _mark_live_exit_pending(self, ticker, order_id=None):
+    def _mark_live_exit_pending(self, ticker, order_id=None, exit_price=None, exit_reason=None, unrealized_pnl=None):
         ticker = str(ticker or "").strip()
         if not ticker:
             return
@@ -63048,12 +64028,24 @@ class KalshiSniperBot:
             entry["status"] = "exit_pending"
             entry["exit_pending_ts"] = time.time()
             entry["exit_order_id"] = order_id
+            normalized_exit_price = self._sports_memory_price(exit_price)
+            if normalized_exit_price is not None:
+                entry["exit_pending_price"] = normalized_exit_price
+                entry["exit_price"] = normalized_exit_price
+            if exit_reason:
+                entry["exit_reason"] = str(exit_reason)
+            if unrealized_pnl is not None:
+                entry["unrealized_pnl_at_exit"] = self.to_float(unrealized_pnl, None)
             state[ticker] = entry
             self.save_live_position_state(state)
         for position in self.live_positions or []:
             if isinstance(position, dict) and str(position.get("ticker") or "").strip() == ticker:
                 position["status"] = "exit_pending"
                 position["exit_order_id"] = order_id
+                if exit_price is not None:
+                    position["exit_price"] = self._sports_memory_price(exit_price)
+                if exit_reason:
+                    position["exit_reason"] = str(exit_reason)
 
     def submit_live_exit_order(self, position, decision):
         position = position if isinstance(position, dict) else {}
@@ -63105,7 +64097,13 @@ class KalshiSniperBot:
             if result.get("submitted"):
                 self._live_order_timestamps.append(time.time())
                 self.live_exit_cooldowns[ticker] = time.time() + float(LIVE_EXIT_COOLDOWN_SECONDS or 60)
-                self._mark_live_exit_pending(ticker, order_id=order_id)
+                self._mark_live_exit_pending(
+                    ticker,
+                    order_id=order_id,
+                    exit_price=payload.get("price"),
+                    exit_reason=decision.get("reason"),
+                    unrealized_pnl=decision.get("unrealized_pnl"),
+                )
                 self.append_live_audit_log(
                     "live_exit_submitted",
                     ticker=ticker,
@@ -63200,6 +64198,10 @@ class KalshiSniperBot:
         family = self._normalize_family_for_profit_memory(ticker=ticker, q=q)
         sports_context = getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None) or {}
         sports_context = sports_context if isinstance(sports_context, dict) else {}
+        sports_memory_context = getattr(q, "sports_memory_context", None) or {}
+        sports_memory_context = sports_memory_context if isinstance(sports_memory_context, dict) else {}
+        sports_memory_dimensions = getattr(q, "sports_memory_dimensions", None) or sports_memory_context.get("dimensions") or {}
+        sports_memory_dimensions = sports_memory_dimensions if isinstance(sports_memory_dimensions, dict) else {}
         elite_context = getattr(q, "elite_public_signal_context", None) or {}
         elite_context = elite_context if isinstance(elite_context, dict) else {}
         entry_context = {
@@ -63209,6 +64211,11 @@ class KalshiSniperBot:
             "market_title": getattr(q, "market_title", None) or getattr(q, "title", None),
             "sports_edge_context": sports_context,
             "sports_tags": list(sports_context.get("tags") or []),
+            "sports_memory_context": sports_memory_context,
+            "sports_memory_dimensions": sports_memory_dimensions,
+            "sports_memory_regime": getattr(q, "sports_memory_regime", None) or sports_memory_context.get("regime"),
+            "sports_memory_rank_adjustment": getattr(q, "sports_memory_rank_adjustment", None) or sports_memory_context.get("rank_adjustment"),
+            "sports_memory_size_multiplier": getattr(q, "sports_memory_size_multiplier", None) or sports_memory_context.get("size_multiplier"),
             "elite_public_signal_context": elite_context,
             "elite_signal_used": bool(elite_context.get("matched") or getattr(q, "elite_signal_used", False)),
             "elite_trader_handle": getattr(q, "elite_trader_handle", None) or ((elite_context.get("signal") or {}).get("trader_handle") if isinstance(elite_context.get("signal"), dict) else None),
@@ -63244,6 +64251,11 @@ class KalshiSniperBot:
                 "phase_or_realm_source": "record_live_position",
                 "sports_edge_context": sports_context,
                 "sports_tags": list(sports_context.get("tags") or []),
+                "sports_memory_context": sports_memory_context,
+                "sports_memory_dimensions": sports_memory_dimensions,
+                "sports_memory_regime": entry_context.get("sports_memory_regime"),
+                "sports_memory_rank_adjustment": entry_context.get("sports_memory_rank_adjustment"),
+                "sports_memory_size_multiplier": entry_context.get("sports_memory_size_multiplier"),
                 "elite_public_signal_context": elite_context,
                 "elite_signal_used": bool(entry_context.get("elite_signal_used")),
                 "elite_trader_handle": entry_context.get("elite_trader_handle"),

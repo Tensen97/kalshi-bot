@@ -557,6 +557,22 @@ def maybe_auto_reprice_recent_order(
         reprice_payload["no_price"] = new_price_cents
     if recent_order.get("count") not in (None, ""):
         reprice_payload["count"] = recent_order.get("count")
+    reprice_entry_context = reprice_payload.get("entry_context") if isinstance(reprice_payload.get("entry_context"), dict) else {}
+    for field in (
+        "sports_memory_context",
+        "sports_memory_dimensions",
+        "sports_memory_rank_adjustment",
+        "sports_memory_confidence_adjustment",
+        "sports_memory_size_multiplier",
+        "sports_memory_aggression_multiplier",
+        "sports_memory_regime",
+    ):
+        value = getattr(q, field, None) if q is not None else None
+        if value is not None:
+            reprice_payload[field] = value
+            reprice_entry_context.setdefault(field, value)
+    if reprice_entry_context:
+        reprice_payload["entry_context"] = reprice_entry_context
     legacy_payload = bot._normalize_legacy_order_payload(reprice_payload)
     if not legacy_payload:
         _auto_reprice_log("AUTO-REPRICE-SKIP", ticker=ticker, order_id=order_id or None, reason="invalid_reprice_payload")
@@ -605,6 +621,11 @@ def maybe_auto_reprice_recent_order(
                     "sports_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
                     "sports_edge_boost": getattr(q, "sports_edge_rank_boost", None),
                     "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
+                    "sports_memory_context": getattr(q, "sports_memory_context", None),
+                    "sports_memory_dimensions": getattr(q, "sports_memory_dimensions", None),
+                    "sports_memory_regime": getattr(q, "sports_memory_regime", None),
+                    "sports_memory_rank_adjustment": getattr(q, "sports_memory_rank_adjustment", None),
+                    "sports_memory_size_multiplier": getattr(q, "sports_memory_size_multiplier", None),
                     "structural_edge_context": getattr(q, "structural_edge_context", None),
                     "structural_tags": getattr(q, "structural_edge_tags", None),
                     "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),
@@ -812,6 +833,13 @@ def submit_live_order(
         "cross_market_edge_context",
         "sports_edge_context",
         "sports_edge_tags",
+        "sports_memory_context",
+        "sports_memory_dimensions",
+        "sports_memory_rank_adjustment",
+        "sports_memory_confidence_adjustment",
+        "sports_memory_size_multiplier",
+        "sports_memory_aggression_multiplier",
+        "sports_memory_regime",
     ):
         if payload.get(field) is None and q is not None:
             try:
@@ -820,6 +848,22 @@ def submit_live_order(
                 value = None
             if value is not None:
                 payload[field] = value
+    entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+    for field in (
+        "sports_memory_context",
+        "sports_memory_dimensions",
+        "sports_memory_rank_adjustment",
+        "sports_memory_confidence_adjustment",
+        "sports_memory_size_multiplier",
+        "sports_memory_aggression_multiplier",
+        "sports_memory_regime",
+        "sports_edge_context",
+        "sports_edge_tags",
+    ):
+        if payload.get(field) is not None:
+            entry_context.setdefault(field, payload.get(field))
+    if entry_context:
+        payload["entry_context"] = entry_context
     structural_context = payload.get("structural_edge_context") if isinstance(payload.get("structural_edge_context"), dict) else {}
     btc_ladder_context = payload.get("btc_1h_ladder_context") if isinstance(payload.get("btc_1h_ladder_context"), dict) else {}
     if not btc_ladder_context and isinstance(structural_context.get("btc_1h_ladder_context"), dict):
@@ -938,6 +982,11 @@ def submit_live_order(
                     "sports_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
                     "sports_edge_boost": getattr(q, "sports_edge_rank_boost", None),
                     "sports_score_at_entry": getattr(q, "sports_edge_score_at_entry", None),
+                    "sports_memory_context": getattr(q, "sports_memory_context", None),
+                    "sports_memory_dimensions": getattr(q, "sports_memory_dimensions", None),
+                    "sports_memory_regime": getattr(q, "sports_memory_regime", None),
+                    "sports_memory_rank_adjustment": getattr(q, "sports_memory_rank_adjustment", None),
+                    "sports_memory_size_multiplier": getattr(q, "sports_memory_size_multiplier", None),
                     "structural_edge_context": getattr(q, "structural_edge_context", None),
                     "structural_tags": getattr(q, "structural_edge_tags", None),
                     "structural_pattern_keys": getattr(q, "structural_pattern_keys", None),

@@ -42,6 +42,38 @@ class StructuralEdgeTests(unittest.TestCase):
         kw.AION_SPORTS_ONLY_MODE = bool(enabled)
         self.addCleanup(setattr, kw, "AION_SPORTS_ONLY_MODE", old_mode)
 
+    def _set_temp_sports_memory(self, bot, tmpdir):
+        bot.aion_sports_memory_file = str(Path(tmpdir) / "aion_adaptive_sports_memory.json")
+        bot.aion_sports_memory_state = None
+        bot.aion_sports_memory_loaded_path = None
+        bot.sports_memory_log_markers = {}
+
+    def _record_sports_memory_result(self, bot, ticker, *, family="KXNBA1HTOTAL", pnl=0.25, entry_price=0.45, exit_price=0.55):
+        event = {
+            "event_type": "trade_closed",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "close_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "ticker": ticker,
+            "family": family,
+            "category": "sports",
+            "market_title": "NBA 1H total ladder",
+            "side": "yes",
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "price": exit_price,
+            "contracts": 3,
+            "pnl_dollars": pnl,
+            "hold_seconds": 420,
+            "spread": 0.02,
+            "original_confidence": 0.72,
+            "sports_tags": ["SPORTS_GOOD_BOOK", "STRUCTURED_LADDER"],
+            "result": "win" if pnl > 0 else "loss" if pnl < 0 else "breakeven",
+            "exit_reason": "unit_test",
+            "order_id": f"{ticker}-{pnl}-{time.time_ns()}",
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            return bot._record_sports_memory_trade_event(event)
+
     def test_execution_log_mode_keeps_execution_and_suppresses_advisory(self):
         old_mode = kw.AION_LOG_MODE
         old_debug = kw.AION_DEBUG_TELEMETRY
@@ -1135,6 +1167,11 @@ class StructuralEdgeTests(unittest.TestCase):
                 no_bid=0.36,
                 no_ask=0.37,
                 liquidity=100,
+                sports_memory_context={"regime": "hot", "reason": "unit_test_memory"},
+                sports_memory_dimensions={"setup_type": "total", "period": "full_game"},
+                sports_memory_rank_adjustment=2.1,
+                sports_memory_size_multiplier=1.08,
+                sports_memory_regime="hot",
             )
 
             result = bot.submit_live_order(
@@ -1155,6 +1192,8 @@ class StructuralEdgeTests(unittest.TestCase):
             self.assertTrue(result["submitted"])
 
         self.assertEqual([payload["side"] for payload in captured_payloads], ["yes", "no"])
+        self.assertEqual(captured_payloads[0]["entry_context"]["sports_memory_regime"], "hot")
+        self.assertEqual(captured_payloads[0]["entry_context"]["sports_memory_size_multiplier"], 1.08)
 
     def test_sports_only_parallel_submits_only_sports(self):
         self._set_sports_only_mode(True)
@@ -1367,6 +1406,192 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertIn("nba_1h_total_ladder", context["structured_ladder_reasons"])
         self.assertGreater(context["structured_ladder_boost"], 0.0)
         self.assertGreater(context["allocation_score"], context["pre_lane_score"])
+
+    def test_sports_memory_updates_after_completed_trade(self):
+        bot = self._make_bot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._set_temp_sports_memory(bot, tmpdir)
+            result = self._record_sports_memory_result(
+                bot,
+                "KXNBA1HTOTAL-OKCSAS-1125",
+                pnl=0.42,
+                entry_price=0.44,
+                exit_price=0.58,
+            )
+            state = bot._load_sports_memory_state(force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(state["records"]), 1)
+        record = state["records"][0]
+        self.assertEqual(record["family"], "KXNBA1HTOTAL")
+        self.assertEqual(record["sport"], "nba")
+        self.assertEqual(record["setup_type"], "1h_total")
+        self.assertGreater(record["roi"], 0.0)
+        self.assertLess(record["confidence_error"], 0.5)
+
+    def test_sports_memory_ignores_crypto_trade_results(self):
+        bot = self._make_bot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._set_temp_sports_memory(bot, tmpdir)
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = bot._record_sports_memory_trade_event(
+                    {
+                        "event_type": "trade_closed",
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "ticker": "KXBTC15M-26MAY250715-UP",
+                        "family": "KXBTC15M",
+                        "category": "crypto",
+                        "side": "yes",
+                        "entry_price": 0.40,
+                        "exit_price": 0.50,
+                        "contracts": 2,
+                        "pnl_dollars": 0.20,
+                    }
+                )
+            state = bot._load_sports_memory_state(force=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "not_sports_trade_closed")
+        self.assertEqual(state["records"], [])
+
+    def test_sports_memory_profitable_structure_boosts_ranking_and_sizing(self):
+        bot = self._make_bot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._set_temp_sports_memory(bot, tmpdir)
+            for index in range(6):
+                self._record_sports_memory_result(
+                    bot,
+                    f"KXNBA1HTOTAL-OKCSAS-{1120 + index}",
+                    pnl=0.36,
+                    entry_price=0.44,
+                    exit_price=0.56,
+                )
+            q = SimpleNamespace(
+                ticker="KXNBA1HTOTAL-OKCSAS-1135",
+                selected_side="yes",
+                selected_price=0.46,
+                yes_bid=0.44,
+                yes_ask=0.46,
+                no_bid=0.54,
+                no_ask=0.56,
+                liquidity=90,
+            )
+            item = {
+                "raw_score": 70.0,
+                "adjusted_score": 70.0,
+                "q": q,
+                "spread": 0.02,
+                "family": "KXNBA1HTOTAL",
+                "expectancy_summary": {
+                    "final_edge": 0.012,
+                    "sports_edge_after_cost": 0.012,
+                    "selected_side": "yes",
+                    "selected_price": 0.46,
+                    "expectancy_score": 0.64,
+                },
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 90, "spread": 0.02},
+                "sports_edge_context": {"boost": 3.0, "tags": ["SPORTS_GOOD_BOOK", "STRUCTURED_LADDER"]},
+                "ev_context": {"ev_edge": 0.012},
+            }
+            market = {"ticker": q.ticker, "series_ticker": "KXNBA1HTOTAL", "title": "NBA 1H total ladder over 113.5"}
+            with contextlib.redirect_stdout(io.StringIO()):
+                allocation = bot._build_lane_allocation_context(item, market=market)
+                unified = bot._build_unified_opportunity_context(item, market=market, allocation=allocation)
+
+        self.assertEqual(allocation["sports_memory_regime"], "hot")
+        self.assertGreater(allocation["sports_memory_rank_adjustment"], 0.0)
+        self.assertGreater(allocation["sports_memory_size_multiplier"], 1.0)
+        self.assertIn("sports_memory_hot", unified["reason"])
+        self.assertGreater(unified["sports_memory_rank_adjustment"], 0.0)
+
+    def test_sports_memory_losing_structure_reduces_smoothly_without_starving_execution(self):
+        bot = self._make_bot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._set_temp_sports_memory(bot, tmpdir)
+            for index in range(6):
+                self._record_sports_memory_result(
+                    bot,
+                    f"KXNBA1HTOTAL-OKCSAS-COLD-{index}",
+                    pnl=-0.30,
+                    entry_price=0.50,
+                    exit_price=0.40,
+                )
+            q = SimpleNamespace(
+                ticker="KXNBA1HTOTAL-OKCSAS-CANDIDATE",
+                selected_side="yes",
+                selected_price=0.46,
+                yes_bid=0.44,
+                yes_ask=0.46,
+                no_bid=0.54,
+                no_ask=0.56,
+                liquidity=160,
+            )
+            item = {
+                "raw_score": 82.0,
+                "adjusted_score": 82.0,
+                "q": q,
+                "spread": 0.02,
+                "family": "KXNBA1HTOTAL",
+                "expectancy_summary": {
+                    "final_edge": 0.030,
+                    "sports_edge_after_cost": 0.030,
+                    "selected_side": "yes",
+                    "selected_price": 0.46,
+                    "expectancy_score": 0.86,
+                },
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 160, "spread": 0.02},
+                "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK", "STRUCTURED_LADDER"]},
+                "ev_context": {"ev_edge": 0.030},
+            }
+            market = {"ticker": q.ticker, "series_ticker": "KXNBA1HTOTAL", "title": "NBA 1H total ladder over 113.5"}
+            with contextlib.redirect_stdout(io.StringIO()):
+                allocation = bot._build_lane_allocation_context(item, market=market)
+                unified = bot._build_unified_opportunity_context(item, market=market, allocation=allocation)
+
+        self.assertEqual(allocation["sports_memory_regime"], "cold")
+        self.assertLess(allocation["sports_memory_rank_adjustment"], 0.0)
+        self.assertGreaterEqual(allocation["sports_memory_size_multiplier"], kw.AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER)
+        self.assertLess(allocation["sports_memory_size_multiplier"], 1.0)
+        self.assertEqual(allocation["decision"], "ALLOW_STRONG_SPORT")
+        self.assertGreater(allocation["allocation_score"], 0.0)
+        self.assertIn("sports_memory_cold", unified["reason"])
+
+    def test_sports_memory_dynamic_size_adjustment_is_controlled(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-SIZE-TEST",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.42,
+            yes_bid=0.40,
+            yes_ask=0.42,
+            no_bid=0.58,
+            no_ask=0.60,
+            yes_top_size=50,
+            no_top_size=50,
+            liquidity=120,
+            orderbook_ready=True,
+            quote_ready=True,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            resolved = bot._resolve_dynamic_live_entry_size(
+                q,
+                explicit_size=4,
+                payload={
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "count": 4,
+                    "selected_side": "yes",
+                    "selected_price": 0.42,
+                    "sports_memory_size_multiplier": 0.82,
+                    "sports_memory_regime": "cold",
+                },
+                ev_context={"ticker": q.ticker, "family": q.family, "ev_tier": "B"},
+                source="unit_test_sports_memory",
+            )
+
+        self.assertEqual(resolved, 3)
+        self.assertGreaterEqual(resolved, 1)
 
     def test_quality_calibration_allows_exceptional_hr_quality(self):
         bot = self._make_bot()
