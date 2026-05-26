@@ -17,6 +17,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = kw.KalshiSniperBot.__new__(kw.KalshiSniperBot)
         bot.structural_edge_log_markers = {}
         bot.sports_edge_ranking_log_markers = {}
+        bot.game_thesis_log_markers = {}
         bot.sports_momentum_state = {}
         bot.targeted_orderbook_cache = {}
         bot.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
@@ -1194,6 +1195,304 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual([payload["side"] for payload in captured_payloads], ["yes", "no"])
         self.assertEqual(captured_payloads[0]["entry_context"]["sports_memory_regime"], "hot")
         self.assertEqual(captured_payloads[0]["entry_context"]["sports_memory_size_multiplier"], 1.08)
+
+    def test_game_thesis_boosts_aligned_sports_candidates(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        total_1h = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-OKCSAS-1135",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.44,
+            yes_ask=0.46,
+            no_bid=0.54,
+            no_ask=0.56,
+            liquidity=220,
+        )
+        total_full = SimpleNamespace(
+            ticker="KXNBATOTAL-OKCSAS-2245",
+            family="KXNBATOTAL",
+            selected_side="yes",
+            selected_price=0.48,
+            yes_bid=0.46,
+            yes_ask=0.48,
+            no_bid=0.52,
+            no_ask=0.54,
+            liquidity=210,
+        )
+        unrelated = SimpleNamespace(
+            ticker="KXMLBMONEYLINE-NYYBOS-NYY",
+            family="KXMLBMONEYLINE",
+            selected_side="yes",
+            selected_price=0.50,
+            yes_bid=0.48,
+            yes_ask=0.50,
+            no_bid=0.50,
+            no_ask=0.52,
+            liquidity=180,
+        )
+        markets = [
+            {
+                "ticker": total_1h.ticker,
+                "series_ticker": "KXNBA1HTOTAL",
+                "event_ticker": "KXNBA-OKCSAS",
+                "title": "NBA Thunder vs Spurs 1H total over 113.5",
+            },
+            {
+                "ticker": total_full.ticker,
+                "series_ticker": "KXNBATOTAL",
+                "event_ticker": "KXNBA-OKCSAS",
+                "title": "NBA Thunder vs Spurs game total over 224.5",
+            },
+            {
+                "ticker": unrelated.ticker,
+                "series_ticker": "KXMLBMONEYLINE",
+                "event_ticker": "KXMLB-NYYBOS",
+                "title": "MLB Yankees vs Red Sox moneyline",
+            },
+        ]
+        expectancy = {
+            total_1h.ticker: {
+                "expectancy_summary": {"final_edge": 0.038, "selected_side": "yes", "selected_price": 0.46, "expectancy_score": 0.92},
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 220, "spread": 0.02},
+                "sports_edge_context": {"boost": 6.0, "tags": ["SPORTS_GOOD_BOOK", "STRUCTURED_LADDER"]},
+                "ev_context": {"ev_edge": 0.038},
+            },
+            total_full.ticker: {
+                "expectancy_summary": {"final_edge": 0.036, "selected_side": "yes", "selected_price": 0.48, "expectancy_score": 0.90},
+                "quality_snapshot": {"selected_price": 0.48, "liquidity_depth": 210, "spread": 0.02},
+                "sports_edge_context": {"boost": 5.5, "tags": ["SPORTS_GOOD_BOOK", "STRUCTURED_LADDER"]},
+                "ev_context": {"ev_edge": 0.036},
+            },
+            unrelated.ticker: {
+                "expectancy_summary": {"final_edge": 0.024, "selected_side": "yes", "selected_price": 0.50, "expectancy_score": 0.74},
+                "quality_snapshot": {"selected_price": 0.50, "liquidity_depth": 180, "spread": 0.02},
+                "sports_edge_context": {"boost": 2.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.024},
+            },
+        }
+        for ticker, item in expectancy.items():
+            item["q"] = {total_1h.ticker: total_1h, total_full.ticker: total_full, unrelated.ticker: unrelated}[ticker]
+            item["family"] = getattr(item["q"], "family")
+            item["spread"] = 0.02
+            item["raw_score"] = 76.0 if ticker != unrelated.ticker else 78.0
+            item["adjusted_score"] = item["raw_score"]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked = bot._apply_dual_lane_allocation_ranking(
+                [
+                    (76.0, total_1h, 0.02, "KXNBA1HTOTAL"),
+                    (76.0, total_full, 0.02, "KXNBATOTAL"),
+                    (78.0, unrelated, 0.02, "KXMLBMONEYLINE"),
+                ],
+                markets,
+                expectancy_summary_by_ticker=expectancy,
+                source="unit_test_game_thesis",
+            )
+
+        boosted = expectancy[total_1h.ticker]["lane_allocation"]
+        self.assertEqual(ranked[0][1].ticker, total_1h.ticker)
+        self.assertEqual(boosted["game_thesis_type"], "high_scoring_environment")
+        self.assertGreaterEqual(boosted["game_thesis_confidence"], kw.AION_GAME_THESIS_STRONG_SCORE)
+        self.assertGreater(boosted["game_thesis_rank_boost"], 0.0)
+        self.assertGreater(boosted["game_thesis_size_multiplier"], 1.0)
+        self.assertIn(total_full.ticker, boosted["game_related_candidates"])
+        self.assertEqual(getattr(total_1h, "game_thesis_type"), "high_scoring_environment")
+
+    def test_game_thesis_weak_game_does_not_block_sports_candidate(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBMONEYLINE-NYYBOS-NYY",
+            family="KXMLBMONEYLINE",
+            selected_side="yes",
+            selected_price=0.49,
+            yes_bid=0.47,
+            yes_ask=0.49,
+            no_bid=0.51,
+            no_ask=0.53,
+            liquidity=110,
+        )
+        expectancy = {
+            q.ticker: {
+                "q": q,
+                "family": q.family,
+                "spread": 0.02,
+                "raw_score": 70.0,
+                "adjusted_score": 70.0,
+                "expectancy_summary": {"final_edge": 0.018, "selected_side": "yes", "selected_price": 0.49, "expectancy_score": 0.70},
+                "quality_snapshot": {"selected_price": 0.49, "liquidity_depth": 110, "spread": 0.02},
+                "sports_edge_context": {"boost": 2.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.018},
+            }
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked = bot._apply_dual_lane_allocation_ranking(
+                [(70.0, q, 0.02, q.family)],
+                [{"ticker": q.ticker, "series_ticker": q.family, "event_ticker": "KXMLB-NYYBOS", "title": "MLB Yankees vs Red Sox moneyline"}],
+                expectancy_summary_by_ticker=expectancy,
+                source="unit_test_game_thesis_weak",
+            )
+
+        allocation = expectancy[q.ticker]["lane_allocation"]
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0][1].ticker, q.ticker)
+        self.assertEqual(allocation["lane"], "SPORTS")
+        self.assertNotEqual(allocation.get("final_quality_action"), "skip")
+        self.assertEqual(allocation.get("game_thesis_rank_boost"), 0.0)
+
+    def test_game_thesis_ignores_crypto_and_non_sports_candidates(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        crypto_q = SimpleNamespace(ticker="KXBTC15M-26MAY250715-UP", family="KXBTC15M", selected_side="yes", selected_price=0.40, liquidity=500)
+        sports_q = SimpleNamespace(ticker="KXNCAABSPREAD-PURMICH", family="KXNCAABSPREAD", selected_side="yes", selected_price=0.52, liquidity=120)
+        expectancy = {
+            crypto_q.ticker: {"q": crypto_q, "family": crypto_q.family, "spread": 0.01, "raw_score": 98.0, "adjusted_score": 98.0},
+            sports_q.ticker: {
+                "q": sports_q,
+                "family": sports_q.family,
+                "spread": 0.02,
+                "raw_score": 72.0,
+                "adjusted_score": 72.0,
+                "expectancy_summary": {"final_edge": 0.020, "selected_side": "yes", "selected_price": 0.52, "expectancy_score": 0.72},
+                "quality_snapshot": {"selected_price": 0.52, "liquidity_depth": 120, "spread": 0.02},
+                "sports_edge_context": {"boost": 2.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.020},
+            },
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked = bot._apply_dual_lane_allocation_ranking(
+                [(98.0, crypto_q, 0.01, crypto_q.family), (72.0, sports_q, 0.02, sports_q.family)],
+                [
+                    {"ticker": crypto_q.ticker, "series_ticker": crypto_q.family, "title": "Bitcoin up in 15 minutes"},
+                    {"ticker": sports_q.ticker, "series_ticker": sports_q.family, "event_ticker": "KXNCAAB-PURMICH", "title": "Purdue vs Michigan spread"},
+                ],
+                expectancy_summary_by_ticker=expectancy,
+                source="unit_test_game_thesis_sports_only",
+            )
+
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0][1].ticker, sports_q.ticker)
+        self.assertEqual(expectancy[crypto_q.ticker]["lane_allocation"]["decision"], "SPORTS_ONLY_CRYPTO_BLOCK")
+        self.assertNotIn("game_thesis_context", expectancy[crypto_q.ticker]["lane_allocation"])
+
+    def test_game_thesis_dynamic_size_adjustment_is_controlled(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-SIZE-TEST",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.42,
+            yes_bid=0.40,
+            yes_ask=0.42,
+            no_bid=0.58,
+            no_ask=0.60,
+            yes_top_size=100,
+            no_top_size=100,
+            liquidity=180,
+            orderbook_ready=True,
+            quote_ready=True,
+            game_id="nba:okcsas",
+            game_thesis_type="high_scoring_environment",
+            game_thesis_confidence=76.0,
+            game_thesis_size_multiplier=1.18,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            resolved = bot._resolve_dynamic_live_entry_size(
+                q,
+                explicit_size=4,
+                payload={
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "count": 4,
+                    "selected_side": "yes",
+                    "selected_price": 0.42,
+                    "game_id": q.game_id,
+                    "game_thesis_type": q.game_thesis_type,
+                    "game_thesis_confidence": q.game_thesis_confidence,
+                    "game_thesis_size_multiplier": q.game_thesis_size_multiplier,
+                },
+                ev_context={"ticker": q.ticker, "family": q.family, "ev_tier": "B"},
+                source="unit_test_game_thesis_size",
+            )
+
+        self.assertGreaterEqual(resolved, 4)
+        self.assertLessEqual(resolved, kw.MAX_LIVE_ORDER_SIZE)
+
+    def test_game_thesis_metadata_reaches_submit_payload(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        captured_payloads = []
+        bot.recent_submitted_order_for_ticker = lambda ticker: None
+        bot.recent_submitted_order_count_for_family = lambda family: 0
+        bot.recent_submitted_order_count_total = lambda: 0
+        bot.get_live_submit_authorization = lambda payload: {"ok": True}
+        bot.can_build_live_auth = lambda: True
+        bot._reset_live_trade_counter_if_needed = lambda: None
+        bot._active_live_order_timestamps = lambda: []
+        bot._live_order_timestamps = []
+        bot.already_holding = lambda ticker: False
+        bot.extract_order_execution_summary = lambda response: {"order_id": response.get("order_id")}
+        bot.persist_live_entry_metadata = lambda **kwargs: None
+        bot.append_live_audit_log = lambda *args, **kwargs: None
+        bot.append_aion_learning_archive_event = lambda *args, **kwargs: None
+        bot.place_live_order = lambda payload: captured_payloads.append(dict(payload)) or {
+            "submitted": True,
+            "reason": "submitted",
+            "endpoint": "/trade-api/v2/portfolio/orders",
+            "payload": dict(payload),
+            "response": {"order_id": "unit-game-thesis"},
+            "status_code": 201,
+        }
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-OKCSAS-1135",
+            family="KXNBA1HTOTAL",
+            selected_side="no",
+            selected_price=0.41,
+            yes_bid=0.58,
+            yes_ask=0.60,
+            no_bid=0.39,
+            no_ask=0.41,
+            liquidity=100,
+            game_thesis_context={
+                "game_id": "nba:kxnba_okcsas",
+                "thesis_type": "low_scoring_environment",
+                "thesis_confidence": 74.0,
+                "related_candidates": ["KXNBA1HTOTAL-OKCSAS-1135"],
+            },
+            game_id="nba:kxnba_okcsas",
+            game_thesis_type="low_scoring_environment",
+            game_thesis_confidence=74.0,
+            game_thesis_rank_boost=4.2,
+            game_thesis_size_multiplier=1.10,
+            game_related_candidates=["KXNBA1HTOTAL-OKCSAS-1135"],
+            game_primary_candidate="KXNBA1HTOTAL-OKCSAS-1135",
+            game_secondary_candidates=[],
+        )
+
+        result = bot.submit_live_order(
+            q,
+            size=2,
+            lane="SPORTS",
+            payload_override={
+                "ticker": q.ticker,
+                "family": q.family,
+                "side": "no",
+                "selected_side": "no",
+                "selected_price": 0.41,
+                "price": 0.41,
+                "count": 2,
+            },
+        )
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(captured_payloads[0]["entry_context"]["game_id"], "nba:kxnba_okcsas")
+        self.assertEqual(captured_payloads[0]["entry_context"]["game_thesis_type"], "low_scoring_environment")
+        self.assertEqual(captured_payloads[0]["entry_context"]["game_thesis_size_multiplier"], 1.10)
 
     def test_sports_only_parallel_submits_only_sports(self):
         self._set_sports_only_mode(True)

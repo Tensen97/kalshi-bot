@@ -320,6 +320,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "SPORTS-REGIME",
     "SPORTS-ADAPT",
     "SPORTS-SIZING",
+    "GAME-THESIS",
+    "GAME-CONVICTION",
+    "GAME-BOOST",
+    "GAME-SELECT",
     "AION-CRYPTO-EXECUTION-BLOCK",
     "AION-SPORTS-ONLY-ALLOW",
     "AION-CRYPTO-LANE-WINNER",
@@ -2015,6 +2019,12 @@ AION_SPORTS_MEMORY_MAX_RANK_BOOST = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_B
 AION_SPORTS_MEMORY_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_PENALTY", 4.0)
 AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER", 0.82)
 AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER", 1.22)
+AION_GAME_THESIS_ENABLED = get_env_bool("AION_GAME_THESIS_ENABLED", 1)
+AION_GAME_THESIS_MIN_ALIGNED = get_env_int("AION_GAME_THESIS_MIN_ALIGNED", 2)
+AION_GAME_THESIS_STRONG_SCORE = get_env_float("AION_GAME_THESIS_STRONG_SCORE", 68.0)
+AION_GAME_THESIS_MAX_RANK_BOOST = get_env_float("AION_GAME_THESIS_MAX_RANK_BOOST", 7.0)
+AION_GAME_THESIS_MAX_SIZE_MULTIPLIER = get_env_float("AION_GAME_THESIS_MAX_SIZE_MULTIPLIER", 1.18)
+AION_GAME_THESIS_LOG_COOLDOWN_SECONDS = get_env_float("AION_GAME_THESIS_LOG_COOLDOWN_SECONDS", 180.0)
 AION_DUAL_LANE_SECONDARY_ENABLED = get_env_bool("AION_DUAL_LANE_SECONDARY_ENABLED", 1)
 TARGETED_DEAD_BOOK_MIN_CYCLES = 3
 SPORTS_QUOTE_CONTINUITY_ENABLED = (os.environ.get("SPORTS_QUOTE_CONTINUITY_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -2436,6 +2446,7 @@ class KalshiSniperBot:
         self.aion_sports_memory_file = str(AION_SPORTS_MEMORY_FILE)
         self.aion_sports_memory_state = None
         self.sports_memory_log_markers = {}
+        self.game_thesis_log_markers = {}
         print(
             "[SPORTS-MEMORY] "
             + json.dumps(
@@ -9210,6 +9221,8 @@ class KalshiSniperBot:
                 or sports_memory_context.get("dimensions")
             )
             sports_memory_dimensions = sports_memory_dimensions if isinstance(sports_memory_dimensions, dict) else {}
+            game_thesis_context = self._learning_archive_value(sources, "game_thesis_context")
+            game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
             price = self._learning_archive_float(
                 self._learning_archive_value(
                     sources,
@@ -9264,6 +9277,24 @@ class KalshiSniperBot:
                 "sports_memory_size_multiplier": self._learning_archive_float(
                     self._learning_archive_value(sources, "sports_memory_size_multiplier")
                     or sports_memory_context.get("size_multiplier")
+                ),
+                "game_thesis_context": game_thesis_context,
+                "game_id": self._learning_archive_value(sources, "game_id") or game_thesis_context.get("game_id"),
+                "game_thesis_type": self._learning_archive_value(sources, "game_thesis_type") or game_thesis_context.get("thesis_type"),
+                "game_thesis_confidence": self._learning_archive_float(
+                    self._learning_archive_value(sources, "game_thesis_confidence")
+                    or game_thesis_context.get("thesis_confidence")
+                    or game_thesis_context.get("confidence")
+                ),
+                "game_thesis_rank_boost": self._learning_archive_float(
+                    self._learning_archive_value(sources, "game_thesis_rank_boost")
+                    or game_thesis_context.get("applied_rank_boost")
+                    or game_thesis_context.get("ranking_boost")
+                ),
+                "game_thesis_size_multiplier": self._learning_archive_float(
+                    self._learning_archive_value(sources, "game_thesis_size_multiplier")
+                    or game_thesis_context.get("applied_size_multiplier")
+                    or game_thesis_context.get("size_multiplier")
                 ),
             }
             if event_type in {"candidate_seen", "trade_opened"}:
@@ -10197,6 +10228,452 @@ class KalshiSniperBot:
                 cooldown_seconds=120.0,
             )
         return {"ok": True, "saved": bool(saved), "record": observation, "signal": signal}
+
+    def _emit_game_thesis_log(self, tag, payload, marker=None, cooldown_seconds=None):
+        tag = str(tag or "GAME-THESIS").strip().upper()
+        payload = payload if isinstance(payload, dict) else {}
+        markers = getattr(self, "game_thesis_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self.game_thesis_log_markers = markers
+        cooldown_seconds = (
+            AION_GAME_THESIS_LOG_COOLDOWN_SECONDS
+            if cooldown_seconds is None
+            else float(cooldown_seconds or 0.0)
+        )
+        marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+        now_ts = time.time()
+        if marker_key is not None:
+            previous_ts = self.to_float(markers.get(marker_key), 0.0) or 0.0
+            if now_ts - previous_ts < cooldown_seconds:
+                return
+            markers[marker_key] = now_ts
+            if len(markers) > 1200:
+                cutoff = now_ts - 7200.0
+                self.game_thesis_log_markers = {
+                    key: value for key, value in markers.items()
+                    if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"[{tag}] " + json.dumps({"reason": "game_thesis_log_failed"}))
+
+    def _game_thesis_game_id(self, *, market=None, q=None, allocation=None, family=None, ticker=None):
+        market = market if isinstance(market, dict) else {}
+        allocation = allocation if isinstance(allocation, dict) else {}
+        ticker = str(ticker or allocation.get("ticker") or getattr(q, "ticker", "") or market.get("ticker") or "").strip()
+        family = str(
+            family
+            or allocation.get("family")
+            or getattr(q, "family", "")
+            or self.get_market_family(market or {"ticker": ticker})
+            or ""
+        ).strip().upper()
+        if self.get_market_discovery_category(market if market else (family or ticker or "")) != "sports":
+            return None
+        raw = str(
+            market.get("event_ticker")
+            or market.get("eventTicker")
+            or market.get("event_id")
+            or market.get("eventId")
+            or ""
+        ).strip()
+        if not raw and ticker:
+            parts = [part for part in ticker.split("-") if part]
+            if len(parts) >= 2:
+                raw = parts[1]
+        if not raw:
+            raw = str(market.get("event_title") or market.get("subtitle") or "").strip()
+        if not raw:
+            return None
+        sport = self._sports_memory_sport_type(
+            family=family,
+            ticker=ticker,
+            title=market.get("title") or market.get("subtitle") or market.get("event_title") or getattr(q, "market_title", None),
+        )
+        normalized = re.sub(r"[^A-Za-z0-9]+", "_", raw.lower()).strip("_")
+        if not normalized:
+            return None
+        return f"{sport}:{normalized[:72]}"
+
+    def _game_thesis_setup_type(self, *, family=None, ticker=None, market=None, q=None):
+        market = market if isinstance(market, dict) else {}
+        return self._sports_memory_setup_type(
+            family=family,
+            ticker=ticker,
+            title=market.get("title") or market.get("subtitle") or market.get("event_title") or getattr(q, "market_title", None) or getattr(q, "title", None),
+            sports_tags=getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None) or [],
+        )
+
+    def _game_thesis_candidate_signal(self, allocation=None, *, item=None, market=None):
+        if not AION_GAME_THESIS_ENABLED:
+            return None
+        allocation = allocation if isinstance(allocation, dict) else {}
+        item = item if isinstance(item, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        if str(allocation.get("lane") or "").strip().upper() != "SPORTS":
+            return None
+        q = item.get("q")
+        ticker = str(allocation.get("ticker") or getattr(q, "ticker", "") or market.get("ticker") or "").strip()
+        family = str(allocation.get("family") or item.get("family") or self.get_market_family(market or {"ticker": ticker}) or "").strip().upper()
+        if not self._is_sports_only_allowed_candidate(family=family, ticker=ticker, market=market, q=q, lane="SPORTS"):
+            return None
+        game_id = self._game_thesis_game_id(market=market, q=q, allocation=allocation, family=family, ticker=ticker)
+        if not game_id:
+            return None
+        text = self._quality_market_text(family=family, ticker=ticker, market=market, q=q)
+        side = self._normalize_live_side(allocation.get("selected_side") or getattr(q, "selected_side", None) or getattr(q, "side", None))
+        selected_price = self._sports_memory_price(allocation.get("selected_price") or getattr(q, "selected_price", None))
+        spread = self.to_float(allocation.get("spread"), None)
+        liquidity = self.to_float(allocation.get("liquidity"), 0.0) or 0.0
+        edge = self.to_float(allocation.get("edge"), self.to_float(allocation.get("edge_after_cost"), 0.0)) or 0.0
+        conviction = self._opportunity_score_value(allocation.get("sports_conviction_score"), 0.0)
+        unified_score = self.to_float(
+            allocation.get("unified_opportunity_score"),
+            self.to_float((allocation.get("unified_opportunity") or {}).get("unified_score") if isinstance(allocation.get("unified_opportunity"), dict) else None, allocation.get("allocation_score")),
+        ) or 0.0
+        memory_rank = self.to_float(allocation.get("sports_memory_rank_adjustment"), 0.0) or 0.0
+        family_adjustment = self.to_float(allocation.get("family_profit_memory_adjustment"), 0.0) or 0.0
+        setup_type = self._game_thesis_setup_type(family=family, ticker=ticker, market=market, q=q)
+        period = self._sports_memory_period_bucket(family=family, ticker=ticker, title=text)
+        book_quality = 0.50
+        if spread is None:
+            book_quality = 0.58 if liquidity >= 30.0 else 0.45
+        elif spread <= 0.025:
+            book_quality = 1.0
+        elif spread <= 0.05:
+            book_quality = 0.82
+        elif spread <= 0.08:
+            book_quality = 0.62
+        elif spread <= 0.12:
+            book_quality = 0.40
+        else:
+            book_quality = 0.22
+        if liquidity >= 120.0:
+            book_quality = min(1.0, book_quality + 0.10)
+        elif liquidity < 10.0:
+            book_quality = max(0.0, book_quality - 0.14)
+        candidate_quality = max(
+            0.0,
+            min(
+                1.0,
+                (max(0.0, min(100.0, unified_score)) / 100.0) * 0.34
+                + min(1.0, max(0.0, edge) / 0.035) * 0.22
+                + (conviction / 100.0) * 0.22
+                + book_quality * 0.12
+                + max(0.0, min(1.0, memory_rank / max(1.0, AION_SPORTS_MEMORY_MAX_RANK_BOOST))) * 0.06
+                + max(0.0, min(1.0, family_adjustment / 3.0)) * 0.04,
+            ),
+        )
+        thesis_weights = {}
+
+        def _add_thesis(name, weight):
+            name = str(name or "").strip().lower()
+            numeric = self.to_float(weight, 0.0) or 0.0
+            if name and numeric > 0.0:
+                thesis_weights[name] = max(thesis_weights.get(name, 0.0), min(1.0, numeric))
+
+        total_like = bool("TOTAL" in family or "TOTAL" in text or "OVER" in text or "UNDER" in text)
+        spread_like = bool("SPREAD" in family or "SPREAD" in text)
+        moneyline_like = bool("MONEYLINE" in family or "MONEYLINE" in text or " TO WIN" in text or " WINNER" in text)
+        side_yes = side == "yes"
+        side_no = side == "no"
+        if total_like:
+            under_text = "UNDER" in text and "OVER" not in text
+            over_text = "OVER" in text and "UNDER" not in text
+            if (under_text and side_yes) or (over_text and side_no) or (side_no and not over_text):
+                _add_thesis("low_scoring_environment", 0.94)
+            else:
+                _add_thesis("high_scoring_environment", 0.94)
+            if period == "1h":
+                _add_thesis("1h_momentum", 0.72)
+            else:
+                _add_thesis("full_game_continuation", 0.40)
+        if spread_like or moneyline_like:
+            if side_no or (selected_price is not None and selected_price <= 0.42):
+                _add_thesis("underdog_pressure", 0.82)
+            elif side_yes or (selected_price is not None and selected_price >= 0.56):
+                _add_thesis("favorite_dominance", 0.82)
+            else:
+                _add_thesis("volatile_choppy_game", 0.42)
+            if period == "1h":
+                _add_thesis("1h_momentum", 0.44)
+        if spread is not None and spread >= 0.09:
+            _add_thesis("volatile_choppy_game", 0.50)
+        if not thesis_weights:
+            _add_thesis("weak_no_thesis", 0.20)
+        primary_thesis = max(thesis_weights.items(), key=lambda row: row[1])[0]
+        return {
+            "game_id": game_id,
+            "ticker": ticker,
+            "family": family,
+            "setup_type": setup_type,
+            "period": period,
+            "selected_side": side,
+            "selected_price": selected_price,
+            "candidate_quality": round(candidate_quality, 6),
+            "book_quality": round(book_quality, 6),
+            "edge": round(edge, 6),
+            "conviction_score": round(conviction, 4),
+            "unified_score": round(unified_score, 4),
+            "sports_memory_rank_adjustment": round(memory_rank, 4),
+            "family_profit_memory_adjustment": round(family_adjustment, 4),
+            "thesis_weights": thesis_weights,
+            "primary_thesis": primary_thesis,
+        }
+
+    def _build_game_thesis_contexts(self, decorated=None, *, market_lookup=None, expectancy_summary_by_ticker=None, source="ranking"):
+        if not AION_GAME_THESIS_ENABLED:
+            return {}
+        market_lookup = market_lookup if isinstance(market_lookup, dict) else {}
+        expectancy_summary_by_ticker = expectancy_summary_by_ticker if isinstance(expectancy_summary_by_ticker, dict) else {}
+        groups = {}
+        for allocation, _rank_index, candidate in decorated or []:
+            allocation = allocation if isinstance(allocation, dict) else {}
+            if str(allocation.get("lane") or "").strip().upper() != "SPORTS":
+                continue
+            ticker = str(allocation.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            market = market_lookup.get(ticker, {})
+            item = expectancy_summary_by_ticker.get(ticker) if isinstance(expectancy_summary_by_ticker.get(ticker), dict) else {}
+            if not item and isinstance(candidate, (list, tuple)) and len(candidate) >= 4:
+                item = {"raw_score": candidate[0], "q": candidate[1], "spread": candidate[2], "family": candidate[3]}
+            signal = self._game_thesis_candidate_signal(allocation, item=item, market=market)
+            if not signal:
+                continue
+            allocation["game_thesis_signal"] = signal
+            groups.setdefault(signal.get("game_id"), []).append({"allocation": allocation, "signal": signal, "candidate": candidate})
+        contexts = {}
+        min_aligned = max(1, int(AION_GAME_THESIS_MIN_ALIGNED or 2))
+        for game_id, rows in groups.items():
+            if not game_id or not rows:
+                continue
+            thesis_scores = {}
+            for row in rows:
+                signal = row.get("signal") or {}
+                quality = self.to_float(signal.get("candidate_quality"), 0.0) or 0.0
+                for thesis, weight in (signal.get("thesis_weights") or {}).items():
+                    if thesis == "weak_no_thesis":
+                        continue
+                    thesis_scores[thesis] = thesis_scores.get(thesis, 0.0) + quality * (self.to_float(weight, 0.0) or 0.0)
+            if thesis_scores:
+                thesis_type = max(thesis_scores.items(), key=lambda row: row[1])[0]
+                thesis_raw_score = thesis_scores.get(thesis_type, 0.0)
+            else:
+                thesis_type = "weak_no_thesis"
+                thesis_raw_score = 0.0
+            aligned_rows = [
+                row for row in rows
+                if self.to_float((row.get("signal") or {}).get("thesis_weights", {}).get(thesis_type), 0.0) > 0.0
+            ]
+            aligned_count = len(aligned_rows)
+            related_count = len(rows)
+            avg_quality = sum(self.to_float((row.get("signal") or {}).get("candidate_quality"), 0.0) or 0.0 for row in aligned_rows) / max(1, aligned_count)
+            avg_book = sum(self.to_float((row.get("signal") or {}).get("book_quality"), 0.0) or 0.0 for row in aligned_rows) / max(1, aligned_count)
+            avg_memory = sum(max(0.0, self.to_float((row.get("signal") or {}).get("sports_memory_rank_adjustment"), 0.0) or 0.0) for row in aligned_rows) / max(1, aligned_count)
+            avg_family = sum(max(0.0, self.to_float((row.get("signal") or {}).get("family_profit_memory_adjustment"), 0.0) or 0.0) for row in aligned_rows) / max(1, aligned_count)
+            consistency = aligned_count / max(1.0, float(related_count))
+            candidate_depth = min(1.0, aligned_count / max(1.0, float(min_aligned + 1)))
+            thesis_strength = min(1.0, thesis_raw_score / max(1.0, float(min_aligned) * 0.75))
+            confidence = max(
+                0.0,
+                min(
+                    100.0,
+                    18.0
+                    + candidate_depth * 20.0
+                    + avg_quality * 26.0
+                    + consistency * 14.0
+                    + avg_book * 10.0
+                    + thesis_strength * 8.0
+                    + min(1.0, avg_memory / max(1.0, AION_SPORTS_MEMORY_MAX_RANK_BOOST)) * 7.0
+                    + min(1.0, avg_family / 3.0) * 5.0,
+                ),
+            )
+            if aligned_count < min_aligned and confidence < (float(AION_GAME_THESIS_STRONG_SCORE) + 6.0):
+                confidence = min(confidence, 54.0)
+            strong = bool(thesis_type != "weak_no_thesis" and confidence >= float(AION_GAME_THESIS_STRONG_SCORE))
+            rank_boost = 0.0
+            size_multiplier = 1.0
+            aggression_multiplier = 1.0
+            if strong:
+                rank_boost = min(float(AION_GAME_THESIS_MAX_RANK_BOOST), max(0.0, (confidence - 55.0) * 0.24))
+                size_multiplier = min(float(AION_GAME_THESIS_MAX_SIZE_MULTIPLIER), 1.0 + max(0.0, confidence - 64.0) / 100.0)
+                aggression_multiplier = min(1.14, 1.0 + max(0.0, confidence - 62.0) / 140.0)
+            primary_row = max(aligned_rows or rows, key=lambda row: self.to_float((row.get("signal") or {}).get("candidate_quality"), 0.0) or 0.0)
+            related_candidates = [str((row.get("signal") or {}).get("ticker") or "").strip() for row in rows]
+            primary_ticker = str((primary_row.get("signal") or {}).get("ticker") or "").strip()
+            secondary_candidates = [ticker for ticker in related_candidates if ticker and ticker != primary_ticker][:8]
+            context = {
+                "game_id": game_id,
+                "thesis_type": thesis_type,
+                "thesis_confidence": round(confidence, 4),
+                "confidence": round(confidence, 4),
+                "aligned_candidates": aligned_count,
+                "related_candidate_count": related_count,
+                "related_candidates": related_candidates[:12],
+                "primary_candidate": primary_ticker or None,
+                "secondary_candidates": secondary_candidates,
+                "candidate_depth": round(candidate_depth, 4),
+                "consistency": round(consistency, 4),
+                "avg_candidate_quality": round(avg_quality, 4),
+                "avg_book_quality": round(avg_book, 4),
+                "avg_sports_memory_boost": round(avg_memory, 4),
+                "avg_family_memory": round(avg_family, 4),
+                "ranking_boost": round(rank_boost, 4),
+                "size_multiplier": round(size_multiplier, 4),
+                "aggression_multiplier": round(aggression_multiplier, 4),
+                "strong": strong,
+                "reason": "strong_game_thesis" if strong else "weak_or_insufficient_game_thesis",
+            }
+            contexts[game_id] = context
+            if related_count >= 2 or strong:
+                self._emit_game_thesis_log(
+                    "GAME-THESIS",
+                    {
+                        "source": source,
+                        "game_id": game_id,
+                        "thesis_type": thesis_type,
+                        "confidence": context.get("thesis_confidence"),
+                        "aligned_candidates": aligned_count,
+                        "related_candidates": related_candidates[:8],
+                        "primary_candidate": primary_ticker or None,
+                        "ranking_boost": context.get("ranking_boost"),
+                        "reason": context.get("reason"),
+                    },
+                    marker=("GAME-THESIS", source, game_id, thesis_type, int(time.time() // 180)),
+                )
+                self._emit_game_thesis_log(
+                    "GAME-CONVICTION",
+                    {
+                        "source": source,
+                        "game_id": game_id,
+                        "thesis_type": thesis_type,
+                        "confidence": context.get("thesis_confidence"),
+                        "candidate_depth": context.get("candidate_depth"),
+                        "consistency": context.get("consistency"),
+                        "avg_candidate_quality": context.get("avg_candidate_quality"),
+                        "avg_book_quality": context.get("avg_book_quality"),
+                        "avg_sports_memory_boost": context.get("avg_sports_memory_boost"),
+                        "strong": strong,
+                        "reason": context.get("reason"),
+                    },
+                    marker=("GAME-CONVICTION", source, game_id, int(time.time() // 180)),
+                )
+        return contexts
+
+    def _apply_game_thesis_to_allocations(self, decorated=None, thesis_contexts=None, *, source="ranking"):
+        if not AION_GAME_THESIS_ENABLED:
+            return decorated or []
+        thesis_contexts = thesis_contexts if isinstance(thesis_contexts, dict) else {}
+        updated = []
+        for allocation, rank_index, candidate in decorated or []:
+            allocation = allocation if isinstance(allocation, dict) else {}
+            q = candidate[1] if isinstance(candidate, (list, tuple)) and len(candidate) >= 2 else None
+            signal = allocation.get("game_thesis_signal") if isinstance(allocation.get("game_thesis_signal"), dict) else {}
+            context = thesis_contexts.get(signal.get("game_id")) if signal else None
+            if not isinstance(context, dict):
+                updated.append((allocation, rank_index, candidate))
+                continue
+            thesis_type = context.get("thesis_type")
+            aligned = bool(self.to_float((signal.get("thesis_weights") or {}).get(thesis_type), 0.0) > 0.0)
+            eligible = bool(
+                context.get("strong")
+                and str(allocation.get("lane") or "").strip().upper() == "SPORTS"
+                and allocation.get("decision") != "SKIP_WEAK_SPORT"
+                and allocation.get("final_quality_action") != "skip"
+            )
+            base_boost = self.to_float(context.get("ranking_boost"), 0.0) or 0.0
+            applied_boost = 0.0
+            if eligible and base_boost > 0.0:
+                applied_boost = base_boost if aligned else round(base_boost * 0.35, 4)
+            size_multiplier = 1.0
+            if applied_boost > 0.0:
+                size_multiplier = self.to_float(context.get("size_multiplier"), 1.0) or 1.0
+                if not aligned:
+                    size_multiplier = 1.0 + ((size_multiplier - 1.0) * 0.35)
+                current_allocation_score = self.to_float(allocation.get("allocation_score"), self.to_float(allocation.get("pre_lane_score"), 0.0)) or 0.0
+                current_adjustment = self.to_float(allocation.get("allocation_adjustment"), 0.0) or 0.0
+                current_unified = self.to_float(allocation.get("unified_opportunity_score"), None)
+                allocation["allocation_adjustment"] = round(current_adjustment + applied_boost, 4)
+                allocation["allocation_score"] = round(current_allocation_score + applied_boost, 4)
+                if current_unified is not None:
+                    allocation["unified_opportunity_score"] = round(max(0.0, min(100.0, current_unified + applied_boost)), 4)
+                unified_context = allocation.get("unified_opportunity") if isinstance(allocation.get("unified_opportunity"), dict) else {}
+                if unified_context:
+                    unified_context["unified_score"] = allocation.get("unified_opportunity_score", unified_context.get("unified_score"))
+                    base_size = self.to_float(unified_context.get("size_multiplier"), self.to_float(allocation.get("unified_size_multiplier"), 1.0)) or 1.0
+                    unified_context["size_multiplier"] = round(max(0.35, min(1.75, base_size * size_multiplier)), 4)
+                    reason = str(unified_context.get("reason") or "")
+                    if f"game_thesis_{thesis_type}" not in reason:
+                        unified_context["reason"] = "+".join(part for part in (reason, f"game_thesis_{thesis_type}") if part)
+                    allocation["unified_opportunity"] = unified_context
+                    allocation["unified_size_multiplier"] = unified_context.get("size_multiplier")
+                else:
+                    allocation["unified_size_multiplier"] = round(size_multiplier, 4)
+                self._emit_game_thesis_log(
+                    "GAME-BOOST",
+                    {
+                        "source": source,
+                        "game_id": context.get("game_id"),
+                        "ticker": allocation.get("ticker"),
+                        "family": allocation.get("family"),
+                        "thesis_type": thesis_type,
+                        "thesis_confidence": context.get("thesis_confidence"),
+                        "aligned": aligned,
+                        "ranking_boost": round(applied_boost, 4),
+                        "size_multiplier": round(size_multiplier, 4),
+                        "final_allocation_score": allocation.get("allocation_score"),
+                        "final_unified_score": allocation.get("unified_opportunity_score"),
+                        "reason": "game_thesis_rank_and_size_boost",
+                    },
+                    marker=("GAME-BOOST", source, allocation.get("ticker"), int(time.time() // 180)),
+                )
+            game_context = dict(context)
+            game_context["candidate_aligned"] = aligned
+            game_context["candidate_thesis_weights"] = signal.get("thesis_weights") or {}
+            game_context["applied_rank_boost"] = round(applied_boost, 4)
+            game_context["applied_size_multiplier"] = round(size_multiplier, 4)
+            allocation["game_thesis_context"] = game_context
+            allocation["game_id"] = context.get("game_id")
+            allocation["game_thesis_type"] = thesis_type
+            allocation["game_thesis_confidence"] = context.get("thesis_confidence")
+            allocation["game_thesis_rank_boost"] = round(applied_boost, 4)
+            allocation["game_thesis_size_multiplier"] = round(size_multiplier, 4)
+            allocation["game_thesis_aggression_multiplier"] = context.get("aggression_multiplier")
+            allocation["game_related_candidates"] = context.get("related_candidates")
+            allocation["game_primary_candidate"] = context.get("primary_candidate")
+            allocation["game_secondary_candidates"] = context.get("secondary_candidates")
+            if q is not None:
+                for attr_name, attr_value in (
+                    ("game_thesis_context", allocation.get("game_thesis_context")),
+                    ("game_id", allocation.get("game_id")),
+                    ("game_thesis_type", allocation.get("game_thesis_type")),
+                    ("game_thesis_confidence", allocation.get("game_thesis_confidence")),
+                    ("game_thesis_rank_boost", allocation.get("game_thesis_rank_boost")),
+                    ("game_thesis_size_multiplier", allocation.get("game_thesis_size_multiplier")),
+                    ("game_thesis_aggression_multiplier", allocation.get("game_thesis_aggression_multiplier")),
+                    ("game_related_candidates", allocation.get("game_related_candidates")),
+                    ("game_primary_candidate", allocation.get("game_primary_candidate")),
+                    ("game_secondary_candidates", allocation.get("game_secondary_candidates")),
+                    ("unified_opportunity_score", allocation.get("unified_opportunity_score")),
+                    ("unified_size_multiplier", allocation.get("unified_size_multiplier")),
+                ):
+                    try:
+                        if attr_value is not None:
+                            setattr(q, attr_name, attr_value)
+                    except Exception:
+                        pass
+            if isinstance(candidate, (list, tuple)) and len(candidate) >= 4:
+                candidate = (
+                    allocation.get("allocation_score", candidate[0]),
+                    candidate[1],
+                    candidate[2],
+                    candidate[3],
+                )
+            updated.append((allocation, rank_index, candidate))
+        return updated
 
     def recent_submitted_order_for_ticker(self, ticker, window_seconds=None):
         ticker = str(ticker or "").strip()
@@ -30907,6 +31384,11 @@ class KalshiSniperBot:
             "sports_memory_regime": context.get("sports_memory_regime"),
             "sports_memory_rank_adjustment": context.get("sports_memory_rank_adjustment"),
             "sports_memory_size_multiplier": context.get("sports_memory_size_multiplier"),
+            "game_id": allocation.get("game_id") or context.get("game_id"),
+            "game_thesis_type": allocation.get("game_thesis_type") or context.get("game_thesis_type"),
+            "game_thesis_confidence": allocation.get("game_thesis_confidence") or context.get("game_thesis_confidence"),
+            "game_thesis_rank_boost": allocation.get("game_thesis_rank_boost") or context.get("game_thesis_rank_boost"),
+            "game_thesis_size_multiplier": allocation.get("game_thesis_size_multiplier") or context.get("game_thesis_size_multiplier"),
             "reason": context.get("reason"),
         }
         print("[AION-UNIFIED-OPPORTUNITY-SCORE] " + json.dumps(payload, sort_keys=True, default=str))
@@ -31160,6 +31642,25 @@ class KalshiSniperBot:
                 elif allocation.get("decision") == "ALLOW_STRONG_SPORT":
                     strong_sports.append(allocation)
             decorated.append((allocation, index, (allocation.get("allocation_score"), q, spread, family)))
+        game_thesis_contexts = self._build_game_thesis_contexts(
+            decorated,
+            market_lookup=market_lookup,
+            expectancy_summary_by_ticker=expectancy_summary_by_ticker,
+            source=source,
+        )
+        decorated = self._apply_game_thesis_to_allocations(
+            decorated,
+            game_thesis_contexts,
+            source=source,
+        )
+        self.last_game_thesis_contexts = game_thesis_contexts
+        for allocation, _rank_index, _candidate in decorated:
+            ticker = str(allocation.get("ticker") or "").strip()
+            if ticker and isinstance(expectancy_summary_by_ticker.get(ticker), dict):
+                expectancy_summary_by_ticker[ticker]["lane_allocation"] = allocation
+                expectancy_summary_by_ticker[ticker]["allocation_score"] = allocation.get("allocation_score")
+                expectancy_summary_by_ticker[ticker]["unified_opportunity_score"] = allocation.get("unified_opportunity_score")
+                expectancy_summary_by_ticker[ticker]["game_thesis_context"] = allocation.get("game_thesis_context")
         decorated.sort(
             key=lambda row: (
                 1 if row[0].get("decision") != "SKIP_WEAK_SPORT" else 0,
@@ -31179,10 +31680,14 @@ class KalshiSniperBot:
             "crypto_ladder_reserved_count": len(crypto_reserved),
             "weak_sports_count": len(weak_sports),
             "strong_sports_count": len(strong_sports),
+            "game_thesis_count": len(game_thesis_contexts),
+            "strong_game_thesis_count": sum(1 for context in game_thesis_contexts.values() if isinstance(context, dict) and context.get("strong")),
             "top_lane": decorated[0][0].get("lane") if decorated else None,
             "top_ticker": decorated[0][0].get("ticker") if decorated else None,
             "top_score": decorated[0][0].get("allocation_score") if decorated else None,
             "top_unified_score": decorated[0][0].get("unified_opportunity_score") if decorated else None,
+            "top_game_id": decorated[0][0].get("game_id") if decorated else None,
+            "top_game_thesis": decorated[0][0].get("game_thesis_type") if decorated else None,
         }
         self.last_lane_allocation_summary = summary
         print("[AION-LANE-SPLIT] " + json.dumps(summary, sort_keys=True, default=str))
@@ -31221,6 +31726,11 @@ class KalshiSniperBot:
                         "sports_memory_regime": allocation.get("sports_memory_regime"),
                         "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
                         "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
+                        "game_id": allocation.get("game_id"),
+                        "game_thesis_type": allocation.get("game_thesis_type"),
+                        "game_thesis_confidence": allocation.get("game_thesis_confidence"),
+                        "game_thesis_rank_boost": allocation.get("game_thesis_rank_boost"),
+                        "game_thesis_size_multiplier": allocation.get("game_thesis_size_multiplier"),
                         "trash_patterns": allocation.get("trash_prop_patterns"),
                         "final_quality_action": allocation.get("final_quality_action"),
                         "final_quality_reason": allocation.get("final_quality_reason"),
@@ -31249,6 +31759,11 @@ class KalshiSniperBot:
                 "sports_memory_regime": allocation.get("sports_memory_regime"),
                 "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
                 "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
+                "game_id": allocation.get("game_id"),
+                "game_thesis_type": allocation.get("game_thesis_type"),
+                "game_thesis_confidence": allocation.get("game_thesis_confidence"),
+                "game_thesis_rank_boost": allocation.get("game_thesis_rank_boost"),
+                "game_thesis_size_multiplier": allocation.get("game_thesis_size_multiplier"),
                 "final_action": allocation.get("final_quality_action"),
                 "reason": allocation.get("final_quality_reason"),
                 "final_decision": allocation.get("decision"),
@@ -31351,6 +31866,11 @@ class KalshiSniperBot:
                         "sports_memory_regime": allocation.get("sports_memory_regime"),
                         "sports_memory_rank_adjustment": allocation.get("sports_memory_rank_adjustment"),
                         "sports_memory_size_multiplier": allocation.get("sports_memory_size_multiplier"),
+                        "game_id": allocation.get("game_id"),
+                        "game_thesis_type": allocation.get("game_thesis_type"),
+                        "game_thesis_confidence": allocation.get("game_thesis_confidence"),
+                        "game_thesis_rank_boost": allocation.get("game_thesis_rank_boost"),
+                        "game_thesis_size_multiplier": allocation.get("game_thesis_size_multiplier"),
                         "sports_quality_reason": allocation.get("final_quality_reason") or allocation.get("reason"),
                         "final_action": allocation.get("final_quality_action"),
                         "final_decision": allocation.get("decision"),
@@ -31378,6 +31898,10 @@ class KalshiSniperBot:
                             "quality_action": allocation.get("final_quality_action"),
                             "quality_reason": allocation.get("final_quality_reason"),
                             "reason": allocation.get("reason"),
+                            "game_id": allocation.get("game_id"),
+                            "game_thesis_type": allocation.get("game_thesis_type"),
+                            "game_thesis_confidence": allocation.get("game_thesis_confidence"),
+                            "game_thesis_rank_boost": allocation.get("game_thesis_rank_boost"),
                         }
                         for allocation, _index, _candidate in decorated[:5]
                     ],
@@ -31387,6 +31911,27 @@ class KalshiSniperBot:
                 default=str,
             )
         )
+        if decorated:
+            top_allocation = decorated[0][0]
+            if top_allocation.get("game_thesis_context"):
+                self._emit_game_thesis_log(
+                    "GAME-SELECT",
+                    {
+                        "source": source,
+                        "ticker": top_allocation.get("ticker"),
+                        "family": top_allocation.get("family"),
+                        "game_id": top_allocation.get("game_id"),
+                        "thesis_type": top_allocation.get("game_thesis_type"),
+                        "thesis_confidence": top_allocation.get("game_thesis_confidence"),
+                        "ranking_boost": top_allocation.get("game_thesis_rank_boost"),
+                        "unified_score": top_allocation.get("unified_opportunity_score"),
+                        "selected_side": top_allocation.get("selected_side"),
+                        "primary_candidate": top_allocation.get("game_primary_candidate"),
+                        "secondary_candidates": top_allocation.get("game_secondary_candidates"),
+                        "reason": "final_selected_candidate_game_context",
+                    },
+                    marker=("GAME-SELECT", source, top_allocation.get("ticker"), int(time.time() // 180)),
+                )
         return final_ranked
 
     def _lane_submit_truth_payload(
@@ -31596,6 +32141,16 @@ class KalshiSniperBot:
                     ("sports_memory_size_multiplier", allocation.get("sports_memory_size_multiplier") or unified_context.get("sports_memory_size_multiplier")),
                     ("sports_memory_aggression_multiplier", allocation.get("sports_memory_aggression_multiplier") or unified_context.get("sports_memory_aggression_multiplier")),
                     ("sports_memory_regime", allocation.get("sports_memory_regime") or unified_context.get("sports_memory_regime")),
+                    ("game_thesis_context", allocation.get("game_thesis_context")),
+                    ("game_id", allocation.get("game_id")),
+                    ("game_thesis_type", allocation.get("game_thesis_type")),
+                    ("game_thesis_confidence", allocation.get("game_thesis_confidence")),
+                    ("game_thesis_rank_boost", allocation.get("game_thesis_rank_boost")),
+                    ("game_thesis_size_multiplier", allocation.get("game_thesis_size_multiplier")),
+                    ("game_thesis_aggression_multiplier", allocation.get("game_thesis_aggression_multiplier")),
+                    ("game_related_candidates", allocation.get("game_related_candidates")),
+                    ("game_primary_candidate", allocation.get("game_primary_candidate")),
+                    ("game_secondary_candidates", allocation.get("game_secondary_candidates")),
                 ):
                     if attr_value is not None:
                         try:
@@ -36222,6 +36777,13 @@ class KalshiSniperBot:
             "sports_memory_size_multiplier",
             "sports_memory_aggression_multiplier",
             "sports_memory_regime",
+            "game_thesis_context",
+            "game_id",
+            "game_thesis_type",
+            "game_thesis_confidence",
+            "game_thesis_rank_boost",
+            "game_thesis_size_multiplier",
+            "game_thesis_aggression_multiplier",
             "unified_opportunity_score",
             "unified_size_multiplier",
             "capital_duration_size_multiplier",
@@ -36267,6 +36829,7 @@ class KalshiSniperBot:
             "structural_edge_size_multiplier",
             "cross_market_size_multiplier",
             "sports_conviction_size_multiplier",
+            "game_thesis_size_multiplier",
             "unified_size_multiplier",
             "capital_duration_size_multiplier",
         ):
@@ -36496,6 +37059,39 @@ class KalshiSniperBot:
                     marker=("SPORTS-SIZING-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
+        game_thesis_multiplier = self.to_float(
+            context.get("game_thesis_size_multiplier"),
+            self.to_float(payload.get("game_thesis_size_multiplier"), None),
+        )
+        if (
+            game_thesis_multiplier is not None
+            and game_thesis_multiplier > 1.0
+            and unified_multiplier is None
+            and chosen < hard_max
+        ):
+            before_game_size = chosen
+            thesis_multiplier = min(float(AION_GAME_THESIS_MAX_SIZE_MULTIPLIER), max(1.0, float(game_thesis_multiplier)))
+            chosen = max(1, min(hard_max, int(round(chosen * thesis_multiplier))))
+            if chosen != before_game_size:
+                chosen_label = "game_thesis_size_adjustment"
+                context["game_thesis_size_multiplier_applied"] = round(thesis_multiplier, 4)
+                self._emit_game_thesis_log(
+                    "GAME-BOOST",
+                    {
+                        "source": source or "dynamic_live_entry_size",
+                        "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                        "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                        "game_id": context.get("game_id") or payload.get("game_id"),
+                        "thesis_type": context.get("game_thesis_type") or payload.get("game_thesis_type"),
+                        "thesis_confidence": context.get("game_thesis_confidence") or payload.get("game_thesis_confidence"),
+                        "requested_size": before_game_size,
+                        "adjusted_size": chosen,
+                        "size_multiplier": round(thesis_multiplier, 4),
+                        "reason": "game_thesis_dynamic_size_adjustment",
+                    },
+                    marker=("GAME-BOOST-SIZING", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         original = self.to_float(explicit_size, None)
         if original is None:
             original = self.to_float(payload.get("count"), None)
@@ -36521,6 +37117,9 @@ class KalshiSniperBot:
                             "conviction_size_multiplier": context.get("conviction_size_multiplier"),
                             "sports_memory_size_multiplier": context.get("sports_memory_size_multiplier"),
                             "sports_memory_regime": context.get("sports_memory_regime"),
+                            "game_thesis_type": context.get("game_thesis_type"),
+                            "game_thesis_confidence": context.get("game_thesis_confidence"),
+                            "game_thesis_size_multiplier": context.get("game_thesis_size_multiplier"),
                             "elite_size_quality": quality_context,
                         },
                         sort_keys=True,
@@ -63895,6 +64494,12 @@ class KalshiSniperBot:
                     "sports_memory_regime": entry_context.get("sports_memory_regime") if isinstance(entry_context, dict) else None,
                     "sports_memory_rank_adjustment": entry_context.get("sports_memory_rank_adjustment") if isinstance(entry_context, dict) else None,
                     "sports_memory_size_multiplier": entry_context.get("sports_memory_size_multiplier") if isinstance(entry_context, dict) else None,
+                    "game_thesis_context": entry_context.get("game_thesis_context") if isinstance(entry_context, dict) else {},
+                    "game_id": entry_context.get("game_id") if isinstance(entry_context, dict) else None,
+                    "game_thesis_type": entry_context.get("game_thesis_type") if isinstance(entry_context, dict) else None,
+                    "game_thesis_confidence": entry_context.get("game_thesis_confidence") if isinstance(entry_context, dict) else None,
+                    "game_thesis_rank_boost": entry_context.get("game_thesis_rank_boost") if isinstance(entry_context, dict) else None,
+                    "game_thesis_size_multiplier": entry_context.get("game_thesis_size_multiplier") if isinstance(entry_context, dict) else None,
                     "sports_edge_context": entry_context.get("sports_edge_context") if isinstance(entry_context, dict) else {},
                     "sports_tags": entry_context.get("sports_tags") if isinstance(entry_context, dict) else [],
                     "exit_reason": "position_reconcile_closed",
@@ -64202,6 +64807,8 @@ class KalshiSniperBot:
         sports_memory_context = sports_memory_context if isinstance(sports_memory_context, dict) else {}
         sports_memory_dimensions = getattr(q, "sports_memory_dimensions", None) or sports_memory_context.get("dimensions") or {}
         sports_memory_dimensions = sports_memory_dimensions if isinstance(sports_memory_dimensions, dict) else {}
+        game_thesis_context = getattr(q, "game_thesis_context", None) or {}
+        game_thesis_context = game_thesis_context if isinstance(game_thesis_context, dict) else {}
         elite_context = getattr(q, "elite_public_signal_context", None) or {}
         elite_context = elite_context if isinstance(elite_context, dict) else {}
         entry_context = {
@@ -64216,6 +64823,15 @@ class KalshiSniperBot:
             "sports_memory_regime": getattr(q, "sports_memory_regime", None) or sports_memory_context.get("regime"),
             "sports_memory_rank_adjustment": getattr(q, "sports_memory_rank_adjustment", None) or sports_memory_context.get("rank_adjustment"),
             "sports_memory_size_multiplier": getattr(q, "sports_memory_size_multiplier", None) or sports_memory_context.get("size_multiplier"),
+            "game_thesis_context": game_thesis_context,
+            "game_id": getattr(q, "game_id", None) or game_thesis_context.get("game_id"),
+            "game_thesis_type": getattr(q, "game_thesis_type", None) or game_thesis_context.get("thesis_type"),
+            "game_thesis_confidence": getattr(q, "game_thesis_confidence", None) or game_thesis_context.get("thesis_confidence"),
+            "game_thesis_rank_boost": getattr(q, "game_thesis_rank_boost", None) or game_thesis_context.get("applied_rank_boost"),
+            "game_thesis_size_multiplier": getattr(q, "game_thesis_size_multiplier", None) or game_thesis_context.get("size_multiplier"),
+            "game_related_candidates": getattr(q, "game_related_candidates", None) or game_thesis_context.get("related_candidates"),
+            "game_primary_candidate": getattr(q, "game_primary_candidate", None) or game_thesis_context.get("primary_candidate"),
+            "game_secondary_candidates": getattr(q, "game_secondary_candidates", None) or game_thesis_context.get("secondary_candidates"),
             "elite_public_signal_context": elite_context,
             "elite_signal_used": bool(elite_context.get("matched") or getattr(q, "elite_signal_used", False)),
             "elite_trader_handle": getattr(q, "elite_trader_handle", None) or ((elite_context.get("signal") or {}).get("trader_handle") if isinstance(elite_context.get("signal"), dict) else None),
@@ -64256,6 +64872,15 @@ class KalshiSniperBot:
                 "sports_memory_regime": entry_context.get("sports_memory_regime"),
                 "sports_memory_rank_adjustment": entry_context.get("sports_memory_rank_adjustment"),
                 "sports_memory_size_multiplier": entry_context.get("sports_memory_size_multiplier"),
+                "game_thesis_context": game_thesis_context,
+                "game_id": entry_context.get("game_id"),
+                "game_thesis_type": entry_context.get("game_thesis_type"),
+                "game_thesis_confidence": entry_context.get("game_thesis_confidence"),
+                "game_thesis_rank_boost": entry_context.get("game_thesis_rank_boost"),
+                "game_thesis_size_multiplier": entry_context.get("game_thesis_size_multiplier"),
+                "game_related_candidates": entry_context.get("game_related_candidates"),
+                "game_primary_candidate": entry_context.get("game_primary_candidate"),
+                "game_secondary_candidates": entry_context.get("game_secondary_candidates"),
                 "elite_public_signal_context": elite_context,
                 "elite_signal_used": bool(entry_context.get("elite_signal_used")),
                 "elite_trader_handle": entry_context.get("elite_trader_handle"),
