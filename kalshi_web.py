@@ -934,7 +934,7 @@ def _aion_track_execution_cycle(*args):
         return
     if tag in {"CRYPTO-PROB-CALIBRATION", "CRYPTO-STRIKE-DISTANCE", "CRYPTO-LADDER-CLUSTER", "CRYPTO-CHEAP-RANGE-DECISION", "CRYPTO-SIZE-PRESSURE", "CRYPTO-QUALITY-RANK"}:
         _aion_track_ticker(_AION_EXECUTION_CYCLE_STATE["crypto_scanned"], payload)
-    elif tag in {"SPORTS-CONVICTION-SCORE", "SPORTS-HIGH-CONVICTION-ENTRY", "SPORTS-WEAK-PROP-REJECT"}:
+    elif tag in {"SPORTS-CONVICTION-SCORE", "SPORTS-HIGH-CONVICTION-ENTRY", "SPORTS-WEAK-PROP-DEMOTE"}:
         _aion_track_ticker(_AION_EXECUTION_CYCLE_STATE["sports_scanned"], payload)
     if tag in {"CRYPTO-QUALIFIED", "CRYPTO-EXECUTABLE-CANDIDATE"}:
         _aion_track_ticker(_AION_EXECUTION_CYCLE_STATE["crypto_qualified"], payload)
@@ -3405,16 +3405,14 @@ class KalshiSniperBot:
                 )
             )
         )
+        true_book_block = bool(explicit_fake_or_corrupt or stale_timing or spread_absurd or not executable_price)
         reason = "sports_thin_liquidity_warning"
         allowed = bool(
             self.is_sports_family(family, ticker=ticker)
             and family != "KXBTC15M"
             and (blocker in weak_liquidity_blockers or not quote_ready or not orderbook_ready)
             and executable_price
-            and not explicit_fake_or_corrupt
-            and not stale_timing
-            and not spread_absurd
-            and edge_ok
+            and not true_book_block
         )
         if not self.is_sports_family(family, ticker=ticker) or family == "KXBTC15M":
             reason = "not_relaxable_sports_family"
@@ -3429,7 +3427,7 @@ class KalshiSniperBot:
         elif spread_absurd:
             reason = "sports_spread_absurd_for_family"
         elif not edge_ok:
-            reason = "edge_or_profitability_not_strong_enough"
+            reason = "thin_book_without_confirmed_edge_demoted_to_size"
         return {
             "allowed": bool(allowed),
             "reason": reason,
@@ -3444,6 +3442,8 @@ class KalshiSniperBot:
             "liquidity": liquidity_value,
             "edge_after_cost": edge_value,
             "profitability_score": profitability_value,
+            "edge_ok": bool(edge_ok),
+            "true_book_block": bool(true_book_block),
             "blocker_reason": blocker or None,
             "unsafe_price_status": unsafe_status or None,
             "unsafe_resolution_reason": unsafe_reason or None,
@@ -8861,7 +8861,27 @@ class KalshiSniperBot:
             yes_bid is not None and yes_ask is not None
             and no_bid is not None and no_ask is not None
         )
-        selected_price_ready = any(
+        selected_price_cents_hint = self.to_float(
+            _pick(
+                quote_diag.get("selected_price_cents"),
+                market.get("selected_price_cents"),
+                getattr(q, "selected_price_cents", None),
+            ),
+            None,
+        )
+        selected_price_hint = self._sports_spread_price_value(
+            _pick(
+                quote_diag.get("selected_price_dollars"),
+                quote_diag.get("selected_price"),
+                market.get("selected_price_dollars"),
+                market.get("selected_price"),
+                getattr(q, "selected_price_dollars", None),
+                getattr(q, "selected_price", None),
+            )
+        )
+        selected_price_ready = bool(selected_price_cents_hint is not None and 1.0 <= float(selected_price_cents_hint) <= 99.0) or bool(
+            selected_price_hint is not None and KALSHI_CONTRACT_MIN_PRICE <= selected_price_hint <= KALSHI_CONTRACT_MAX_PRICE
+        ) or any(
             price is not None and KALSHI_CONTRACT_MIN_PRICE <= price <= KALSHI_CONTRACT_MAX_PRICE
             for price in (yes_ask, no_ask, quote_diag.get("selected_price"), quote_diag.get("selected_price_dollars"))
         )
@@ -9489,6 +9509,18 @@ class KalshiSniperBot:
             or market.get("selected_side")
             or _q_get("selected_side", "side")
         )
+        selected_price_hint = _price(
+            _context_value(
+                "selected_price_dollars",
+                "selected_price",
+                "selected_price_hint",
+                "intended_entry_price",
+            )
+        )
+        if selected_price_hint is not None and preferred_side == "yes" and yes_ask is None:
+            yes_ask = selected_price_hint
+        if selected_price_hint is not None and preferred_side == "no" and no_ask is None:
+            no_ask = selected_price_hint
 
         def _prob(value):
             numeric = self.to_float(value, None)
@@ -9603,7 +9635,21 @@ class KalshiSniperBot:
             if bid is not None and ask is not None and ask >= bid:
                 spread = round(max(0.0, float(ask) - float(bid)), 4)
             side_liquidity = max(_size(top_size), reported_liquidity if _size(top_size) <= 0.0 else 0.0)
-            executable = bool(ask is not None and KALSHI_CONTRACT_MIN_PRICE <= ask <= KALSHI_CONTRACT_MAX_PRICE and side_liquidity > 0.0)
+            sports_thin_executable = bool(
+                is_sports
+                and ask is not None
+                and KALSHI_CONTRACT_MIN_PRICE <= ask <= KALSHI_CONTRACT_MAX_PRICE
+                and (
+                    bid is not None
+                    or preferred_side == side
+                    or selected_price_hint is not None
+                )
+            )
+            executable = bool(
+                ask is not None
+                and KALSHI_CONTRACT_MIN_PRICE <= ask <= KALSHI_CONTRACT_MAX_PRICE
+                and (side_liquidity > 0.0 or sports_thin_executable)
+            )
             momentum_alignment, momentum_reason = _momentum_alignment(side)
             spread_penalty = (spread if spread is not None else 0.20) * 18.0
             liquidity_score = min(8.0, math.log10(side_liquidity + 1.0) * 2.0) if side_liquidity > 0.0 else 0.0
@@ -9652,6 +9698,7 @@ class KalshiSniperBot:
                     f"{side}_price_out_of_bounds" if ask < KALSHI_CONTRACT_MIN_PRICE or ask > KALSHI_CONTRACT_MAX_PRICE else
                     f"missing_{side}_liquidity"
                 ),
+                "sports_thin_executable": bool(sports_thin_executable),
             }
 
         yes_snapshot = _side_snapshot("yes", yes_bid, yes_ask, yes_top_size)
@@ -9660,7 +9707,15 @@ class KalshiSniperBot:
         reason = "selected_by_two_sided_score"
         selected = None
         if not two_sided_quote_ready:
-            reason = "missing_two_sided_quote"
+            if is_sports:
+                executable = [item for item in (yes_snapshot, no_snapshot) if item["executable"]]
+                if executable:
+                    selected = max(executable, key=lambda item: item["final_score"])
+                    reason = f"sports_one_sided_{selected['side']}_executable"
+                else:
+                    reason = "missing_two_sided_quote"
+            else:
+                reason = "missing_two_sided_quote"
         else:
             executable = [item for item in (yes_snapshot, no_snapshot) if item["executable"]]
             if not executable:
@@ -25275,12 +25330,8 @@ class KalshiSniperBot:
             "no_executable_selected_side_price",
             "missing_executable_selected_side_ask",
             "quote_invalid",
-            "quote_not_ready",
-            "quote_not_usable",
             "quote_content_failed",
-            "quote_not_ready_after_refresh",
             "missing_spread",
-            "orderbook_not_usable",
             "empty_market",
             "dead_corrupt_orderbook",
             "dead_orderbook",
@@ -25338,7 +25389,7 @@ class KalshiSniperBot:
             return "hard_safety"
         if text in obsolete_labels:
             return "obsolete_legacy"
-        if text in {"unsafe_price", "unsafe_spread", "unsafe_spread_bucket", "spread_extreme", "spread_wait", "spread_above_threshold", "edge_below_threshold", "edge_below_aggressive_floor", "near_safe_relief_denied", "sports_context_unavailable", "sports_context_required_for_weak_signal"}:
+        if text in {"unsafe_price", "unsafe_spread", "unsafe_spread_bucket", "spread_extreme", "spread_wait", "spread_above_threshold", "edge_below_threshold", "edge_below_aggressive_floor", "near_safe_relief_denied", "sports_context_unavailable", "sports_context_required_for_weak_signal", "quote_not_ready", "quote_not_usable", "quote_not_ready_after_refresh", "orderbook_not_usable", "no_executable_side"}:
             return "profit_quality"
         if text in {"execution_attempt_cooldown", "entry_attempt_cooldown", "cooldown_active", "cooldown"}:
             return "duplicate_cadence"
@@ -30671,15 +30722,52 @@ class KalshiSniperBot:
                             f"price={yes_ask} spread={spread}"
                         )
                 else:
-                    reason = "momentum_not_stable"
-                    now_ts = time.time()
-                    last_log_ts = float(self.live_momentum_hard_block_log_last_seen.get(ticker, 0.0) or 0.0)
-                    if (now_ts - last_log_ts) >= 30.0:
-                        print(
-                            f"[LIVE-EXECUTION-MOMENTUM-HARD-BLOCK] ticker={ticker} "
-                            f"reason=momentum_not_stable why={adaptive_details.get('why')}"
+                    sports_timing_cost_allowed = bool(
+                        self.is_sports_family(family, ticker=ticker)
+                        and evaluated_price is not None
+                        and min_price_bound <= evaluated_price <= max_price_bound
+                        and spread is not None
+                        and 0.0 <= spread <= float(AION_SPORTS_MAX_SPREAD_HARD)
+                        and (
+                            selected_side in {"yes", "no"}
+                            or yes_ask is not None
+                            or no_ask is not None
+                            or selected_price_cents is not None
                         )
-                        self.live_momentum_hard_block_log_last_seen[ticker] = now_ts
+                    )
+                    if sports_timing_cost_allowed:
+                        adaptive_allow = True
+                        allowed = True
+                        edge = "good"
+                        reason = "sports_timing_gate_demoted_to_execution_cost"
+                        print(
+                            "[AION-TIMING-GATE-BYPASS] "
+                            + json.dumps(
+                                {
+                                    "ticker": ticker or None,
+                                    "family": family,
+                                    "gate": "smart_entry_gate",
+                                    "original_reason": "momentum_not_stable",
+                                    "selected_side": selected_side,
+                                    "selected_price": selected_price_value,
+                                    "evaluated_price": evaluated_price,
+                                    "spread": spread,
+                                    "reason": reason,
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                    else:
+                        reason = "momentum_not_stable"
+                        now_ts = time.time()
+                        last_log_ts = float(self.live_momentum_hard_block_log_last_seen.get(ticker, 0.0) or 0.0)
+                        if (now_ts - last_log_ts) >= 30.0:
+                            print(
+                                f"[LIVE-EXECUTION-MOMENTUM-HARD-BLOCK] ticker={ticker} "
+                                f"reason=momentum_not_stable why={adaptive_details.get('why')}"
+                            )
+                            self.live_momentum_hard_block_log_last_seen[ticker] = now_ts
         if family == "KXMLBTOTAL" and (allowed or adaptive_allow):
             mlb_confirm_ok, mlb_confirm_reason = self._evaluate_mlb_total_entry_confirmation(
                 ticker,
@@ -33328,10 +33416,12 @@ class KalshiSniperBot:
         )
         if trash_patterns and not exceptional_trash_quality:
             trash_penalty = AION_SPORTS_TRASH_PROP_SKIP_PENALTY if severe_trash else AION_SPORTS_TRASH_PROP_PENALTY
-            final_action = "skip" if severe_trash else "demote"
+            final_action = "demote"
             final_reason = "+".join(trash_patterns)
-            context["decision"] = "SKIP_WEAK_SPORT" if severe_trash else "DEMOTE_WEAK_SPORT"
+            context["decision"] = "DEMOTE_WEAK_SPORT"
             context["strong"] = False
+            if severe_trash:
+                context["severe_trash_pattern_warning"] = True
         elif trash_patterns and exceptional_trash_quality:
             final_action = "allow_exceptional_trash_pattern"
             final_reason = "exceptional_quality_overrode_trash_pattern:" + "+".join(trash_patterns)
@@ -33711,7 +33801,7 @@ class KalshiSniperBot:
         )
         if severe_weak:
             adjustment = -abs(AION_WEAK_SPORTS_SKIP_DEMOTE)
-            decision = "SKIP_WEAK_SPORT"
+            decision = "DEMOTE_WEAK_SPORT"
             reason = "+".join(weak_reasons)
         elif weak_reasons and not strong:
             adjustment = -abs(AION_WEAK_SPORTS_DEMOTE)
@@ -33762,8 +33852,8 @@ class KalshiSniperBot:
         print("[SPORTS-CONVICTION-SCORE] " + json.dumps(conviction_payload, sort_keys=True, default=str))
         if sports_high_conviction:
             print("[SPORTS-HIGH-CONVICTION-ENTRY] " + json.dumps(conviction_payload, sort_keys=True, default=str))
-        if sports_weak_prop_reject or decision == "SKIP_WEAK_SPORT":
-            print("[SPORTS-WEAK-PROP-REJECT] " + json.dumps(conviction_payload, sort_keys=True, default=str))
+        if sports_weak_prop_reject or decision == "DEMOTE_WEAK_SPORT":
+            print("[SPORTS-WEAK-PROP-DEMOTE] " + json.dumps(conviction_payload, sort_keys=True, default=str))
         return {
             "lane": "SPORTS",
             "ticker": ticker,
@@ -47263,6 +47353,33 @@ class KalshiSniperBot:
                     "canonical_bypass": True,
                 }
             if signal_strength == "weak" and SPORTS_CONTEXT_REQUIRE_FOR_WEAK_SIGNALS:
+                selected_price_present = bool(selected_price_normalized is not None and 0.0 < selected_price_normalized < 1.0)
+                weak_signal_cost_allowed = bool(
+                    selected_price_present
+                    and selected_side_has_price
+                    and (selected_side_has_liquidity or canonical_quote_ready or four_sided_quote_valid or payload)
+                )
+                if weak_signal_cost_allowed:
+                    allow_reason = "weak_signal_context_demoted_to_ranking_cost"
+                    print(
+                        f"[LIVE-SPORTS-CONTEXT-WARN] ticker={ticker} family={family} event_key={event_key} "
+                        f"signal_strength={signal_strength} context_status={context_status} reason={allow_reason} "
+                        f"weak_reasons={signal_details.get('weak_reasons')}"
+                    )
+                    print(
+                        f"[LIVE-SPORTS-CONTEXT-ALLOWED] ticker={ticker} family={family} event_key={event_key} "
+                        f"signal_strength={signal_strength} context_status={context_status} reason={allow_reason}"
+                    )
+                    return True, allow_reason, {
+                        "ticker": ticker,
+                        "family": family,
+                        "event_key": event_key,
+                        "signal_strength": signal_strength,
+                        "context_status": context_status,
+                        "reason": allow_reason,
+                        "signal_details": signal_details,
+                        "weak_signal_demoted": True,
+                    }
                 block_reason = "sports_context_required_for_weak_signal"
                 print(
                     f"[LIVE-SPORTS-CONTEXT-BLOCKED] ticker={ticker} family={family} event_key={event_key} "
@@ -73495,6 +73612,42 @@ class KalshiSniperBot:
                 family=selected_family,
                 canonical_execution_state=canonical_realm_vv_state if "canonical_realm_vv_state" in locals() else None,
             )
+            phase55_edge_probe, _phase55_edge_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
+            phase55_soft_bypass = bool(
+                not phase55_allowed
+                and self.is_sports_family(selected_family, ticker=auto_live_ticker)
+                and payload_preview is not None
+                and selected_submission_price_valid
+                and (selected_side_has_price or bool((payload_preview or {}).get("selected_side")) or bool(selected_quote))
+                and (selected_side_has_liquidity or depth_available or bool(quote_readiness_diagnostic.get("quote_ready")))
+                and (
+                    final_submit_allowed_by_realm_vv
+                    or self.to_float(phase55_edge_probe, 0.0) > 0.0
+                    or self.to_float((expectancy_summary or {}).get("sports_edge_after_cost") if isinstance(expectancy_summary, dict) else None, 0.0) > 0.0
+                )
+            )
+            if phase55_soft_bypass:
+                print(
+                    "[AION-TIMING-GATE-BYPASS] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "original_reason": phase55_reason,
+                            "selected_price": selected_submission_price_hint,
+                            "selected_side_has_price": bool(selected_side_has_price),
+                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                            "depth_available": bool(depth_available),
+                            "quote_ready": bool(quote_readiness_diagnostic.get("quote_ready")),
+                            "edge_after_cost": self.to_float(phase55_edge_probe, 0.0),
+                            "reason": "sports_timing_gate_demoted_to_execution_cost",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                phase55_allowed = True
+                phase55_reason = "sports_timing_gate_demoted_to_execution_cost"
             final_blocker_entry_ready = bool(phase55_allowed)
             if not phase55_allowed:
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)

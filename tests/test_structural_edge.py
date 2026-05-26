@@ -295,6 +295,35 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(decision["selected_side"], "no")
         self.assertEqual(decision["selected_price"], 0.37)
 
+    def test_sports_side_selection_allows_one_sided_thin_executable_book(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXNBA-ONESIDED-TEST",
+            family="KXNBA",
+            lane="SPORTS",
+            market={
+                "ticker": "KXNBA-ONESIDED-TEST",
+                "series_ticker": "KXNBA",
+                "selected_side": "yes",
+                "selected_price": 0.52,
+                "title": "NBA game winner",
+            },
+            yes_bid=None,
+            yes_ask=None,
+            no_bid=None,
+            no_ask=None,
+            yes_top_size=0,
+            no_top_size=0,
+            preferred_side="yes",
+            quote_diag={"selected_side": "yes", "selected_price": 0.52},
+            source="unit_test",
+        )
+
+        self.assertEqual(decision["selected_side"], "yes")
+        self.assertEqual(decision["selected_price"], 0.52)
+        self.assertEqual(decision["reason"], "sports_one_sided_yes_executable")
+        self.assertTrue(decision["yes_executable"])
+
     def test_selected_side_is_preserved_into_order_payload(self):
         bot = self._make_bot()
         market = {
@@ -947,7 +976,8 @@ class StructuralEdgeTests(unittest.TestCase):
         )
 
         self.assertEqual(ranked[0][1].ticker, btc_q.ticker)
-        self.assertEqual(expectancy[sports_q.ticker]["lane_allocation"]["decision"], "SKIP_WEAK_SPORT")
+        self.assertEqual(expectancy[sports_q.ticker]["lane_allocation"]["decision"], "DEMOTE_WEAK_SPORT")
+        self.assertNotEqual(expectancy[sports_q.ticker]["lane_allocation"].get("final_quality_action"), "skip")
         self.assertTrue(expectancy[btc_q.ticker]["lane_allocation"]["reserved"])
 
     def test_sports_only_mode_blocks_crypto_allocation_and_keeps_sports(self):
@@ -2488,12 +2518,48 @@ class StructuralEdgeTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(context["decision"], "SKIP_WEAK_SPORT")
-        self.assertEqual(context["final_quality_action"], "skip")
+        self.assertEqual(context["decision"], "DEMOTE_WEAK_SPORT")
+        self.assertEqual(context["final_quality_action"], "demote")
         self.assertIn("home_run_prop", context["trash_prop_patterns"])
         self.assertIn("multi_home_run_moonshot", context["trash_prop_patterns"])
         self.assertGreater(context["trash_prop_penalty"], 0.0)
         self.assertTrue(context["sports_weak_prop_reject"])
+
+    def test_sports_context_required_for_weak_signal_demotes_when_payload_tradeable(self):
+        bot = self._make_bot()
+        bot._get_trusted_sports_context = lambda *args, **kwargs: {
+            "trusted": False,
+            "status": "context_unavailable",
+            "reason": "unit_missing_context",
+        }
+        bot._emit_live_correlation_snapshot = lambda *args, **kwargs: None
+        q = SimpleNamespace(
+            ticker="KXNBA-WEAK-CONTEXT",
+            yes_bid=0.40,
+            yes_ask=0.58,
+            no_bid=0.42,
+            no_ask=0.60,
+            liquidity=0,
+            volume=0,
+        )
+        candidate = {
+            "ticker": q.ticker,
+            "family": "KXNBA",
+            "market": {"ticker": q.ticker, "series_ticker": "KXNBA", "title": "NBA game winner"},
+            "quote": q,
+            "payload": {
+                "selected_side": "yes",
+                "selected_price": 0.58,
+                "yes_price": 0.58,
+            },
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allowed, reason, details = bot.sports_context_check(candidate)
+
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "weak_signal_context_demoted_to_ranking_cost")
+        self.assertTrue(details["weak_signal_demoted"])
 
     def test_quality_calibration_boosts_nba_1h_total_ladder(self):
         bot = self._make_bot()
@@ -4260,6 +4326,56 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(reason, "wide_spread")
         self.assertEqual(market["_sports_spread_context"]["reason"], "spread_absurd_unusable")
 
+    def test_sports_spread_selected_price_cents_prevents_missing_price_blocker(self):
+        bot = self._make_bot()
+        decision = bot._sports_adaptive_spread_decision(
+            {"ticker": "KXNBA-CENTS-PRICE", "series_ticker": "KXNBA", "volume": 5},
+            family="KXNBA",
+            spread=0.04,
+            liquidity=5,
+            quote_diag={"selected_side": "yes", "selected_price_cents": 58},
+            context="unit_selected_price_cents",
+            emit_log=False,
+        )
+
+        self.assertTrue(decision["selected_price_ready"])
+        self.assertTrue(decision["allowed"])
+        self.assertNotEqual(decision["reason"], "selected_price_missing_or_invalid")
+
+    def test_sports_liquidity_relaxation_demotes_thin_book_without_confirmed_edge(self):
+        bot = self._make_bot()
+        decision = bot._sports_liquidity_relaxation_decision(
+            ticker="KXNBA-THIN-BOOK",
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.55,
+            spread=0.08,
+            blocker_reason="orderbook_not_usable",
+            quote_ready=False,
+            orderbook_ready=False,
+            edge_after_cost=0.0,
+            profitability_score=0.0,
+        )
+        broken = bot._sports_liquidity_relaxation_decision(
+            ticker="KXNBA-BROKEN-BOOK",
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.55,
+            spread=0.08,
+            blocker_reason="orderbook_not_usable",
+            unsafe_price_status="fake_orderbook",
+            quote_ready=False,
+            orderbook_ready=False,
+        )
+
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["reason"], "thin_book_without_confirmed_edge_demoted_to_size")
+        self.assertEqual(decision["final_effect"], "sports_thin_liquidity_warning")
+        self.assertFalse(decision["true_book_block"])
+        self.assertFalse(broken["allowed"])
+        self.assertTrue(broken["true_book_block"])
+        self.assertEqual(broken["reason"], "hard_book_or_price_integrity_block")
+
     def test_non_sports_wide_spread_remains_strict(self):
         bot = self._make_bot()
         market = {
@@ -4414,6 +4530,56 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(details["adaptive_allow"])
         self.assertTrue(details["sports_spread_context"]["allowed"])
         self.assertLess(details["sports_spread_context"]["size_multiplier"], 1.0)
+
+    def test_sports_smart_entry_demotes_timing_gate_to_execution_cost(self):
+        bot = self._make_bot()
+        bot.live_momentum_hard_block_log_last_seen = {}
+        bot.phase55_rolling_price_history = {"unit_timing": [0.55, 0.53]}
+        bot._build_phase55_timing_history_key = lambda *args, **kwargs: "unit_timing"
+        bot._should_adaptive_allow_momentum_warning = lambda *args, **kwargs: (False, {"why": "unit_momentum_down"})
+        bot._get_live_session_entry_adjustment = lambda **kwargs: {"adaptive_block": False}
+        market = {
+            "ticker": "KXNBA-TIMING-GATE",
+            "series_ticker": "KXNBA",
+            "status": "open",
+            "title": "NBA game winner",
+            "yes_bid": 0.50,
+            "yes_ask": 0.52,
+            "no_bid": 0.48,
+            "no_ask": 0.50,
+            "volume": 20,
+            "liquidity_dollars": 30,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.52,
+            yes_bid=0.50,
+            yes_ask=0.52,
+            no_bid=0.48,
+            no_ask=0.50,
+            liquidity=30,
+            volume=20,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allowed, reason, details = bot._evaluate_smart_entry_gate(
+                market,
+                q,
+                payload={"selected_side": "yes", "selected_price": 0.52, "selected_price_cents": 52},
+            )
+
+        self.assertTrue(allowed)
+        self.assertTrue(details["adaptive_allow"])
+        self.assertEqual(reason, "sports_timing_gate_demoted_to_execution_cost")
+
+    def test_soft_quote_orderbook_blockers_are_profit_quality_not_hard_safety(self):
+        bot = self._make_bot()
+        for reason in ("quote_not_ready", "quote_not_ready_after_refresh", "orderbook_not_usable", "no_executable_side"):
+            self.assertEqual(bot._classify_aion_execution_blocker(reason), "profit_quality")
+        for reason in ("malformed_orderbook", "fake_book", "duplicate_position", "daily_loss_guard"):
+            self.assertEqual(bot._classify_aion_execution_blocker(reason), "hard_safety")
 
     def test_sports_smart_entry_still_blocks_broken_spread_book(self):
         bot = self._make_bot()
