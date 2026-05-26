@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aion_data_coverage import audit_kalshi_data_coverage, build_sports_data_signal
@@ -19,7 +20,7 @@ class DataCoverageAuditTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "event_type": "candidate_seen",
-                                "timestamp_utc": "2026-05-24T08:00:00Z",
+                                "timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                                 "ticker": f"KXNBA1HTOTAL-TEST-{index}",
                                 "family": "KXNBA1HTOTAL",
                                 "price": 0.34,

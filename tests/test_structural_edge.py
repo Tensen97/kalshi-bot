@@ -1,5 +1,8 @@
 import unittest
+import contextlib
+import io
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +21,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.targeted_orderbook_cache = {}
         bot.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
         bot.family_profit_memory_log_markers = {}
+        bot.live_family_perf_stats = {}
         bot.btc_1h_history_store = None
         bot.btc_1h_history_audit = {}
         bot.btc_1h_history_no_data_logged = True
@@ -32,6 +36,310 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.live_trade_count_today = 0
         bot.live_positions = []
         return bot
+
+    def _set_sports_only_mode(self, enabled):
+        old_mode = kw.AION_SPORTS_ONLY_MODE
+        kw.AION_SPORTS_ONLY_MODE = bool(enabled)
+        self.addCleanup(setattr, kw, "AION_SPORTS_ONLY_MODE", old_mode)
+
+    def test_execution_log_mode_keeps_execution_and_suppresses_advisory(self):
+        old_mode = kw.AION_LOG_MODE
+        old_debug = kw.AION_DEBUG_TELEMETRY
+        old_total = kw._TELEMETRY_STATE.get("advisory_suppressed_total", 0)
+        old_counts = kw._TELEMETRY_STATE.get("advisory_suppressed_by_tag").copy()
+        old_last_summary = kw._TELEMETRY_STATE.get("last_advisory_summary_ts", 0.0)
+        try:
+            kw.AION_LOG_MODE = "execution"
+            kw.AION_DEBUG_TELEMETRY = False
+            kw._TELEMETRY_STATE["last_advisory_summary_ts"] = time.time()
+            before = int(kw._TELEMETRY_STATE.get("advisory_suppressed_total", 0) or 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(
+                    kw._should_emit_module_log(
+                        '[AION-CRYPTO-SUBMIT-ATTEMPT] {"ticker":"KXBTC-TEST","reason":"unit_test"}'
+                    )
+                )
+                self.assertTrue(
+                    kw._should_emit_module_log(
+                        "[LIVE-SELECT-DECISION] final_trade_path chosen_ticker=KXBTC-TEST family=KXBTC"
+                    )
+                )
+                self.assertFalse(
+                    kw._should_emit_module_log(
+                        "[LIVE-SELECT-DECISION] top_decision_trace=[]"
+                    )
+                )
+                self.assertFalse(
+                    kw._should_emit_module_log(
+                        '[AION-SELECTED-PRICE-RESOLVED] {"ticker":"KXBTC-TEST","selected_price_dollars":0.42}'
+                    )
+                )
+                self.assertFalse(
+                    kw._should_emit_module_log(
+                        "[AION-FINAL-BLOCKER-TRACE] ticker=KXBTC-TEST final_block_reason=unsafe_price"
+                    )
+                )
+                self.assertFalse(
+                    kw._should_emit_module_log(
+                        '[LIVE-REACTIVATION-WATCHLIST] {"ticker":"KXBTC-TEST","state":"unchanged"}'
+                    )
+                )
+                self.assertFalse(kw._should_emit_module_log("operator dashboard snapshot"))
+            self.assertGreaterEqual(
+                int(kw._TELEMETRY_STATE.get("advisory_suppressed_total", 0) or 0),
+                before + 1,
+            )
+        finally:
+            kw.AION_LOG_MODE = old_mode
+            kw.AION_DEBUG_TELEMETRY = old_debug
+            kw._TELEMETRY_STATE["advisory_suppressed_total"] = old_total
+            kw._TELEMETRY_STATE["advisory_suppressed_by_tag"].clear()
+            kw._TELEMETRY_STATE["advisory_suppressed_by_tag"].update(old_counts)
+            kw._TELEMETRY_STATE["last_advisory_summary_ts"] = old_last_summary
+
+    def test_cycle_execution_summary_tracks_execution_truth(self):
+        old_mode = kw.AION_LOG_MODE
+        old_debug = kw.AION_DEBUG_TELEMETRY
+        old_cycle_state = {
+            key: value.copy() if hasattr(value, "copy") else value
+            for key, value in kw._AION_EXECUTION_CYCLE_STATE.items()
+        }
+        old_total = kw._TELEMETRY_STATE.get("advisory_suppressed_total", 0)
+        old_counts = kw._TELEMETRY_STATE.get("advisory_suppressed_by_tag").copy()
+        old_last_summary = kw._TELEMETRY_STATE.get("last_advisory_summary_ts", 0.0)
+        try:
+            kw.AION_LOG_MODE = "execution"
+            kw.AION_DEBUG_TELEMETRY = False
+            kw._aion_reset_cycle_execution_summary(None)
+            kw._TELEMETRY_STATE["advisory_suppressed_total"] = 0
+            kw._TELEMETRY_STATE["advisory_suppressed_by_tag"].clear()
+            kw._TELEMETRY_STATE["last_advisory_summary_ts"] = time.time()
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                kw.print('[AION-RUNONCE-START] {"cycle_count":101,"timestamp":1779694300.0}')
+                kw.print('[CRYPTO-PROB-CALIBRATION] {"ticker":"KXBTC-TEST"}')
+                kw.print('[CRYPTO-QUALIFIED] {"ticker":"KXBTC-TEST"}')
+                kw.print('[SPORTS-CONVICTION-SCORE] {"ticker":"KXNCAABSPREAD-PURMICH"}')
+                kw.print('[AION-SPORTS-SUBMIT-ATTEMPT] {"ticker":"KXNCAABSPREAD-PURMICH","reason":"unit_test"}')
+                kw.print('[AION-CRYPTO-SUBMIT-ATTEMPT] {"ticker":"KXBTC-TEST","reason":"unit_test"}')
+                kw.print('[POSITION-OPEN] {"ticker":"KXBTC-TEST"}')
+                kw.print('[AION-FINAL-SUBMIT-BLOCKED] {"ticker":"KXETH-TEST","reason":"duplicate_guard"}')
+                kw.print("[AION-FINAL-BLOCKER-TRACE] ticker=KXBTC-TRACE final_block_reason=unsafe_price")
+                kw.print('[LIVE-REACTIVATION-WATCHLIST] {"ticker":"KXBTC-TEST","state":"unchanged"}')
+                kw.print('[AION-RUNONCE-START] {"cycle_count":102,"timestamp":1779694360.0}')
+
+            rendered = out.getvalue()
+            self.assertIn("[AION-CYCLE-EXECUTION-SUMMARY]", rendered)
+            self.assertIn('"crypto_candidates_scanned": 1', rendered)
+            self.assertIn('"sports_candidates_scanned": 1', rendered)
+            self.assertIn('"crypto_qualified_count": 1', rendered)
+            self.assertIn('"sports_qualified_count": 1', rendered)
+            self.assertIn('"positions_opened": 1', rendered)
+            self.assertIn('"duplicate_guard": 1', rendered)
+            self.assertIn('"unsafe_price": 1', rendered)
+            self.assertIn('"advisory_logs_suppressed": 1', rendered)
+            self.assertNotIn("[AION-FINAL-BLOCKER-TRACE]", rendered)
+            self.assertNotIn("[LIVE-REACTIVATION-WATCHLIST]", rendered)
+        finally:
+            kw.AION_LOG_MODE = old_mode
+            kw.AION_DEBUG_TELEMETRY = old_debug
+            kw._AION_EXECUTION_CYCLE_STATE.clear()
+            kw._AION_EXECUTION_CYCLE_STATE.update(old_cycle_state)
+            kw._TELEMETRY_STATE["advisory_suppressed_total"] = old_total
+            kw._TELEMETRY_STATE["advisory_suppressed_by_tag"].clear()
+            kw._TELEMETRY_STATE["advisory_suppressed_by_tag"].update(old_counts)
+            kw._TELEMETRY_STATE["last_advisory_summary_ts"] = old_last_summary
+
+    def test_crypto_side_selection_can_choose_yes_when_yes_edge_is_better(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXBTC-26MAY2505-B79150",
+            family="KXBTC",
+            lane="CRYPTO_LADDER",
+            market={"ticker": "KXBTC-26MAY2505-B79150", "title": "Bitcoin range"},
+            yes_bid=0.39,
+            yes_ask=0.40,
+            no_bid=0.58,
+            no_ask=0.61,
+            yes_top_size=120,
+            no_top_size=120,
+            quote_diag={"yes_edge_after_cost": 0.05, "no_edge_after_cost": 0.01},
+            source="unit_test",
+        )
+        self.assertEqual(decision["selected_side"], "yes")
+        self.assertEqual(decision["selected_price"], 0.40)
+        self.assertGreater(decision["yes_final_score"], decision["no_final_score"])
+
+    def test_crypto_side_selection_can_choose_no_when_no_edge_is_better(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXETH-26MAY2505-B2130",
+            family="KXETH",
+            lane="CRYPTO_LADDER",
+            market={"ticker": "KXETH-26MAY2505-B2130", "title": "Ethereum range"},
+            yes_bid=0.54,
+            yes_ask=0.57,
+            no_bid=0.41,
+            no_ask=0.44,
+            yes_top_size=80,
+            no_top_size=90,
+            quote_diag={"yes_edge_after_cost": -0.01, "no_edge_after_cost": 0.06},
+            source="unit_test",
+        )
+        self.assertEqual(decision["selected_side"], "no")
+        self.assertEqual(decision["selected_price"], 0.44)
+        self.assertGreater(decision["no_final_score"], decision["yes_final_score"])
+
+    def test_btc15m_down_momentum_can_select_no_on_up_contract(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXBTC15M-26MAY250715-UP",
+            family="KXBTC15M",
+            lane="CRYPTO_LADDER",
+            market={"ticker": "KXBTC15M-26MAY250715-UP", "title": "Bitcoin up in 15 minutes"},
+            yes_bid=0.49,
+            yes_ask=0.52,
+            no_bid=0.46,
+            no_ask=0.49,
+            yes_top_size=50,
+            no_top_size=50,
+            quote_diag={
+                "yes_edge_after_cost": 0.002,
+                "no_edge_after_cost": 0.004,
+                "momentum_direction": "down",
+                "momentum_strength": 0.90,
+            },
+            preferred_side="yes",
+            source="unit_test",
+        )
+        self.assertEqual(decision["selected_side"], "no")
+        self.assertEqual(decision["reason"], "switched_to_no_better_score")
+
+    def test_sports_side_selection_can_choose_yes_when_yes_edge_is_better(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXNCAABSPREAD-PURMICH",
+            family="KXNCAABSPREAD",
+            lane="SPORTS",
+            market={"ticker": "KXNCAABSPREAD-PURMICH", "title": "Purdue vs Michigan spread"},
+            yes_bid=0.45,
+            yes_ask=0.48,
+            no_bid=0.49,
+            no_ask=0.52,
+            yes_top_size=30,
+            no_top_size=30,
+            quote_diag={"yes_edge_after_cost": 0.04, "no_edge_after_cost": -0.01},
+            source="unit_test",
+        )
+        self.assertEqual(decision["selected_side"], "yes")
+        self.assertEqual(decision["selected_price"], 0.48)
+
+    def test_sports_side_selection_can_choose_no_when_no_edge_is_better(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXNCAABTOTAL-PURMICH",
+            family="KXNCAABTOTAL",
+            lane="SPORTS",
+            market={"ticker": "KXNCAABTOTAL-PURMICH", "title": "Purdue vs Michigan total"},
+            yes_bid=0.60,
+            yes_ask=0.63,
+            no_bid=0.34,
+            no_ask=0.37,
+            yes_top_size=25,
+            no_top_size=25,
+            quote_diag={"yes_edge_after_cost": -0.02, "no_edge_after_cost": 0.05},
+            source="unit_test",
+        )
+        self.assertEqual(decision["selected_side"], "no")
+        self.assertEqual(decision["selected_price"], 0.37)
+
+    def test_selected_side_is_preserved_into_order_payload(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNCAABTOTAL-PURMICH",
+            "title": "Purdue vs Michigan total",
+            "yes_bid": 0.60,
+            "yes_ask": 0.63,
+            "no_bid": 0.34,
+            "no_ask": 0.37,
+            "yes_top_size": 25,
+            "no_top_size": 25,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            title=market["title"],
+            yes_bid=0.60,
+            yes_ask=0.63,
+            no_bid=0.34,
+            no_ask=0.37,
+            yes_top_size=25,
+            no_top_size=25,
+            liquidity=50,
+        )
+        quote_diag = {"yes_edge_after_cost": -0.02, "no_edge_after_cost": 0.05}
+        resolution = bot.resolve_aion_orderbook_for_payload(
+            market["ticker"],
+            candidate=q,
+            market=market,
+            quote_diag=quote_diag,
+            price_source="ask",
+            selection_stage="submit_unit_test",
+            allow_refresh=False,
+        )
+        self.assertEqual(resolution["selected_side"], "no")
+        self.assertEqual(resolution["selected_price"], 0.37)
+        payload = bot.build_live_order_payload(
+            q,
+            size=1,
+            market=market,
+            quote_diag=quote_diag,
+            orderbook_resolution=resolution,
+            allow_orderbook_refresh=False,
+        )
+        self.assertEqual(payload["side"], "no")
+        self.assertEqual(payload["selected_side"], "no")
+        self.assertEqual(payload["selected_price"], 0.37)
+        self.assertEqual(payload["no_price"], 37)
+        self.assertNotIn("yes_price", payload)
+
+    def test_missing_no_quote_blocks_two_sided_selection(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXBTC-TEST",
+            family="KXBTC",
+            lane="CRYPTO_LADDER",
+            market={"ticker": "KXBTC-TEST"},
+            yes_bid=None,
+            yes_ask=0.52,
+            no_bid=None,
+            no_ask=None,
+            yes_top_size=10,
+            no_top_size=10,
+            quote_diag={"yes_edge_after_cost": 0.05, "no_edge_after_cost": 0.05},
+            source="unit_test",
+        )
+        self.assertIsNone(decision["selected_side"])
+        self.assertEqual(decision["reason"], "missing_two_sided_quote")
+
+    def test_missing_yes_quote_blocks_two_sided_selection(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXETH-TEST",
+            family="KXETH",
+            lane="CRYPTO_LADDER",
+            market={"ticker": "KXETH-TEST"},
+            yes_bid=None,
+            yes_ask=None,
+            no_bid=None,
+            no_ask=0.48,
+            yes_top_size=10,
+            no_top_size=10,
+            quote_diag={"yes_edge_after_cost": 0.05, "no_edge_after_cost": 0.05},
+            source="unit_test",
+        )
+        self.assertIsNone(decision["selected_side"])
+        self.assertEqual(decision["reason"], "missing_two_sided_quote")
 
     def test_ladder_dislocation_gets_structural_score_and_boost(self):
         bot = self._make_bot()
@@ -362,6 +670,7 @@ class StructuralEdgeTests(unittest.TestCase):
             self.assertGreater(context["size_multiplier"], 1.0)
 
     def test_btc1h_adaptive_cycle_promotes_best_ladder_candidate_without_storage_dependency(self):
+        self._set_sports_only_mode(False)
         bot = self._make_bot()
         bot._fetch_btc1h_cycle_markets = lambda status="open", limit=None: ([], [])
         bot._refresh_btc1h_settlement_learning = lambda source="unit": {
@@ -437,6 +746,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertIn("markets_to_merge", summary)
 
     def test_crypto_ladder_cycle_promotes_eth_ladder_and_uses_crypto_lane(self):
+        self._set_sports_only_mode(False)
         bot = self._make_bot()
         bot._fetch_btc1h_cycle_markets = lambda status="open", limit=None: ([], [])
         bot._refresh_btc1h_settlement_learning = lambda source="unit": {
@@ -516,6 +826,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(lane, "CRYPTO_LADDER")
 
     def test_dual_lane_allocation_reserves_btc1h_over_weak_sports_prop(self):
+        self._set_sports_only_mode(False)
         bot = self._make_bot()
         btc_q = SimpleNamespace(
             ticker="KXBTC-26MAY2517-B74875",
@@ -598,6 +909,341 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(expectancy[sports_q.ticker]["lane_allocation"]["decision"], "SKIP_WEAK_SPORT")
         self.assertTrue(expectancy[btc_q.ticker]["lane_allocation"]["reserved"])
 
+    def test_sports_only_mode_blocks_crypto_allocation_and_keeps_sports(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        crypto_q = SimpleNamespace(
+            ticker="KXBTC15M-26MAY250715-UP",
+            selected_side="yes",
+            selected_price=0.34,
+            yes_bid=0.33,
+            yes_ask=0.34,
+            no_bid=0.66,
+            no_ask=0.67,
+            liquidity=220,
+        )
+        sports_q = SimpleNamespace(
+            ticker="KXNCAABSPREAD-PURMICH",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.44,
+            yes_ask=0.46,
+            no_bid=0.54,
+            no_ask=0.56,
+            liquidity=180,
+        )
+        markets = [
+            {"ticker": crypto_q.ticker, "series_ticker": "KXBTC15M", "title": "Bitcoin up in 15 minutes"},
+            {"ticker": sports_q.ticker, "series_ticker": "KXNCAABSPREAD", "title": "Purdue vs Michigan spread"},
+        ]
+        expectancy = {
+            crypto_q.ticker: {
+                "raw_score": 95.0,
+                "adjusted_score": 95.0,
+                "q": crypto_q,
+                "spread": 0.01,
+                "family": "KXBTC15M",
+                "expectancy_summary": {"final_edge": 0.030, "selected_side": "yes", "selected_price": 0.34},
+                "quality_snapshot": {"selected_price": 0.34, "liquidity_depth": 220, "spread": 0.01},
+                "ev_context": {"ev_edge": 0.030, "crypto_momentum_score": 90.0},
+            },
+            sports_q.ticker: {
+                "raw_score": 72.0,
+                "adjusted_score": 72.0,
+                "q": sports_q,
+                "spread": 0.02,
+                "family": "KXNCAABSPREAD",
+                "expectancy_summary": {
+                    "final_edge": 0.020,
+                    "sports_edge_after_cost": 0.020,
+                    "selected_side": "yes",
+                    "selected_price": 0.46,
+                    "expectancy_score": 0.75,
+                },
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 180, "spread": 0.02},
+                "sports_edge_context": {"boost": 4.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.020},
+            },
+        }
+
+        ranked = bot._apply_dual_lane_allocation_ranking(
+            [(95.0, crypto_q, 0.01, "KXBTC15M"), (72.0, sports_q, 0.02, "KXNCAABSPREAD")],
+            markets,
+            expectancy_summary_by_ticker=expectancy,
+            source="unit_test_sports_only",
+        )
+
+        self.assertEqual(ranked[0][1].ticker, sports_q.ticker)
+        self.assertEqual(expectancy[crypto_q.ticker]["lane_allocation"]["decision"], "SPORTS_ONLY_CRYPTO_BLOCK")
+        self.assertEqual(expectancy[crypto_q.ticker]["unified_opportunity_score"], 0.0)
+        self.assertGreater(expectancy[sports_q.ticker]["lane_allocation"]["unified_opportunity_score"], 0.0)
+
+    def test_sports_only_mode_blocks_crypto_payload_before_sizing(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXETH15M-26MAY250715-UP",
+            selected_side="yes",
+            selected_price=0.28,
+            yes_bid=0.27,
+            yes_ask=0.28,
+            no_bid=0.72,
+            no_ask=0.73,
+            liquidity=120,
+        )
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: self.fail("crypto payload should block before orderbook/sizing")
+        bot._resolve_dynamic_live_entry_size = lambda *args, **kwargs: self.fail("crypto payload should block before sizing")
+
+        payload = bot.build_live_order_payload(
+            q,
+            market={"ticker": q.ticker, "series_ticker": "KXETH15M", "title": "Ethereum up in 15 minutes"},
+            selected_ticker=q.ticker,
+            selection_stage="unit_test_sports_only",
+        )
+
+        self.assertIsNone(payload)
+
+    def test_sports_only_discovery_filters_crypto_and_non_sports(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        markets = [
+            {"ticker": "KXBTC15M-26MAY250715-UP", "series_ticker": "KXBTC15M", "title": "Bitcoin up"},
+            {"ticker": "KXTEMPCHI-26MAY-HIGH", "series_ticker": "KXTEMP", "title": "Chicago temperature"},
+            {"ticker": "KXNCAABSPREAD-PURMICH", "series_ticker": "KXNCAABSPREAD", "title": "Purdue vs Michigan spread"},
+            {"ticker": "KXMLBMONEYLINE-NYYBOS", "series_ticker": "KXMLBMONEYLINE", "title": "Yankees vs Red Sox"},
+        ]
+
+        filtered = bot._filter_sports_only_markets(markets, source="unit_test_discovery", force_log=True)
+
+        self.assertEqual([market["ticker"] for market in filtered], ["KXNCAABSPREAD-PURMICH", "KXMLBMONEYLINE-NYYBOS"])
+
+    def test_sports_only_btc_cycle_discovery_is_disabled(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        bot._fetch_btc1h_cycle_markets = lambda *args, **kwargs: self.fail("sports-only mode should not fetch crypto cycle markets")
+
+        summary = bot._run_btc1h_adaptive_cycle(
+            markets=[{"ticker": "KXBTC1H-CYCLE-70000", "series_ticker": "KXBTC1H", "title": "Bitcoin above $70,000"}],
+            source="unit_test_sports_only",
+            force=True,
+        )
+
+        self.assertFalse(summary["enabled"])
+        self.assertEqual(summary["markets_to_merge"], [])
+        self.assertEqual(summary["reason"], "sports_only_mode_crypto_discovery_disabled")
+
+    def test_sports_only_final_ranking_purges_crypto_and_weather(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        crypto_q = SimpleNamespace(ticker="KXBTC15M-26MAY250715-UP", liquidity=220, volume=1000)
+        weather_q = SimpleNamespace(ticker="KXTEMPCHI-26MAY-HIGH", liquidity=180, volume=800)
+        sports_q = SimpleNamespace(ticker="KXNCAABSPREAD-PURMICH", liquidity=160, volume=700)
+        markets = [
+            {"ticker": crypto_q.ticker, "series_ticker": "KXBTC15M", "title": "Bitcoin up"},
+            {"ticker": weather_q.ticker, "series_ticker": "KXTEMP", "title": "Chicago high temperature"},
+            {"ticker": sports_q.ticker, "series_ticker": "KXNCAABSPREAD", "title": "Purdue vs Michigan spread"},
+        ]
+
+        ranked = bot.rank_final_candidates(
+            [
+                (99.0, crypto_q, 0.01, "KXBTC15M"),
+                (98.0, weather_q, 0.01, "KXTEMP"),
+                (72.0, sports_q, 0.02, "KXNCAABSPREAD"),
+            ],
+            markets=markets,
+        )
+
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0][1].ticker, sports_q.ticker)
+
+    def test_sports_only_dynamic_sizing_blocks_crypto_and_non_sports(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        crypto_q = SimpleNamespace(ticker="KXETH15M-26MAY250715-UP", family="KXETH15M", selected_side="yes", selected_price=0.28)
+        weather_q = SimpleNamespace(ticker="KXTEMPCHI-26MAY-HIGH", family="KXTEMP", selected_side="yes", selected_price=0.42)
+
+        crypto_size = bot._resolve_dynamic_live_entry_size(
+            crypto_q,
+            explicit_size=5,
+            payload={"ticker": crypto_q.ticker, "family": crypto_q.family, "count": 5},
+            ev_context={"ticker": crypto_q.ticker, "family": crypto_q.family, "ev_tier": "S"},
+            source="unit_test_sports_only_sizing",
+        )
+        weather_size = bot._resolve_dynamic_live_entry_size(
+            weather_q,
+            explicit_size=5,
+            payload={"ticker": weather_q.ticker, "family": weather_q.family, "count": 5},
+            ev_context={"ticker": weather_q.ticker, "family": weather_q.family, "ev_tier": "S"},
+            source="unit_test_sports_only_sizing",
+        )
+
+        self.assertEqual(crypto_size, 0)
+        self.assertEqual(weather_size, 0)
+
+    def test_sports_only_submit_live_order_blocks_non_sports(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(ticker="KXTEMPCHI-26MAY-HIGH", family="KXTEMP", selected_side="yes", selected_price=0.42)
+
+        result = bot.submit_live_order(
+            q,
+            payload_override={"ticker": q.ticker, "family": q.family, "side": "yes", "price": 0.42, "count": 1},
+        )
+
+        self.assertFalse(result["submitted"])
+        self.assertIn(result["reason"], {"sports_only_weather_execution_disabled", "sports_only_non_sports_execution_disabled"})
+
+    def test_sports_only_submit_live_order_allows_sports_yes_and_no(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        captured_payloads = []
+        bot.recent_submitted_order_for_ticker = lambda ticker: None
+        bot.recent_submitted_order_count_for_family = lambda family: 0
+        bot.recent_submitted_order_count_total = lambda: 0
+        bot.get_live_submit_authorization = lambda payload: {"ok": True}
+        bot.can_build_live_auth = lambda: True
+        bot._reset_live_trade_counter_if_needed = lambda: None
+        bot._active_live_order_timestamps = lambda: []
+        bot._live_order_timestamps = []
+        bot.already_holding = lambda ticker: False
+        bot.extract_order_execution_summary = lambda response: {"order_id": response.get("order_id")}
+        bot.persist_live_entry_metadata = lambda **kwargs: None
+        bot.append_live_audit_log = lambda *args, **kwargs: None
+        bot.append_aion_learning_archive_event = lambda *args, **kwargs: None
+
+        def fake_place_live_order(payload):
+            captured_payloads.append(dict(payload))
+            return {
+                "submitted": True,
+                "reason": "submitted",
+                "endpoint": "/trade-api/v2/portfolio/orders",
+                "payload": dict(payload),
+                "response": {"order_id": f"unit-{len(captured_payloads)}"},
+                "status_code": 201,
+            }
+
+        bot.place_live_order = fake_place_live_order
+
+        for side, price in (("yes", 0.48), ("no", 0.37)):
+            q = SimpleNamespace(
+                ticker=f"KXNCAABTOTAL-PURMICH-{side.upper()}",
+                family="KXNCAABTOTAL",
+                selected_side=side,
+                selected_price=price,
+                yes_bid=0.45,
+                yes_ask=0.48,
+                no_bid=0.36,
+                no_ask=0.37,
+                liquidity=100,
+            )
+
+            result = bot.submit_live_order(
+                q,
+                size=2,
+                lane="SPORTS",
+                payload_override={
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "side": side,
+                    "selected_side": side,
+                    "selected_price": price,
+                    "price": price,
+                    "count": 2,
+                },
+            )
+
+            self.assertTrue(result["submitted"])
+
+        self.assertEqual([payload["side"] for payload in captured_payloads], ["yes", "no"])
+
+    def test_sports_only_parallel_submits_only_sports(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        submitted = []
+        crypto_q = SimpleNamespace(
+            ticker="KXBTC15M-26MAY250715-UP",
+            selected_side="yes",
+            selected_price=0.34,
+            yes_bid=0.33,
+            yes_ask=0.34,
+            no_bid=0.66,
+            no_ask=0.67,
+            liquidity=220,
+        )
+        sports_q = SimpleNamespace(
+            ticker="KXNCAABSPREAD-PURMICH",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.44,
+            yes_ask=0.46,
+            no_bid=0.54,
+            no_ask=0.56,
+            liquidity=180,
+        )
+        bot.last_dual_lane_buy_candidates = [
+            {
+                "ticker": crypto_q.ticker,
+                "lane": "CRYPTO_LADDER",
+                "family": "KXBTC15M",
+                "q": crypto_q,
+                "market": {"ticker": crypto_q.ticker, "series_ticker": "KXBTC15M"},
+                "allocation": {"lane": "CRYPTO_LADDER", "allocation_score": 96.0, "edge": 0.03, "spread": 0.01, "liquidity": 220},
+            },
+            {
+                "ticker": sports_q.ticker,
+                "lane": "SPORTS",
+                "family": "KXNCAABSPREAD",
+                "q": sports_q,
+                "market": {"ticker": sports_q.ticker, "series_ticker": "KXNCAABSPREAD"},
+                "allocation": {
+                    "lane": "SPORTS",
+                    "allocation_score": 84.0,
+                    "edge": 0.02,
+                    "confidence": 0.78,
+                    "spread": 0.02,
+                    "liquidity": 180,
+                    "decision": "ALLOW_STRONG_SPORT",
+                    "reason": "strong_sports_only_candidate",
+                },
+            },
+        ]
+        bot.already_holding = lambda ticker: False
+        bot.check_live_duplicate_position_api = lambda ticker: {"blocked": False}
+        bot.build_live_order_payload = lambda q, **kwargs: {
+            "ticker": q.ticker,
+            "side": "yes",
+            "price": q.selected_price,
+            "count": 2,
+            "yes_price": int(q.selected_price * 100),
+        }
+        bot.submit_live_order = lambda q, lane=None, payload_override=None, **kwargs: submitted.append(q.ticker) or {
+            "submitted": True,
+            "reason": "submitted",
+            "payload": dict(payload_override or {}),
+        }
+        bot.record_live_position = lambda q, size=None, entry_price=None, side=None: None
+
+        result = bot._execute_parallel_lane_submit_attempts(source="unit_test_sports_only")
+
+        self.assertFalse(result["crypto_submitted"])
+        self.assertTrue(result["sports_submitted"])
+        self.assertEqual(result["crypto_reason"], "sports_only_crypto_execution_disabled")
+        self.assertEqual(submitted, [sports_q.ticker])
+
+    def test_sports_only_submit_live_order_hard_blocks_crypto(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(ticker="KXSOL-26MAY2517-UP", family="KXSOL", selected_side="yes", selected_price=0.30)
+
+        result = bot.submit_live_order(
+            q,
+            lane="CRYPTO_LADDER",
+            payload_override={"ticker": q.ticker, "side": "yes", "price": 0.30, "count": 1},
+        )
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "sports_only_crypto_execution_disabled")
+
     def test_sports_lane_allocation_keeps_strong_sports_candidate(self):
         bot = self._make_bot()
         q = SimpleNamespace(
@@ -676,6 +1322,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertIn("home_run_prop", context["trash_prop_patterns"])
         self.assertIn("multi_home_run_moonshot", context["trash_prop_patterns"])
         self.assertGreater(context["trash_prop_penalty"], 0.0)
+        self.assertTrue(context["sports_weak_prop_reject"])
 
     def test_quality_calibration_boosts_nba_1h_total_ladder(self):
         bot = self._make_bot()
@@ -818,6 +1465,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(submitted, [(sports_q.ticker, 2, 0.48, "yes")])
 
     def test_parallel_lane_submit_attempts_submit_crypto_and_sports_independently(self):
+        self._set_sports_only_mode(False)
         bot = self._make_bot()
         submitted = []
         crypto_q = SimpleNamespace(
@@ -899,6 +1547,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual([item[0] for item in submitted], [crypto_q.ticker, sports_q.ticker])
 
     def test_parallel_lane_submit_attempts_crypto_when_sports_primary_blocked(self):
+        self._set_sports_only_mode(False)
         bot = self._make_bot()
         submitted = []
         crypto_q = SimpleNamespace(
@@ -1094,6 +1743,1106 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertFalse(snapshot["is_crypto_ladder"])
         self.assertEqual(vars(sports_q), before)
 
+    def test_crypto_final_decision_uses_ready_book_not_sports_liquidity_score(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXETH-26MAY2517-B1920",
+            selected_side="yes",
+            selected_price=None,
+            yes_bid=0.30,
+            yes_ask=0.31,
+            no_bid=0.69,
+            no_ask=0.70,
+            yes_top_size=3,
+            no_top_size=3,
+            liquidity=3,
+            volume=0,
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": "KXETH",
+            "event_ticker": "KXETH-26MAY2517",
+            "title": "Ethereum above $1,920 at 5pm",
+            "yes_bid_dollars": 0.30,
+            "yes_ask_dollars": 0.31,
+            "no_bid_dollars": 0.69,
+            "no_ask_dollars": 0.70,
+            "yes_ask_size_fp": 3,
+            "no_ask_size_fp": 3,
+            "ladder_boost": 1.0,
+        }
+        bot.is_targeted_series_market = lambda market: False
+        bot.get_market_min_entry_liquidity = lambda market: 10.0
+        bot.get_market_liquidity_priority = lambda market: {
+            "yes_top_size": 3,
+            "no_top_size": 3,
+            "score": 1.0,
+            "reasons": ["unit_low_depth"],
+            "has_real_liquidity": True,
+            "both_sides_quoted": True,
+        }
+        bot._resolve_effective_liquidity_signal = lambda *args, **kwargs: {
+            "effective_source": "topbook",
+            "liquidity_final": 3.0,
+            "fallback_used": True,
+            "effective_top_size": 3.0,
+        }
+        bot._build_aion_market_priority_profile = lambda **kwargs: {
+            "crypto_priority": True,
+            "market_priority_score": 0.0,
+            "execution_quality_profile": {},
+        }
+        bot._build_aion_scan_rebalancer_profile = lambda **kwargs: {"scan_weight": 1.0}
+        bot._get_family_performance_weight = lambda family: 0.0
+        bot.get_market_discovery_category = lambda family: "crypto"
+        bot._is_btc_volatility_family = lambda *args, **kwargs: False
+        bot.get_minutes_to_event = lambda market: 30.0
+        bot.get_event_time_bucket = lambda minutes: "normal"
+        bot.get_effective_max_minutes_to_event = lambda: 120.0
+        bot._get_elite_public_signal_match = lambda **kwargs: {"boost": 0.0}
+        bot._evaluate_market_psychology = lambda **kwargs: {
+            "blocked": False,
+            "shadow_only": False,
+            "psychology_delta": 0.0,
+            "adjusted_score": kwargs.get("original_score", 0.0),
+            "original_score": kwargs.get("original_score", 0.0),
+        }
+        bot._evaluate_live_edge_quality = lambda **kwargs: {
+            "confidence_score": 0.0,
+            "confidence_weight": 0.0,
+        }
+        bot._realm_xxxii_shadow_arb_audit = lambda *args, **kwargs: {
+            "hard_block": True,
+            "reject_reason": "low_liquidity_score",
+        }
+        bot._record_shadow_arb_validation = lambda *args, **kwargs: {}
+        bot._get_live_session_entry_adjustment = lambda **kwargs: {"score_penalty": 0.0}
+        bot._record_live_reject_telemetry = lambda **kwargs: None
+        bot._record_live_near_pass = lambda **kwargs: None
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: {
+            "orderbook_ready": True,
+            "selected_side": "yes",
+            "selected_price": 0.31,
+            "selected_price_cents": 31,
+            "yes_bid": 0.30,
+            "yes_ask": 0.31,
+            "no_bid": 0.69,
+            "no_ask": 0.70,
+            "yes_top_size": 3,
+            "no_top_size": 3,
+            "selected_top_size": 3,
+            "liquidity_depth": 3,
+            "selected_side_has_liquidity": True,
+        }
+
+        result = bot.score_final_candidate_decision(market, q, 0.01, "KXETH")
+
+        self.assertEqual(result["decision"], "BUY")
+        self.assertEqual(result["decision_reason"], "crypto_lane_orderbook_ready")
+        self.assertEqual(q.selected_side, "yes")
+        self.assertEqual(q.selected_price, 0.31)
+
+    def test_crypto_live_eligibility_allows_cheap_valid_price(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        market = {
+            "ticker": "KXBTC-26MAY2517-B73875",
+            "series_ticker": "KXBTC",
+            "event_ticker": "KXBTC-26MAY2517",
+            "title": "Bitcoin above $73,875 at 5pm",
+            "status": "open",
+            "close_time": close_time,
+        }
+        q = SimpleNamespace(ticker=market["ticker"], selected_side="yes", selected_price=0.01, liquidity=0)
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market=market,
+            q=q,
+            family="KXBTC",
+            ticker=market["ticker"],
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.01,
+                "selected_price_cents": 1,
+                "yes_bid": 0.0,
+                "yes_ask": 0.01,
+                "no_bid": 0.99,
+                "no_ask": 1.0,
+                "yes_top_size": 272,
+                "no_top_size": 309,
+                "selected_top_size": 272,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.01,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["price_allowed"])
+        self.assertEqual(result["selected_price_cents"], 1)
+        self.assertEqual(result["liquidity_source"], "topbook_fallback")
+
+    def test_crypto_live_eligibility_blocks_impossible_price(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        market = {
+            "ticker": "KXBTC-26MAY2517-B73875",
+            "series_ticker": "KXBTC",
+            "status": "open",
+            "close_time": close_time,
+        }
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market=market,
+            family="KXBTC",
+            ticker=market["ticker"],
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 1.25,
+                "selected_price_cents": 125,
+                "yes_bid": 0.98,
+                "yes_ask": 1.25,
+                "yes_top_size": 10,
+                "selected_top_size": 10,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.02,
+            edge_after_cost=0.01,
+            emit_log=False,
+        )
+
+        self.assertFalse(result["eligible"])
+        self.assertFalse(result["price_allowed"])
+        self.assertIn("unsafe_price", result["blockers"])
+
+    def test_crypto_live_market_allowed_despite_stale_sports_lifecycle(self):
+        bot = self._make_bot()
+        bot._get_sports_market_lifecycle_state = lambda **kwargs: "pregame_far"
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=35)).isoformat()
+        market = {
+            "ticker": "KXETH-26MAY2517-B1920",
+            "series_ticker": "KXETH",
+            "status": "open",
+            "close_time": close_time,
+            "ladder_boost": 2.0,
+        }
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market=market,
+            family="KXETH",
+            ticker=market["ticker"],
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.31,
+                "selected_price_cents": 31,
+                "yes_bid": 0.30,
+                "yes_ask": 0.31,
+                "no_bid": 0.69,
+                "no_ask": 0.70,
+                "yes_top_size": 6,
+                "no_top_size": 6,
+                "selected_top_size": 6,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.01,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["market_live_allowed"])
+        self.assertTrue(result["lifecycle_allowed"])
+
+    def test_crypto_closed_or_expired_market_blocked(self):
+        bot = self._make_bot()
+        future_close = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        past_close = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        base_resolution = {
+            "orderbook_ready": True,
+            "selected_side": "yes",
+            "selected_price": 0.31,
+            "selected_price_cents": 31,
+            "yes_bid": 0.30,
+            "yes_ask": 0.31,
+            "no_bid": 0.69,
+            "no_ask": 0.70,
+            "yes_top_size": 6,
+            "no_top_size": 6,
+            "selected_top_size": 6,
+            "selected_side_has_liquidity": True,
+        }
+
+        for status, close_time, blocker in (
+            ("closed", future_close, "market_not_live"),
+            ("open", past_close, "lifecycle_not_allowed"),
+        ):
+            with self.subTest(status=status):
+                result = bot._evaluate_crypto_ladder_live_eligibility(
+                    market={
+                        "ticker": "KXSOL-26MAY2517-B180",
+                        "series_ticker": "KXSOL",
+                        "status": status,
+                        "close_time": close_time,
+                        "ladder_boost": 2.0,
+                    },
+                    family="KXSOL",
+                    ticker="KXSOL-26MAY2517-B180",
+                    orderbook_resolution=base_resolution,
+                    spread=0.01,
+                    edge_after_cost=0.0,
+                    emit_log=False,
+                )
+                self.assertFalse(result["eligible"])
+                self.assertIn(blocker, result["blockers"])
+
+    def test_crypto_topbook_liquidity_fallback_qualifies_when_reported_zero(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=40)).isoformat()
+        market = {
+            "ticker": "KXXRP-26MAY2517-B250",
+            "series_ticker": "KXXRP",
+            "status": "open",
+            "close_time": close_time,
+            "ladder_boost": 1.0,
+            "liquidity": 0,
+        }
+        q = SimpleNamespace(ticker=market["ticker"], selected_side="yes", selected_price=0.24, liquidity=0)
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market=market,
+            q=q,
+            family="KXXRP",
+            ticker=market["ticker"],
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.24,
+                "selected_price_cents": 24,
+                "yes_bid": 0.22,
+                "yes_ask": 0.24,
+                "no_bid": 0.76,
+                "no_ask": 0.78,
+                "yes_top_size": 7,
+                "no_top_size": 8,
+                "selected_top_size": 7,
+                "liquidity_depth": 0,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.02,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["liquidity_source"], "topbook_fallback")
+        self.assertGreater(result["liquidity"], 0)
+
+    def test_crypto_ranked_candidate_score_can_clear_zero_raw_edge(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={
+                "ticker": "KXBTC-26MAY2502-B77250",
+                "series_ticker": "KXBTC",
+                "status": "open",
+                "close_time": close_time,
+            },
+            q=SimpleNamespace(ticker="KXBTC-26MAY2502-B77250", selected_side="yes"),
+            family="KXBTC",
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.19,
+                "selected_price_cents": 19,
+                "yes_bid": 0.14,
+                "yes_ask": 0.19,
+                "no_bid": 0.81,
+                "no_ask": 0.86,
+                "yes_top_size": 40,
+                "no_top_size": 140,
+                "selected_top_size": 40,
+                "liquidity_depth": 140,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.05,
+            edge_after_cost=0.0,
+            candidate_score=90.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["edge_allowed"])
+        self.assertEqual(result["candidate_score"], 90.0)
+        self.assertEqual(result["edge_after_cost"], 0.0)
+
+    def test_crypto_deep_tail_without_structure_is_skipped(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={
+                "ticker": "KXBTC-26MAY2517-B79000",
+                "series_ticker": "KXBTC",
+                "status": "open",
+                "close_time": close_time,
+                "current_asset_price": 77000,
+                "selected_range_low": 79000,
+                "selected_range_high": 79100,
+                "momentum_direction": "down",
+            },
+            q=SimpleNamespace(ticker="KXBTC-26MAY2517-B79000", selected_side="yes"),
+            family="KXBTC",
+            ticker="KXBTC-26MAY2517-B79000",
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.02,
+                "selected_price_cents": 2,
+                "yes_bid": 0.01,
+                "yes_ask": 0.02,
+                "no_bid": 0.98,
+                "no_ask": 0.99,
+                "yes_top_size": 80,
+                "no_top_size": 100,
+                "selected_top_size": 80,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.01,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["distance_class"], "deep_tail_range")
+        self.assertIn("unsupported_deep_tail", result["blockers"])
+        self.assertEqual(result["cheap_range_decision"], "skip_unsupported_deep_tail")
+
+    def test_crypto_deep_tail_with_momentum_cluster_support_can_pass(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        bot.btc1h_cycle_priority_by_ticker = {
+            "KXBTC-26MAY2517-B79000": {
+                "ladder_boost": 3.0,
+                "historical_boost": 1.5,
+                "neighbor_confirmation": True,
+                "components": {"nearby_confirmation": 0.72, "repricing_lag": 0.40},
+                "score": 72.0,
+            }
+        }
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={
+                "ticker": "KXBTC-26MAY2517-B79000",
+                "series_ticker": "KXBTC",
+                "status": "open",
+                "close_time": close_time,
+                "current_asset_price": 77000,
+                "selected_range_low": 79000,
+                "selected_range_high": 79100,
+                "momentum_direction": "up",
+            },
+            q=SimpleNamespace(ticker="KXBTC-26MAY2517-B79000", selected_side="yes"),
+            family="KXBTC",
+            ticker="KXBTC-26MAY2517-B79000",
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.02,
+                "selected_price_cents": 2,
+                "yes_bid": 0.01,
+                "yes_ask": 0.02,
+                "no_bid": 0.98,
+                "no_ask": 0.99,
+                "yes_top_size": 80,
+                "no_top_size": 100,
+                "selected_top_size": 80,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.01,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["distance_class"], "deep_tail_range")
+        self.assertTrue(result["deep_tail_supported"])
+        self.assertEqual(result["cheap_range_decision"], "allow_supported_deep_tail")
+        self.assertLess(result["crypto_size_multiplier"], 1.0)
+
+    def test_crypto_reachable_range_gets_quality_and_size_boost(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        bot.btc1h_cycle_priority_by_ticker = {
+            "KXETH-26MAY2517-B2420": {
+                "ladder_boost": 2.0,
+                "historical_boost": 1.0,
+                "neighbor_confirmation": True,
+                "components": {"nearby_confirmation": 0.66, "repricing_lag": 0.35},
+                "score": 65.0,
+            }
+        }
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={
+                "ticker": "KXETH-26MAY2517-B2420",
+                "series_ticker": "KXETH",
+                "status": "open",
+                "close_time": close_time,
+                "current_asset_price": 2400,
+                "selected_range_low": 2412,
+                "selected_range_high": 2420,
+                "momentum_direction": "up",
+            },
+            q=SimpleNamespace(ticker="KXETH-26MAY2517-B2420", selected_side="yes"),
+            family="KXETH",
+            ticker="KXETH-26MAY2517-B2420",
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.08,
+                "selected_price_cents": 8,
+                "yes_bid": 0.07,
+                "yes_ask": 0.08,
+                "no_bid": 0.92,
+                "no_ask": 0.93,
+                "yes_top_size": 90,
+                "no_top_size": 100,
+                "selected_top_size": 90,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.01,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertIn(result["distance_class"], {"near_range", "reachable_range"})
+        self.assertTrue(result["cluster_support"])
+        self.assertTrue(result["momentum_support"])
+        self.assertGreater(result["crypto_size_multiplier"], 1.0)
+
+    def test_btc15m_momentum_gets_boosted(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=12)).isoformat()
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={
+                "ticker": "KXBTC15M-26MAY250715-UP",
+                "series_ticker": "KXBTC15M",
+                "title": "Bitcoin up in 15 minutes",
+                "status": "open",
+                "close_time": close_time,
+                "momentum_direction": "up",
+                "momentum_score": 0.82,
+                "repricing_velocity": 0.012,
+            },
+            q=SimpleNamespace(ticker="KXBTC15M-26MAY250715-UP", selected_side="yes"),
+            family="KXBTC15M",
+            ticker="KXBTC15M-26MAY250715-UP",
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.42,
+                "selected_price_cents": 42,
+                "yes_bid": 0.40,
+                "yes_ask": 0.42,
+                "no_bid": 0.58,
+                "no_ask": 0.60,
+                "yes_top_size": 120,
+                "no_top_size": 130,
+                "selected_top_size": 120,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.02,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["crypto_momentum_entry"])
+        self.assertGreaterEqual(result["crypto_momentum_score"], 58.0)
+        self.assertGreaterEqual(result["repricing_capture_score"], 58.0)
+        self.assertTrue(result["static_ev_override"])
+        self.assertGreater(result["momentum_edge"], 0.0)
+        self.assertGreater(result["effective_edge_after_cost"], 0.0)
+        self.assertGreater(result["crypto_size_multiplier"], 1.5)
+
+    def test_btc15m_static_zero_edge_without_momentum_is_not_overridden(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=12)).isoformat()
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={
+                "ticker": "KXBTC15M-26MAY250715-UP",
+                "series_ticker": "KXBTC15M",
+                "title": "Bitcoin up in 15 minutes",
+                "status": "open",
+                "close_time": close_time,
+                "momentum_direction": "unknown",
+                "momentum_score": 0.0,
+                "repricing_velocity": 0.0,
+            },
+            q=SimpleNamespace(ticker="KXBTC15M-26MAY250715-UP", selected_side="yes"),
+            family="KXBTC15M",
+            ticker="KXBTC15M-26MAY250715-UP",
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.42,
+                "selected_price_cents": 42,
+                "yes_bid": 0.40,
+                "yes_ask": 0.42,
+                "no_bid": 0.58,
+                "no_ask": 0.60,
+                "yes_top_size": 120,
+                "no_top_size": 130,
+                "selected_top_size": 120,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.02,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertFalse(result["eligible"])
+        self.assertFalse(result["static_ev_override"])
+        self.assertEqual(result["momentum_edge"], 0.0)
+        self.assertIn("edge_too_low", result["blockers"])
+
+    def test_btc15m_repricing_capture_scores_and_sizes_up(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=9)).isoformat()
+        bot.btc1h_cycle_priority_by_ticker = {
+            "KXETH15M-26MAY250715-DOWN": {
+                "historical_boost": 1.2,
+                "neighbor_confirmation": True,
+                "components": {"nearby_confirmation": 0.70, "repricing_lag": 0.45},
+            }
+        }
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={
+                "ticker": "KXETH15M-26MAY250715-DOWN",
+                "series_ticker": "KXETH15M",
+                "title": "Ethereum down in 15 minutes",
+                "status": "open",
+                "close_time": close_time,
+                "momentum_direction": "down",
+                "momentum_score": -0.75,
+                "repricing_velocity": -0.018,
+            },
+            q=SimpleNamespace(ticker="KXETH15M-26MAY250715-DOWN", selected_side="yes"),
+            family="KXETH15M",
+            ticker="KXETH15M-26MAY250715-DOWN",
+            orderbook_resolution={
+                "orderbook_ready": True,
+                "selected_side": "yes",
+                "selected_price": 0.44,
+                "selected_price_cents": 44,
+                "yes_bid": 0.42,
+                "yes_ask": 0.44,
+                "no_bid": 0.56,
+                "no_ask": 0.58,
+                "yes_top_size": 160,
+                "no_top_size": 150,
+                "selected_top_size": 160,
+                "selected_side_has_liquidity": True,
+            },
+            spread=0.02,
+            edge_after_cost=0.0,
+            emit_log=False,
+        )
+
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["crypto_momentum_entry"])
+        self.assertEqual(result["side_expected_direction"], "down")
+        self.assertGreaterEqual(result["repricing_capture_score"], 70.0)
+        self.assertGreater(result["crypto_size_multiplier"], 2.0)
+
+    def test_crypto_quality_size_cap_does_not_apply_to_sports(self):
+        bot = self._make_bot()
+        sports_q = SimpleNamespace(
+            ticker="KXMLBSTRIKEOUT-TEST-65",
+            family="KXMLBSTRIKEOUT",
+            ev_tier="S",
+            elite_edge_size_multiplier=8.0,
+            ELITE_EDGE_CONFIDENCE=91.0,
+            STRUCTURAL_EDGE_SCORE=92.0,
+            CROSS_MARKET_EDGE_SCORE=84.0,
+            expected_roi=0.11,
+            expected_value=0.038,
+            ev_edge=0.055,
+            selected_side="yes",
+            selected_price=0.20,
+            yes_bid=0.19,
+            yes_ask=0.21,
+            no_bid=0.79,
+            no_ask=0.81,
+            yes_top_size=180,
+            no_top_size=200,
+            spread=0.02,
+            orderbook_ready=True,
+            quote_ready=True,
+            crypto_quality_size_cap=1,
+        )
+
+        resolved = bot._resolve_dynamic_live_entry_size(
+            sports_q,
+            explicit_size=1,
+            payload={"ticker": sports_q.ticker, "count": 1, "selected_side": "yes", "selected_price": 0.20},
+            ev_context={
+                "ticker": sports_q.ticker,
+                "family": sports_q.family,
+                "ev_tier": "S",
+                "ELITE_EDGE_CONFIDENCE": 91.0,
+                "STRUCTURAL_EDGE_SCORE": 92.0,
+                "CROSS_MARKET_EDGE_SCORE": 84.0,
+                "elite_edge_size_multiplier": 8.0,
+                "expected_roi": 0.11,
+                "expected_value": 0.038,
+                "ev_edge": 0.055,
+                "crypto_quality_size_cap": 1,
+            },
+        )
+
+        self.assertGreater(resolved, 1)
+
+    def test_crypto_fast_profit_exit_triggers_near_target(self):
+        bot = self._make_bot()
+        ticker = "KXBTC15M-26MAY250715-UP"
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.crypto_exit_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.30,
+            "side": "yes",
+            "count": 100,
+            "entry_ts": time.time() - 45,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXBTC15M"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.25}
+        q = SimpleNamespace(
+            ticker=ticker,
+            yes_bid=0.41,
+            yes_ask=0.42,
+            no_bid=0.58,
+            no_ask=0.59,
+        )
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.30, "count": 100, "entry_ts": time.time() - 45},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "crypto_fast_take_profit")
+        self.assertGreaterEqual(decision["unrealized_pnl"], 10.0)
+
+    def test_crypto_reversal_exit_triggers_with_profit(self):
+        bot = self._make_bot()
+        ticker = "KXETH15M-26MAY250715-UP"
+        bot.live_exit_price_history = {ticker: [{"ts": time.time() - 20, "price": 0.42}]}
+        bot.dynamic_exit_log_markers = {}
+        bot.crypto_exit_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.32,
+            "side": "yes",
+            "count": 50,
+            "entry_ts": time.time() - 70,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXETH15M"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": -0.20}
+        q = SimpleNamespace(
+            ticker=ticker,
+            yes_bid=0.38,
+            yes_ask=0.39,
+            no_bid=0.61,
+            no_ask=0.62,
+        )
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.32, "count": 50, "entry_ts": time.time() - 70},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "green_momentum_flip")
+        self.assertTrue(decision["green_momentum_flip_exit"])
+        self.assertGreater(decision["unrealized_pnl"], 0.0)
+
+    def test_crypto_stall_exit_protects_profit(self):
+        bot = self._make_bot()
+        ticker = "KXBTC15M-26MAY250715-UP"
+        now = time.time()
+        bot.live_exit_price_history = {
+            ticker: [
+                {"ts": now - 45, "price": 0.37},
+                {"ts": now - 20, "price": 0.372},
+            ]
+        }
+        bot.dynamic_exit_log_markers = {}
+        bot.crypto_exit_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.35,
+            "side": "yes",
+            "count": 20,
+            "entry_ts": now - 80,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXBTC15M"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.0}
+        q = SimpleNamespace(
+            ticker=ticker,
+            yes_bid=0.372,
+            yes_ask=0.382,
+            no_bid=0.618,
+            no_ask=0.628,
+        )
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.35, "count": 20, "entry_ts": now - 80},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "crypto_momentum_stall")
+        self.assertTrue(decision["crypto_momentum_stall_exit"])
+
+    def test_sports_profitable_position_triggers_profit_lock(self):
+        bot = self._make_bot()
+        ticker = "KXNCAABSPREAD-PURMICH-35"
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.30,
+            "side": "yes",
+            "count": 5,
+            "entry_ts": time.time() - 120,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXNCAABSPREAD"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.18}
+        q = SimpleNamespace(ticker=ticker, yes_bid=0.52, yes_ask=0.54, no_bid=0.46, no_ask=0.48)
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.30, "count": 5, "entry_ts": time.time() - 120},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "fast_profit_dollar_lock")
+        self.assertTrue(decision["profit_lock_exit"])
+        self.assertTrue(decision["is_sports_position"])
+
+    def test_crypto_profitable_position_triggers_profit_lock(self):
+        bot = self._make_bot()
+        ticker = "KXBTC-26MAY2517-B79000"
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.crypto_exit_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.02,
+            "side": "yes",
+            "count": 100,
+            "entry_ts": time.time() - 60,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXBTC"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.0}
+        q = SimpleNamespace(ticker=ticker, yes_bid=0.04, yes_ask=0.05, no_bid=0.95, no_ask=0.96)
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.02, "count": 100, "entry_ts": time.time() - 60},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "fast_profit_dollar_lock")
+        self.assertTrue(decision["profit_lock_exit"])
+        self.assertTrue(decision["is_crypto_ladder_position"])
+
+    def test_profit_lock_tracks_peak_value_and_trailing_giveback(self):
+        bot = self._make_bot()
+        ticker = "KXNCAABTOTAL-PURMICH"
+        now = time.time()
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.30,
+            "side": "yes",
+            "count": 10,
+            "entry_ts": now - 180,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXNCAABTOTAL"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.10}
+
+        first = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.30, "count": 10, "entry_ts": now - 180},
+            quotes_by_ticker={ticker: SimpleNamespace(ticker=ticker, yes_bid=0.70, yes_ask=0.72, no_bid=0.28, no_ask=0.30)},
+        )
+        second = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.30, "count": 10, "entry_ts": now - 210},
+            quotes_by_ticker={ticker: SimpleNamespace(ticker=ticker, yes_bid=0.50, yes_ask=0.52, no_bid=0.48, no_ask=0.50)},
+        )
+
+        self.assertTrue(first["peak_value_updated"])
+        self.assertGreaterEqual(first["peak_value"], 7.0)
+        self.assertEqual(second["action"], "exit")
+        self.assertEqual(second["reason"], "trailing_profit_giveback")
+        self.assertTrue(second["trailing_profit_exit"])
+        self.assertGreaterEqual(second["peak_giveback_pct"], 0.30)
+
+    def test_near_max_payout_position_exits(self):
+        bot = self._make_bot()
+        ticker = "KXNFLMONEYLINE-TEST"
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.40,
+            "side": "yes",
+            "count": 2,
+            "entry_ts": time.time() - 90,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXNFLMONEYLINE"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.25}
+        q = SimpleNamespace(ticker=ticker, yes_bid=0.72, yes_ask=0.74, no_bid=0.26, no_ask=0.28)
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.40, "count": 2, "entry_ts": time.time() - 90},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "max_payout_profit_lock")
+        self.assertTrue(decision["max_payout_lock_exit"])
+
+    def test_profit_lock_handles_no_side_positions(self):
+        bot = self._make_bot()
+        ticker = "KXNCAABTOTAL-PURMICH"
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.50,
+            "side": "no",
+            "count": 4,
+            "entry_ts": time.time() - 80,
+        }
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: "KXNCAABTOTAL"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": -0.15}
+        q = SimpleNamespace(ticker=ticker, yes_bid=0.33, yes_ask=0.35, no_bid=0.65, no_ask=0.67)
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "no", "entry_price": 0.50, "count": 4, "entry_ts": time.time() - 80},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["side"], "no")
+        self.assertEqual(decision["reason"], "fast_profit_pct_lock")
+        self.assertTrue(decision["profit_lock_pct_exit"])
+
+    def test_strong_sports_conviction_sizes_and_ranks_higher(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNCAABSPREAD-PURMICH-35",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.44,
+            yes_ask=0.46,
+            no_bid=0.54,
+            no_ask=0.56,
+            liquidity=180,
+        )
+        context = bot._build_lane_allocation_context(
+            {
+                "raw_score": 74.0,
+                "adjusted_score": 74.0,
+                "q": q,
+                "spread": 0.02,
+                "family": "KXNCAABSPREAD",
+                "expectancy_summary": {
+                    "final_edge": 0.024,
+                    "sports_edge_after_cost": 0.024,
+                    "selected_side": "yes",
+                    "selected_price": 0.46,
+                    "expectancy_score": 0.78,
+                },
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 180, "spread": 0.02},
+                "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.024},
+            },
+            market={"ticker": q.ticker, "series_ticker": "KXNCAABSPREAD", "title": "Purdue vs Michigan spread"},
+        )
+
+        self.assertEqual(context["decision"], "ALLOW_STRONG_SPORT")
+        self.assertTrue(context["sports_high_conviction"])
+        self.assertGreater(context["sports_conviction_score"], 62.0)
+        self.assertGreater(context["sports_conviction_size_multiplier"], 1.0)
+        self.assertGreater(context["allocation_score"], context["pre_lane_score"] + kw.AION_STRONG_SPORTS_LANE_BOOST)
+
+    def test_crypto_activation_gate_uses_crypto_eligibility_not_sports_prefilter_survivors(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        market = {
+            "ticker": "KXETH-26MAY2517-B2400",
+            "series_ticker": "KXETH",
+            "event_ticker": "KXETH-26MAY2517",
+            "title": "Ethereum above $2,400 at 5pm",
+            "status": "open",
+            "close_time": close_time,
+            "ladder_boost": 1.0,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            selected_side="yes",
+            selected_price=0.19,
+            yes_bid=0.17,
+            yes_ask=0.19,
+            no_bid=0.81,
+            no_ask=0.83,
+            yes_top_size=5,
+            no_top_size=6,
+            liquidity=0,
+        )
+        bot.build_quote = lambda market_arg: q
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: {
+            "orderbook_ready": True,
+            "selected_side": "yes",
+            "selected_price": 0.19,
+            "selected_price_cents": 19,
+            "yes_bid": 0.17,
+            "yes_ask": 0.19,
+            "no_bid": 0.81,
+            "no_ask": 0.83,
+            "yes_top_size": 5,
+            "no_top_size": 6,
+            "selected_top_size": 5,
+            "liquidity_depth": 0,
+            "selected_side_has_liquidity": True,
+        }
+
+        result = bot.get_controlled_activation_status(market, "KXETH", {})
+
+        self.assertTrue(result["armed"])
+        self.assertEqual(result["denied_reasons"], [])
+        self.assertEqual(result["activation_reason"], "crypto_specific_live_eligibility")
+
+    def test_crypto_activation_gate_uses_strict_prefilter_survivor_for_ranked_edge(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        market = {
+            "ticker": "KXBTC-26MAY2502-B77250",
+            "series_ticker": "KXBTC",
+            "event_ticker": "KXBTC-26MAY2502",
+            "title": "Bitcoin above $77,250 at 2am",
+            "status": "open",
+            "close_time": close_time,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            selected_side="yes",
+            selected_price=0.19,
+            yes_bid=0.14,
+            yes_ask=0.19,
+            no_bid=0.81,
+            no_ask=0.86,
+            yes_top_size=40,
+            no_top_size=140,
+            liquidity=140,
+        )
+        bot.build_quote = lambda market_arg: q
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: {
+            "orderbook_ready": True,
+            "selected_side": "yes",
+            "selected_price": 0.19,
+            "selected_price_cents": 19,
+            "yes_bid": 0.14,
+            "yes_ask": 0.19,
+            "no_bid": 0.81,
+            "no_ask": 0.86,
+            "yes_top_size": 40,
+            "no_top_size": 140,
+            "selected_top_size": 40,
+            "liquidity_depth": 140,
+            "selected_side_has_liquidity": True,
+        }
+
+        result = bot.get_controlled_activation_status(market, "KXBTC", {"KXBTC": 1})
+
+        self.assertTrue(result["armed"])
+        self.assertEqual(result["denied_reasons"], [])
+        self.assertEqual(result["activation_reason"], "crypto_specific_live_eligibility")
+
+    def test_sports_activation_gate_still_requires_sports_prefilter_survivor(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA1HTOTAL-TEST-1125",
+            "series_ticker": "KXNBA1HTOTAL",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 48,
+            "yes_ask": 50,
+            "no_bid": 50,
+            "no_ask": 52,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            yes_bid=0.48,
+            yes_ask=0.50,
+            no_bid=0.50,
+            no_ask=0.52,
+        )
+        bot.build_quote = lambda market_arg: q
+        bot.get_market_liquidity_priority = lambda market_arg: {"top_book_state": "both_non_zero"}
+        bot.get_market_quality_preference = lambda market_arg, liquidity_priority=None: {
+            "both_sides_quoted": True,
+            "narrow_spread": True,
+            "recent_activity": True,
+        }
+        bot._derive_sports_synthetic_top_size = lambda *args, **kwargs: (None, None, None)
+
+        result = bot.get_controlled_activation_status(market, "KXNBA1HTOTAL", {})
+
+        self.assertFalse(result["armed"])
+        self.assertIn("no_prefilter_survivors", result["denied_reasons"])
+
+    def test_crypto_eligibility_helper_does_not_apply_to_sports_candidate(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBSPREAD-SPORTS-TEST",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            liquidity=12,
+        )
+        before = dict(vars(q))
+        result = bot._evaluate_crypto_ladder_live_eligibility(
+            market={"ticker": q.ticker, "series_ticker": "KXMLBSPREAD", "status": "open"},
+            q=q,
+            family="KXMLBSPREAD",
+            ticker=q.ticker,
+            emit_log=False,
+        )
+
+        self.assertFalse(result["is_crypto_ladder"])
+        self.assertEqual(vars(q), before)
+
     def test_structural_context_increases_ev_conviction_sizing(self):
         candidate = {
             "ticker": "KXMLBSTRIKEOUT-TEST-65",
@@ -1278,6 +3027,291 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreaterEqual(resolved, 1)
         self.assertGreaterEqual(resolved * q.selected_price, 1.0)
         self.assertLessEqual(resolved * q.selected_price, kw.AION_WEAK_MAX_DOLLAR_EXPOSURE)
+
+    def test_unified_opportunity_elite_crypto_beats_mediocre_future_sports(self):
+        self._set_sports_only_mode(False)
+        bot = self._make_bot()
+        crypto_close = (datetime.now(timezone.utc) + timedelta(minutes=12)).isoformat()
+        sports_start = (datetime.now(timezone.utc) + timedelta(minutes=240)).isoformat()
+        crypto_q = SimpleNamespace(
+            ticker="KXBTC15M-26MAY250715-UP",
+            selected_side="yes",
+            selected_price=0.34,
+            yes_bid=0.33,
+            yes_ask=0.34,
+            no_bid=0.66,
+            no_ask=0.67,
+            liquidity=180,
+            crypto_momentum_score=82.0,
+            repricing_capture_score=78.0,
+            crypto_distance_class="reachable_range",
+        )
+        sports_q = SimpleNamespace(
+            ticker="KXNCAABSPREAD-FUTURE-MEDIOCRE",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            liquidity=80,
+        )
+        markets = [
+            {"ticker": crypto_q.ticker, "series_ticker": "KXBTC15M", "title": "Bitcoin up in 15 minutes", "close_time": crypto_close},
+            {"ticker": sports_q.ticker, "series_ticker": "KXNCAABSPREAD", "title": "NCAA spread", "event_start_time": sports_start},
+        ]
+        expectancy = {
+            crypto_q.ticker: {
+                "raw_score": 70.0,
+                "adjusted_score": 70.0,
+                "q": crypto_q,
+                "spread": 0.01,
+                "family": "KXBTC15M",
+                "expectancy_summary": {"final_edge": 0.022, "selected_side": "yes", "selected_price": 0.34},
+                "quality_snapshot": {"selected_price": 0.34, "liquidity_depth": 180, "spread": 0.01},
+                "ev_context": {"ev_edge": 0.022, "crypto_momentum_score": 82.0, "repricing_capture_score": 78.0},
+            },
+            sports_q.ticker: {
+                "raw_score": 88.0,
+                "adjusted_score": 88.0,
+                "q": sports_q,
+                "spread": 0.02,
+                "family": "KXNCAABSPREAD",
+                "expectancy_summary": {"final_edge": 0.006, "sports_edge_after_cost": 0.006, "selected_side": "yes", "selected_price": 0.47, "expectancy_score": 0.52},
+                "quality_snapshot": {"selected_price": 0.47, "liquidity_depth": 80, "spread": 0.02},
+                "sports_edge_context": {"boost": 0.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.006},
+            },
+        }
+
+        ranked = bot._apply_dual_lane_allocation_ranking(
+            [(88.0, sports_q, 0.02, "KXNCAABSPREAD"), (70.0, crypto_q, 0.01, "KXBTC15M")],
+            markets,
+            expectancy_summary_by_ticker=expectancy,
+            source="unit_test_unified",
+        )
+
+        self.assertEqual(ranked[0][1].ticker, crypto_q.ticker)
+        self.assertGreater(
+            expectancy[crypto_q.ticker]["lane_allocation"]["unified_opportunity_score"],
+            expectancy[sports_q.ticker]["lane_allocation"]["unified_opportunity_score"],
+        )
+        self.assertTrue(expectancy[crypto_q.ticker]["lane_allocation"]["unified_opportunity"]["fast_turnover_boost"])
+
+    def test_unified_opportunity_elite_sports_beats_mediocre_crypto(self):
+        bot = self._make_bot()
+        sports_start = (datetime.now(timezone.utc) + timedelta(minutes=240)).isoformat()
+        crypto_close = (datetime.now(timezone.utc) + timedelta(minutes=180)).isoformat()
+        sports_q = SimpleNamespace(
+            ticker="KXNCAABSPREAD-PURMICH-ELITE",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.44,
+            yes_ask=0.46,
+            no_bid=0.54,
+            no_ask=0.56,
+            liquidity=220,
+        )
+        crypto_q = SimpleNamespace(
+            ticker="KXETH-26MAY2517-DEEPTAIL",
+            selected_side="yes",
+            selected_price=0.02,
+            yes_bid=0.01,
+            yes_ask=0.02,
+            no_bid=0.98,
+            no_ask=0.99,
+            liquidity=20,
+            crypto_momentum_score=12.0,
+            repricing_capture_score=10.0,
+            crypto_distance_class="deep_tail_range",
+        )
+        markets = [
+            {"ticker": sports_q.ticker, "series_ticker": "KXNCAABSPREAD", "title": "Purdue vs Michigan spread", "event_start_time": sports_start},
+            {"ticker": crypto_q.ticker, "series_ticker": "KXETH", "title": "Ethereum far range", "close_time": crypto_close},
+        ]
+        expectancy = {
+            sports_q.ticker: {
+                "raw_score": 78.0,
+                "adjusted_score": 78.0,
+                "q": sports_q,
+                "spread": 0.02,
+                "family": "KXNCAABSPREAD",
+                "expectancy_summary": {"final_edge": 0.030, "sports_edge_after_cost": 0.030, "selected_side": "yes", "selected_price": 0.46, "expectancy_score": 0.86},
+                "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 220, "spread": 0.02},
+                "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                "ev_context": {"ev_edge": 0.030},
+            },
+            crypto_q.ticker: {
+                "raw_score": 92.0,
+                "adjusted_score": 92.0,
+                "q": crypto_q,
+                "spread": 0.01,
+                "family": "KXETH",
+                "expectancy_summary": {"final_edge": 0.001, "selected_side": "yes", "selected_price": 0.02},
+                "quality_snapshot": {"selected_price": 0.02, "liquidity_depth": 20, "spread": 0.01},
+                "ev_context": {"ev_edge": 0.001, "crypto_momentum_score": 12.0, "repricing_capture_score": 10.0, "crypto_distance_class": "deep_tail_range"},
+            },
+        }
+
+        ranked = bot._apply_dual_lane_allocation_ranking(
+            [(92.0, crypto_q, 0.01, "KXETH"), (78.0, sports_q, 0.02, "KXNCAABSPREAD")],
+            markets,
+            expectancy_summary_by_ticker=expectancy,
+            source="unit_test_unified",
+        )
+
+        self.assertEqual(ranked[0][1].ticker, sports_q.ticker)
+        self.assertLess(
+            expectancy[sports_q.ticker]["lane_allocation"]["capital_lock_penalty"],
+            10.0,
+        )
+        self.assertGreater(
+            expectancy[sports_q.ticker]["lane_allocation"]["unified_opportunity_score"],
+            expectancy[crypto_q.ticker]["lane_allocation"]["unified_opportunity_score"],
+        )
+
+    def test_capital_duration_penalizes_future_sports_but_allows_elite(self):
+        bot = self._make_bot()
+        far_start = (datetime.now(timezone.utc) + timedelta(minutes=240)).isoformat()
+        weak_q = SimpleNamespace(ticker="KXNCAABSPREAD-FAR-WEAK", selected_side="yes", selected_price=0.49, yes_bid=0.47, yes_ask=0.49, no_bid=0.51, no_ask=0.53, liquidity=60)
+        elite_q = SimpleNamespace(ticker="KXNCAABSPREAD-FAR-ELITE", selected_side="yes", selected_price=0.46, yes_bid=0.44, yes_ask=0.46, no_bid=0.54, no_ask=0.56, liquidity=220)
+        weak_item = {
+            "raw_score": 78.0,
+            "adjusted_score": 78.0,
+            "q": weak_q,
+            "spread": 0.02,
+            "family": "KXNCAABSPREAD",
+            "expectancy_summary": {"final_edge": 0.005, "sports_edge_after_cost": 0.005, "selected_side": "yes", "selected_price": 0.49, "expectancy_score": 0.50},
+            "quality_snapshot": {"selected_price": 0.49, "liquidity_depth": 60, "spread": 0.02},
+            "sports_edge_context": {"boost": 0.0, "tags": ["SPORTS_GOOD_BOOK"]},
+            "ev_context": {"ev_edge": 0.005},
+        }
+        elite_item = {
+            "raw_score": 78.0,
+            "adjusted_score": 78.0,
+            "q": elite_q,
+            "spread": 0.02,
+            "family": "KXNCAABSPREAD",
+            "expectancy_summary": {"final_edge": 0.032, "sports_edge_after_cost": 0.032, "selected_side": "yes", "selected_price": 0.46, "expectancy_score": 0.88},
+            "quality_snapshot": {"selected_price": 0.46, "liquidity_depth": 220, "spread": 0.02},
+            "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK"]},
+            "ev_context": {"ev_edge": 0.032},
+        }
+
+        weak_allocation = bot._build_lane_allocation_context(weak_item, market={"ticker": weak_q.ticker, "series_ticker": "KXNCAABSPREAD", "event_start_time": far_start})
+        elite_allocation = bot._build_lane_allocation_context(elite_item, market={"ticker": elite_q.ticker, "series_ticker": "KXNCAABSPREAD", "title": "Purdue vs Michigan spread", "event_start_time": far_start})
+        weak_context = bot._build_unified_opportunity_context(weak_item, market={"ticker": weak_q.ticker, "series_ticker": "KXNCAABSPREAD", "event_start_time": far_start}, allocation=weak_allocation)
+        elite_context = bot._build_unified_opportunity_context(elite_item, market={"ticker": elite_q.ticker, "series_ticker": "KXNCAABSPREAD", "title": "Purdue vs Michigan spread", "event_start_time": far_start}, allocation=elite_allocation)
+
+        self.assertTrue(weak_context["future_event_demote"])
+        self.assertFalse(elite_context["future_event_demote"])
+        self.assertGreater(weak_context["capital_lock_penalty"], elite_context["capital_lock_penalty"])
+        self.assertGreater(elite_context["unified_score"], weak_context["unified_score"])
+
+    def test_btc15m_fast_turnover_boost_with_momentum(self):
+        bot = self._make_bot()
+        close_time = (datetime.now(timezone.utc) + timedelta(minutes=12)).isoformat()
+        q = SimpleNamespace(
+            ticker="KXBTC15M-26MAY250715-UP",
+            selected_side="yes",
+            selected_price=0.36,
+            yes_bid=0.35,
+            yes_ask=0.36,
+            no_bid=0.64,
+            no_ask=0.65,
+            liquidity=150,
+            crypto_momentum_score=84.0,
+            repricing_capture_score=80.0,
+            crypto_distance_class="reachable_range",
+        )
+        item = {
+            "raw_score": 72.0,
+            "adjusted_score": 72.0,
+            "q": q,
+            "spread": 0.01,
+            "family": "KXBTC15M",
+            "expectancy_summary": {"final_edge": 0.018, "selected_side": "yes", "selected_price": 0.36},
+            "quality_snapshot": {"selected_price": 0.36, "liquidity_depth": 150, "spread": 0.01},
+            "ev_context": {"ev_edge": 0.018, "crypto_momentum_score": 84.0, "repricing_capture_score": 80.0},
+        }
+        market = {"ticker": q.ticker, "series_ticker": "KXBTC15M", "title": "Bitcoin up in 15 minutes", "close_time": close_time}
+        allocation = bot._build_lane_allocation_context(item, market=market)
+        context = bot._build_unified_opportunity_context(item, market=market, allocation=allocation)
+
+        self.assertTrue(context["fast_turnover_boost"])
+        self.assertEqual(context["capital_lock_penalty"], 0.0)
+        self.assertGreater(context["unified_score"], 70.0)
+
+    def test_low_bankroll_concentrates_capital_in_best_opportunity(self):
+        bot = self._make_bot()
+        bot.available_cash = 10.0
+        best = {
+            "ticker": "KXBTC15M-BEST",
+            "lane": "CRYPTO_LADDER",
+            "family": "KXBTC15M",
+            "allocation": {"unified_opportunity_score": 90.0, "allocation_score": 86.0},
+        }
+        weaker = {
+            "ticker": "KXNCAABSPREAD-WEAKER",
+            "lane": "SPORTS",
+            "family": "KXNCAABSPREAD",
+            "allocation": {"unified_opportunity_score": 68.0, "allocation_score": 84.0},
+        }
+
+        self.assertTrue(bot._opportunity_cost_gate(best, [best, weaker], source="unit_test")["allowed"])
+        blocked = bot._opportunity_cost_gate(weaker, [best, weaker], source="unit_test")
+
+        self.assertFalse(blocked["allowed"])
+        self.assertEqual(blocked["reason"], "low_cash_concentrate_best_opportunity")
+
+    def test_unified_scoring_preserves_selected_no_side_into_payload(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNCAABTOTAL-NOEDGE",
+            selected_side="no",
+            selected_price=0.42,
+            yes_bid=0.56,
+            yes_ask=0.58,
+            no_bid=0.40,
+            no_ask=0.42,
+            liquidity=120,
+        )
+        item = {
+            "raw_score": 82.0,
+            "adjusted_score": 82.0,
+            "q": q,
+            "spread": 0.02,
+            "family": "KXNCAABTOTAL",
+            "expectancy_summary": {"final_edge": 0.022, "sports_edge_after_cost": 0.022, "selected_side": "no", "selected_price": 0.42, "expectancy_score": 0.78},
+            "quality_snapshot": {"selected_side": "no", "selected_price": 0.42, "liquidity_depth": 120, "spread": 0.02},
+            "sports_edge_context": {"boost": 4.0, "tags": ["SPORTS_GOOD_BOOK"]},
+            "ev_context": {"ev_edge": 0.022},
+        }
+        market = {"ticker": q.ticker, "series_ticker": "KXNCAABTOTAL", "title": "NCAA total"}
+        allocation = bot._build_lane_allocation_context(item, market=market)
+        context = bot._build_unified_opportunity_context(item, market=market, allocation=allocation)
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: {
+            "orderbook_ready": True,
+            "selected_side": "no",
+            "selected_price": 0.42,
+            "selected_price_dollars": 0.42,
+            "selected_price_cents": 42,
+            "yes_bid": 0.56,
+            "yes_ask": 0.58,
+            "no_bid": 0.40,
+            "no_ask": 0.42,
+            "no_top_size": 120,
+            "selected_side_has_liquidity": True,
+        }
+        q.unified_opportunity_score = context["unified_score"]
+        q.unified_size_multiplier = context["size_multiplier"]
+
+        payload = bot.build_live_order_payload(q, market=market, selection_stage="dual_lane_secondary")
+
+        self.assertEqual(payload["side"], "no")
+        self.assertEqual(payload["selected_side"], "no")
+        self.assertEqual(payload["no_price"], 42)
+        self.assertNotIn("yes_price", payload)
 
 
 if __name__ == "__main__":

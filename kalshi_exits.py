@@ -2,6 +2,7 @@
 
 import json
 import time
+from datetime import datetime, timezone
 
 
 def coerce_live_exit_price(value, to_float):
@@ -226,6 +227,237 @@ def log_sports_harvest_decision(bot, decision, *, log_cooldown_seconds):
         )
 
 
+def _coerce_timestamp(value):
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+        if numeric > 100000.0:
+            return numeric
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _resolve_minutes_left(*containers):
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "minutes_left",
+            "minutes_to_expiration",
+            "minutes_to_close",
+            "time_to_settlement_minutes",
+        ):
+            if container.get(key) not in (None, ""):
+                try:
+                    return float(container.get(key))
+                except Exception:
+                    pass
+        for key in (
+            "close_time_ts",
+            "expiration_time_ts",
+            "expected_expiration_time_ts",
+            "settlement_time_ts",
+            "close_time",
+            "expiration_time",
+            "expected_expiration_time",
+            "settlement_time",
+        ):
+            ts = _coerce_timestamp(container.get(key))
+            if ts is not None:
+                return (float(ts) - time.time()) / 60.0
+    return None
+
+
+def log_crypto_exit_decision(bot, decision, *, log_cooldown_seconds):
+    decision = decision if isinstance(decision, dict) else {}
+    if not decision.get("is_crypto_short_cycle"):
+        return
+    ticker = str(decision.get("ticker") or "unknown").strip() or "unknown"
+    action = str(decision.get("action") or "hold").strip().lower() or "hold"
+    reason = str(decision.get("reason") or "unknown").strip().lower() or "unknown"
+    pnl = bot.to_float(decision.get("unrealized_pnl"), 0.0) or 0.0
+    marker = (
+        action,
+        reason,
+        round(pnl, 4),
+        round(bot.to_float(decision.get("exit_price"), 0.0) or 0.0, 4),
+        int((bot.to_float(decision.get("hold_seconds"), 0.0) or 0.0) // 15),
+    )
+    now_ts = time.time()
+    log_map = getattr(bot, "crypto_exit_log_markers", {})
+    if not isinstance(log_map, dict):
+        log_map = {}
+    previous = log_map.get(ticker)
+    previous_ts = bot.to_float(previous.get("ts"), 0.0) if isinstance(previous, dict) else 0.0
+    if isinstance(previous, dict) and previous.get("marker") == marker and now_ts - previous_ts < log_cooldown_seconds:
+        return
+    log_map[ticker] = {"marker": marker, "ts": now_ts}
+    bot.crypto_exit_log_markers = log_map
+    payload = {
+        "ticker": ticker,
+        "family": decision.get("family"),
+        "asset": decision.get("crypto_asset"),
+        "timeframe": decision.get("crypto_timeframe"),
+        "side": decision.get("side"),
+        "entry_price": decision.get("entry_price"),
+        "current_price": decision.get("current_price"),
+        "current_price_value": decision.get("current_price"),
+        "exit_price": decision.get("exit_price"),
+        "count": decision.get("count"),
+        "unrealized_pnl": decision.get("unrealized_pnl"),
+        "unrealized_profit_dollars": decision.get("unrealized_pnl"),
+        "pnl_pct": decision.get("pnl_pct"),
+        "unrealized_profit_pct": decision.get("pnl_pct"),
+        "profit_target_dollars": decision.get("crypto_fast_take_profit_dollars"),
+        "profit_target_pct": decision.get("crypto_fast_take_profit_pct"),
+        "minutes_left": decision.get("minutes_left"),
+        "momentum_direction": decision.get("crypto_momentum_direction"),
+        "momentum_strength": decision.get("crypto_momentum_strength"),
+        "recent_delta": decision.get("recent_delta"),
+        "last_step_delta": decision.get("last_step_delta"),
+        "action": action,
+        "reason": reason,
+        "exit_attempted": bool(action == "exit"),
+    }
+    print("[CRYPTO-EXIT-DECISION] " + json.dumps(payload, sort_keys=True, default=str))
+    if action == "exit" and reason == "crypto_fast_take_profit":
+        print("[CRYPTO-FAST-PROFIT-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+    elif action == "exit" and reason == "crypto_repricing_profit":
+        print("[CRYPTO-REPRICING-PROFIT-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+    elif action == "exit" and reason == "crypto_momentum_stall":
+        print("[CRYPTO-MOMENTUM-STALL-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+    elif action == "exit" and reason in {"crypto_momentum_reversal", "crypto_reversal_protect"}:
+        print("[CRYPTO-MOMENTUM-REVERSAL-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+        print("[CRYPTO-REVERSAL-PROTECT-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+    elif action != "exit":
+        print("[CRYPTO-EXIT-HOLD] " + json.dumps(payload, sort_keys=True, default=str))
+
+
+def _profit_lock_position_key(ticker, side):
+    ticker = str(ticker or "").strip() or "unknown"
+    side = str(side or "").strip().lower() or "unknown"
+    return f"{ticker}|{side}"
+
+
+def update_live_exit_peak_value(bot, *, ticker, side, entry_cost, current_value, cashout_value, max_payout, now_ts=None):
+    key = _profit_lock_position_key(ticker, side)
+    now_ts = float(now_ts or time.time())
+    observed_value = cashout_value if cashout_value is not None else current_value
+    observed_value = bot.to_float(observed_value, None)
+    if observed_value is None:
+        return {"peak_value": None, "peak_profit": None, "peak_giveback_pct": 0.0, "updated": False}
+    peak_map = getattr(bot, "live_exit_peak_values", {})
+    if not isinstance(peak_map, dict):
+        peak_map = {}
+    previous = peak_map.get(key) if isinstance(peak_map.get(key), dict) else {}
+    previous_peak = bot.to_float(previous.get("peak_value"), None)
+    if previous_peak is None or observed_value > previous_peak + 0.005:
+        peak_map[key] = {
+            "ticker": ticker,
+            "side": side,
+            "peak_value": round(float(observed_value), 4),
+            "entry_cost": round(float(entry_cost or 0.0), 4),
+            "max_payout": round(float(max_payout or 0.0), 4),
+            "updated_ts": now_ts,
+        }
+        bot.live_exit_peak_values = peak_map
+        peak_value = float(observed_value)
+        updated = True
+    else:
+        peak_value = float(previous_peak)
+        updated = False
+    entry_cost = bot.to_float(entry_cost, 0.0) or 0.0
+    current_profit = max(0.0, float(observed_value) - float(entry_cost))
+    peak_profit = max(0.0, float(peak_value) - float(entry_cost))
+    peak_giveback_pct = 0.0
+    if peak_profit > 0.0:
+        peak_giveback_pct = max(0.0, min(1.0, (peak_profit - current_profit) / peak_profit))
+    return {
+        "peak_value": round(float(peak_value), 4),
+        "peak_profit": round(float(peak_profit), 4),
+        "peak_giveback_pct": round(float(peak_giveback_pct), 4),
+        "updated": bool(updated),
+        "observed_value": round(float(observed_value), 4),
+    }
+
+
+def _profit_lock_payload(decision):
+    decision = decision if isinstance(decision, dict) else {}
+    return {
+        "ticker": decision.get("ticker"),
+        "side": decision.get("side"),
+        "market_type": decision.get("family"),
+        "lane": decision.get("lane"),
+        "entry_cost": decision.get("entry_cost"),
+        "current_value": decision.get("current_value"),
+        "cashout_value": decision.get("cashout_value"),
+        "max_payout": decision.get("max_payout"),
+        "unrealized_profit_dollars": decision.get("profit_lock_unrealized_pnl", decision.get("unrealized_pnl")),
+        "unrealized_profit_pct": decision.get("profit_lock_unrealized_profit_pct", decision.get("unrealized_profit_pct")),
+        "peak_value": decision.get("peak_value"),
+        "peak_giveback_pct": decision.get("peak_giveback_pct"),
+        "reason": decision.get("reason"),
+        "exit_attempted": bool(decision.get("action") == "exit"),
+    }
+
+
+def log_profit_lock_decision(bot, decision, *, log_cooldown_seconds):
+    decision = decision if isinstance(decision, dict) else {}
+    ticker = str(decision.get("ticker") or "unknown").strip() or "unknown"
+    reason = str(decision.get("reason") or "unknown").strip().lower() or "unknown"
+    action = str(decision.get("action") or "hold").strip().lower() or "hold"
+    pnl = bot.to_float(decision.get("profit_lock_unrealized_pnl", decision.get("unrealized_pnl")), 0.0) or 0.0
+    peak_value = bot.to_float(decision.get("peak_value"), 0.0) or 0.0
+    peak_profit = bot.to_float(decision.get("peak_profit"), 0.0) or 0.0
+    giveback = bot.to_float(decision.get("peak_giveback_pct"), 0.0) or 0.0
+    should_log_check = bool(
+        (action == "exit" and (decision.get("profit_lock_exit") or pnl > 0.0 or peak_profit > 0.0))
+        or decision.get("peak_value_updated")
+        or pnl > 0.0
+        or giveback > 0.0
+        or reason in {"missing_executable_exit_bid", "inverted_exit_book"}
+    )
+    if not should_log_check:
+        return
+    marker = (
+        action,
+        reason,
+        round(pnl, 4),
+        round(peak_value, 4),
+        round(giveback, 3),
+        int((bot.to_float(decision.get("hold_seconds"), 0.0) or 0.0) // 15),
+    )
+    now_ts = time.time()
+    log_map = getattr(bot, "profit_lock_log_markers", {})
+    if not isinstance(log_map, dict):
+        log_map = {}
+    previous = log_map.get(ticker)
+    previous_ts = bot.to_float(previous.get("ts"), 0.0) if isinstance(previous, dict) else 0.0
+    if isinstance(previous, dict) and previous.get("marker") == marker and now_ts - previous_ts < log_cooldown_seconds:
+        return
+    log_map[ticker] = {"marker": marker, "ts": now_ts}
+    bot.profit_lock_log_markers = log_map
+    payload = _profit_lock_payload(decision)
+    print("[AION-PROFIT-LOCK-CHECK] " + json.dumps(payload, sort_keys=True, default=str))
+    if decision.get("peak_value_updated"):
+        print("[AION-PEAK-VALUE-UPDATE] " + json.dumps(payload, sort_keys=True, default=str))
+    if action == "exit":
+        print("[AION-PROFIT-LOCK-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+        if reason in {"trailing_profit_giveback", "green_to_red_peak_giveback"}:
+            print("[AION-TRAILING-PROFIT-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+        if decision.get("is_sports_position"):
+            print("[SPORTS-PROFIT-LOCK-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+        if decision.get("is_crypto_ladder_position"):
+            print("[CRYPTO-PROFIT-LOCK-EXIT] " + json.dumps(payload, sort_keys=True, default=str))
+    elif reason in {"missing_executable_exit_bid", "inverted_exit_book", "profit_lock_no_executable_exit"}:
+        print("[AION-EXIT-SKIP] " + json.dumps(payload, sort_keys=True, default=str))
+
+
 def evaluate_dynamic_live_exit(
     bot,
     position,
@@ -245,6 +477,14 @@ def evaluate_dynamic_live_exit(
     fast_cut_min_hold_seconds,
     min_hold_seconds,
     log_cooldown_seconds,
+    crypto_fast_take_profit_dollars=10.0,
+    crypto_fast_take_profit_pct=0.25,
+    crypto_momentum_reversal_exit=True,
+    crypto_near_expiry_profit_exit=True,
+    sports_fast_take_profit_dollars=1.0,
+    sports_fast_take_profit_pct=0.25,
+    sports_trailing_profit_giveback_pct=0.30,
+    sports_max_payout_lock_pct=0.70,
 ):
     now_ts = time.time()
     position = position if isinstance(position, dict) else {}
@@ -322,6 +562,20 @@ def evaluate_dynamic_live_exit(
         is_sports_position = bool(bot.is_sports_family(family, ticker=ticker))
     except Exception:
         is_sports_position = False
+    is_crypto_ladder_position = False
+    crypto_asset = None
+    crypto_timeframe = None
+    try:
+        is_crypto_ladder_position = bool(bot._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q))
+        crypto_asset = bot._crypto_ladder_asset_symbol(family=family, ticker=ticker, market=market, q=q)
+        crypto_timeframe = bot._crypto_ladder_timeframe(family=family, ticker=ticker, market=market, q=q)
+    except Exception:
+        is_crypto_ladder_position = False
+    is_crypto_short_cycle = bool(
+        is_crypto_ladder_position
+        and crypto_asset in {"BTC", "ETH"}
+        and str(crypto_timeframe or "").strip().lower() == "15m"
+    )
     sports_lifecycle_state = "unknown"
     if is_sports_position:
         try:
@@ -353,6 +607,125 @@ def evaluate_dynamic_live_exit(
             and bot.to_float(price_context.get("no_bid"), 0.0) > bot.to_float(price_context.get("no_ask"), 0.0)
         )
     )
+    minutes_left = _resolve_minutes_left(position, metadata.get("metadata") if isinstance(metadata, dict) else {}, market)
+    entry_cost = round(float(entry_price) * float(count), 4)
+    current_value = round(float(current_price) * float(count), 4)
+    cashout_value = round(float(exit_price) * float(count), 4) if executable_exit_price else None
+    profit_lock_value = cashout_value if cashout_value is not None else current_value
+    profit_lock_unrealized = round(float(profit_lock_value) - float(entry_cost), 4)
+    profit_lock_pct = round(float(profit_lock_unrealized) / float(entry_cost), 6) if entry_cost > 0.0 else None
+    max_payout = round(float(count), 4)
+    max_payout_pct = round(float(profit_lock_value) / float(max_payout), 6) if max_payout > 0.0 else 0.0
+    family_text = f"{family or ''} {ticker or ''}".upper()
+    weak_sports_profit_profile = bool(
+        is_sports_position
+        and any(token in family_text for token in ("PROP", "PLAYER", "TENNIS", "HR", "HOMER", "STRIKEOUT", "ALT"))
+    )
+    mainstream_sports_profile = bool(
+        is_sports_position
+        and any(token in family_text for token in ("SPREAD", "TOTAL", "MONEYLINE", "NBA", "NCAAB", "NFL", "MLB"))
+        and not weak_sports_profit_profile
+    )
+    sports_profit_dollars = max(0.01, bot.to_float(sports_fast_take_profit_dollars, 1.0) or 1.0)
+    sports_profit_pct = bot.to_float(sports_fast_take_profit_pct, 0.25)
+    if sports_profit_pct is None:
+        sports_profit_pct = 0.25
+    if sports_profit_pct > 1.0:
+        sports_profit_pct = sports_profit_pct / 100.0
+    sports_profit_pct = max(0.01, min(5.0, float(sports_profit_pct)))
+    sports_trailing_pct = bot.to_float(sports_trailing_profit_giveback_pct, 0.30)
+    if sports_trailing_pct is None:
+        sports_trailing_pct = 0.30
+    if sports_trailing_pct > 1.0:
+        sports_trailing_pct = sports_trailing_pct / 100.0
+    sports_trailing_pct = max(0.05, min(0.90, float(sports_trailing_pct)))
+    if weak_sports_profit_profile:
+        sports_trailing_pct = max(0.05, sports_trailing_pct * 0.75)
+    elif mainstream_sports_profile:
+        sports_trailing_pct = min(0.45, sports_trailing_pct * 1.15)
+    sports_max_payout_pct = bot.to_float(sports_max_payout_lock_pct, 0.70)
+    if sports_max_payout_pct is None:
+        sports_max_payout_pct = 0.70
+    if sports_max_payout_pct > 1.0:
+        sports_max_payout_pct = sports_max_payout_pct / 100.0
+    sports_max_payout_pct = max(0.25, min(0.98, float(sports_max_payout_pct)))
+    universal_profit_dollars = sports_profit_dollars if is_sports_position else 1.0
+    universal_profit_pct = sports_profit_pct if is_sports_position else 0.25
+    universal_trailing_pct = sports_trailing_pct if is_sports_position else 0.30
+    universal_max_payout_pct = sports_max_payout_pct if is_sports_position else 0.70
+    peak_context = update_live_exit_peak_value(
+        bot,
+        ticker=ticker,
+        side=side,
+        entry_cost=entry_cost,
+        current_value=current_value,
+        cashout_value=cashout_value,
+        max_payout=max_payout,
+        now_ts=now_ts,
+    )
+    peak_value = peak_context.get("peak_value")
+    peak_profit = bot.to_float(peak_context.get("peak_profit"), 0.0) or 0.0
+    peak_giveback_pct = bot.to_float(peak_context.get("peak_giveback_pct"), 0.0) or 0.0
+    peak_profit_floor = max(0.25, universal_profit_dollars * 0.50)
+    profit_lock_dollar_exit = bool(executable_exit_price and profit_lock_unrealized >= universal_profit_dollars)
+    profit_lock_pct_exit = bool(
+        executable_exit_price
+        and profit_lock_pct is not None
+        and float(profit_lock_pct) >= universal_profit_pct
+        and profit_lock_unrealized > 0.0
+    )
+    max_payout_lock_exit = bool(
+        executable_exit_price
+        and max_payout_pct >= universal_max_payout_pct
+        and profit_lock_unrealized > 0.0
+    )
+    trailing_profit_exit = bool(
+        executable_exit_price
+        and peak_profit >= peak_profit_floor
+        and peak_giveback_pct >= universal_trailing_pct
+    )
+    green_momentum_flip_exit = bool(
+        executable_exit_price
+        and peak_profit >= peak_profit_floor
+        and weak_momentum
+        and profit_lock_unrealized > 0.0
+    )
+    green_to_red_peak_exit = bool(
+        executable_exit_price
+        and peak_profit >= peak_profit_floor
+        and profit_lock_unrealized <= 0.0
+        and peak_giveback_pct >= min(0.20, universal_trailing_pct)
+    )
+    near_expiry_profit_lock_exit = bool(
+        executable_exit_price
+        and profit_lock_unrealized > 0.0
+        and minutes_left is not None
+        and 0.0 <= float(minutes_left) <= 5.0
+    )
+    universal_profit_lock_exit = bool(
+        max_payout_lock_exit
+        or profit_lock_dollar_exit
+        or profit_lock_pct_exit
+        or trailing_profit_exit
+        or green_momentum_flip_exit
+        or green_to_red_peak_exit
+        or near_expiry_profit_lock_exit
+    )
+    profit_lock_reason = None
+    if max_payout_lock_exit:
+        profit_lock_reason = "max_payout_profit_lock"
+    elif trailing_profit_exit:
+        profit_lock_reason = "trailing_profit_giveback"
+    elif green_to_red_peak_exit:
+        profit_lock_reason = "green_to_red_peak_giveback"
+    elif green_momentum_flip_exit:
+        profit_lock_reason = "green_momentum_flip"
+    elif profit_lock_dollar_exit:
+        profit_lock_reason = "fast_profit_dollar_lock"
+    elif profit_lock_pct_exit:
+        profit_lock_reason = "fast_profit_pct_lock"
+    elif near_expiry_profit_lock_exit:
+        profit_lock_reason = "near_expiry_profit_lock"
     sports_min_profit = min(max(0.005, min_profit * 0.55), min_profit)
     sports_rotation_profit = max(0.006, min_profit * 0.45)
     sports_fast_profit = max(0.012, min_profit * 0.75)
@@ -415,6 +788,70 @@ def evaluate_dynamic_live_exit(
             or (current_price <= max(0.05, entry_price * 0.35) and pnl_per_contract < 0.0)
         )
     )
+    fast_profit_target_dollars = max(0.0, bot.to_float(crypto_fast_take_profit_dollars, 10.0) or 10.0)
+    fast_profit_target_pct = bot.to_float(crypto_fast_take_profit_pct, 0.25)
+    if fast_profit_target_pct is None:
+        fast_profit_target_pct = 0.25
+    if fast_profit_target_pct > 1.0:
+        fast_profit_target_pct = fast_profit_target_pct / 100.0
+    fast_profit_target_pct = max(0.01, min(5.0, float(fast_profit_target_pct)))
+    crypto_fast_profit_exit = bool(
+        is_crypto_short_cycle
+        and executable_exit_price
+        and pnl_per_contract > 0.0
+        and (
+            (fast_profit_target_dollars > 0.0 and unrealized_pnl >= fast_profit_target_dollars)
+            or (
+                pnl_pct is not None
+                and (float(pnl_pct) / 100.0) >= fast_profit_target_pct
+                and pnl_per_contract >= max(0.01, min_profit * 0.50)
+            )
+        )
+    )
+    crypto_repricing_profit_exit = bool(
+        is_crypto_short_cycle
+        and executable_exit_price
+        and pnl_per_contract >= max(0.012, min_profit * 0.55)
+        and (
+            recent_delta >= max(0.012, momentum_eps * 3.0)
+            or last_step_delta >= max(0.008, momentum_eps * 2.0)
+            or current_price >= min(0.98, entry_price + max(0.06, entry_price * 0.20))
+        )
+        and (spread_ok or pnl_per_contract >= max(0.018, min_profit))
+    )
+    crypto_momentum_reversal = bool(
+        is_crypto_short_cycle
+        and bool(crypto_momentum_reversal_exit)
+        and executable_exit_price
+        and pnl_per_contract > 0.0
+        and (
+            weak_momentum
+            or recent_delta <= -max(0.004, momentum_eps)
+            or last_step_delta <= -max(0.003, momentum_eps * 0.75)
+            or side_support < -max(neutral_band, 0.10)
+        )
+    )
+    crypto_momentum_stall_exit = bool(
+        is_crypto_short_cycle
+        and executable_exit_price
+        and pnl_per_contract >= max(0.008, min_profit * 0.35)
+        and hold_seconds >= max(25.0, fast_cut_min_hold_seconds)
+        and not strong_momentum
+        and (
+            abs(recent_delta) <= max(0.003, momentum_eps)
+            or last_step_delta <= max(0.002, momentum_eps * 0.5)
+            or side_support <= 0.0
+            or (spread is not None and spread > max_exit_spread)
+        )
+    )
+    crypto_near_expiry_profit = bool(
+        is_crypto_short_cycle
+        and bool(crypto_near_expiry_profit_exit)
+        and executable_exit_price
+        and pnl_per_contract > 0.0
+        and minutes_left is not None
+        and 0.0 <= float(minutes_left) <= 3.0
+    )
 
     action = "hold"
     reason = "existing_hold_logic"
@@ -425,6 +862,26 @@ def evaluate_dynamic_live_exit(
         reason = "missing_executable_exit_bid"
     elif inverted_book:
         reason = "inverted_exit_book"
+    elif crypto_fast_profit_exit:
+        action = "exit"
+        reason = "crypto_fast_take_profit"
+    elif universal_profit_lock_exit:
+        action = "exit"
+        reason = profit_lock_reason or "profit_lock"
+        if reason in {"trailing_profit_giveback", "green_to_red_peak_giveback"}:
+            required_loss_confirmations = 1
+    elif crypto_repricing_profit_exit:
+        action = "exit"
+        reason = "crypto_repricing_profit"
+    elif crypto_momentum_reversal:
+        action = "exit"
+        reason = "crypto_reversal_protect"
+    elif crypto_momentum_stall_exit:
+        action = "exit"
+        reason = "crypto_momentum_stall"
+    elif crypto_near_expiry_profit:
+        action = "exit"
+        reason = "crypto_near_expiry_profit"
     elif is_sports_position and near_lock_harvest:
         action = "exit"
         reason = "near_lock_harvest"
@@ -524,6 +981,46 @@ def evaluate_dynamic_live_exit(
         "dynamic_stop_loss": round(dynamic_stop_loss, 4),
         "quote_source": quote_source,
         "is_sports_position": bool(is_sports_position),
+        "is_crypto_ladder_position": bool(is_crypto_ladder_position),
+        "is_crypto_short_cycle": bool(is_crypto_short_cycle),
+        "lane": "CRYPTO" if is_crypto_ladder_position else "SPORTS" if is_sports_position else "OTHER",
+        "entry_cost": entry_cost,
+        "current_value": current_value,
+        "cashout_value": cashout_value,
+        "max_payout": max_payout,
+        "max_payout_pct": max_payout_pct,
+        "profit_lock_unrealized_pnl": profit_lock_unrealized,
+        "profit_lock_unrealized_profit_pct": profit_lock_pct,
+        "peak_value": peak_value,
+        "peak_profit": peak_profit,
+        "peak_giveback_pct": peak_giveback_pct,
+        "peak_value_updated": bool(peak_context.get("updated")),
+        "profit_lock_exit": bool(universal_profit_lock_exit),
+        "profit_lock_reason": profit_lock_reason,
+        "profit_lock_dollar_exit": bool(profit_lock_dollar_exit),
+        "profit_lock_pct_exit": bool(profit_lock_pct_exit),
+        "max_payout_lock_exit": bool(max_payout_lock_exit),
+        "trailing_profit_exit": bool(trailing_profit_exit),
+        "green_momentum_flip_exit": bool(green_momentum_flip_exit),
+        "green_to_red_peak_exit": bool(green_to_red_peak_exit),
+        "near_expiry_profit_lock_exit": bool(near_expiry_profit_lock_exit),
+        "sports_fast_take_profit_dollars": sports_profit_dollars,
+        "sports_fast_take_profit_pct": sports_profit_pct,
+        "sports_trailing_profit_giveback_pct": sports_trailing_pct,
+        "sports_max_payout_lock_pct": sports_max_payout_pct,
+        "crypto_asset": crypto_asset,
+        "crypto_timeframe": crypto_timeframe,
+        "crypto_fast_take_profit_dollars": fast_profit_target_dollars,
+        "crypto_fast_take_profit_pct": fast_profit_target_pct,
+        "crypto_fast_profit_exit": bool(crypto_fast_profit_exit),
+        "crypto_repricing_profit_exit": bool(crypto_repricing_profit_exit),
+        "crypto_momentum_reversal": bool(crypto_momentum_reversal),
+        "crypto_reversal_protect_exit": bool(crypto_momentum_reversal),
+        "crypto_momentum_stall_exit": bool(crypto_momentum_stall_exit),
+        "crypto_near_expiry_profit": bool(crypto_near_expiry_profit),
+        "crypto_momentum_direction": "aligned" if strong_momentum else "reversing" if weak_momentum else "flat",
+        "crypto_momentum_strength": round(abs(recent_delta) + abs(last_step_delta) + max(0.0, abs(side_support)), 4),
+        "minutes_left": minutes_left,
         "sports_lifecycle_state": sports_lifecycle_state,
         "probability_collapse": bool(probability_collapse),
         "near_lock_harvest": bool(near_lock_harvest),
@@ -532,6 +1029,8 @@ def evaluate_dynamic_live_exit(
         "dead_prop_exit": bool(dead_prop_exit),
     }
     log_dynamic_exit_decision(bot, decision, log_cooldown_seconds=log_cooldown_seconds)
+    log_profit_lock_decision(bot, decision, log_cooldown_seconds=log_cooldown_seconds)
+    log_crypto_exit_decision(bot, decision, log_cooldown_seconds=log_cooldown_seconds)
     log_sports_harvest_decision(bot, decision, log_cooldown_seconds=log_cooldown_seconds)
     return decision
 

@@ -123,6 +123,50 @@ def normalize_event_order_payload(
 
 
 def place_live_order(bot, payload):
+    payload = payload if isinstance(payload, dict) else {}
+    ticker_hint = str(payload.get("ticker") or "").strip()
+    family_hint = str(payload.get("family") or "").strip().upper()
+    if not family_hint and ticker_hint:
+        family_resolver = getattr(bot, "get_market_family", None)
+        if callable(family_resolver):
+            try:
+                family_hint = str(family_resolver(payload) or "").strip().upper()
+            except Exception:
+                family_hint = ""
+    sports_only_blocker = getattr(bot, "_sports_only_execution_blocked", None)
+    if callable(sports_only_blocker) and (ticker_hint or family_hint):
+        lane_hint = ""
+        lane_resolver = getattr(bot, "_candidate_execution_lane", None)
+        if callable(lane_resolver):
+            try:
+                lane_hint = lane_resolver(family=family_hint, ticker=ticker_hint, market=payload, q=None)
+            except Exception:
+                lane_hint = ""
+        reason = "sports_only_non_sports_execution_disabled"
+        reason_resolver = getattr(bot, "_sports_only_block_reason", None)
+        if callable(reason_resolver):
+            try:
+                reason = reason_resolver(family=family_hint, ticker=ticker_hint, market=payload, q=None, lane=lane_hint)
+            except Exception:
+                reason = "sports_only_non_sports_execution_disabled"
+        try:
+            if sports_only_blocker(
+                family=family_hint,
+                ticker=ticker_hint,
+                market=payload,
+                q=None,
+                lane=lane_hint,
+                reason=reason,
+                source="kalshi_execution.place_live_order",
+                force=True,
+            ):
+                return {
+                    "submitted": False,
+                    "reason": reason,
+                    "payload": payload,
+                }
+        except Exception:
+            pass
     legacy_payload = bot._normalize_legacy_order_payload(payload)
     if not legacy_payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
@@ -624,6 +668,50 @@ def submit_live_order(
     max_sports_live_positions,
     live_order_rate_limit,
 ):
+    payload_hint = dict(payload_override) if isinstance(payload_override, dict) else {}
+    ticker_hint = str(payload_hint.get("ticker") or getattr(q, "ticker", "") or "").strip()
+    family_hint = str(payload_hint.get("family") or getattr(q, "family", "") or "").strip().upper()
+    if not family_hint and ticker_hint:
+        family_resolver = getattr(bot, "get_market_family", None)
+        if callable(family_resolver):
+            try:
+                family_hint = str(family_resolver(payload_hint or {"ticker": ticker_hint}) or "").strip().upper()
+            except Exception:
+                family_hint = ""
+    sports_only_blocker = getattr(bot, "_sports_only_execution_blocked", None)
+    if callable(sports_only_blocker) and (ticker_hint or family_hint):
+        market_hint = payload_hint or {"ticker": ticker_hint, "series_ticker": family_hint}
+        lane_hint = str(lane or "").strip().upper()
+        lane_resolver = getattr(bot, "_candidate_execution_lane", None)
+        if not lane_hint and callable(lane_resolver):
+            try:
+                lane_hint = lane_resolver(family=family_hint, ticker=ticker_hint, market=market_hint, q=q)
+            except Exception:
+                lane_hint = ""
+        reason = "sports_only_non_sports_execution_disabled"
+        reason_resolver = getattr(bot, "_sports_only_block_reason", None)
+        if callable(reason_resolver):
+            try:
+                reason = reason_resolver(family=family_hint, ticker=ticker_hint, market=market_hint, q=q, lane=lane_hint)
+            except Exception:
+                reason = "sports_only_non_sports_execution_disabled"
+        try:
+            if sports_only_blocker(
+                family=family_hint,
+                ticker=ticker_hint,
+                market=market_hint,
+                q=q,
+                lane=lane_hint,
+                reason=reason,
+                source="kalshi_execution.submit_live_order",
+            ):
+                return {
+                    "submitted": False,
+                    "reason": reason,
+                    "payload": payload_hint or None,
+                }
+        except Exception:
+            pass
     payload = dict(payload_override) if isinstance(payload_override, dict) else bot.build_live_order_payload(q, size=size)
     if not payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
