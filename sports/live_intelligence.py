@@ -6341,7 +6341,7 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
         if ticker == primary_ticker and primary_ticker and not primary_submitted:
             skipped.append({"ticker": ticker, "reason": "primary_leg_failed_continue_ladder"})
             self._emit_sports_ladder_log(
-                "SPORTS-LADDER-SKIP",
+                "SPORTS-LADDER",
                 {
                     "source": source,
                     "plan_id": plan.get("plan_id"),
@@ -6386,8 +6386,19 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
             )
             continue
         if int(self.live_trade_count_today or 0) >= int(MAX_LIVE_TRADES_PER_DAY or 0):
-            skipped.append({"ticker": ticker, "reason": "daily_trade_cap"})
-            break
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-SKIP",
+                {
+                    "source": source,
+                    "plan_id": plan.get("plan_id"),
+                    "game_id": game_id,
+                    "ticker": ticker,
+                    "reason": "daily_trade_count_warning",
+                    "live_trade_count_today": int(self.live_trade_count_today or 0),
+                    "max_live_trades_per_day": int(MAX_LIVE_TRADES_PER_DAY or 0),
+                },
+                marker=("SPORTS-LADDER-WARN", source, ticker, "daily_trade_count", int(time.time() // 180)),
+            )
         daily_loss_blocked = bool(
             getattr(self, "trading_halted", False)
             or self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS
@@ -18174,11 +18185,11 @@ def find_best_live_ticker(self, markets=None):
             "phase55_ready_count": aggression_phase55_ready_count,
             "safety_gates_preserved": True,
             "duplicate_guard": True,
-            "cooldown_guard": True,
-            "max_live_positions_guard": True,
-            "daily_trade_cap_guard": True,
+            "cooldown_guard": "duplicate_cadence",
+            "max_live_positions_guard": "demoted_to_family_exposure_cap",
+            "daily_trade_cap_guard": "warning_only",
             "kalshi_bounds_guard": True,
-            "unsafe_spread_guard": True,
+            "unsafe_spread_guard": "execution_cost",
             "unsafe_price_guard": True,
             "live_arm_guard": True,
             "exit_risk_guard": True,

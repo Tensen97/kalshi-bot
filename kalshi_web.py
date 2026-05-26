@@ -4520,7 +4520,7 @@ class KalshiSniperBot:
         spread_reasons = {"wide_spread", "poor_spread_score", "spread_too_wide", "spread_outside_allowed_range", "spread_not_safe"}
         liquidity_reasons = {"low_liquidity", "low_liquidity_score", "not_tradable", "low_volume", "continuity_liquidity_not_safe", "liquidity_below_synthetic_floor"}
         phase55_reasons = {"timing_penalty", "no_stochastic_crossover", "no_micro_pullback", "phase55_status_insufficient_data", "phase55_status_trigger_wait", "phase55_status_pullback_wait", "immediate_entry_protection", "entry_timing_pass_not_explicit"}
-        execution_reasons = {"duplicate_position_guard", "already_active_position", "same_family_active_position", "max_total_live_positions", "live_trading_not_armed", "missing_selected_quote", "invalid_payload", "order_size_below_minimum", "execution_attempt_cooldown", "group_not_allowed", "group_blocked", "cooldown", "rate_limited", "daily_trade_cap", "no_order_api_path", "auth_smoke_required_failed", "user_aborted", "live_trading_not_armed", "stale_signal", "duplicate", "missing_phase55_status", "aggressive_trade_cap", "aggressive_cooldown_active", "aggressive_lane_blocked"}
+        execution_reasons = {"duplicate_position_guard", "already_active_position", "same_family_active_position", "live_trading_not_armed", "missing_selected_quote", "invalid_payload", "order_size_below_minimum", "execution_attempt_cooldown", "group_not_allowed", "group_blocked", "cooldown", "rate_limited", "no_order_api_path", "auth_smoke_required_failed", "user_aborted", "live_trading_not_armed", "stale_signal", "duplicate", "missing_phase55_status", "aggressive_trade_cap", "aggressive_cooldown_active", "aggressive_lane_blocked"}
         api_failure_reasons = {"api_error", "http_error", "timeout", "exception", "no_order_api_path"}
         flags = {
             "spread_reject": reason_text in spread_reasons or category_text == "spread" or "spread" in reason_text,
@@ -9358,7 +9358,6 @@ class KalshiSniperBot:
             and not missing_quotes
             and not resolution_uncertainty
             and not duplicate_block
-            and not daily_cap_block
             and telegram_alert_ready
             and canary_contracts_ok
         )
@@ -9385,8 +9384,6 @@ class KalshiSniperBot:
             block_reason = "resolution_uncertainty"
         elif duplicate_block:
             block_reason = duplicate_detail.get("reason") or "duplicate_block"
-        elif daily_cap_block:
-            block_reason = "daily_trade_cap"
         elif not telegram_alert_ready:
             block_reason = "telegram_alert_not_ready"
         elif not canary_contracts_ok:
@@ -17576,19 +17573,21 @@ class KalshiSniperBot:
             "duplicate_position_guard",
             "duplicate_live_position",
             "already_active_position",
-            "daily_cap",
-            "daily_trade_cap",
             "daily_loss_guard",
             "daily_loss_limit",
+            "recent_order_pending_confirmation",
+            "rate_limited",
+            "kalshi_api_rejection",
+            "api_error",
+        }
+        capacity_warning_labels = {
+            "daily_cap",
+            "daily_trade_cap",
             "max_live_positions",
             "max_total_live_positions",
             "position_limit",
             "pending_family_order_limit",
             "pending_global_order_limit",
-            "recent_order_pending_confirmation",
-            "rate_limited",
-            "kalshi_api_rejection",
-            "api_error",
         }
         obsolete_labels = {
             "phase55_block",
@@ -17618,6 +17617,8 @@ class KalshiSniperBot:
             return "obsolete_legacy"
         if text in hard_labels:
             return "hard_safety"
+        if text in capacity_warning_labels:
+            return "telemetry_warning"
         if text in obsolete_labels:
             return "obsolete_legacy"
         if text in {"unsafe_price", "unsafe_spread", "unsafe_spread_bucket", "spread_extreme", "spread_wait", "spread_above_threshold", "edge_below_threshold", "edge_below_aggressive_floor", "near_safe_relief_denied", "sports_context_unavailable", "sports_context_required_for_weak_signal", "quote_not_ready", "quote_not_usable", "quote_not_ready_after_refresh", "orderbook_not_usable", "no_executable_side"}:
@@ -17880,10 +17881,6 @@ class KalshiSniperBot:
             hard_block_reason = 'missing_executable_selected_side_ask'
         elif not orderbook_ready_value and not depth_available_value and not selected_side_has_liquidity_value:
             hard_block_reason = 'dead_corrupt_orderbook'
-        elif daily_cap_hit:
-            hard_block_reason = 'daily_cap'
-        elif max_positions_hit:
-            hard_block_reason = 'max_live_positions'
 
         canonical_execute_requested = bool(
             final_submit_allowed_by_realm_vv
@@ -17905,8 +17902,6 @@ class KalshiSniperBot:
             and quote_content_pass
             and auth_ready
             and not duplicate_blocked
-            and not daily_cap_hit
-            and not max_positions_hit
             and (orderbook_ready_value or depth_available_value or selected_side_has_liquidity_value)
             and hard_block_reason is None
         )
@@ -18022,6 +18017,14 @@ class KalshiSniperBot:
             'price_bounds_block_reason': price_bounds_decision.get("block_reason"),
             'price_valid': bool(selected_price_valid and not near_certain_price_block),
             'canonical_execute_requested': bool(canonical_execute_requested),
+            'risk_capacity_warnings': {
+                'daily_trade_count_warning': bool(daily_cap_hit),
+                'max_live_positions_warning': bool(max_positions_hit),
+                'live_trade_count_today': live_trade_count_today,
+                'max_live_trades': max_live_trades,
+                'open_live_positions': open_live_positions,
+                'max_live_positions': max_live_positions,
+            },
         }
 
     def _emit_aion_canonical_final(self, *, canonical_final=None):
@@ -24594,7 +24597,7 @@ class KalshiSniperBot:
             "orderbook_ready": bool(payload) if "orderbook_ready" not in allocation else bool(allocation.get("orderbook_ready")),
             "price_bounds_pass": bool(selected_price_float is not None and 0.0 < selected_price_float < 1.0),
             "duplicate_guard": duplicate_result,
-            "exposure_daily_cap": "pass" if daily_count < max_daily else "blocked",
+            "exposure_daily_cap": "pass" if daily_count < max_daily else "warning_only",
             "daily_trade_count": daily_count,
             "max_daily_trades": max_daily,
             "submit_allowed": bool(submit_allowed),
@@ -24791,9 +24794,27 @@ class KalshiSniperBot:
                 duplicate = self.check_live_duplicate_position_api(ticker)
                 if duplicate.get("blocked"):
                     result = {"submitted": False, "reason": duplicate.get("reason") or "duplicate_position_guard"}
-                elif int(self.live_trade_count_today or 0) >= int(MAX_LIVE_TRADES_PER_DAY or 0):
-                    result = {"submitted": False, "reason": "daily_trade_cap"}
                 else:
+                    if int(self.live_trade_count_today or 0) >= int(MAX_LIVE_TRADES_PER_DAY or 0):
+                        try:
+                            print(
+                                "[AION-RISK-GOVERNOR] "
+                                + json.dumps(
+                                    {
+                                        "ticker": ticker,
+                                        "family": family,
+                                        "ok": True,
+                                        "reason": "daily_trade_count_warning",
+                                        "live_trade_count_today": int(self.live_trade_count_today or 0),
+                                        "max_live_trades_per_day": int(MAX_LIVE_TRADES_PER_DAY or 0),
+                                        "responsible_subsystem": "dual_lane_secondary",
+                                    },
+                                    sort_keys=True,
+                                    default=str,
+                                )
+                            )
+                        except Exception:
+                            pass
                     payload = self.build_live_order_payload(
                         q,
                         market=market,
@@ -42069,6 +42090,18 @@ class KalshiSniperBot:
             q,
             max_simultaneous_live_positions=MAX_SIMULTANEOUS_LIVE_POSITIONS,
             max_live_trades_per_day=MAX_LIVE_TRADES_PER_DAY,
+            max_daily_loss=MAX_DAILY_LOSS,
+        )
+
+    def evaluate_live_order_risk_governor(self, payload, q=None):
+        return kalshi_risk_module.evaluate_live_order_risk_governor(
+            self,
+            payload,
+            q=q,
+            max_live_order_size=MAX_LIVE_ORDER_SIZE,
+            max_daily_loss=MAX_DAILY_LOSS,
+            max_dollars_per_trade=globals().get("AION_KELLY_MAX_DOLLARS_PER_TRADE", globals().get("AION_ELITE_MAX_DOLLAR_EXPOSURE", 30.0)),
+            max_family_exposure_dollars=globals().get("AION_KELLY_MAX_FAMILY_EXPOSURE_DOLLARS", globals().get("REALM_XVIII_MAX_FAMILY_EXPOSURE_DOLLARS", 10.0)),
         )
 
     def should_enter_yes(self, q):
@@ -48616,7 +48649,7 @@ class KalshiSniperBot:
                         "duplicate_guard": duplicate_guard_detail,
                         "exposure_daily_cap": "pass"
                         if int(self.live_trade_count_today or 0) < int(MAX_LIVE_TRADES_PER_DAY or 0)
-                        else "blocked",
+                        else "warning_only",
                         "orderbook_ready": bool(quote_readiness_diagnostic.get("orderbook_ready") or (payload_preview or {}).get("orderbook_ready")),
                         "submit_allowed": bool(submit_attempt_price_bounds_pass and payload_preview is not None),
                         "reason": "submit_live_order",
@@ -51775,15 +51808,16 @@ class KalshiSniperBot:
         live_arm_ok = bool(decision_context.get("live_arm_ok", True))
         max_positions_block = bool(decision_context.get("max_positions_block"))
         daily_cap_block = bool(decision_context.get("daily_cap_block"))
+        capacity_warnings = []
         hard_blockers = []
         if duplicate_block:
             hard_blockers.append("duplicate_position")
         if cooldown_block:
             hard_blockers.append("cooldown_active")
         if max_positions_block:
-            hard_blockers.append("max_live_positions")
+            capacity_warnings.append("max_live_positions_warning")
         if daily_cap_block:
-            hard_blockers.append("daily_trade_cap")
+            capacity_warnings.append("daily_trade_count_warning")
         if not live_arm_ok:
             hard_blockers.append("live_arm")
         selected_side = str(tradeability.get("selected_side") or decision_context.get("selected_side") or orderbook_context.get("selected_side") or "").strip().lower() or None
@@ -51805,6 +51839,17 @@ class KalshiSniperBot:
         depth_available = bool(tradeability.get("depth_available") or selected_side_has_liquidity)
         blocker = str(tradeability.get("blocker_class") or tradeability.get("blocker") or tradeability.get("blocker_detail") or "").strip().lower() or None
         blocker_detail = str(tradeability.get("blocker_detail") or tradeability.get("unsafe_resolution_reason") or tradeability.get("unsafe_price_status") or blocker or "unknown").strip().lower() or "unknown"
+        if blocker in {"daily_trade_cap", "daily_cap", "max_live_positions", "max_total_live_positions", "position_limit", "pending_family_order_limit", "pending_global_order_limit"}:
+            capacity_warnings.append(blocker)
+            blocker = None
+            blocker_detail = None
+            tradeability["blocker_class"] = None
+            tradeability["blocker"] = None
+            tradeability["blocker_detail"] = None
+            if quote_ready and orderbook_ready and price_bounds_pass and selected_side_has_price and (selected_side_has_liquidity or depth_available):
+                tradeability["tradeable"] = True
+        if capacity_warnings:
+            tradeability["risk_capacity_warnings"] = sorted(set(capacity_warnings))
         wait_reason = None
         if hard_blockers:
             decision = "SKIP"
@@ -51856,7 +51901,7 @@ class KalshiSniperBot:
                 and selected_side_has_price
                 and (selected_side_has_liquidity or depth_available)
                 and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
-                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}
+                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
             )
             near_miss_allowed = bool(
                 profile in {"opportunistic", "beast"}
@@ -51867,7 +51912,7 @@ class KalshiSniperBot:
                 and selected_price_cents is not None
                 and int(selected_price_cents) <= 99
                 and confidence >= max(0.35, confidence_floor * 0.75)
-                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}
+                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
                 and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
                 and (tradeability.get("liquidity") or 0.0) >= 0.0
             )
@@ -52011,7 +52056,7 @@ class KalshiSniperBot:
                 and price_bounds_pass
                 and tradeability.get("selected_price_cents") is not None
                 and tradeability.get("selected_price_cents") <= 99
-                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}
+                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
                 and (tradeability.get("liquidity") or 0.0) >= 0.0
             )
             if aggressive_wide_spread_ok:
@@ -52045,7 +52090,7 @@ class KalshiSniperBot:
             phase55_status = "pullback_wait"
         elif decision == "WAIT":
             phase55_status = "trigger_wait"
-        elif blocker in {"duplicate_position", "cooldown_active", "live_arm", "daily_trade_cap", "max_live_positions"}:
+        elif blocker in {"duplicate_position", "cooldown_active", "live_arm"}:
             phase55_status = "immediate_reject"
         elif blocker == "edge_below_threshold":
             phase55_status = "probability_block"

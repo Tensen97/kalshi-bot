@@ -167,6 +167,49 @@ def place_live_order(bot, payload):
                 }
         except Exception:
             pass
+    action_hint = str(payload.get("action") or "").strip().lower()
+    exit_hint = bool(
+        action_hint in {"sell", "exit", "close"}
+        or payload.get("reduce_only")
+        or payload.get("exit_reason")
+        or payload.get("exit_order")
+    )
+    if not exit_hint and action_hint in {"", "buy"} and not bool(payload.get("_risk_governor_checked")):
+        risk_governor = getattr(bot, "evaluate_live_order_risk_governor", None)
+        if callable(risk_governor):
+            risk_result = risk_governor(payload, q=None)
+            try:
+                if (not risk_result.get("ok")) or risk_result.get("cap_reasons") or risk_result.get("warnings"):
+                    print(
+                        "[AION-RISK-GOVERNOR] "
+                        + json.dumps(
+                            {
+                                "ticker": risk_result.get("ticker") or payload.get("ticker"),
+                                "family": risk_result.get("family") or family_hint,
+                                "side": risk_result.get("side") or payload.get("side"),
+                                "selected_price": risk_result.get("selected_price") or payload.get("price"),
+                                "ok": bool(risk_result.get("ok")),
+                                "reason": risk_result.get("reason"),
+                                "final_count": risk_result.get("final_count"),
+                                "cap_reasons": risk_result.get("cap_reasons"),
+                                "warnings": risk_result.get("warnings"),
+                                "responsible_subsystem": "canonical_risk_governor",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+            except Exception:
+                pass
+            if not risk_result.get("ok"):
+                return {
+                    "submitted": False,
+                    "reason": risk_result.get("reason") or "risk_governor_block",
+                    "payload": risk_result.get("payload") or payload,
+                    "risk": risk_result,
+                }
+            payload = risk_result.get("payload") if isinstance(risk_result.get("payload"), dict) else payload
+            payload["_risk_governor_checked"] = True
     legacy_payload = bot._normalize_legacy_order_payload(payload)
     if not legacy_payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
@@ -505,12 +548,11 @@ def maybe_auto_reprice_recent_order(
         return {"handled": False, "submitted": False, "reason": "auth_not_ready"}
     bot._reset_live_trade_counter_if_needed()
     if int(bot.live_trade_count_today or 0) >= int(max_live_trades_per_day or 0):
-        if order_id and hasattr(bot, "cancel_live_order"):
-            cancel_result = bot.cancel_live_order(order_id)
-            _auto_reprice_log("AUTO-REPRICE-CANCEL", ticker=ticker, old_order_id=order_id, reason="daily_trade_cap")
-            if hasattr(bot, "append_live_audit_log") and cancel_result.get("ok"):
-                bot.append_live_audit_log("order_cancelled", ticker=ticker, order_id=order_id, side=side, reason="daily_trade_cap", status_code=cancel_result.get("status_code"))
-        return {"handled": True, "submitted": False, "reason": "daily_trade_cap"}
+        current_payload["risk_warning_daily_trade_count"] = {
+            "live_trade_count_today": int(bot.live_trade_count_today or 0),
+            "max_live_trades_per_day": int(max_live_trades_per_day or 0),
+        }
+        _auto_reprice_log("AUTO-REPRICE-WARN", ticker=ticker, order_id=order_id or None, reason="daily_trade_count_warning")
     active_timestamps = bot._active_live_order_timestamps()
     if len(active_timestamps) >= int(live_order_rate_limit or 1):
         _auto_reprice_log("AUTO-REPRICE-SKIP", ticker=ticker, order_id=order_id or None, reason="rate_limited")
@@ -819,24 +861,53 @@ def submit_live_order(
     max_pending_family_orders = int(
         max_sports_live_positions if bot._is_sports_market_or_family(family) else max_simultaneous_live_positions
     )
+    pending_total_orders = bot.recent_submitted_order_count_total()
+    max_pending_total_orders = int(max_simultaneous_live_positions or 0)
     if max_pending_family_orders > 0 and pending_family_orders >= max_pending_family_orders:
-        return {
-            "submitted": False,
-            "reason": "pending_family_order_limit",
-            "payload": payload,
+        payload["risk_warning_pending_family_orders"] = {
             "pending_family_orders": pending_family_orders,
             "max_pending_family_orders": max_pending_family_orders,
         }
-    pending_total_orders = bot.recent_submitted_order_count_total()
-    max_pending_total_orders = int(max_simultaneous_live_positions or 0)
     if max_pending_total_orders > 0 and pending_total_orders >= max_pending_total_orders:
-        return {
-            "submitted": False,
-            "reason": "pending_global_order_limit",
-            "payload": payload,
+        payload["risk_warning_pending_global_orders"] = {
             "pending_total_orders": pending_total_orders,
             "max_pending_total_orders": max_pending_total_orders,
         }
+    risk_governor = getattr(bot, "evaluate_live_order_risk_governor", None)
+    if callable(risk_governor):
+        risk_result = risk_governor(payload, q=q)
+        try:
+            if (not risk_result.get("ok")) or risk_result.get("cap_reasons") or risk_result.get("warnings"):
+                print(
+                    "[AION-RISK-GOVERNOR] "
+                    + json.dumps(
+                        {
+                            "ticker": risk_result.get("ticker") or payload.get("ticker"),
+                            "family": risk_result.get("family") or family,
+                            "side": risk_result.get("side") or payload.get("side"),
+                            "selected_price": risk_result.get("selected_price") or payload.get("price"),
+                            "ok": bool(risk_result.get("ok")),
+                            "reason": risk_result.get("reason"),
+                            "final_count": risk_result.get("final_count"),
+                            "cap_reasons": risk_result.get("cap_reasons"),
+                            "warnings": risk_result.get("warnings"),
+                            "responsible_subsystem": "canonical_risk_governor",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        except Exception:
+            pass
+        if not risk_result.get("ok"):
+            return {
+                "submitted": False,
+                "reason": risk_result.get("reason") or "risk_governor_block",
+                "payload": risk_result.get("payload") or payload,
+                "risk": risk_result,
+            }
+        payload = risk_result.get("payload") if isinstance(risk_result.get("payload"), dict) else payload
+        payload["_risk_governor_checked"] = True
     authorization = bot.get_live_submit_authorization(payload)
     if not authorization.get("ok"):
         return {"submitted": False, "reason": authorization.get("reason"), "payload": payload, "authorization": authorization}
@@ -844,7 +915,10 @@ def submit_live_order(
         return {"submitted": False, "reason": "auth_not_ready", "payload": payload}
     bot._reset_live_trade_counter_if_needed()
     if int(bot.live_trade_count_today or 0) >= int(max_live_trades_per_day or 0):
-        return {"submitted": False, "reason": "daily_trade_cap", "payload": payload}
+        payload["risk_warning_daily_trade_count"] = {
+            "live_trade_count_today": int(bot.live_trade_count_today or 0),
+            "max_live_trades_per_day": int(max_live_trades_per_day or 0),
+        }
     active_timestamps = bot._active_live_order_timestamps()
     if len(active_timestamps) >= int(live_order_rate_limit or 1):
         return {"submitted": False, "reason": "rate_limited", "payload": payload}
