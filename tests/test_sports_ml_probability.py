@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from probability.sports_ml import (
@@ -49,6 +50,73 @@ class SportsMLProbabilityTests(unittest.TestCase):
             path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
             examples = build_training_examples([path])
             self.assertEqual(examples, [])
+
+    def test_public_archive_rows_are_side_expanded_and_weighted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "market_history.jsonl"
+            row = {
+                "event_type": "market_history",
+                "category": "binary",
+                "family": "KXNBA1HTOTAL",
+                "ticker": "KXNBA1HTOTAL-TEST-100",
+                "settlement_result": "yes",
+                "last_price": 0.55,
+                "spread": 0.03,
+                "liquidity": 100,
+            }
+            path.write_text(json.dumps(row), encoding="utf-8")
+            examples = build_training_examples([path])
+            self.assertEqual(len(examples), 2)
+            self.assertEqual({example["source_tag"] for example in examples}, {"public_archive"})
+            self.assertEqual({example["sample_weight"] for example in examples}, {1.0})
+            self.assertEqual(sorted(example["label"] for example in examples), [0, 1])
+
+    def test_bot_settled_rows_receive_higher_recent_weight(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "archive.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            old = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+            rows = [
+                {
+                    "event_type": "candidate_seen",
+                    "category": "sports",
+                    "family": "KXMLBMATCH",
+                    "ticker": "KXMLBMATCH-RECENT",
+                    "side": "yes",
+                    "price": 0.45,
+                },
+                {
+                    "event_type": "trade_closed",
+                    "category": "sports",
+                    "family": "KXMLBMATCH",
+                    "ticker": "KXMLBMATCH-RECENT",
+                    "contracts": 1,
+                    "pnl_dollars": 0.10,
+                    "timestamp_utc": now,
+                },
+                {
+                    "event_type": "candidate_seen",
+                    "category": "sports",
+                    "family": "KXMLBMATCH",
+                    "ticker": "KXMLBMATCH-OLD",
+                    "side": "yes",
+                    "price": 0.55,
+                },
+                {
+                    "event_type": "trade_closed",
+                    "category": "sports",
+                    "family": "KXMLBMATCH",
+                    "ticker": "KXMLBMATCH-OLD",
+                    "contracts": 1,
+                    "pnl_dollars": -0.10,
+                    "timestamp_utc": old,
+                },
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            examples = build_training_examples([path], recent_days=14)
+            weights_by_ticker = {example["ticker"]: example["sample_weight"] for example in examples}
+            self.assertEqual(weights_by_ticker["KXMLBMATCH-RECENT"], 10.0)
+            self.assertEqual(weights_by_ticker["KXMLBMATCH-OLD"], 5.0)
 
     def test_trained_model_softly_adjusts_probability(self):
         with tempfile.TemporaryDirectory() as tmpdir:

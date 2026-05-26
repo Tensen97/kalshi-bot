@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import builtins
 import hashlib
 import json
 import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
-    from runtime.paths import runtime_state_file, safe_atomic_json_write
+    from runtime.paths import runtime_memory_file, runtime_state_file, safe_atomic_json_write
 except Exception:  # pragma: no cover - import fallback for standalone scripts
+    def runtime_memory_file(name):
+        return str(Path("/tmp") / str(name))
+
     def runtime_state_file(name):
         return str(Path("/tmp") / str(name))
 
@@ -28,6 +32,19 @@ DEFAULT_MODEL_PATH = runtime_state_file("aion_sports_ml_probability_model.json")
 DEFAULT_SCHEMA_PATH = runtime_state_file("aion_sports_ml_probability_schema.json")
 DEFAULT_SUMMARY_PATH = runtime_state_file("aion_sports_ml_probability_training_summary.json")
 DEFAULT_ARCHIVE_PATH = "data/aion_learning_archive.jsonl"
+DEFAULT_PUBLIC_HISTORY_DB_PATH = runtime_memory_file("aion_sports_history.sqlite")
+DEFAULT_PUBLIC_HISTORY_JSONL_PATH = "data/kalshi_market_history.jsonl"
+DEFAULT_TRAINING_INPUTS = [
+    DEFAULT_PUBLIC_HISTORY_DB_PATH,
+    DEFAULT_PUBLIC_HISTORY_JSONL_PATH,
+    DEFAULT_ARCHIVE_PATH,
+]
+SOURCE_WEIGHTS = {
+    "public_archive": 1.0,
+    "bot_settled": 5.0,
+    "bot_recent_settled": 10.0,
+}
+DEFAULT_RECENT_BOT_DAYS = 14
 
 BANNED_NONSPORTS_TOKENS = {"BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB", "CRYPTO"}
 SPORTS_FAMILY_PREFIXES = (
@@ -98,6 +115,44 @@ def _utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_datetime(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _record_datetime(record):
+    for name in (
+        "close_timestamp_utc",
+        "timestamp_utc",
+        "source_time",
+        "settlement_time",
+        "close_time",
+        "ts",
+        "timestamp",
+    ):
+        parsed = _parse_datetime(_record_get(record, name))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _safe_float(value, default=None):
     try:
         if value is None:
@@ -142,6 +197,47 @@ def _hash_feature(value):
         return 0.0
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:8], 16) / float(0xFFFFFFFF)
+
+
+def _price_bucket_midpoint(bucket):
+    return {
+        "under_20": 0.15,
+        "20_35": 0.275,
+        "35_45": 0.40,
+        "35_50": 0.425,
+        "45_60": 0.525,
+        "60_80": 0.70,
+        "over_80": 0.875,
+    }.get(str(bucket or "").strip().lower())
+
+
+def _spread_bucket_midpoint(bucket):
+    return {
+        "tight": 0.015,
+        "usable": 0.04,
+        "wide": 0.075,
+        "very_wide": 0.12,
+        "extreme": 0.18,
+    }.get(str(bucket or "").strip().lower(), 0.04)
+
+
+def _liquidity_bucket_value(bucket):
+    return {
+        "deep": 3000.0,
+        "solid": 1000.0,
+        "thin": 200.0,
+        "very_thin": 25.0,
+        "no_volume": 0.0,
+    }.get(str(bucket or "").strip().lower(), 100.0)
+
+
+def _normalize_outcome(value):
+    text = str(value or "").strip().lower()
+    if text in {"yes", "y", "true", "1", "win", "won"}:
+        return "yes"
+    if text in {"no", "n", "false", "0", "loss", "lost"}:
+        return "no"
+    return text or None
 
 
 def _record_get(record, *names):
@@ -547,8 +643,11 @@ def iter_jsonl_records(paths):
     for raw_path in paths:
         path = Path(raw_path)
         if path.is_dir():
-            for child in sorted(path.glob("*.jsonl")):
+            for child in sorted(path.glob("*.jsonl")) + sorted(path.glob("*.sqlite")) + sorted(path.glob("*.sqlite3")):
                 yield from iter_jsonl_records([child])
+            continue
+        if _is_sqlite_path(path):
+            yield from iter_sqlite_sports_history_records(path)
             continue
         if not path.exists():
             continue
@@ -565,10 +664,169 @@ def iter_jsonl_records(paths):
                     yield record
 
 
+def _is_sqlite_path(path):
+    suffix = str(getattr(path, "suffix", "") or "").lower()
+    name = str(getattr(path, "name", "") or "").lower()
+    return suffix in {".sqlite", ".sqlite3", ".db"} or ".sqlite" in name
+
+
+def iter_sqlite_sports_history_records(path):
+    path = Path(path)
+    if not path.exists():
+        return
+    try:
+        import sqlite3
+    except Exception:
+        return
+    try:
+        uri = f"file:{path.resolve()}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return
+    try:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sports_history_records'"
+        ).fetchone()
+        if not table_exists:
+            return
+        for row in conn.execute(
+            """
+            SELECT
+                source_time,
+                ticker,
+                market_title,
+                sport_type,
+                family,
+                category,
+                implied_probability_bucket,
+                payout_asymmetry_bucket,
+                spread_bucket,
+                liquidity_bucket,
+                movement_bucket,
+                volatility_bucket,
+                volume_bucket,
+                outcome,
+                resolution_status,
+                data_source,
+                backfill_run_id,
+                recency_weight
+            FROM sports_history_records
+            """
+        ):
+            record = dict(row)
+            record["event_type"] = "sports_history_record"
+            record["category"] = "sports"
+            record["settlement_result"] = record.get("outcome")
+            record["timestamp_utc"] = record.get("source_time")
+            record["_ml_source_hint"] = "public_archive"
+            yield record
+    except Exception:
+        return
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _source_tag_for_record(record, *, recent_days=DEFAULT_RECENT_BOT_DAYS):
+    explicit = str(record.get("source_tag") or record.get("_ml_source_hint") or "").strip().lower()
+    if explicit in SOURCE_WEIGHTS:
+        return explicit
+    event_type = str(record.get("event_type") or "").strip().lower()
+    if event_type in {"market_history", "sports_history_record", "public_archive_labeled"}:
+        return "public_archive"
+    if event_type == "trade_closed":
+        timestamp = _record_datetime(record)
+        if timestamp is not None:
+            age = datetime.now(timezone.utc) - timestamp
+            if age <= timedelta(days=max(1, int(recent_days or DEFAULT_RECENT_BOT_DAYS))):
+                return "bot_recent_settled"
+        return "bot_settled"
+    return "public_archive" if record.get("settlement_result") is not None else "bot_settled"
+
+
+def _sample_weight_for_source(source_tag):
+    return float(SOURCE_WEIGHTS.get(str(source_tag or "").strip().lower(), 1.0))
+
+
+def _public_archive_side_rows(record):
+    outcome = _normalize_outcome(
+        record.get("settlement_result")
+        or record.get("outcome")
+        or record.get("result")
+        or record.get("resolution")
+    )
+    if outcome not in {"yes", "no"}:
+        return []
+    yes_price = (
+        _price_bucket_midpoint(record.get("implied_probability_bucket") or record.get("odds_bucket"))
+        or _normal_price(record.get("yes_price"))
+        or _normal_price(record.get("last_price"))
+        or _normal_price(record.get("yes_ask"))
+        or _normal_price(record.get("yes_bid"))
+        or 0.50
+    )
+    spread = _safe_float(record.get("spread"), None)
+    if spread is None:
+        spread = _spread_bucket_midpoint(record.get("spread_bucket"))
+    liquidity = _safe_float(record.get("liquidity_dollars", record.get("liquidity")), None)
+    if liquidity is None:
+        liquidity = _liquidity_bucket_value(record.get("liquidity_bucket"))
+    base = {
+        "event_type": "public_archive_labeled",
+        "source_tag": "public_archive",
+        "category": "sports",
+        "family": record.get("family"),
+        "ticker": record.get("ticker"),
+        "market_title": record.get("market_title") or record.get("title"),
+        "sport_type": record.get("sport_type"),
+        "spread": spread,
+        "liquidity_dollars": liquidity,
+        "sports_regime": record.get("volatility_bucket") or record.get("movement_bucket"),
+        "entry_mode": record.get("movement_bucket"),
+        "settlement_result": outcome,
+        "timestamp_utc": record.get("timestamp_utc") or record.get("source_time") or record.get("close_time"),
+    }
+    yes_row = dict(base)
+    yes_row.update(
+        {
+            "side": "yes",
+            "selected_side": "yes",
+            "price": _clip(yes_price, 0.01, 0.99),
+            "sports_implied_probability": _clip(yes_price, 0.01, 0.99),
+            "label": 1 if outcome == "yes" else 0,
+        }
+    )
+    no_price = 1.0 - _clip(yes_price, 0.01, 0.99)
+    no_row = dict(base)
+    no_row.update(
+        {
+            "side": "no",
+            "selected_side": "no",
+            "price": _clip(no_price, 0.01, 0.99),
+            "sports_implied_probability": _clip(no_price, 0.01, 0.99),
+            "label": 1 if outcome == "no" else 0,
+        }
+    )
+    return [yes_row, no_row]
+
+
 def _training_label(record):
-    if str(record.get("event_type") or "").strip().lower() != "trade_closed":
-        return None
     if not is_sports_record(record):
+        return None
+    source_tag = _source_tag_for_record(record)
+    if source_tag == "public_archive":
+        explicit_label = record.get("label")
+        if explicit_label in {0, 1, False, True}:
+            return 1 if bool(explicit_label) else 0
+        outcome = _normalize_outcome(record.get("settlement_result") or record.get("outcome") or record.get("result"))
+        side = str(record.get("selected_side") or record.get("side") or "yes").strip().lower()
+        if outcome in {"yes", "no"} and side in {"yes", "no"}:
+            return 1 if side == outcome else 0
+        return None
+    if str(record.get("event_type") or "").strip().lower() != "trade_closed":
         return None
     pnl = _safe_float(record.get("pnl_dollars"), None)
     won = record.get("won")
@@ -586,15 +844,60 @@ def _training_label(record):
     return None
 
 
-def build_training_examples(paths, *, max_records=None):
+def _compact_example(record, label, *, source_tag):
+    features = build_sports_ml_features(record)
+    return {
+        "label": int(label),
+        "vector": array("f", vectorize_features(features)),
+        "ticker": features.get("ticker"),
+        "family": features.get("family"),
+        "source_tag": source_tag,
+        "sample_weight": _sample_weight_for_source(source_tag),
+    }
+
+
+def build_training_dataset(paths, *, max_records=None, recent_days=DEFAULT_RECENT_BOT_DAYS):
     recent_features = {}
     examples = []
+    stats = {
+        "records_seen": 0,
+        "sports_records_seen": 0,
+        "historical_archive_rows_found": 0,
+        "usable_labeled_archive_rows": 0,
+        "public_archive_examples": 0,
+        "bot_settled_rows_found": 0,
+        "bot_recent_settled_rows_found": 0,
+        "usable_bot_settled_rows": 0,
+        "source_counts": {},
+        "source_weighted_rows": {},
+    }
     seen = 0
     for record in iter_jsonl_records(paths):
         seen += 1
+        stats["records_seen"] += 1
         if max_records is not None and seen > max_records:
             break
         if not is_sports_record(record):
+            continue
+        stats["sports_records_seen"] += 1
+        source_tag = _source_tag_for_record(record, recent_days=recent_days)
+        if source_tag == "public_archive":
+            stats["historical_archive_rows_found"] += 1
+            rows = _public_archive_side_rows(record)
+            if rows:
+                stats["usable_labeled_archive_rows"] += 1
+            for row in rows:
+                label = _training_label(row)
+                if label is None:
+                    continue
+                example = _compact_example(row, label, source_tag="public_archive")
+                examples.append(example)
+                stats["public_archive_examples"] += 1
+                stats["source_counts"]["public_archive"] = stats["source_counts"].get("public_archive", 0) + 1
+                stats["source_weighted_rows"]["public_archive"] = round(
+                    stats["source_weighted_rows"].get("public_archive", 0.0) + example["sample_weight"],
+                    4,
+                )
             continue
         event_type = str(record.get("event_type") or "").strip().lower()
         keys = _record_keys(record)
@@ -603,6 +906,11 @@ def build_training_examples(paths, *, max_records=None):
                 recent_features[key] = record
             continue
         label = _training_label(record)
+        if event_type == "trade_closed":
+            if source_tag == "bot_recent_settled":
+                stats["bot_recent_settled_rows_found"] += 1
+            else:
+                stats["bot_settled_rows_found"] += 1
         if label is None:
             continue
         merged = dict(record)
@@ -613,9 +921,22 @@ def build_training_examples(paths, *, max_records=None):
                 tmp.update({name: value for name, value in record.items() if value is not None})
                 merged = tmp
                 break
-        features = build_sports_ml_features(merged)
-        examples.append({"label": int(label), "features": features, "ticker": features.get("ticker"), "family": features.get("family")})
-    return examples
+        source_tag = _source_tag_for_record(merged, recent_days=recent_days)
+        example = _compact_example(merged, label, source_tag=source_tag)
+        examples.append(example)
+        stats["usable_bot_settled_rows"] += 1
+        stats["source_counts"][source_tag] = stats["source_counts"].get(source_tag, 0) + 1
+        stats["source_weighted_rows"][source_tag] = round(
+            stats["source_weighted_rows"].get(source_tag, 0.0) + example["sample_weight"],
+            4,
+        )
+    stats["examples"] = len(examples)
+    stats["weighted_examples"] = round(sum(_safe_float(row.get("sample_weight"), 1.0) or 1.0 for row in examples), 4)
+    return {"examples": examples, "stats": stats}
+
+
+def build_training_examples(paths, *, max_records=None, recent_days=DEFAULT_RECENT_BOT_DAYS):
+    return build_training_dataset(paths, max_records=max_records, recent_days=recent_days).get("examples", [])
 
 
 def _record_keys(record):
@@ -627,6 +948,49 @@ def _record_keys(record):
     return keys
 
 
+def _example_vector(row):
+    vector = row.get("vector") if isinstance(row, dict) else None
+    if vector is not None:
+        return vector
+    return array("f", vectorize_features(row.get("features") if isinstance(row, dict) else {}))
+
+
+def _split_train_validation(vectors, labels, sample_weights):
+    if len(labels) < 50:
+        return vectors, labels, sample_weights, [], [], []
+    train_vectors = []
+    train_labels = []
+    train_sample_weights = []
+    validation_vectors = []
+    validation_labels = []
+    validation_sample_weights = []
+    for index, (vector, label, weight) in enumerate(zip(vectors, labels, sample_weights)):
+        if index % 5 == 0:
+            validation_vectors.append(vector)
+            validation_labels.append(label)
+            validation_sample_weights.append(weight)
+        else:
+            train_vectors.append(vector)
+            train_labels.append(label)
+            train_sample_weights.append(weight)
+    return train_vectors, train_labels, train_sample_weights, validation_vectors, validation_labels, validation_sample_weights
+
+
+def _resolve_epochs(example_count, requested_epochs):
+    if requested_epochs is not None:
+        return max(1, int(requested_epochs))
+    example_count = int(example_count or 0)
+    if example_count >= 250000:
+        return 6
+    if example_count >= 100000:
+        return 8
+    if example_count >= 25000:
+        return 18
+    if example_count >= 5000:
+        return 50
+    return 260
+
+
 def train_sports_ml_probability_model(
     paths,
     *,
@@ -635,10 +999,13 @@ def train_sports_ml_probability_model(
     summary_path=DEFAULT_SUMMARY_PATH,
     min_examples=25,
     max_records=None,
-    epochs=260,
+    epochs=None,
     learning_rate=0.08,
+    recent_days=DEFAULT_RECENT_BOT_DAYS,
 ):
-    examples = build_training_examples(paths, max_records=max_records)
+    dataset = build_training_dataset(paths, max_records=max_records, recent_days=recent_days)
+    examples = dataset.get("examples") or []
+    dataset_stats = dataset.get("stats") if isinstance(dataset, dict) else {}
     positives = sum(1 for row in examples if row["label"] == 1)
     negatives = sum(1 for row in examples if row["label"] == 0)
     summary = {
@@ -648,6 +1015,16 @@ def train_sports_ml_probability_model(
         "examples": len(examples),
         "positives": positives,
         "negatives": negatives,
+        "historical_archive_rows_found": int(dataset_stats.get("historical_archive_rows_found") or 0),
+        "usable_labeled_archive_rows": int(dataset_stats.get("usable_labeled_archive_rows") or 0),
+        "bot_settled_rows_found": int(dataset_stats.get("bot_settled_rows_found") or 0),
+        "recent_bot_settled_rows_found": int(dataset_stats.get("bot_recent_settled_rows_found") or 0),
+        "usable_bot_settled_rows": int(dataset_stats.get("usable_bot_settled_rows") or 0),
+        "final_weighted_training_rows": round(_safe_float(dataset_stats.get("weighted_examples"), 0.0) or 0.0, 4),
+        "source_counts": dataset_stats.get("source_counts") or {},
+        "source_weighted_rows": dataset_stats.get("source_weighted_rows") or {},
+        "source_weights": dict(SOURCE_WEIGHTS),
+        "recent_bot_days": int(recent_days or DEFAULT_RECENT_BOT_DAYS),
         "model_path": str(model_path),
         "schema_path": str(schema_path),
         "summary_path": str(summary_path),
@@ -661,12 +1038,40 @@ def train_sports_ml_probability_model(
         summary["reason"] = "need_both_winning_and_losing_sports_examples"
         safe_atomic_json_write(summary_path, summary)
         return summary
-    vectors = [vectorize_features(row["features"]) for row in examples]
+    vectors = [_example_vector(row) for row in examples]
     labels = [int(row["label"]) for row in examples]
-    means, scales = _feature_stats(vectors)
-    weights, intercept = _train_logistic(vectors, labels, means, scales, epochs=epochs, learning_rate=learning_rate)
-    metrics = _evaluate_logistic(vectors, labels, means, scales, weights, intercept)
-    blend_weight = min(0.35, max(0.10, len(examples) / 800.0))
+    sample_weights = [_safe_float(row.get("sample_weight"), 1.0) or 1.0 for row in examples]
+    train_vectors, train_labels, train_sample_weights, validation_vectors, validation_labels, validation_sample_weights = _split_train_validation(
+        vectors,
+        labels,
+        sample_weights,
+    )
+    means, scales = _feature_stats(train_vectors)
+    effective_epochs = _resolve_epochs(len(train_vectors), epochs)
+    weights, intercept = _train_logistic(
+        train_vectors,
+        train_labels,
+        train_sample_weights,
+        means,
+        scales,
+        epochs=effective_epochs,
+        learning_rate=learning_rate,
+    )
+    metrics = _evaluate_logistic(train_vectors, train_labels, train_sample_weights, means, scales, weights, intercept, prefix="train_")
+    if validation_vectors:
+        metrics.update(
+            _evaluate_logistic(
+                validation_vectors,
+                validation_labels,
+                validation_sample_weights,
+                means,
+                scales,
+                weights,
+                intercept,
+                prefix="validation_",
+            )
+        )
+    blend_weight = min(0.40, max(0.12, summary["final_weighted_training_rows"] / 50000.0))
     model = {
         "model_type": "aion_sports_logistic_probability",
         "version": MODEL_VERSION,
@@ -682,6 +1087,9 @@ def train_sports_ml_probability_model(
             "ok": True,
             "reason": "trained",
             "blend_weight": round(blend_weight, 4),
+            "train_examples": len(train_labels),
+            "validation_examples": len(validation_labels),
+            "epochs": effective_epochs,
         },
     }
     schema = {
@@ -689,12 +1097,27 @@ def train_sports_ml_probability_model(
         "feature_names": FEATURE_NAMES,
         "target": "selected_side_realized_win_probability",
         "sports_only": True,
+        "source_tags": sorted(SOURCE_WEIGHTS),
+        "source_weights": dict(SOURCE_WEIGHTS),
         "created_at_utc": summary["trained_at_utc"],
     }
-    safe_atomic_json_write(model_path, model)
-    safe_atomic_json_write(schema_path, schema)
     summary = dict(model["training_summary"])
-    safe_atomic_json_write(summary_path, summary)
+    model_write_ok = safe_atomic_json_write(model_path, model)
+    schema_write_ok = safe_atomic_json_write(schema_path, schema)
+    summary["model_write_ok"] = bool(model_write_ok)
+    summary["schema_write_ok"] = bool(schema_write_ok)
+    if not model_write_ok or not schema_write_ok:
+        summary["ok"] = False
+        summary["reason"] = "artifact_write_failed"
+        safe_atomic_json_write(summary_path, summary)
+        return summary
+    summary["summary_write_ok"] = True
+    summary_write_ok = safe_atomic_json_write(summary_path, summary)
+    if not summary_write_ok:
+        summary["ok"] = False
+        summary["reason"] = "summary_write_failed"
+        summary["summary_write_ok"] = False
+        return summary
     _MODEL_CACHE.update({"path": None, "mtime": None, "model": None})
     return summary
 
@@ -712,15 +1135,18 @@ def _feature_stats(vectors):
     return means, scales
 
 
-def _train_logistic(vectors, labels, means, scales, *, epochs, learning_rate):
+def _train_logistic(vectors, labels, sample_weights, means, scales, *, epochs, learning_rate):
     weights = [0.0] * len(FEATURE_NAMES)
     positive_rate = max(0.01, min(0.99, sum(labels) / float(len(labels) or 1)))
     intercept = math.log(positive_rate / (1.0 - positive_rate))
     positives = max(1, sum(labels))
     negatives = max(1, len(labels) - positives)
+    average_source_weight = sum(sample_weights or [1.0]) / float(len(sample_weights or [1.0]) or 1)
+    if average_source_weight <= 0:
+        average_source_weight = 1.0
     l2 = 0.001
     for _epoch in range(int(epochs)):
-        for vector, label in zip(vectors, labels):
+        for vector, label, source_weight in zip(vectors, labels, sample_weights):
             z = intercept
             scaled = []
             for index, value in enumerate(vector):
@@ -729,15 +1155,16 @@ def _train_logistic(vectors, labels, means, scales, *, epochs, learning_rate):
                 scaled.append(x)
                 z += weights[index] * x
             pred = _sigmoid(z)
-            sample_weight = len(labels) / (2.0 * (positives if label else negatives))
-            error = (pred - label) * sample_weight
+            class_weight = len(labels) / (2.0 * (positives if label else negatives))
+            source_weight = max(0.01, _safe_float(source_weight, 1.0) or 1.0) / average_source_weight
+            error = (pred - label) * class_weight * source_weight
             intercept -= learning_rate * error
             for index, x in enumerate(scaled):
                 weights[index] -= learning_rate * ((error * x) + (l2 * weights[index]))
     return [round(weight, 10) for weight in weights], round(intercept, 10)
 
 
-def _evaluate_logistic(vectors, labels, means, scales, weights, intercept):
+def _evaluate_logistic(vectors, labels, sample_weights, means, scales, weights, intercept, *, prefix=""):
     predictions = []
     for vector in vectors:
         z = intercept
@@ -748,15 +1175,31 @@ def _evaluate_logistic(vectors, labels, means, scales, weights, intercept):
     correct = 0
     brier = 0.0
     logloss = 0.0
-    for pred, label in zip(predictions, labels):
-        correct += int((pred >= 0.50) == bool(label))
-        brier += (pred - label) ** 2
-        logloss -= (label * math.log(pred)) + ((1 - label) * math.log(1.0 - pred))
+    weighted_correct = 0.0
+    weighted_brier = 0.0
+    weighted_logloss = 0.0
+    total_weight = 0.0
+    for pred, label, weight in zip(predictions, labels, sample_weights):
+        weight = max(0.01, _safe_float(weight, 1.0) or 1.0)
+        hit = int((pred >= 0.50) == bool(label))
+        loss = -((label * math.log(pred)) + ((1 - label) * math.log(1.0 - pred)))
+        square = (pred - label) ** 2
+        correct += hit
+        brier += square
+        logloss += loss
+        weighted_correct += hit * weight
+        weighted_brier += square * weight
+        weighted_logloss += loss * weight
+        total_weight += weight
     count = max(1, len(labels))
+    total_weight = max(0.01, total_weight)
     return {
-        "accuracy": round(correct / count, 4),
-        "brier_score": round(brier / count, 6),
-        "logloss": round(logloss / count, 6),
+        f"{prefix}accuracy": round(correct / count, 4),
+        f"{prefix}brier_score": round(brier / count, 6),
+        f"{prefix}logloss": round(logloss / count, 6),
+        f"{prefix}weighted_accuracy": round(weighted_correct / total_weight, 4),
+        f"{prefix}weighted_brier_score": round(weighted_brier / total_weight, 6),
+        f"{prefix}weighted_logloss": round(weighted_logloss / total_weight, 6),
     }
 
 
@@ -792,13 +1235,15 @@ def prediction_sanity(input_path=None, *, model_path=DEFAULT_MODEL_PATH):
 
 
 def cli_train(argv=None):
-    parser = argparse.ArgumentParser(description="Train AION sports-only ML probability model from learning archive JSONL.")
-    parser.add_argument("--input", nargs="+", default=[DEFAULT_ARCHIVE_PATH])
+    parser = argparse.ArgumentParser(description="Train AION sports-only ML probability model from public archive plus bot outcomes.")
+    parser.add_argument("--input", nargs="+", default=DEFAULT_TRAINING_INPUTS)
     parser.add_argument("--model", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--schema", default=DEFAULT_SCHEMA_PATH)
     parser.add_argument("--summary", default=DEFAULT_SUMMARY_PATH)
     parser.add_argument("--min-examples", type=int, default=25)
     parser.add_argument("--max-records", type=int, default=None)
+    parser.add_argument("--recent-days", type=int, default=DEFAULT_RECENT_BOT_DAYS)
+    parser.add_argument("--epochs", type=int, default=None)
     args = parser.parse_args(argv)
     summary = train_sports_ml_probability_model(
         args.input,
@@ -807,6 +1252,8 @@ def cli_train(argv=None):
         summary_path=args.summary,
         min_examples=args.min_examples,
         max_records=args.max_records,
+        recent_days=args.recent_days,
+        epochs=args.epochs,
     )
     builtins.print(json.dumps(summary, indent=2, sort_keys=True, default=str))
     return 0 if summary.get("ok") or summary.get("reason") in {"not_enough_labeled_sports_examples", "need_both_winning_and_losing_sports_examples"} else 1
