@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 ROOT = Path('/opt/kalshi-bot/kalshi_web.py')
+ROOT_DIR = ROOT.parent
 
 
 def load_module():
+    if str(ROOT_DIR) not in sys.path:
+        sys.path.insert(0, str(ROOT_DIR))
     spec = importlib.util.spec_from_file_location('kalshi_web', ROOT)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader

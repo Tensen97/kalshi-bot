@@ -22,6 +22,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.sports_regime_log_markers = {}
         bot.sports_graph_log_markers = {}
         bot.sports_spread_log_markers = {}
+        bot.sports_execution_log_markers = {}
         bot.last_sports_graph_contexts = {}
         bot.last_sports_ladder_plan = {}
         bot.last_sports_ladder_execution_summary = {}
@@ -4343,6 +4344,168 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertLess(allocation["sports_spread_rank_adjustment"], 0.0)
         self.assertLess(allocation["sports_spread_size_multiplier"], 1.0)
         self.assertLess(context["sports_spread_size_multiplier"], 1.0)
+        self.assertGreater(context["unified_score"], 0.0)
+
+    def test_sports_side_selection_uses_execution_fill_quality(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA-MICROSTRUCTURE-SIDE",
+            "series_ticker": "KXNBA",
+            "title": "NBA game winner",
+            "yes_bid": 0.45,
+            "yes_ask": 0.49,
+            "no_bid": 0.47,
+            "no_ask": 0.51,
+            "yes_top_size": 30,
+            "no_top_size": 1,
+        }
+
+        decision = bot._aion_select_bidirectional_side(
+            ticker=market["ticker"],
+            family="KXNBA",
+            lane="SPORTS",
+            market=market,
+            quote_diag={
+                "yes_edge_after_cost": 0.012,
+                "no_edge_after_cost": 0.012,
+                "yes_top_size": 30,
+                "no_top_size": 1,
+            },
+        )
+
+        self.assertEqual(decision["selected_side"], "yes")
+        self.assertGreater(decision["yes_fill_probability"], decision["no_fill_probability"])
+        self.assertGreater(decision["selected_fill_probability"], 0.0)
+
+    def test_sports_execution_quality_boosts_deep_tradeable_books(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA-EXEC-QUALITY",
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.49,
+            yes_bid=0.45,
+            yes_ask=0.49,
+            no_bid=0.47,
+            no_ask=0.51,
+            yes_top_size=24,
+            no_top_size=18,
+            liquidity=110,
+            volume=80,
+            game_thesis_confidence=74,
+            sports_regime="favorable",
+            sports_momentum_classification="strong_positive",
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": q.family,
+            "status": "open",
+            "title": "NBA game winner",
+            "yes_bid": 0.45,
+            "yes_ask": 0.49,
+            "no_bid": 0.47,
+            "no_ask": 0.51,
+            "yes_top_size": 24,
+            "no_top_size": 18,
+            "liquidity_dollars": 110,
+            "volume": 80,
+            "game_thesis_confidence": 74,
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 24,
+            "no_top_size": 18,
+            "both_sides_quoted": True,
+            "liquidity_final": 110,
+        }
+        item = {
+            "q": q,
+            "family": q.family,
+            "spread": 0.04,
+            "raw_score": 76.0,
+            "adjusted_score": 76.0,
+            "expectancy_summary": {
+                "final_edge": 0.022,
+                "edge_after_cost": 0.022,
+                "expectancy_score": 0.70,
+                "game_thesis_confidence": 74,
+                "sports_regime": "favorable",
+                "sports_momentum_classification": "strong_positive",
+            },
+            "sports_edge_context": {"boost": 4.0, "tags": ["SPORTS_GOOD_BOOK"]},
+            "quality_snapshot": {"selected_price": 0.49, "liquidity_depth": 110, "spread": 0.04, "confidence_score": 0.70},
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allocation = bot._build_lane_allocation_context(item, market=market)
+            context = bot._build_unified_opportunity_context(item, market=market, allocation=allocation, source="unit_test_execution_quality")
+
+        self.assertEqual(allocation["lane"], "SPORTS")
+        self.assertGreater(allocation["sports_execution_fill_probability"], 0.65)
+        self.assertGreater(allocation["sports_execution_rank_adjustment"], 0.0)
+        self.assertGreaterEqual(allocation["sports_execution_size_multiplier"], 1.0)
+        self.assertGreater(context["sports_execution_rank_adjustment"], 0.0)
+        self.assertIn("sports_execution_quality", context["reason"])
+
+    def test_sports_execution_quality_downsizes_thin_books_without_blocking(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA-EXEC-THIN",
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.59,
+            yes_bid=0.38,
+            yes_ask=0.59,
+            no_bid=0.41,
+            no_ask=0.62,
+            yes_top_size=0,
+            no_top_size=1,
+            liquidity=2,
+            volume=3,
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": q.family,
+            "status": "open",
+            "title": "NBA game winner",
+            "yes_bid": 0.38,
+            "yes_ask": 0.59,
+            "no_bid": 0.41,
+            "no_ask": 0.62,
+            "yes_top_size": 0,
+            "no_top_size": 1,
+            "liquidity_dollars": 2,
+            "volume": 3,
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "one_sided",
+            "yes_top_size": 0,
+            "no_top_size": 1,
+            "both_sides_quoted": True,
+            "liquidity_final": 2,
+        }
+        item = {
+            "q": q,
+            "family": q.family,
+            "spread": 0.21,
+            "raw_score": 70.0,
+            "adjusted_score": 70.0,
+            "expectancy_summary": {
+                "final_edge": 0.018,
+                "edge_after_cost": 0.018,
+                "expectancy_score": 0.68,
+            },
+            "sports_edge_context": {"boost": 4.0, "tags": ["SPORTS_GOOD_BOOK"]},
+            "quality_snapshot": {"selected_price": 0.59, "liquidity_depth": 2, "spread": 0.21, "confidence_score": 0.68},
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allocation = bot._build_lane_allocation_context(item, market=market)
+            context = bot._build_unified_opportunity_context(item, market=market, allocation=allocation, source="unit_test_execution_thin")
+
+        self.assertEqual(allocation["lane"], "SPORTS")
+        self.assertLess(allocation["sports_execution_rank_adjustment"], 0.0)
+        self.assertLess(allocation["sports_execution_size_multiplier"], 1.0)
         self.assertGreater(context["unified_score"], 0.0)
 
     def test_crypto_eligibility_helper_does_not_apply_to_sports_candidate(self):

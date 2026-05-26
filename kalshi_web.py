@@ -334,6 +334,9 @@ _TELEMETRY_CRITICAL_TAGS = {
     "SPORTS-SPREAD-SKIP",
     "SPORTS-SPREAD-PASS",
     "SPORTS-SPREAD-EXECUTE",
+    "SPORTS-EXECUTION-QUALITY",
+    "SPORTS-FILL",
+    "SPORTS-ORDERBOOK",
     "GAME-THESIS",
     "GAME-CONVICTION",
     "GAME-BOOST",
@@ -2055,6 +2058,11 @@ AION_SPORTS_SPREAD_PREFILTER_MAX_EXECUTABLE = get_env_float("AION_SPORTS_SPREAD_
 AION_SPORTS_SPREAD_PREFILTER_ABSURD = get_env_float("AION_SPORTS_SPREAD_PREFILTER_ABSURD", 0.66)
 AION_SPORTS_SPREAD_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_SPREAD_MAX_RANK_PENALTY", 8.0)
 AION_SPORTS_SPREAD_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_SPREAD_MIN_SIZE_MULTIPLIER", 0.55)
+AION_SPORTS_EXECUTION_LOG_COOLDOWN_SECONDS = get_env_float("AION_SPORTS_EXECUTION_LOG_COOLDOWN_SECONDS", 180.0)
+AION_SPORTS_EXECUTION_MAX_RANK_BOOST = get_env_float("AION_SPORTS_EXECUTION_MAX_RANK_BOOST", 4.5)
+AION_SPORTS_EXECUTION_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_EXECUTION_MAX_RANK_PENALTY", 4.0)
+AION_SPORTS_EXECUTION_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EXECUTION_MIN_SIZE_MULTIPLIER", 0.65)
+AION_SPORTS_EXECUTION_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_EXECUTION_MAX_SIZE_MULTIPLIER", 1.12)
 AION_GAME_THESIS_ENABLED = get_env_bool("AION_GAME_THESIS_ENABLED", 1)
 AION_GAME_THESIS_MIN_ALIGNED = get_env_int("AION_GAME_THESIS_MIN_ALIGNED", 2)
 AION_GAME_THESIS_STRONG_SCORE = get_env_float("AION_GAME_THESIS_STRONG_SCORE", 68.0)
@@ -2500,6 +2508,7 @@ class KalshiSniperBot:
         self.sports_regime_log_markers = {}
         self.sports_graph_log_markers = {}
         self.sports_spread_log_markers = {}
+        self.sports_execution_log_markers = {}
         self.last_sports_graph_contexts = {}
         self.last_sports_ladder_plan = {}
         self.last_sports_ladder_execution_summary = {}
@@ -8963,6 +8972,343 @@ class KalshiSniperBot:
                 )
         return result
 
+    def _emit_sports_execution_log(self, tag, payload, marker=None, cooldown_seconds=None):
+        tag = str(tag or "SPORTS-EXECUTION-QUALITY").strip().upper()
+        payload = payload if isinstance(payload, dict) else {}
+        markers = getattr(self, "sports_execution_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self.sports_execution_log_markers = markers
+        cooldown_seconds = (
+            AION_SPORTS_EXECUTION_LOG_COOLDOWN_SECONDS
+            if cooldown_seconds is None
+            else float(cooldown_seconds or 0.0)
+        )
+        marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+        now_ts = time.time()
+        if marker_key is not None:
+            previous_ts = self.to_float(markers.get(marker_key), 0.0) or 0.0
+            if now_ts - previous_ts < cooldown_seconds:
+                return
+            markers[marker_key] = now_ts
+            if len(markers) > 1200:
+                cutoff = now_ts - 7200.0
+                self.sports_execution_log_markers = {
+                    key: value for key, value in markers.items()
+                    if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"[{tag}] " + json.dumps({"reason": "sports_execution_log_failed"}))
+
+    def _sports_execution_quality_decision(
+        self,
+        market=None,
+        *,
+        q=None,
+        family=None,
+        quote_diag=None,
+        selected_side=None,
+        selected_price=None,
+        spread=None,
+        liquidity=None,
+        edge_after_cost=None,
+        context="sports_execution",
+        emit_log=True,
+    ):
+        market = market if isinstance(market, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        family = str(family or self.get_market_family(market) or getattr(q, "family", "") or "").strip().upper()
+        ticker = str(market.get("ticker") or getattr(q, "ticker", "") or quote_diag.get("ticker") or "").strip()
+        if not self.is_sports_family(family, ticker=ticker) or family == "KXBTC15M":
+            return {
+                "has_signal": False,
+                "allowed": False,
+                "reason": "non_sports_execution_quality_ignored",
+                "family": family,
+                "ticker": ticker or None,
+                "fill_probability": 0.0,
+                "execution_quality_score": 0.0,
+                "rank_adjustment": 0.0,
+                "size_multiplier": 1.0,
+                "context": context,
+            }
+
+        def _pick(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        def _q_get(*names):
+            if q is None:
+                return None
+            for name in names:
+                try:
+                    value = getattr(q, name, None)
+                except Exception:
+                    value = None
+                if value not in (None, ""):
+                    return value
+            return None
+
+        def _price(*values):
+            return self._sports_spread_price_value(_pick(*values))
+
+        def _size(*values):
+            numeric = self.to_float(_pick(*values), None)
+            if numeric is None or not math.isfinite(float(numeric)):
+                return 0.0
+            return max(0.0, float(numeric))
+
+        yes_bid = _price(quote_diag.get("yes_bid_dollars"), quote_diag.get("yes_bid"), market.get("yes_bid_dollars"), market.get("yes_bid"), _q_get("yes_bid", "yes_bid_dollars"))
+        yes_ask = _price(quote_diag.get("yes_ask_dollars"), quote_diag.get("yes_ask"), market.get("yes_ask_dollars"), market.get("yes_ask"), _q_get("yes_ask", "yes_ask_dollars"))
+        no_bid = _price(quote_diag.get("no_bid_dollars"), quote_diag.get("no_bid"), market.get("no_bid_dollars"), market.get("no_bid"), _q_get("no_bid", "no_bid_dollars"))
+        no_ask = _price(quote_diag.get("no_ask_dollars"), quote_diag.get("no_ask"), market.get("no_ask_dollars"), market.get("no_ask"), _q_get("no_ask", "no_ask_dollars"))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+
+        liquidity_priority = {}
+        try:
+            liquidity_priority = self.get_market_liquidity_priority(market) or {}
+        except Exception:
+            liquidity_priority = {}
+        yes_top = _size(
+            quote_diag.get("yes_top_size"),
+            quote_diag.get("yes_ask_size"),
+            liquidity_priority.get("yes_top_size"),
+            market.get("yes_top_size"),
+            market.get("yes_ask_size"),
+            market.get("yes_ask_size_fp"),
+            _q_get("yes_top_size", "yes_ask_size"),
+        )
+        no_top = _size(
+            quote_diag.get("no_top_size"),
+            quote_diag.get("no_ask_size"),
+            liquidity_priority.get("no_top_size"),
+            market.get("no_top_size"),
+            market.get("no_ask_size"),
+            market.get("no_ask_size_fp"),
+            _q_get("no_top_size", "no_ask_size"),
+        )
+        top_depth = yes_top + no_top
+        selected_side = self._aion_normalize_live_side(
+            selected_side
+            or quote_diag.get("selected_side")
+            or market.get("selected_side")
+            or _q_get("selected_side", "side")
+        )
+        if selected_price is None:
+            selected_price = _pick(
+                quote_diag.get("selected_price_dollars"),
+                quote_diag.get("selected_price"),
+                market.get("selected_price_dollars"),
+                market.get("selected_price"),
+                _q_get("selected_price", "selected_price_dollars", "price"),
+            )
+        selected_price = _price(selected_price, yes_ask if selected_side == "yes" else no_ask if selected_side == "no" else None)
+        spread_value = self._sports_spread_value(spread)
+        if spread_value is None:
+            spread_value = self._sports_spread_value(_pick(quote_diag.get("spread"), market.get("spread"), _q_get("spread")))
+        if spread_value is None:
+            side_spreads = []
+            if yes_bid is not None and yes_ask is not None and yes_ask >= yes_bid:
+                side_spreads.append(yes_ask - yes_bid)
+            if no_bid is not None and no_ask is not None and no_ask >= no_bid:
+                side_spreads.append(no_ask - no_bid)
+            spread_value = min(side_spreads) if side_spreads else None
+        liquidity_value = self.to_float(
+            liquidity,
+            self.to_float(
+                quote_diag.get("liquidity_depth"),
+                self.to_float(
+                    quote_diag.get("liquidity"),
+                    self.to_float(liquidity_priority.get("liquidity_final"), self.to_float(market.get("liquidity_dollars", market.get("liquidity")), self.to_float(_q_get("liquidity_depth", "liquidity"), 0.0))),
+                ),
+            ),
+        ) or 0.0
+        edge_value = self.to_float(
+            edge_after_cost,
+            self.to_float(
+                quote_diag.get("edge_after_cost"),
+                self.to_float(
+                    quote_diag.get("sports_edge_after_cost"),
+                    self.to_float(market.get("edge_after_cost"), self.to_float(market.get("sports_edge_after_cost"), self.to_float(_q_get("edge_after_cost", "final_edge", "ev_edge"), 0.0))),
+                ),
+            ),
+        ) or 0.0
+        thesis_confidence = max(
+            self.to_float(quote_diag.get("game_thesis_confidence"), 0.0) or 0.0,
+            self.to_float(quote_diag.get("thesis_confidence"), 0.0) or 0.0,
+            self.to_float(market.get("game_thesis_confidence"), 0.0) or 0.0,
+            self.to_float(_q_get("game_thesis_confidence"), 0.0) or 0.0,
+        )
+        sports_memory_rank = self.to_float(quote_diag.get("sports_memory_rank_adjustment"), self.to_float(market.get("sports_memory_rank_adjustment"), self.to_float(_q_get("sports_memory_rank_adjustment"), 0.0))) or 0.0
+        sports_memory_size = self.to_float(quote_diag.get("sports_memory_size_multiplier"), self.to_float(market.get("sports_memory_size_multiplier"), self.to_float(_q_get("sports_memory_size_multiplier"), 1.0))) or 1.0
+        sports_regime = str(quote_diag.get("sports_regime") or market.get("sports_regime") or _q_get("sports_regime") or "").strip().lower()
+        sports_momentum_class = str(quote_diag.get("sports_momentum_classification") or market.get("sports_momentum_classification") or _q_get("sports_momentum_classification") or "").strip().lower()
+        sports_graph_rank = self.to_float(quote_diag.get("sports_graph_rank_adjustment"), self.to_float(market.get("sports_graph_rank_adjustment"), self.to_float(_q_get("sports_graph_rank_adjustment"), 0.0))) or 0.0
+        ladder_role = str(quote_diag.get("sports_ladder_role") or market.get("sports_ladder_role") or _q_get("sports_ladder_role") or "").strip().lower()
+        selected_top = yes_top if selected_side == "yes" else no_top if selected_side == "no" else max(yes_top, no_top)
+        opposite_top = no_top if selected_side == "yes" else yes_top if selected_side == "no" else min(yes_top, no_top)
+        side_pressure = (selected_top + 1.0) / max(top_depth + 2.0, 2.0)
+        quote_complete = bool(yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None)
+        selected_price_valid = bool(selected_price is not None and KALSHI_CONTRACT_MIN_PRICE <= selected_price <= KALSHI_CONTRACT_MAX_PRICE)
+        has_signal = bool(selected_side in {"yes", "no"} and selected_price_valid and (top_depth > 0.0 or liquidity_value > 0.0 or quote_complete))
+
+        depth_score = self._clamp(math.log1p(max(0.0, selected_top)) / math.log1p(30.0), 0.0, 1.0)
+        book_depth_score = self._clamp(math.log1p(max(0.0, top_depth)) / math.log1p(60.0), 0.0, 1.0)
+        liquidity_score = self._clamp(math.log1p(max(0.0, liquidity_value)) / math.log1p(250.0), 0.0, 1.0)
+        if spread_value is None:
+            spread_score = 0.55
+        else:
+            spread_score = 1.0 - self._clamp((float(spread_value) - 0.02) / 0.30, 0.0, 1.0)
+        edge_score = self._clamp(max(0.0, edge_value) / 0.025, 0.0, 1.0)
+        book_score = 1.0 if quote_complete else 0.55 if selected_price_valid and top_depth > 0.0 else 0.25
+        boundary_distance = abs(float(selected_price) - 0.50) if selected_price_valid else 0.50
+        price_score = 1.0 - self._clamp((boundary_distance - 0.35) / 0.15, 0.0, 1.0)
+        pressure_score = self._clamp(0.45 + side_pressure * 0.65, 0.0, 1.0)
+        fill_probability = (
+            depth_score * 0.22
+            + book_depth_score * 0.14
+            + liquidity_score * 0.12
+            + spread_score * 0.18
+            + edge_score * 0.14
+            + book_score * 0.08
+            + price_score * 0.06
+            + pressure_score * 0.06
+        )
+        adaptive_reasons = []
+        if thesis_confidence >= 70.0:
+            fill_probability += 0.045
+            adaptive_reasons.append("strong_game_thesis")
+        elif thesis_confidence >= 58.0:
+            fill_probability += 0.025
+            adaptive_reasons.append("moderate_game_thesis")
+        if sports_regime in {"favorable", "hot"} or sports_momentum_class in {"strong_positive", "moderate_positive"}:
+            fill_probability += 0.025
+            adaptive_reasons.append("favorable_live_regime")
+        elif sports_regime in {"unstable", "choppy"} or sports_momentum_class in {"unstable", "choppy"}:
+            fill_probability -= 0.025
+            adaptive_reasons.append("choppy_live_regime")
+        elif sports_regime == "negative" or sports_momentum_class == "negative":
+            fill_probability -= 0.045
+            adaptive_reasons.append("negative_live_regime")
+        if sports_memory_rank > 0.0 or sports_memory_size > 1.01:
+            fill_probability += 0.020
+            adaptive_reasons.append("positive_sports_memory")
+        elif sports_memory_rank < 0.0 or sports_memory_size < 0.99:
+            fill_probability -= 0.015
+            adaptive_reasons.append("soft_negative_sports_memory")
+        if sports_graph_rank > 0.0:
+            fill_probability += 0.015
+            adaptive_reasons.append("relationship_graph_alignment")
+        elif sports_graph_rank < 0.0:
+            fill_probability -= 0.010
+            adaptive_reasons.append("relationship_graph_conflict")
+        if ladder_role == "primary":
+            fill_probability += 0.025
+            adaptive_reasons.append("primary_ladder_leg")
+        elif ladder_role in {"secondary", "live"}:
+            fill_probability += 0.010
+            adaptive_reasons.append("aligned_ladder_leg")
+        fill_probability = self._clamp(fill_probability, 0.0, 1.0)
+
+        rank_adjustment = (fill_probability - 0.52) * 8.0
+        if edge_value > 0.0:
+            rank_adjustment += min(1.0, edge_value * 25.0)
+        if selected_top < 1.0 and liquidity_value < 5.0:
+            rank_adjustment -= 1.25
+            adaptive_reasons.append("thin_selected_top")
+        if spread_value is not None and spread_value > 0.24:
+            rank_adjustment -= 1.10
+            adaptive_reasons.append("expensive_top_of_book")
+        if not has_signal:
+            rank_adjustment = min(rank_adjustment, -1.50)
+            adaptive_reasons.append("missing_tradeable_execution_signal")
+        rank_adjustment = self._clamp(
+            rank_adjustment,
+            -float(AION_SPORTS_EXECUTION_MAX_RANK_PENALTY),
+            float(AION_SPORTS_EXECUTION_MAX_RANK_BOOST),
+        )
+        size_multiplier = 1.0 + self._clamp((fill_probability - 0.55) * 0.38, -0.22, 0.12)
+        if edge_value >= 0.018:
+            size_multiplier += 0.015
+        if selected_top < 1.0 and liquidity_value < 5.0:
+            size_multiplier -= 0.075
+        if spread_value is not None and spread_value > 0.24:
+            size_multiplier -= 0.065
+        if not has_signal:
+            size_multiplier = min(size_multiplier, 0.82)
+        size_multiplier = self._clamp(
+            size_multiplier,
+            float(AION_SPORTS_EXECUTION_MIN_SIZE_MULTIPLIER),
+            float(AION_SPORTS_EXECUTION_MAX_SIZE_MULTIPLIER),
+        )
+        if not has_signal:
+            reason = "missing_tradeable_execution_signal_downsize"
+        elif fill_probability >= 0.72:
+            reason = "high_fill_quality"
+        elif fill_probability >= 0.58:
+            reason = "tradeable_fill_quality"
+        elif fill_probability >= 0.42:
+            reason = "thin_or_costly_book_downsize"
+        else:
+            reason = "poor_fill_probability_downsize"
+        result = {
+            "has_signal": bool(has_signal),
+            "allowed": True,
+            "hard_reject": False,
+            "reason": reason,
+            "adaptive_reasons": adaptive_reasons or ["sports_orderbook_execution_quality"],
+            "family": family,
+            "ticker": ticker or None,
+            "selected_side": selected_side,
+            "selected_price": self._safe_round(selected_price, 4, None),
+            "spread": self._safe_round(spread_value, 4, None),
+            "liquidity": round(liquidity_value, 4),
+            "yes_top_size": round(yes_top, 4),
+            "no_top_size": round(no_top, 4),
+            "selected_top_size": round(selected_top, 4),
+            "opposite_top_size": round(opposite_top, 4),
+            "top_depth": round(top_depth, 4),
+            "side_pressure": round(side_pressure, 4),
+            "fill_probability": round(fill_probability, 4),
+            "execution_quality_score": round(fill_probability * 100.0, 4),
+            "rank_adjustment": round(rank_adjustment, 4),
+            "size_multiplier": round(size_multiplier, 4),
+            "quote_complete": bool(quote_complete),
+            "game_thesis_confidence": round(thesis_confidence, 4),
+            "sports_regime": sports_regime or None,
+            "sports_momentum_classification": sports_momentum_class or None,
+            "sports_memory_rank_adjustment": round(sports_memory_rank, 4),
+            "sports_memory_size_multiplier": round(sports_memory_size, 4),
+            "sports_graph_rank_adjustment": round(sports_graph_rank, 4),
+            "sports_ladder_role": ladder_role or None,
+            "edge_after_cost": round(edge_value, 6),
+            "context": context,
+        }
+        if emit_log and (abs(rank_adjustment) >= 0.5 or abs(size_multiplier - 1.0) >= 0.02 or reason != "tradeable_fill_quality"):
+            marker_bucket = int(time.time() // max(30, int(AION_SPORTS_EXECUTION_LOG_COOLDOWN_SECONDS or 180)))
+            self._emit_sports_execution_log(
+                "SPORTS-EXECUTION-QUALITY",
+                result,
+                marker=("SPORTS-EXECUTION-QUALITY", context, ticker or family, reason, marker_bucket),
+            )
+            if abs(size_multiplier - 1.0) >= 0.02:
+                self._emit_sports_execution_log(
+                    "SPORTS-FILL",
+                    result,
+                    marker=("SPORTS-FILL", context, ticker or family, marker_bucket),
+                )
+        return result
+
     def _infer_missing_binary_quotes(self, yes_bid, yes_ask, no_bid, no_ask):
         if no_bid is None and yes_ask is not None:
             no_bid = max(0.0, 1.0 - float(yes_ask))
@@ -9207,7 +9553,26 @@ class KalshiSniperBot:
             edge_score = float(side_edge) * 100.0
             momentum_score = momentum_alignment * 12.0
             preference_score = 0.25 if preferred_side == side else 0.0
-            final_score = edge_score + liquidity_score + momentum_score + preference_score - spread_penalty
+            total_top = max(0.0, yes_top_size) + max(0.0, no_top_size)
+            side_pressure = (side_liquidity + 1.0) / max(total_top + 2.0, 2.0)
+            depth_score = self._clamp(math.log1p(side_liquidity) / math.log1p(30.0), 0.0, 1.0)
+            if spread is None:
+                spread_fill_score = 0.48
+            else:
+                spread_fill_score = 1.0 - self._clamp((spread - 0.02) / 0.30, 0.0, 1.0)
+            edge_fill_score = self._clamp(max(0.0, side_edge) / 0.025, 0.0, 1.0)
+            book_fill_score = 1.0 if bid is not None and ask is not None and executable else 0.25
+            fill_probability = self._clamp(
+                depth_score * 0.34
+                + spread_fill_score * 0.26
+                + edge_fill_score * 0.20
+                + book_fill_score * 0.10
+                + self._clamp(0.45 + side_pressure * 0.65, 0.0, 1.0) * 0.10,
+                0.0,
+                1.0,
+            )
+            fill_score = (fill_probability - 0.50) * 8.0
+            final_score = edge_score + liquidity_score + momentum_score + preference_score + fill_score - spread_penalty
             return {
                 "side": side,
                 "bid": bid,
@@ -9216,6 +9581,9 @@ class KalshiSniperBot:
                 "spread": spread,
                 "top_size": top_size,
                 "liquidity": side_liquidity,
+                "side_pressure": round(side_pressure, 4),
+                "fill_probability": round(fill_probability, 4),
+                "fill_score": round(fill_score, 4),
                 "edge_after_cost": round(float(side_edge), 6),
                 "edge_source": edge_source,
                 "momentum_alignment": round(momentum_alignment, 4),
@@ -9272,6 +9640,12 @@ class KalshiSniperBot:
             "no_edge_after_cost": no_snapshot["edge_after_cost"],
             "yes_final_score": yes_snapshot["final_score"],
             "no_final_score": no_snapshot["final_score"],
+            "yes_fill_probability": yes_snapshot["fill_probability"],
+            "no_fill_probability": no_snapshot["fill_probability"],
+            "yes_fill_score": yes_snapshot["fill_score"],
+            "no_fill_score": no_snapshot["fill_score"],
+            "yes_side_pressure": yes_snapshot["side_pressure"],
+            "no_side_pressure": no_snapshot["side_pressure"],
             "yes_executable": bool(yes_snapshot["executable"]),
             "no_executable": bool(no_snapshot["executable"]),
             "preferred_side": preferred_side,
@@ -9280,6 +9654,8 @@ class KalshiSniperBot:
             "selected_top_size": selected["top_size"] if selected else None,
             "selected_edge_after_cost": selected["edge_after_cost"] if selected else None,
             "selected_final_score": selected["final_score"] if selected else None,
+            "selected_fill_probability": selected["fill_probability"] if selected else None,
+            "selected_side_pressure": selected["side_pressure"] if selected else None,
             "momentum_direction": momentum_direction,
             "momentum_strength": momentum_strength,
             "two_sided_quote_ready": bool(two_sided_quote_ready),
@@ -12940,6 +13316,11 @@ class KalshiSniperBot:
                 "sports_regime_rank_adjustment",
                 "sports_regime_size_multiplier",
                 "sports_regime_aggression_multiplier",
+                "sports_execution_context",
+                "sports_execution_fill_probability",
+                "sports_execution_quality_score",
+                "sports_execution_rank_adjustment",
+                "sports_execution_size_multiplier",
             ):
                 value = payload.get(field)
                 if value is None and q is not None:
@@ -33145,6 +33526,42 @@ class KalshiSniperBot:
             )
         sports_spread_rank_adjustment = self.to_float(sports_spread_context.get("rank_adjustment"), 0.0) if sports_spread_context.get("allowed") else 0.0
         sports_spread_size_multiplier = self.to_float(sports_spread_context.get("size_multiplier"), 1.0) if sports_spread_context.get("allowed") else 1.0
+        sports_execution_context = item.get("sports_execution_context") if isinstance(item.get("sports_execution_context"), dict) else {}
+        if not sports_execution_context and isinstance((market or {}).get("_sports_execution_context"), dict):
+            sports_execution_context = dict((market or {}).get("_sports_execution_context") or {})
+        if not sports_execution_context:
+            sports_execution_context = self._sports_execution_quality_decision(
+                market,
+                q=q,
+                family=family,
+                selected_side=selected_side,
+                selected_price=selected_price,
+                spread=spread,
+                liquidity=liquidity,
+                edge_after_cost=final_edge,
+                quote_diag={
+                    "selected_side": selected_side,
+                    "selected_price": selected_price,
+                    "yes_bid": getattr(q, "yes_bid", None),
+                    "yes_ask": getattr(q, "yes_ask", None),
+                    "no_bid": getattr(q, "no_bid", None),
+                    "no_ask": getattr(q, "no_ask", None),
+                    "yes_top_size": getattr(q, "yes_top_size", None),
+                    "no_top_size": getattr(q, "no_top_size", None),
+                    "game_thesis_confidence": item.get("game_thesis_confidence") or expectancy_summary.get("game_thesis_confidence"),
+                    "sports_memory_rank_adjustment": item.get("sports_memory_rank_adjustment") or expectancy_summary.get("sports_memory_rank_adjustment"),
+                    "sports_memory_size_multiplier": item.get("sports_memory_size_multiplier") or expectancy_summary.get("sports_memory_size_multiplier"),
+                    "sports_regime": item.get("sports_regime") or expectancy_summary.get("sports_regime"),
+                    "sports_momentum_classification": item.get("sports_momentum_classification") or expectancy_summary.get("sports_momentum_classification"),
+                    "sports_graph_rank_adjustment": item.get("sports_graph_rank_adjustment") or expectancy_summary.get("sports_graph_rank_adjustment"),
+                    "sports_ladder_role": item.get("sports_ladder_role") or expectancy_summary.get("sports_ladder_role"),
+                    "edge_after_cost": final_edge,
+                },
+                context="sports_lane_quality",
+                emit_log=False,
+            )
+        sports_execution_rank_adjustment = self.to_float(sports_execution_context.get("rank_adjustment"), 0.0) if sports_execution_context.get("allowed") else 0.0
+        sports_execution_size_multiplier = self.to_float(sports_execution_context.get("size_multiplier"), 1.0) if sports_execution_context.get("allowed") else 1.0
         weak_reasons = []
         if final_edge <= 0.0:
             weak_reasons.append("no_positive_edge")
@@ -33212,6 +33629,10 @@ class KalshiSniperBot:
         if sports_spread_rank_adjustment < 0.0:
             adjustment += sports_spread_rank_adjustment
             reason = f"{reason}+adaptive_wide_spread_penalty" if reason else "adaptive_wide_spread_penalty"
+        if abs(sports_execution_rank_adjustment) >= 0.01:
+            adjustment += sports_execution_rank_adjustment
+            execution_reason = "sports_execution_quality_boost" if sports_execution_rank_adjustment > 0.0 else "sports_execution_quality_penalty"
+            reason = f"{reason}+{execution_reason}" if reason else execution_reason
         conviction_payload = {
             "ticker": ticker,
             "family": family,
@@ -33232,6 +33653,9 @@ class KalshiSniperBot:
             "sports_spread_rank_adjustment": round(sports_spread_rank_adjustment, 4),
             "sports_spread_size_multiplier": round(sports_spread_size_multiplier, 4),
             "sports_spread_threshold": sports_spread_context.get("threshold_used"),
+            "sports_execution_fill_probability": sports_execution_context.get("fill_probability"),
+            "sports_execution_rank_adjustment": round(sports_execution_rank_adjustment, 4),
+            "sports_execution_size_multiplier": round(sports_execution_size_multiplier, 4),
             "decision": decision,
             "reason": reason,
         }
@@ -33266,6 +33690,11 @@ class KalshiSniperBot:
             "sports_spread_context": sports_spread_context,
             "sports_spread_rank_adjustment": round(sports_spread_rank_adjustment, 4),
             "sports_spread_size_multiplier": round(sports_spread_size_multiplier, 4),
+            "sports_execution_context": sports_execution_context,
+            "sports_execution_fill_probability": sports_execution_context.get("fill_probability"),
+            "sports_execution_quality_score": sports_execution_context.get("execution_quality_score"),
+            "sports_execution_rank_adjustment": round(sports_execution_rank_adjustment, 4),
+            "sports_execution_size_multiplier": round(sports_execution_size_multiplier, 4),
             "strong": strong,
             "allocation_adjustment": round(adjustment, 4),
             "decision": decision,
@@ -33657,6 +34086,23 @@ class KalshiSniperBot:
             allocation.get("sports_spread_size_multiplier"),
             self.to_float(sports_spread_context.get("size_multiplier"), 1.0),
         ) or 1.0
+        sports_execution_context = allocation.get("sports_execution_context") if isinstance(allocation.get("sports_execution_context"), dict) else {}
+        sports_execution_rank_adjustment = self.to_float(
+            allocation.get("sports_execution_rank_adjustment"),
+            self.to_float(sports_execution_context.get("rank_adjustment"), 0.0),
+        ) or 0.0
+        sports_execution_size_multiplier = self.to_float(
+            allocation.get("sports_execution_size_multiplier"),
+            self.to_float(sports_execution_context.get("size_multiplier"), 1.0),
+        ) or 1.0
+        sports_execution_fill_probability = self.to_float(
+            allocation.get("sports_execution_fill_probability"),
+            self.to_float(sports_execution_context.get("fill_probability"), None),
+        )
+        sports_execution_quality_score = self.to_float(
+            allocation.get("sports_execution_quality_score"),
+            self.to_float(sports_execution_context.get("execution_quality_score"), None),
+        )
         sports_graph_context = allocation.get("sports_graph_context") if isinstance(allocation.get("sports_graph_context"), dict) else {}
         sports_graph_rank_adjustment = self.to_float(
             allocation.get("sports_graph_rank_adjustment"),
@@ -33723,6 +34169,7 @@ class KalshiSniperBot:
         sports_live_memory_component = sports_memory_rank_adjustment if lane == "SPORTS" else 0.0
         sports_live_regime_component = sports_regime_rank_adjustment if lane == "SPORTS" else 0.0
         sports_live_spread_component = sports_spread_rank_adjustment if lane == "SPORTS" else 0.0
+        sports_live_execution_component = sports_execution_rank_adjustment if lane == "SPORTS" else 0.0
         sports_live_graph_component = sports_graph_rank_adjustment if lane == "SPORTS" else 0.0
         memory_component = max(
             -10.0,
@@ -33737,6 +34184,7 @@ class KalshiSniperBot:
         )
         regime_component = max(-6.0, min(8.0, sports_live_regime_component))
         sports_spread_component = max(-8.0, min(1.0, sports_live_spread_component))
+        sports_execution_component = max(-4.0, min(4.5, sports_live_execution_component))
         graph_component = max(-5.0, min(7.0, sports_live_graph_component))
         confidence_component = min(8.0, confidence * 0.08)
         target_component = 0.0
@@ -33754,7 +34202,7 @@ class KalshiSniperBot:
         duration = self._build_capital_duration_context(lane=lane, allocation=allocation, item=item, market=market)
         capital_lock_penalty = self.to_float(duration.get("capital_lock_penalty"), 0.0) or 0.0
         turnover_boost = self.to_float(duration.get("capital_turnover_boost"), 0.0) or 0.0
-        unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
+        unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + sports_execution_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
         if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
             unified_score -= 30.0
         unified_score = round(max(0.0, min(100.0, unified_score)), 4)
@@ -33838,6 +34286,28 @@ class KalshiSniperBot:
                     marker=("SPORTS-SPREAD-SIZE-UNIFIED", source, ticker, int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
+        if lane == "SPORTS" and sports_execution_size_multiplier > 0.0:
+            pre_execution_size_multiplier = size_multiplier
+            size_multiplier = max(0.35, min(1.65, size_multiplier * sports_execution_size_multiplier))
+            if abs(sports_execution_size_multiplier - 1.0) >= 0.01:
+                self._emit_sports_execution_log(
+                    "SPORTS-FILL",
+                    {
+                        "source": source,
+                        "ticker": ticker,
+                        "family": family,
+                        "unified_score": unified_score,
+                        "base_size_multiplier": round(pre_execution_size_multiplier, 4),
+                        "sports_execution_size_multiplier": round(sports_execution_size_multiplier, 4),
+                        "final_size_multiplier": round(size_multiplier, 4),
+                        "fill_probability": self._safe_round(sports_execution_fill_probability, 4, None),
+                        "execution_quality_score": self._safe_round(sports_execution_quality_score, 4, None),
+                        "rank_adjustment": round(sports_execution_rank_adjustment, 4),
+                        "reason": sports_execution_context.get("reason") or "sports_execution_quality_size_adaptation",
+                    },
+                    marker=("SPORTS-FILL-UNIFIED", source, ticker, int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         if lane == "SPORTS" and sports_graph_size_multiplier > 0.0:
             pre_graph_size_multiplier = size_multiplier
             size_multiplier = max(0.35, min(1.65, size_multiplier * sports_graph_size_multiplier))
@@ -33874,6 +34344,8 @@ class KalshiSniperBot:
             reasons.append(f"sports_regime_{sports_regime}_{sports_momentum_classification}")
         if lane == "SPORTS" and sports_spread_context and sports_spread_rank_adjustment < 0.0:
             reasons.append("sports_spread_adaptive_penalty")
+        if lane == "SPORTS" and sports_execution_context.get("has_signal"):
+            reasons.append("sports_execution_quality")
         if lane == "SPORTS" and sports_graph_context:
             reasons.append("sports_graph_lag" if sports_graph_lag_detected else "sports_graph_relationship")
         if duration.get("fast_turnover_boost"):
@@ -33916,6 +34388,11 @@ class KalshiSniperBot:
             "sports_spread_rank_adjustment": round(sports_spread_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
             "sports_spread_size_multiplier": round(sports_spread_size_multiplier, 4) if lane == "SPORTS" else None,
             "sports_spread_context": sports_spread_context if lane == "SPORTS" else {},
+            "sports_execution_rank_adjustment": round(sports_execution_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
+            "sports_execution_size_multiplier": round(sports_execution_size_multiplier, 4) if lane == "SPORTS" else None,
+            "sports_execution_fill_probability": self._safe_round(sports_execution_fill_probability, 4, None) if lane == "SPORTS" else None,
+            "sports_execution_quality_score": self._safe_round(sports_execution_quality_score, 4, None) if lane == "SPORTS" else None,
+            "sports_execution_context": sports_execution_context if lane == "SPORTS" else {},
             "sports_graph_rank_adjustment": round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
             "sports_graph_size_multiplier": round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None,
             "sports_graph_role": sports_graph_role if lane == "SPORTS" else None,
@@ -33966,6 +34443,11 @@ class KalshiSniperBot:
                 ("sports_spread_context", sports_spread_context if lane == "SPORTS" else None),
                 ("sports_spread_rank_adjustment", round(sports_spread_rank_adjustment, 4) if lane == "SPORTS" else None),
                 ("sports_spread_size_multiplier", round(sports_spread_size_multiplier, 4) if lane == "SPORTS" else None),
+                ("sports_execution_context", sports_execution_context if lane == "SPORTS" else None),
+                ("sports_execution_rank_adjustment", round(sports_execution_rank_adjustment, 4) if lane == "SPORTS" else None),
+                ("sports_execution_size_multiplier", round(sports_execution_size_multiplier, 4) if lane == "SPORTS" else None),
+                ("sports_execution_fill_probability", self._safe_round(sports_execution_fill_probability, 4, None) if lane == "SPORTS" else None),
+                ("sports_execution_quality_score", self._safe_round(sports_execution_quality_score, 4, None) if lane == "SPORTS" else None),
                 ("sports_graph_context", sports_graph_context if lane == "SPORTS" else None),
                 ("sports_graph_rank_adjustment", round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else None),
                 ("sports_graph_size_multiplier", round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None),
@@ -34019,6 +34501,10 @@ class KalshiSniperBot:
             "sports_spread_rank_adjustment": context.get("sports_spread_rank_adjustment"),
             "sports_spread_size_multiplier": context.get("sports_spread_size_multiplier"),
             "sports_spread_threshold": (context.get("sports_spread_context") or {}).get("threshold_used") if isinstance(context.get("sports_spread_context"), dict) else None,
+            "sports_execution_fill_probability": context.get("sports_execution_fill_probability"),
+            "sports_execution_quality_score": context.get("sports_execution_quality_score"),
+            "sports_execution_rank_adjustment": context.get("sports_execution_rank_adjustment"),
+            "sports_execution_size_multiplier": context.get("sports_execution_size_multiplier"),
             "sports_graph_role": context.get("sports_graph_role"),
             "sports_graph_direction": context.get("sports_graph_direction"),
             "sports_graph_relationship_types": context.get("sports_graph_relationship_types"),
@@ -39553,6 +40039,11 @@ class KalshiSniperBot:
             "sports_spread_context",
             "sports_spread_rank_adjustment",
             "sports_spread_size_multiplier",
+            "sports_execution_context",
+            "sports_execution_fill_probability",
+            "sports_execution_quality_score",
+            "sports_execution_rank_adjustment",
+            "sports_execution_size_multiplier",
             "sports_graph_context",
             "sports_graph_game_id",
             "sports_graph_role",
@@ -39932,6 +40423,42 @@ class KalshiSniperBot:
             context.get("sports_graph_size_multiplier"),
             self.to_float(payload.get("sports_graph_size_multiplier"), None),
         )
+        sports_execution_multiplier = self.to_float(
+            context.get("sports_execution_size_multiplier"),
+            self.to_float(payload.get("sports_execution_size_multiplier"), None),
+        )
+        if (
+            sports_execution_multiplier is not None
+            and sports_execution_multiplier > 0.0
+            and abs(sports_execution_multiplier - 1.0) >= 0.01
+            and unified_multiplier is None
+        ):
+            before_execution_size = chosen
+            execution_multiplier = max(
+                float(AION_SPORTS_EXECUTION_MIN_SIZE_MULTIPLIER),
+                min(float(AION_SPORTS_EXECUTION_MAX_SIZE_MULTIPLIER), float(sports_execution_multiplier)),
+            )
+            chosen = max(1, min(hard_max, int(round(chosen * execution_multiplier))))
+            if chosen != before_execution_size:
+                chosen_label = "sports_execution_quality_size_adjustment"
+                context["sports_execution_size_multiplier_applied"] = round(execution_multiplier, 4)
+                self._emit_sports_execution_log(
+                    "SPORTS-FILL",
+                    {
+                        "source": source or "dynamic_live_entry_size",
+                        "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                        "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                        "requested_size": before_execution_size,
+                        "adjusted_size": chosen,
+                        "sports_execution_size_multiplier": round(execution_multiplier, 4),
+                        "fill_probability": context.get("sports_execution_fill_probability") or payload.get("sports_execution_fill_probability"),
+                        "execution_quality_score": context.get("sports_execution_quality_score") or payload.get("sports_execution_quality_score"),
+                        "rank_adjustment": context.get("sports_execution_rank_adjustment") or payload.get("sports_execution_rank_adjustment"),
+                        "reason": "sports_execution_quality_dynamic_size_adjustment",
+                    },
+                    marker=("SPORTS-FILL-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
         if (
             sports_graph_multiplier is not None
             and sports_graph_multiplier > 0.0
@@ -67948,6 +68475,8 @@ class KalshiSniperBot:
         sports_regime_context = sports_regime_context if isinstance(sports_regime_context, dict) else {}
         sports_spread_context = getattr(q, "sports_spread_context", None) or {}
         sports_spread_context = sports_spread_context if isinstance(sports_spread_context, dict) else {}
+        sports_execution_context = getattr(q, "sports_execution_context", None) or {}
+        sports_execution_context = sports_execution_context if isinstance(sports_execution_context, dict) else {}
         sports_ladder_context = getattr(q, "sports_ladder_context", None) or {}
         sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
         sports_graph_context = getattr(q, "sports_graph_context", None) or {}
@@ -67978,6 +68507,11 @@ class KalshiSniperBot:
             "sports_spread_rank_adjustment": getattr(q, "sports_spread_rank_adjustment", None) or sports_spread_context.get("rank_adjustment"),
             "sports_spread_size_multiplier": getattr(q, "sports_spread_size_multiplier", None) or sports_spread_context.get("size_multiplier"),
             "sports_spread_threshold": sports_spread_context.get("threshold_used"),
+            "sports_execution_context": sports_execution_context,
+            "sports_execution_fill_probability": getattr(q, "sports_execution_fill_probability", None) or sports_execution_context.get("fill_probability"),
+            "sports_execution_quality_score": getattr(q, "sports_execution_quality_score", None) or sports_execution_context.get("execution_quality_score"),
+            "sports_execution_rank_adjustment": getattr(q, "sports_execution_rank_adjustment", None) or sports_execution_context.get("rank_adjustment"),
+            "sports_execution_size_multiplier": getattr(q, "sports_execution_size_multiplier", None) or sports_execution_context.get("size_multiplier"),
             "sports_graph_context": sports_graph_context,
             "sports_graph_game_id": getattr(q, "sports_graph_game_id", None) or sports_graph_context.get("game_id"),
             "sports_graph_role": getattr(q, "sports_graph_role", None) or sports_graph_context.get("role"),
