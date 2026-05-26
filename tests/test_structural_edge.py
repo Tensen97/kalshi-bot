@@ -19,6 +19,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.sports_edge_ranking_log_markers = {}
         bot.game_thesis_log_markers = {}
         bot.sports_ladder_log_markers = {}
+        bot.sports_regime_log_markers = {}
         bot.last_sports_ladder_plan = {}
         bot.last_sports_ladder_execution_summary = {}
         bot.sports_momentum_state = {}
@@ -1852,6 +1853,220 @@ class StructuralEdgeTests(unittest.TestCase):
             plan = bot._build_sports_ladder_plan(bot.last_dual_lane_buy_candidates, source="unit_test_ladder_sports_only")
 
         self.assertEqual([leg["ticker"] for leg in plan["legs"]], [sports_q.ticker])
+
+    def test_live_sports_regime_favorable_boosts_ranking_aggression_and_sizing(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-OKCSAS-1135",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.44,
+            yes_ask=0.46,
+            no_bid=0.53,
+            no_ask=0.55,
+            liquidity=180,
+        )
+        market = {"ticker": q.ticker, "series_ticker": q.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA 1H total over"}
+        allocation = {
+            "lane": "SPORTS",
+            "ticker": q.ticker,
+            "family": q.family,
+            "selected_side": "yes",
+            "selected_price": 0.46,
+            "spread": 0.02,
+            "liquidity": 180,
+            "edge": 0.032,
+            "sports_conviction_score": 84.0,
+            "sports_memory_rank_adjustment": 2.5,
+            "sports_memory_regime": "hot",
+            "game_id": "nba:kxnba_okcsas",
+            "game_thesis_type": "high_scoring_environment",
+            "game_thesis_confidence": 81.0,
+            "game_related_candidates": ["a", "b", "c"],
+        }
+        bot.compute_live_sports_momentum = lambda *args, **kwargs: {
+            "momentum_score": 0.62,
+            "price_delta": 0.018,
+            "repricing_velocity": 0.002,
+            "directional_consistency": 0.9,
+            "spread_behavior": "tightening",
+            "volatility_state": "stable",
+            "orderbook_pressure": "yes_pressure",
+            "size_acceleration": 0.45,
+            "history_points": 5,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._apply_live_sports_regime_to_allocation(allocation, market=market, q=q, source="unit_test_regime_hot")
+            unified = bot._build_unified_opportunity_context({"q": q, "adjusted_score": 70.0}, market=market, allocation=result, source="unit_test_regime_hot")
+
+        self.assertEqual(result["sports_regime"], "favorable")
+        self.assertEqual(result["sports_momentum_classification"], "strong_positive")
+        self.assertGreater(result["sports_regime_rank_adjustment"], 0.0)
+        self.assertGreater(result["sports_regime_aggression_multiplier"], 1.0)
+        self.assertGreater(result["sports_regime_size_multiplier"], 1.0)
+        self.assertIn("sports_regime_favorable", unified["reason"])
+
+    def test_live_sports_regime_choppy_reduces_size_without_blocking(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(ticker="KXMLBTOTAL-NYYBOS-85", family="KXMLBTOTAL", selected_side="yes", selected_price=0.49, liquidity=8)
+        market = {"ticker": q.ticker, "series_ticker": q.family, "event_ticker": "KXMLB-NYYBOS", "title": "MLB total over"}
+        allocation = {"lane": "SPORTS", "ticker": q.ticker, "family": q.family, "selected_side": "yes", "selected_price": 0.49, "spread": 0.07, "liquidity": 8, "edge": 0.018}
+        bot.compute_live_sports_momentum = lambda *args, **kwargs: {
+            "momentum_score": 0.01,
+            "price_delta": 0.001,
+            "repricing_velocity": 0.0,
+            "directional_consistency": 0.1,
+            "spread_behavior": "widening",
+            "volatility_state": "burst",
+            "orderbook_pressure": "balanced",
+            "size_acceleration": 1.0,
+            "history_points": 4,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            signal = bot._get_live_sports_regime_signal(market=market, q=q, allocation=allocation, source="unit_test_regime_choppy")
+            check = bot._sports_momentum_pre_submit_check(
+                q=q,
+                market=market,
+                allocation=allocation,
+                payload={"ticker": q.ticker, "family": q.family, "side": "yes", "selected_side": "yes", "selected_price": 0.49, "price": 0.49, "orderbook_ready": True},
+                source="unit_test_regime_choppy",
+            )
+
+        self.assertEqual(signal["regime"], "choppy")
+        self.assertEqual(signal["momentum_classification"], "unstable_choppy")
+        self.assertLess(signal["size_multiplier"], 1.0)
+        self.assertLess(signal["rank_adjustment"], 0.0)
+        self.assertTrue(check["allowed"])
+
+    def test_live_sports_regime_negative_allows_exceptional_candidate(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(ticker="KXNFLSPREAD-KCBUF", family="KXNFLSPREAD", selected_side="yes", selected_price=0.51, liquidity=120)
+        market = {"ticker": q.ticker, "series_ticker": q.family, "event_ticker": "KXNFL-KCBUF", "title": "NFL spread favorite"}
+        allocation = {
+            "lane": "SPORTS",
+            "ticker": q.ticker,
+            "family": q.family,
+            "selected_side": "yes",
+            "selected_price": 0.51,
+            "spread": 0.03,
+            "liquidity": 120,
+            "edge": 0.041,
+            "sports_conviction_score": 90.0,
+            "unified_opportunity_score": 88.0,
+        }
+        bot.compute_live_sports_momentum = lambda *args, **kwargs: {
+            "momentum_score": -0.78,
+            "price_delta": -0.02,
+            "repricing_velocity": -0.003,
+            "directional_consistency": -0.9,
+            "spread_behavior": "stable",
+            "volatility_state": "stable",
+            "orderbook_pressure": "no_pressure",
+            "size_acceleration": -0.2,
+            "history_points": 5,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            signal = bot._get_live_sports_regime_signal(market=market, q=q, allocation=allocation, source="unit_test_regime_negative")
+            check = bot._sports_momentum_pre_submit_check(
+                q=q,
+                market=market,
+                allocation=allocation,
+                payload={"ticker": q.ticker, "family": q.family, "side": "yes", "selected_side": "yes", "selected_price": 0.51, "price": 0.51, "orderbook_ready": True},
+                source="unit_test_regime_negative",
+            )
+
+        self.assertEqual(signal["regime"], "negative")
+        self.assertTrue(signal["exceptional_candidate"])
+        self.assertLess(signal["size_multiplier"], 1.0)
+        self.assertTrue(check["allowed"])
+
+    def test_live_sports_regime_ignores_crypto_and_non_sports(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(ticker="KXBTC15M-26MAY250715-UP", family="KXBTC15M", selected_side="yes", selected_price=0.40)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            signal = bot._get_live_sports_regime_signal(
+                market={"ticker": q.ticker, "series_ticker": q.family},
+                q=q,
+                allocation={"lane": "CRYPTO_LADDER", "ticker": q.ticker, "family": q.family},
+                source="unit_test_regime_crypto",
+            )
+
+        self.assertFalse(signal["has_signal"])
+        self.assertEqual(signal["rank_adjustment"], 0.0)
+        self.assertEqual(signal["size_multiplier"], 1.0)
+        self.assertIn(signal["reason"], {"non_sports_regime_ignored", "non_sports_lane_regime_ignored"})
+
+    def test_live_sports_momentum_skip_moves_to_next_sports_candidate(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        bad_q = SimpleNamespace(ticker="KXNBA1HTOTAL-OKCSAS-BAD", family="KXNBA1HTOTAL", selected_side="yes", selected_price=None)
+        good_q = SimpleNamespace(ticker="KXNBATOTAL-OKCSAS-2245", family="KXNBATOTAL", selected_side="yes", selected_price=0.48)
+        submitted = []
+
+        def candidate(q, score):
+            return {
+                "ticker": q.ticker,
+                "family": q.family,
+                "lane": "SPORTS",
+                "q": q,
+                "market": {"ticker": q.ticker, "series_ticker": q.family, "event_ticker": "KXNBA-OKCSAS", "title": "NBA total"},
+                "allocation": {
+                    "lane": "SPORTS",
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "allocation_score": score,
+                    "unified_opportunity_score": score,
+                    "edge": 0.03,
+                    "spread": 0.02,
+                    "liquidity": 150,
+                    "decision": "ALLOW_STRONG_SPORT",
+                },
+            }
+
+        bot.last_dual_lane_buy_candidates = [candidate(bad_q, 90.0), candidate(good_q, 82.0)]
+        bot._opportunity_cost_gate = lambda *args, **kwargs: {"allowed": True}
+        bot.already_holding = lambda ticker: False
+        bot.check_live_duplicate_position_api = lambda ticker: {"blocked": False}
+        bot.build_live_order_payload = lambda q, **kwargs: None if q.ticker == bad_q.ticker else {
+            "ticker": q.ticker,
+            "family": q.family,
+            "side": "yes",
+            "selected_side": "yes",
+            "selected_price": 0.48,
+            "price": 0.48,
+            "count": 1,
+            "orderbook_ready": True,
+            "entry_context": {},
+        }
+        bot.compute_live_sports_momentum = lambda *args, **kwargs: {
+            "momentum_score": 0.25,
+            "price_delta": 0.006,
+            "repricing_velocity": 0.001,
+            "directional_consistency": 0.7,
+            "spread_behavior": "stable",
+            "volatility_state": "stable",
+            "orderbook_pressure": "yes_pressure",
+            "size_acceleration": 0.2,
+            "history_points": 4,
+        }
+        bot.submit_live_order = lambda q, lane=None, payload_override=None, **kwargs: submitted.append(q.ticker) or {"submitted": True, "payload": dict(payload_override or {}), "reason": "submitted"}
+        bot.record_live_position = lambda *args, **kwargs: None
+        bot._emit_btc1h_live_execute_log = lambda *args, **kwargs: None
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_dual_lane_secondary_candidate(target_lane="SPORTS", source="unit_test_regime_skip")
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(submitted, [good_q.ticker])
 
     def test_sports_only_parallel_submits_only_sports(self):
         self._set_sports_only_mode(True)
