@@ -327,6 +327,11 @@ _TELEMETRY_CRITICAL_TAGS = {
     "SPORTS-SPREAD-SKIP",
     "SPORTS-SPREAD-PASS",
     "SPORTS-SPREAD-EXECUTE",
+    "SPORTS-PROBABILITY-COST",
+    "SPORTS-PROBABILITY-DOWNSIZE",
+    "SPORTS-PROBABILITY-OVERRIDE",
+    "SPORTS-PROBABILITY-BLOCK",
+    "AION-PROBABILITY-BLOCKER",
     "SPORTS-EXECUTION-QUALITY",
     "SPORTS-FILL",
     "SPORTS-ORDERBOOK",
@@ -2377,6 +2382,7 @@ class KalshiSniperBot:
         self.sports_regime_log_markers = {}
         self.sports_graph_log_markers = {}
         self.sports_spread_log_markers = {}
+        self.sports_probability_log_markers = {}
         self.sports_execution_log_markers = {}
         self.last_sports_graph_contexts = {}
         self.last_sports_ladder_plan = {}
@@ -8492,6 +8498,478 @@ class KalshiSniperBot:
             print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
         except Exception:
             print(f"[{tag}] " + json.dumps({"reason": "sports_spread_log_failed"}))
+
+    def _emit_sports_probability_log(self, tag, payload, marker=None, cooldown_seconds=90.0):
+        tag = str(tag or "SPORTS-PROBABILITY-COST").strip().upper()
+        payload = payload if isinstance(payload, dict) else {}
+        markers = getattr(self, "sports_probability_log_markers", None)
+        if not isinstance(markers, dict):
+            markers = {}
+            self.sports_probability_log_markers = markers
+        marker_key = tuple(marker) if isinstance(marker, (list, tuple)) else marker
+        now_ts = time.time()
+        if marker_key is not None:
+            previous_ts = self.to_float(markers.get(marker_key), 0.0) or 0.0
+            if now_ts - previous_ts < float(cooldown_seconds or 0.0):
+                return
+            markers[marker_key] = now_ts
+            if len(markers) > 1200:
+                cutoff = now_ts - 7200.0
+                self.sports_probability_log_markers = {
+                    key: value for key, value in markers.items()
+                    if self.to_float(value, 0.0) >= cutoff
+                }
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            print(f"[{tag}] " + json.dumps({"reason": "sports_probability_log_failed"}))
+
+    def _sports_probability_value(self, value):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        if not math.isfinite(float(numeric)):
+            return None
+        if 1.0 < numeric <= 100.0:
+            numeric = numeric / 100.0
+        return float(numeric) if 0.0 <= float(numeric) <= 1.0 else None
+
+    def _sports_probability_cost_decision(
+        self,
+        market=None,
+        *,
+        q=None,
+        family=None,
+        probability_context=None,
+        quote_diag=None,
+        selected_side=None,
+        selected_price=None,
+        spread=None,
+        liquidity=None,
+        edge_after_cost=None,
+        fill_probability=None,
+        execution_quality_score=None,
+        context="entry_timing",
+        emit_log=True,
+    ):
+        market = market if isinstance(market, dict) else {}
+        probability_context = probability_context if isinstance(probability_context, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        family = str(family or self.get_market_family(market) or getattr(q, "family", "") or "").strip().upper()
+        ticker = str(market.get("ticker") or getattr(q, "ticker", "") or quote_diag.get("ticker") or "").strip()
+
+        def _pick(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        def _q_get(*names):
+            if q is None:
+                return None
+            for name in names:
+                try:
+                    value = getattr(q, name, None)
+                except Exception:
+                    value = None
+                if value not in (None, ""):
+                    return value
+            return None
+
+        def _price(*values):
+            return self._sports_spread_price_value(_pick(*values))
+
+        implied_context = probability_context.get("implied_probability", {}) or {}
+        fair_context = probability_context.get("fair_value", {}) or {}
+        edge_context = probability_context.get("edge", {}) or {}
+        mispricing_context = probability_context.get("mispricing", {}) or {}
+        probability_signal = str(probability_context.get("final_signal") or "weak").strip().lower() or "weak"
+        probability_block_reason = str(probability_context.get("block_reason") or "").strip() or None
+        probability_confidence = self.to_float(probability_context.get("final_conviction_score"), 0.0) or 0.0
+        if not self.is_sports_family(family, ticker=ticker) or family == "KXBTC15M":
+            return {
+                "allowed": False,
+                "hard_reject": True,
+                "action": "block",
+                "reason": "non_sports_probability_policy",
+                "ticker": ticker or None,
+                "family": family or None,
+                "probability_block_reason": probability_block_reason,
+                "probability_signal": probability_signal,
+                "rank_adjustment": 0.0,
+                "size_multiplier": 1.0,
+                "context": context,
+            }
+
+        yes_bid = _price(quote_diag.get("yes_bid_dollars"), quote_diag.get("yes_bid"), market.get("yes_bid_dollars"), market.get("yes_bid"), _q_get("yes_bid", "yes_bid_dollars"))
+        yes_ask = _price(quote_diag.get("yes_ask_dollars"), quote_diag.get("yes_ask"), market.get("yes_ask_dollars"), market.get("yes_ask"), _q_get("yes_ask", "yes_ask_dollars"))
+        no_bid = _price(quote_diag.get("no_bid_dollars"), quote_diag.get("no_bid"), market.get("no_bid_dollars"), market.get("no_bid"), _q_get("no_bid", "no_bid_dollars"))
+        no_ask = _price(quote_diag.get("no_ask_dollars"), quote_diag.get("no_ask"), market.get("no_ask_dollars"), market.get("no_ask"), _q_get("no_ask", "no_ask_dollars"))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+        selected_side = self._aion_normalize_live_side(
+            selected_side
+            or quote_diag.get("selected_side")
+            or market.get("selected_side")
+            or _q_get("selected_side", "side")
+        )
+        selected_price = _price(
+            selected_price,
+            quote_diag.get("selected_price_dollars"),
+            quote_diag.get("selected_price"),
+            market.get("selected_price_dollars"),
+            market.get("selected_price"),
+            _q_get("selected_price_dollars", "selected_price", "price"),
+            yes_ask if selected_side == "yes" else no_ask if selected_side == "no" else None,
+        )
+        spread_value = self._sports_spread_value(
+            _pick(spread, quote_diag.get("spread"), market.get("spread"), _q_get("spread"))
+        )
+        if spread_value is None:
+            side_spreads = []
+            if yes_bid is not None and yes_ask is not None and yes_ask >= yes_bid:
+                side_spreads.append(yes_ask - yes_bid)
+            if no_bid is not None and no_ask is not None and no_ask >= no_bid:
+                side_spreads.append(no_ask - no_bid)
+            spread_value = min(side_spreads) if side_spreads else None
+        liquidity_priority = {}
+        try:
+            liquidity_priority = self.get_market_liquidity_priority(market, q=q) or {}
+        except Exception:
+            liquidity_priority = {}
+        yes_top = self.to_float(
+            _pick(quote_diag.get("yes_top_size"), quote_diag.get("yes_ask_size"), liquidity_priority.get("yes_top_size"), market.get("yes_top_size"), market.get("yes_ask_size"), market.get("yes_ask_size_fp"), _q_get("yes_top_size", "yes_ask_size")),
+            0.0,
+        ) or 0.0
+        no_top = self.to_float(
+            _pick(quote_diag.get("no_top_size"), quote_diag.get("no_ask_size"), liquidity_priority.get("no_top_size"), market.get("no_top_size"), market.get("no_ask_size"), market.get("no_ask_size_fp"), _q_get("no_top_size", "no_ask_size")),
+            0.0,
+        ) or 0.0
+        top_depth = max(0.0, yes_top) + max(0.0, no_top)
+        liquidity_value = self.to_float(
+            liquidity,
+            self.to_float(
+                quote_diag.get("liquidity_depth"),
+                self.to_float(quote_diag.get("liquidity"), self.to_float(liquidity_priority.get("liquidity_final"), self.to_float(market.get("liquidity_dollars", market.get("liquidity")), self.to_float(_q_get("liquidity_depth", "liquidity"), 0.0)))),
+            ),
+        ) or 0.0
+        quote_complete = bool(yes_bid is not None and yes_ask is not None and no_bid is not None and no_ask is not None)
+        selected_price_valid = bool(selected_price is not None and KALSHI_CONTRACT_MIN_PRICE <= selected_price <= KALSHI_CONTRACT_MAX_PRICE)
+        selected_side_valid = bool(selected_side in {"yes", "no"})
+        selected_top = yes_top if selected_side == "yes" else no_top if selected_side == "no" else max(yes_top, no_top)
+        selected_ask = yes_ask if selected_side == "yes" else no_ask if selected_side == "no" else None
+        selected_bid = yes_bid if selected_side == "yes" else no_bid if selected_side == "no" else None
+        book_usable = bool(
+            selected_side_valid
+            and selected_price_valid
+            and (
+                quote_complete
+                or selected_ask is not None
+                or selected_bid is not None
+                or top_depth > 0.0
+                or liquidity_value > 0.0
+            )
+        )
+
+        implied_yes_probability = self._sports_probability_value(
+            _pick(
+                implied_context.get("yes_probability"),
+                implied_context.get("spread_adjusted_probability"),
+                implied_context.get("market_implied_probability"),
+                quote_diag.get("market_implied_probability"),
+                market.get("market_implied_probability"),
+                _q_get("market_implied_probability"),
+            )
+        )
+        implied_probability = selected_price if selected_price_valid else None
+        if implied_probability is None and implied_yes_probability is not None and selected_side_valid:
+            implied_probability = implied_yes_probability if selected_side == "yes" else 1.0 - implied_yes_probability
+        model_yes_probability = self._sports_probability_value(
+            _pick(
+                fair_context.get("fair_probability"),
+                fair_context.get("model_probability"),
+                quote_diag.get("estimated_win_probability"),
+                market.get("estimated_win_probability"),
+                _q_get("estimated_win_probability"),
+            )
+        )
+        model_probability = None
+        if model_yes_probability is not None and selected_side_valid:
+            model_probability = model_yes_probability if selected_side == "yes" else 1.0 - model_yes_probability
+        elif model_yes_probability is not None:
+            model_probability = model_yes_probability
+        edge_value = max(
+            self.to_float(edge_after_cost, -999.0),
+            self.to_float(quote_diag.get("edge_after_cost"), -999.0),
+            self.to_float(quote_diag.get("sports_edge_after_cost"), -999.0),
+            self.to_float(market.get("edge_after_cost"), -999.0),
+            self.to_float(market.get("sports_edge_after_cost"), -999.0),
+            self.to_float(_q_get("edge_after_cost", "sports_edge_after_cost", "final_edge", "ev_edge"), -999.0),
+            self.to_float(edge_context.get("divergence"), -999.0),
+            self.to_float(mispricing_context.get("divergence"), -999.0),
+            0.0,
+        )
+        if model_probability is not None and selected_price_valid:
+            edge_value = max(edge_value, model_probability - selected_price)
+        sports_execution_context = quote_diag.get("sports_execution_context")
+        sports_execution_context = sports_execution_context if isinstance(sports_execution_context, dict) else {}
+        fill_probability_value = self.to_float(
+            fill_probability,
+            self.to_float(
+                quote_diag.get("selected_fill_probability"),
+                self.to_float(quote_diag.get("fill_probability"), self.to_float(quote_diag.get("sports_execution_fill_probability"), self.to_float(sports_execution_context.get("fill_probability"), self.to_float(_q_get("sports_execution_fill_probability", "selected_fill_probability"), None)))),
+            ),
+        )
+        execution_quality_value = self.to_float(
+            execution_quality_score,
+            self.to_float(
+                quote_diag.get("execution_quality_score"),
+                self.to_float(quote_diag.get("sports_execution_quality_score"), self.to_float(sports_execution_context.get("execution_quality_score"), self.to_float(_q_get("sports_execution_quality_score"), None))),
+            ),
+        )
+        if fill_probability_value is None or execution_quality_value is None:
+            try:
+                execution_context = self._sports_execution_quality_decision(
+                    market,
+                    q=q,
+                    family=family,
+                    quote_diag={
+                        **quote_diag,
+                        "selected_side": selected_side,
+                        "selected_price": selected_price,
+                        "yes_bid": yes_bid,
+                        "yes_ask": yes_ask,
+                        "no_bid": no_bid,
+                        "no_ask": no_ask,
+                        "yes_top_size": yes_top,
+                        "no_top_size": no_top,
+                        "edge_after_cost": edge_value,
+                    },
+                    selected_side=selected_side,
+                    selected_price=selected_price,
+                    spread=spread_value,
+                    liquidity=liquidity_value,
+                    edge_after_cost=edge_value,
+                    context=f"{context}:probability_fill",
+                    emit_log=False,
+                ) or {}
+                if fill_probability_value is None:
+                    fill_probability_value = self.to_float(execution_context.get("fill_probability"), None)
+                if execution_quality_value is None:
+                    execution_quality_value = self.to_float(execution_context.get("execution_quality_score"), None)
+            except Exception:
+                pass
+        if fill_probability_value is None and book_usable:
+            fill_probability_value = 0.45
+        if execution_quality_value is None and fill_probability_value is not None:
+            execution_quality_value = fill_probability_value * 100.0
+
+        thesis_confidence = max(
+            self.to_float(quote_diag.get("game_thesis_confidence"), 0.0) or 0.0,
+            self.to_float(market.get("game_thesis_confidence"), 0.0) or 0.0,
+            self.to_float(_q_get("game_thesis_confidence"), 0.0) or 0.0,
+        )
+        sports_memory_rank = self.to_float(quote_diag.get("sports_memory_rank_adjustment"), self.to_float(market.get("sports_memory_rank_adjustment"), self.to_float(_q_get("sports_memory_rank_adjustment"), 0.0))) or 0.0
+        sports_memory_size = self.to_float(quote_diag.get("sports_memory_size_multiplier"), self.to_float(market.get("sports_memory_size_multiplier"), self.to_float(_q_get("sports_memory_size_multiplier"), 1.0))) or 1.0
+        sports_regime = str(quote_diag.get("sports_regime") or market.get("sports_regime") or _q_get("sports_regime") or "").strip().lower()
+        sports_momentum_class = str(quote_diag.get("sports_momentum_classification") or market.get("sports_momentum_classification") or _q_get("sports_momentum_classification") or "").strip().lower()
+        sports_graph_rank = self.to_float(quote_diag.get("sports_graph_rank_adjustment"), self.to_float(market.get("sports_graph_rank_adjustment"), self.to_float(_q_get("sports_graph_rank_adjustment"), 0.0))) or 0.0
+        ladder_role = str(quote_diag.get("sports_ladder_role") or market.get("sports_ladder_role") or _q_get("sports_ladder_role") or "").strip().lower()
+        support_score = 0.0
+        support_reasons = []
+        if edge_value > 0.0:
+            support_score += 2.0 + min(2.0, edge_value * 80.0)
+            support_reasons.append("positive_edge_after_cost")
+        if fill_probability_value is not None and fill_probability_value >= 0.42:
+            support_score += 1.0
+            support_reasons.append("acceptable_fill_probability")
+        if fill_probability_value is not None and fill_probability_value >= 0.58:
+            support_score += 1.0
+            support_reasons.append("strong_fill_probability")
+        if execution_quality_value is not None and execution_quality_value >= 58.0:
+            support_score += 1.0
+            support_reasons.append("strong_execution_quality")
+        if thesis_confidence >= 70.0:
+            support_score += 1.5
+            support_reasons.append("strong_game_thesis")
+        elif thesis_confidence >= 58.0:
+            support_score += 0.75
+            support_reasons.append("moderate_game_thesis")
+        if sports_regime in {"favorable", "hot"} or sports_momentum_class in {"strong_positive", "moderate_positive"}:
+            support_score += 0.75
+            support_reasons.append("favorable_live_regime")
+        elif sports_regime in {"negative"} or sports_momentum_class in {"negative"}:
+            support_score -= 0.75
+            support_reasons.append("negative_live_regime_cost")
+        if sports_memory_rank > 0.0 or sports_memory_size > 1.01:
+            support_score += 0.75
+            support_reasons.append("positive_sports_memory")
+        elif sports_memory_rank < 0.0 or sports_memory_size < 0.99:
+            support_score -= 0.35
+            support_reasons.append("negative_sports_memory_cost")
+        if sports_graph_rank > 0.0:
+            support_score += 0.50
+            support_reasons.append("relationship_graph_alignment")
+        elif sports_graph_rank < 0.0:
+            support_score -= 0.35
+            support_reasons.append("relationship_graph_conflict_cost")
+        if ladder_role == "primary":
+            support_score += 0.75
+            support_reasons.append("primary_ladder_leg")
+        elif ladder_role in {"secondary", "live"}:
+            support_score += 0.35
+            support_reasons.append("aligned_ladder_leg")
+
+        hard_reject_reason = None
+        if not selected_side_valid:
+            hard_reject_reason = "selected_side_missing"
+        elif not selected_price_valid:
+            hard_reject_reason = "selected_price_missing_or_invalid"
+        elif not book_usable:
+            hard_reject_reason = "book_not_usable_for_probability_override"
+        elif implied_probability is not None and not (0.0 <= implied_probability <= 1.0):
+            hard_reject_reason = "invalid_implied_probability"
+        elif model_probability is not None and not (0.0 <= model_probability <= 1.0):
+            hard_reject_reason = "invalid_model_probability"
+
+        fill_acceptable = bool(
+            fill_probability_value is not None
+            and (
+                fill_probability_value >= 0.38
+                or (book_usable and selected_top > 0.0)
+                or edge_value > 0.0
+            )
+        )
+        sufficient_sports_evidence = bool(
+            book_usable
+            and fill_acceptable
+            and (
+                edge_value > 0.0
+                or (execution_quality_value is not None and execution_quality_value >= 58.0)
+                or support_score >= 3.0
+            )
+        )
+        probability_block_active = bool(probability_block_reason and probability_signal in {"weak", "avoid", "block", "skip"})
+        rank_adjustment = 0.0
+        size_multiplier = 1.0
+        action = "buy"
+        reason = "sports_probability_quality_pass"
+        hard_reject = False
+        if hard_reject_reason:
+            hard_reject = True
+            action = "block"
+            reason = hard_reject_reason
+            rank_adjustment = -8.0
+            size_multiplier = 0.0
+        elif probability_block_active and not sufficient_sports_evidence:
+            hard_reject = True
+            action = "block"
+            reason = "insufficient_sports_execution_evidence"
+            rank_adjustment = -8.0
+            size_multiplier = 0.0
+        else:
+            if probability_block_active:
+                action = "override"
+                reason = "probability_block_demoted_to_cost"
+                rank_adjustment -= 1.50 if support_score >= 4.0 else 2.75
+                size_multiplier = min(size_multiplier, 0.72 if support_score >= 4.0 else 0.55)
+            if probability_signal in {"weak", "avoid", "block", "skip"} and not probability_block_active:
+                action = "cost"
+                rank_adjustment -= 1.25
+                size_multiplier = min(size_multiplier, 0.78)
+                reason = "weak_probability_demoted_to_cost"
+            if implied_probability is not None and implied_probability <= 0.16 and edge_value < 0.018:
+                rank_adjustment -= 1.00
+                size_multiplier = min(size_multiplier, 0.58)
+                reason = f"{reason}+low_implied_probability_learning_size"
+            if model_probability is not None and implied_probability is not None and model_probability < implied_probability - 0.015 and edge_value <= 0.0:
+                rank_adjustment -= 1.75
+                size_multiplier = min(size_multiplier, 0.50)
+                reason = f"{reason}+model_probability_below_market"
+            if fill_probability_value is not None and fill_probability_value < 0.42:
+                rank_adjustment -= 1.00
+                size_multiplier = min(size_multiplier, 0.62)
+                reason = f"{reason}+thin_fill_probability"
+            if edge_value > 0.0 and not probability_block_active:
+                rank_adjustment += min(1.25, edge_value * 25.0)
+            if fill_probability_value is not None and fill_probability_value >= 0.60 and execution_quality_value is not None and execution_quality_value >= 60.0 and not probability_block_active:
+                rank_adjustment += 0.75
+                size_multiplier = max(size_multiplier, 1.04)
+                action = "buy"
+                reason = f"{reason}+strong_probability_execution_quality"
+            if size_multiplier < 0.95 and action != "override":
+                action = "downsize"
+            rank_adjustment = self._clamp(rank_adjustment, -8.0, 2.0)
+            size_multiplier = self._clamp(size_multiplier, 0.35, 1.08)
+
+        result = {
+            "allowed": not hard_reject,
+            "hard_reject": bool(hard_reject),
+            "action": action,
+            "reason": reason,
+            "ticker": ticker or None,
+            "family": family or None,
+            "selected_side": selected_side,
+            "selected_price": self._safe_round(selected_price, 4, None),
+            "implied_probability": self._safe_round(implied_probability, 4, None),
+            "model_probability": self._safe_round(model_probability, 4, None),
+            "probability_signal": probability_signal,
+            "probability_confidence": round(probability_confidence, 4),
+            "probability_block_reason": probability_block_reason,
+            "edge_after_cost": round(edge_value, 6),
+            "fill_probability": self._safe_round(fill_probability_value, 4, None),
+            "execution_quality_score": self._safe_round(execution_quality_value, 4, None),
+            "rank_adjustment": round(rank_adjustment, 4),
+            "size_multiplier": round(size_multiplier, 4),
+            "book_usable": bool(book_usable),
+            "quote_complete": bool(quote_complete),
+            "selected_top_size": round(selected_top, 4),
+            "top_depth": round(top_depth, 4),
+            "liquidity": round(liquidity_value, 4),
+            "spread": self._safe_round(spread_value, 4, None),
+            "support_score": round(support_score, 4),
+            "support_reasons": support_reasons or ["sports_probability_cost"],
+            "game_thesis_confidence": round(thesis_confidence, 4),
+            "sports_regime": sports_regime or None,
+            "sports_momentum_classification": sports_momentum_class or None,
+            "sports_memory_rank_adjustment": round(sports_memory_rank, 4),
+            "sports_memory_size_multiplier": round(sports_memory_size, 4),
+            "sports_graph_rank_adjustment": round(sports_graph_rank, 4),
+            "sports_ladder_role": ladder_role or None,
+            "context": context,
+        }
+        if emit_log and (probability_block_reason or abs(rank_adjustment) >= 0.5 or abs(size_multiplier - 1.0) >= 0.03 or hard_reject):
+            marker_bucket = int(time.time() // 90)
+            if hard_reject:
+                self._emit_sports_probability_log(
+                    "SPORTS-PROBABILITY-BLOCK",
+                    result,
+                    marker=("SPORTS-PROBABILITY-BLOCK", context, ticker or family, reason, marker_bucket),
+                )
+                self._emit_sports_probability_log(
+                    "AION-PROBABILITY-BLOCKER",
+                    result,
+                    marker=("AION-PROBABILITY-BLOCKER", context, ticker or family, reason, marker_bucket),
+                )
+            else:
+                tag = "SPORTS-PROBABILITY-OVERRIDE" if action == "override" else "SPORTS-PROBABILITY-DOWNSIZE" if size_multiplier < 0.95 else "SPORTS-PROBABILITY-COST"
+                self._emit_sports_probability_log(
+                    tag,
+                    result,
+                    marker=(tag, context, ticker or family, action, marker_bucket),
+                )
+                if action == "override" and size_multiplier < 0.95:
+                    self._emit_sports_probability_log(
+                        "SPORTS-PROBABILITY-DOWNSIZE",
+                        result,
+                        marker=("SPORTS-PROBABILITY-DOWNSIZE", context, ticker or family, marker_bucket),
+                    )
+        return result
 
     def _sports_spread_price_value(self, value):
         numeric = self.to_float(value, None)
@@ -36663,6 +37141,14 @@ class KalshiSniperBot:
             "sports_execution_quality_score",
             "sports_execution_rank_adjustment",
             "sports_execution_size_multiplier",
+            "sports_probability_context",
+            "sports_probability_action",
+            "sports_probability_reason",
+            "sports_probability_rank_adjustment",
+            "sports_probability_size_multiplier",
+            "sports_probability_edge_after_cost",
+            "sports_probability_fill_probability",
+            "sports_probability_execution_quality_score",
             "sports_graph_context",
             "sports_graph_game_id",
             "sports_graph_role",
@@ -37076,6 +37562,41 @@ class KalshiSniperBot:
                         "reason": "sports_execution_quality_dynamic_size_adjustment",
                     },
                     marker=("SPORTS-FILL-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
+                    cooldown_seconds=180.0,
+                )
+        sports_probability_multiplier = self.to_float(
+            context.get("sports_probability_size_multiplier"),
+            self.to_float(payload.get("sports_probability_size_multiplier"), None),
+        )
+        if (
+            sports_probability_multiplier is not None
+            and sports_probability_multiplier > 0.0
+            and abs(sports_probability_multiplier - 1.0) >= 0.01
+            and unified_multiplier is None
+        ):
+            before_probability_size = chosen
+            probability_multiplier = max(0.35, min(1.08, float(sports_probability_multiplier)))
+            chosen = max(1, min(hard_max, int(round(chosen * probability_multiplier))))
+            if chosen != before_probability_size:
+                chosen_label = "sports_probability_size_adjustment"
+                context["sports_probability_size_multiplier_applied"] = round(probability_multiplier, 4)
+                self._emit_sports_probability_log(
+                    "SPORTS-PROBABILITY-DOWNSIZE" if probability_multiplier < 1.0 else "SPORTS-PROBABILITY-OVERRIDE",
+                    {
+                        "source": source or "dynamic_live_entry_size",
+                        "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                        "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                        "requested_size": before_probability_size,
+                        "adjusted_size": chosen,
+                        "sports_probability_size_multiplier": round(probability_multiplier, 4),
+                        "action": context.get("sports_probability_action") or payload.get("sports_probability_action"),
+                        "reason": context.get("sports_probability_reason") or payload.get("sports_probability_reason"),
+                        "edge_after_cost": context.get("sports_probability_edge_after_cost") or payload.get("sports_probability_edge_after_cost"),
+                        "fill_probability": context.get("sports_probability_fill_probability") or payload.get("sports_probability_fill_probability"),
+                        "execution_quality_score": context.get("sports_probability_execution_quality_score") or payload.get("sports_probability_execution_quality_score"),
+                        "rank_adjustment": context.get("sports_probability_rank_adjustment") or payload.get("sports_probability_rank_adjustment"),
+                    },
+                    marker=("SPORTS-PROBABILITY-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
                     cooldown_seconds=180.0,
                 )
         if (
@@ -48311,6 +48832,72 @@ class KalshiSniperBot:
         probability_confidence = self.to_float(probability_context.get("final_conviction_score"), 0.0)
         probability_signal = str(probability_context.get("final_signal") or "weak").strip().lower()
         probability_block_reason = probability_context.get("block_reason")
+        sports_probability_context = {}
+        probability_block_demoted = False
+        probability_rank_adjustment = 0.0
+        probability_size_multiplier = 1.0
+        if self._is_sports_market_or_family(family) and family != "KXBTC15M":
+            sports_probability_quote_diag = {
+                "ticker": trace_ticker,
+                "selected_side": getattr(q, "selected_side", None) or getattr(q, "side", None),
+                "selected_price": getattr(q, "selected_price", None) or getattr(q, "selected_price_dollars", None),
+                "yes_bid": getattr(q, "yes_bid", None),
+                "yes_ask": getattr(q, "yes_ask", None),
+                "no_bid": getattr(q, "no_bid", None),
+                "no_ask": getattr(q, "no_ask", None),
+                "yes_top_size": liquidity_priority.get("yes_top_size") or getattr(q, "yes_top_size", None),
+                "no_top_size": liquidity_priority.get("no_top_size") or getattr(q, "no_top_size", None),
+                "liquidity": liquidity_seen,
+                "sports_memory_rank_adjustment": getattr(q, "sports_memory_rank_adjustment", None),
+                "sports_memory_size_multiplier": getattr(q, "sports_memory_size_multiplier", None),
+                "sports_regime": getattr(q, "sports_regime", None),
+                "sports_momentum_classification": getattr(q, "sports_momentum_classification", None),
+                "sports_graph_rank_adjustment": getattr(q, "sports_graph_rank_adjustment", None),
+                "sports_ladder_role": getattr(q, "sports_ladder_role", None),
+                "game_thesis_confidence": getattr(q, "game_thesis_confidence", None),
+                "edge_after_cost": getattr(q, "edge_after_cost", None) or getattr(q, "sports_edge_after_cost", None),
+                "sports_execution_fill_probability": getattr(q, "sports_execution_fill_probability", None),
+                "sports_execution_quality_score": getattr(q, "sports_execution_quality_score", None),
+            }
+            sports_probability_context = self._sports_probability_cost_decision(
+                market,
+                q=q,
+                family=family,
+                probability_context=probability_context,
+                quote_diag=sports_probability_quote_diag,
+                selected_side=sports_probability_quote_diag.get("selected_side"),
+                selected_price=sports_probability_quote_diag.get("selected_price"),
+                spread=spread,
+                liquidity=liquidity_seen,
+                edge_after_cost=sports_probability_quote_diag.get("edge_after_cost"),
+                fill_probability=sports_probability_quote_diag.get("sports_execution_fill_probability"),
+                execution_quality_score=sports_probability_quote_diag.get("sports_execution_quality_score"),
+                context=f"entry_timing:{stage_label}",
+                emit_log=True,
+            )
+            probability_block_demoted = bool(
+                probability_block_reason
+                and sports_probability_context.get("allowed")
+                and not sports_probability_context.get("hard_reject")
+            )
+            probability_rank_adjustment = self.to_float(sports_probability_context.get("rank_adjustment"), 0.0) or 0.0
+            probability_size_multiplier = self.to_float(sports_probability_context.get("size_multiplier"), 1.0) or 1.0
+            for attr_name, attr_value in (
+                ("sports_probability_context", sports_probability_context),
+                ("sports_probability_rank_adjustment", probability_rank_adjustment),
+                ("sports_probability_size_multiplier", probability_size_multiplier),
+                ("sports_probability_action", sports_probability_context.get("action")),
+                ("sports_probability_reason", sports_probability_context.get("reason")),
+                ("sports_probability_edge_after_cost", sports_probability_context.get("edge_after_cost")),
+                ("sports_probability_fill_probability", sports_probability_context.get("fill_probability")),
+                ("sports_probability_execution_quality_score", sports_probability_context.get("execution_quality_score")),
+            ):
+                if attr_value is None:
+                    continue
+                try:
+                    setattr(q, attr_name, attr_value)
+                except Exception:
+                    pass
         external_event_risk = external_context.get("event_risk", {}) or {}
         external_risk_level = str(external_event_risk.get("risk_level") or "NONE").upper()
         external_catalysts = external_context.get("active_catalysts", []) or []
@@ -48563,11 +49150,18 @@ class KalshiSniperBot:
                 immediate_entry_flag = market.get("post_signal_entry_blocked")
         if immediate_entry_flag is not None:
             immediate_entry_blocked = bool(immediate_entry_flag)
-        probability_execution_blocked = bool(
+        raw_probability_execution_blocked = bool(
             probability_block_reason
             and REALM_XXIII_ALLOW_BLOCKS
             and probability_signal == "weak"
         )
+        probability_execution_blocked = bool(raw_probability_execution_blocked and not probability_block_demoted)
+        if (
+            probability_block_reason
+            and sports_probability_context.get("hard_reject")
+            and not probability_block_demoted
+        ):
+            probability_execution_blocked = True
         capital_execution_blocked = bool(
             REALM_XXIV_ALLOW_BLOCKS
             and capital_context.get("soft_circuit_active")
@@ -48876,6 +49470,15 @@ class KalshiSniperBot:
             "probability_signal": probability_signal,
             "probability_block_reason": probability_block_reason,
             "probability_execution_blocked": probability_execution_blocked,
+            "probability_block_demoted": probability_block_demoted,
+            "sports_probability_context": sports_probability_context,
+            "sports_probability_action": sports_probability_context.get("action") if isinstance(sports_probability_context, dict) else None,
+            "sports_probability_reason": sports_probability_context.get("reason") if isinstance(sports_probability_context, dict) else None,
+            "sports_probability_rank_adjustment": round(probability_rank_adjustment, 4),
+            "sports_probability_size_multiplier": round(probability_size_multiplier, 4),
+            "sports_probability_edge_after_cost": sports_probability_context.get("edge_after_cost") if isinstance(sports_probability_context, dict) else None,
+            "sports_probability_fill_probability": sports_probability_context.get("fill_probability") if isinstance(sports_probability_context, dict) else None,
+            "sports_probability_execution_quality_score": sports_probability_context.get("execution_quality_score") if isinstance(sports_probability_context, dict) else None,
             "psychology_context": psychology_context,
             "psychology_score": psychology_context.get("psychology_score"),
             "psychology_regime": psychology_context.get("psychology_regime"),
@@ -56576,6 +57179,62 @@ class KalshiSniperBot:
             probability_signal = str(entry_timing_observation.get("probability_signal") or "weak").strip().lower()
             probability_confidence = self.to_float(entry_timing_observation.get("probability_confidence"), 0.0)
             probability_block_reason = entry_timing_observation.get("probability_block_reason")
+            sports_probability_context = entry_timing_observation.get("sports_probability_context") if isinstance(entry_timing_observation.get("sports_probability_context"), dict) else {}
+            sports_probability_rank_adjustment = self.to_float(
+                entry_timing_observation.get("sports_probability_rank_adjustment"),
+                self.to_float(sports_probability_context.get("rank_adjustment"), 0.0),
+            ) or 0.0
+            sports_probability_size_multiplier = self.to_float(
+                entry_timing_observation.get("sports_probability_size_multiplier"),
+                self.to_float(sports_probability_context.get("size_multiplier"), 1.0),
+            ) or 1.0
+            if self._is_sports_market_or_family(family) and family != "KXBTC15M" and sports_probability_context:
+                if abs(sports_probability_rank_adjustment) >= 0.01:
+                    before_probability_score = candidate_score
+                    candidate_score = round(max(0.0, min(100.0, self.to_float(candidate_score, 0.0) + sports_probability_rank_adjustment)), 4)
+                    if isinstance(score_breakdown, dict):
+                        score_breakdown = dict(score_breakdown)
+                        score_breakdown["sports_probability_cost"] = round(sports_probability_rank_adjustment, 4)
+                    if isinstance(debug_context, dict):
+                        debug_context["sports_probability_context"] = sports_probability_context
+                        debug_context["sports_probability_rank_adjustment"] = round(sports_probability_rank_adjustment, 4)
+                        debug_context["sports_probability_size_multiplier"] = round(sports_probability_size_multiplier, 4)
+                    if isinstance(score_result, dict):
+                        score_result["candidate_score"] = candidate_score
+                        score_result["score_breakdown"] = score_breakdown
+                    self._emit_sports_probability_log(
+                        "SPORTS-PROBABILITY-COST" if sports_probability_rank_adjustment < 0 else "SPORTS-PROBABILITY-OVERRIDE",
+                        {
+                            **sports_probability_context,
+                            "source": "decision_loop_rank",
+                            "score_before": round(self.to_float(before_probability_score, 0.0), 4),
+                            "score_after": candidate_score,
+                            "final_action": "demote" if sports_probability_rank_adjustment < 0 else "boost",
+                        },
+                        marker=("SPORTS-PROBABILITY-RANK", q.ticker, int(time.time() // 90)),
+                    )
+                    if (
+                        sports_probability_rank_adjustment > 0.0
+                        and decision != "BUY"
+                        and candidate_score >= max(0.0, effective_score_threshold)
+                        and not hard_reject_reason
+                        and sports_probability_context.get("allowed", True)
+                    ):
+                        decision = "BUY"
+                        decision_reason = "sports_probability_quality_boost"
+                for attr_name, attr_value in (
+                    ("sports_probability_context", sports_probability_context),
+                    ("sports_probability_rank_adjustment", sports_probability_rank_adjustment),
+                    ("sports_probability_size_multiplier", sports_probability_size_multiplier),
+                    ("sports_probability_action", sports_probability_context.get("action")),
+                    ("sports_probability_reason", sports_probability_context.get("reason")),
+                ):
+                    if attr_value is None:
+                        continue
+                    try:
+                        setattr(q, attr_name, attr_value)
+                    except Exception:
+                        pass
             liquidity_priority = debug_context.get("liquidity_priority", {}) or {}
             fallback_both_sides_quoted = bool(liquidity_priority.get("both_sides_quoted"))
             fallback_yes_top_size = self.to_float(liquidity_priority.get("yes_top_size"), 0.0) or 0.0
@@ -56749,12 +57408,21 @@ class KalshiSniperBot:
             phase55_entry_timing_pass = bool(phase55_status == "entry_ready")
             if not phase55_entry_timing_pass:
                 self._record_execution_failure_audit(reason=phase55_status or decision_reason, stage="entry_timing", phase55_reject=True)
+            probability_hard_block = bool(
+                entry_timing_observation.get("probability_execution_blocked")
+                and not entry_timing_observation.get("probability_block_demoted")
+            )
+            phase55_probability_hard_status = bool(
+                str(phase55_status or "").strip().lower() == "probability_block"
+                and not entry_timing_observation.get("probability_block_demoted")
+            )
             execution_safety_blocked = bool(
                 entry_timing_observation.get("immediate_entry_blocked")
-                or entry_timing_observation.get("probability_execution_blocked")
+                or probability_hard_block
                 or entry_timing_observation.get("capital_execution_blocked")
                 or entry_timing_observation.get("psychology_execution_blocked")
-                or phase55_status in {"immediate_reject", "probability_block", "capital_block", "psychology_block"}
+                or phase55_probability_hard_status
+                or phase55_status in {"immediate_reject", "capital_block", "psychology_block"}
             )
             decision_before_selector = decision
             if (
@@ -72912,6 +73580,12 @@ class KalshiSniperBot:
             or market.get("ticker", "")
             or ""
         ).strip() or None
+        selected_ticker = ticker
+        quote_diag = decision_context.get("quote_diag") if isinstance(decision_context.get("quote_diag"), dict) else {}
+        if not quote_diag:
+            quote_diag = canonical_payload.get("quote_diag") if isinstance(canonical_payload.get("quote_diag"), dict) else {}
+        if not quote_diag:
+            quote_diag = orderbook_context.get("quote_diag") if isinstance(orderbook_context.get("quote_diag"), dict) else {}
         family = str(
             decision_context.get("family")
             or self.get_market_family(market if market else {"ticker": ticker} if ticker else {})
@@ -73160,6 +73834,96 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
+            if decision == "SKIP" and blocker == "edge_below_threshold" and self.is_sports_family(family, ticker=ticker):
+                spread_value = self.to_float(
+                    tradeability.get("spread"),
+                    self.to_float(tradeability.get("spread_dollars"), None),
+                )
+                if spread_value is None and tradeability.get("spread_cents") is not None:
+                    spread_value = self.to_float(tradeability.get("spread_cents"), 0.0) / 100.0
+                probability_cost_context = self._sports_probability_cost_decision(
+                    canonical_payload,
+                    q=quote_payload,
+                    family=family,
+                    probability_context={
+                        "final_signal": "weak",
+                        "final_conviction_score": confidence,
+                        "block_reason": "edge_below_threshold",
+                        "implied_probability": {
+                            "spread_adjusted_probability": selected_price,
+                            "yes_probability": selected_price if selected_side == "yes" else (1.0 - selected_price if selected_price is not None else None),
+                        },
+                        "fair_value": {
+                            "fair_probability": (selected_price + edge) if selected_side == "yes" and selected_price is not None else (1.0 - selected_price - edge if selected_side == "no" and selected_price is not None else None),
+                        },
+                        "edge": {"divergence": edge},
+                    },
+                    quote_diag={
+                        **quote_diag,
+                        "selected_side": selected_side,
+                        "selected_price": selected_price,
+                        "selected_price_cents": selected_price_cents,
+                        "yes_bid": tradeability.get("yes_bid_dollars") or (self.to_float(tradeability.get("yes_bid_cents"), None) / 100.0 if tradeability.get("yes_bid_cents") is not None else None),
+                        "yes_ask": tradeability.get("yes_ask_dollars") or (self.to_float(tradeability.get("yes_ask_cents"), None) / 100.0 if tradeability.get("yes_ask_cents") is not None else None),
+                        "no_bid": tradeability.get("no_bid_dollars") or (self.to_float(tradeability.get("no_bid_cents"), None) / 100.0 if tradeability.get("no_bid_cents") is not None else None),
+                        "no_ask": tradeability.get("no_ask_dollars") or (self.to_float(tradeability.get("no_ask_cents"), None) / 100.0 if tradeability.get("no_ask_cents") is not None else None),
+                        "yes_top_size": tradeability.get("yes_top_size"),
+                        "no_top_size": tradeability.get("no_top_size"),
+                        "liquidity": tradeability.get("liquidity"),
+                        "edge_after_cost": edge,
+                        "fill_probability": tradeability.get("fill_probability"),
+                        "execution_quality_score": tradeability.get("execution_quality_score") or tradeability.get("confidence_score"),
+                    },
+                    selected_side=selected_side,
+                    selected_price=selected_price,
+                    spread=spread_value,
+                    liquidity=tradeability.get("liquidity"),
+                    edge_after_cost=edge,
+                    fill_probability=tradeability.get("fill_probability"),
+                    execution_quality_score=tradeability.get("execution_quality_score") or tradeability.get("confidence_score"),
+                    context="realm_vv_entry_edge_floor",
+                    emit_log=True,
+                )
+                tradeability["sports_probability_context"] = probability_cost_context
+                tradeability["sports_probability_rank_adjustment"] = probability_cost_context.get("rank_adjustment")
+                tradeability["sports_probability_size_multiplier"] = probability_cost_context.get("size_multiplier")
+                for attr_name, attr_value in (
+                    ("sports_probability_context", probability_cost_context),
+                    ("sports_probability_rank_adjustment", probability_cost_context.get("rank_adjustment")),
+                    ("sports_probability_size_multiplier", probability_cost_context.get("size_multiplier")),
+                    ("sports_probability_action", probability_cost_context.get("action")),
+                    ("sports_probability_reason", probability_cost_context.get("reason")),
+                    ("sports_probability_edge_after_cost", probability_cost_context.get("edge_after_cost")),
+                    ("sports_probability_fill_probability", probability_cost_context.get("fill_probability")),
+                    ("sports_probability_execution_quality_score", probability_cost_context.get("execution_quality_score")),
+                ):
+                    if quote_payload is None or attr_value is None:
+                        continue
+                    try:
+                        setattr(quote_payload, attr_name, attr_value)
+                    except Exception:
+                        pass
+                if probability_cost_context.get("allowed") and not probability_cost_context.get("hard_reject"):
+                    decision = "BUY"
+                    blocker = None
+                    blocker_detail = None
+                    tradeability["tradeable"] = True
+                    tradeability["blocker"] = None
+                    tradeability["blocker_class"] = None
+                    tradeability["blocker_detail"] = None
+                    self._emit_sports_probability_log(
+                        "SPORTS-PROBABILITY-OVERRIDE",
+                        {
+                            **probability_cost_context,
+                            "source": "realm_vv_entry_edge_floor",
+                            "old_threshold": round(edge_threshold, 6),
+                            "final_action": "buy",
+                        },
+                        marker=("SPORTS-PROBABILITY-REALM-VV-BUY", ticker or family, int(time.time() // 90)),
+                    )
+                elif probability_cost_context.get("hard_reject"):
+                    blocker = probability_cost_context.get("reason") or "probability_true_hard_block"
+                    blocker_detail = blocker
         elif confidence < confidence_floor:
             decision = "SKIP"
             blocker = "confidence_below_threshold"

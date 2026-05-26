@@ -1,3 +1,4 @@
+import json
 import tempfile
 import time
 import unittest
@@ -127,6 +128,49 @@ class DistilledMemoryTests(unittest.TestCase):
             self.assertIn("KXNBA1HTOTAL", audit["sports_history_families_covered"])
             self.assertGreaterEqual(audit["sports_history_family_count"], 1)
             self.assertTrue(audit["sports_history_asymmetry_bucket_performance"])
+
+    def test_persistent_snapshot_tolerates_recursive_live_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "aion_persistent_intelligence.json"
+            engine = AIONPersistentIntelligence(state_file=state_file, enabled=True)
+            recursive_payload = {"ticker": "KXNBA-RECURSIVE"}
+            recursive_payload["self"] = recursive_payload
+            engine.distilled_learning["observations"].append(recursive_payload)
+
+            snapshot = engine.snapshot()
+            self.assertEqual(
+                snapshot["distilled_learning"]["observations"][0]["self"],
+                "<recursive_ref>",
+            )
+            self.assertTrue(engine.persist())
+            with state_file.open() as handle:
+                persisted = json.load(handle)
+            self.assertEqual(
+                persisted["distilled_learning"]["observations"][0]["self"],
+                "<recursive_ref>",
+            )
+
+    def test_persist_recursion_error_uses_sanitized_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "aion_persistent_intelligence.json"
+            engine = AIONPersistentIntelligence(state_file=state_file, enabled=True)
+            engine.record_ticker_behavior(
+                "KXNBA-RECURSION-FALLBACK",
+                "KXNBA",
+                spread_quality=0.5,
+                stability_score=0.5,
+            )
+
+            def _raise_recursion():
+                raise RecursionError("unit")
+
+            engine.snapshot = _raise_recursion
+            result = engine.persist()
+            self.assertEqual(result["summary"]["snapshot_mode"], "recursion_safe")
+            with state_file.open() as handle:
+                persisted = json.load(handle)
+            self.assertEqual(persisted["summary"]["snapshot_mode"], "recursion_safe")
+            self.assertIn("sports:KXNBA-RECURSION-FALLBACK", persisted["ticker_profiles"])
 
 
 if __name__ == "__main__":

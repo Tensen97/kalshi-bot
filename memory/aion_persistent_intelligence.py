@@ -30,11 +30,29 @@ def _now():
     return time.time()
 
 
-def _json_safe(value):
+def _json_safe(value, _seen=None, _depth=0):
+    if _seen is None:
+        _seen = set()
+    if _depth > 80:
+        return "<max_depth>"
     if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<recursive_ref>"
+        _seen.add(obj_id)
+        try:
+            return {str(key): _json_safe(item, _seen, _depth + 1) for key, item in value.items()}
+        finally:
+            _seen.discard(obj_id)
     if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item) for item in value]
+        obj_id = id(value)
+        if obj_id in _seen:
+            return "<recursive_ref>"
+        _seen.add(obj_id)
+        try:
+            return [_json_safe(item, _seen, _depth + 1) for item in value]
+        finally:
+            _seen.discard(obj_id)
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
@@ -1557,10 +1575,28 @@ class AIONPersistentIntelligence:
             return _json_safe(
                 {
                     "state_file": self.state_file,
-                    "ticker_profiles": deepcopy(self.ticker_profiles),
-                    "family_profiles": deepcopy(self.family_profiles),
-                    "distilled_learning": deepcopy(_ensure_distilled_learning_defaults(self.distilled_learning)),
+                    "ticker_profiles": self.ticker_profiles,
+                    "family_profiles": self.family_profiles,
+                    "distilled_learning": _ensure_distilled_learning_defaults(self.distilled_learning),
                     "summary": self.build_overall_summary(),
+                }
+            )
+
+    def _recursion_safe_snapshot(self):
+        with self._lock:
+            return _json_safe(
+                {
+                    "state_file": self.state_file,
+                    "ticker_profiles": self.ticker_profiles,
+                    "family_profiles": self.family_profiles,
+                    "distilled_learning": self.distilled_learning,
+                    "summary": {
+                        "module": "aion_persistent_intelligence",
+                        "ticker_profile_count": len(self.ticker_profiles) if isinstance(self.ticker_profiles, dict) else 0,
+                        "family_profile_count": len(self.family_profiles) if isinstance(self.family_profiles, dict) else 0,
+                        "snapshot_mode": "recursion_safe",
+                        "timestamp": _now(),
+                    },
                 }
             )
 
@@ -1580,6 +1616,24 @@ class AIONPersistentIntelligence:
                         self.distilled_learning = _ensure_distilled_learning_defaults(payload.get("distilled_learning"))
                     ok = safe_atomic_json_write(self.state_file, payload, indent=2, sort_keys=True, default=str)
                 record_persist_event(subsystem="AION-PERSIST", path=self.state_file, action="persist_state", success=bool(ok), reason=None if ok else "write_failed")
+            except RecursionError:
+                try:
+                    payload = self._recursion_safe_snapshot()
+                    with _state_file_lock(self.state_file):
+                        ok = safe_atomic_json_write(self.state_file, payload, indent=2, sort_keys=True, default=str)
+                    record_persist_event(
+                        subsystem="AION-PERSIST",
+                        path=self.state_file,
+                        action="persist_state",
+                        success=bool(ok),
+                        reason=None if ok else "recursion_sanitized_write_failed",
+                        details={"fallback": "recursion_sanitized"} if ok else None,
+                    )
+                    return payload
+                except Exception as exc:
+                    record_persist_event(subsystem="AION-PERSIST", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
+                    builtins.print("[AION-INTELLIGENCE-MEMORY] " + json.dumps({"reason": exc.__class__.__name__, "state_file": self.state_file, "action": "persist"}, sort_keys=True))
+                    return self._recursion_safe_snapshot()
             except Exception as exc:
                 record_persist_event(subsystem="AION-PERSIST", path=self.state_file, action="persist_state", success=False, reason=exc.__class__.__name__)
                 builtins.print("[AION-INTELLIGENCE-MEMORY] " + json.dumps({"reason": exc.__class__.__name__, "state_file": self.state_file, "action": "persist"}, sort_keys=True))

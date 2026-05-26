@@ -21,6 +21,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.sports_regime_log_markers = {}
         bot.sports_graph_log_markers = {}
         bot.sports_spread_log_markers = {}
+        bot.sports_probability_log_markers = {}
         bot.sports_execution_log_markers = {}
         bot.last_sports_graph_contexts = {}
         bot.last_sports_ladder_plan = {}
@@ -2847,6 +2848,393 @@ class StructuralEdgeTests(unittest.TestCase):
             self.assertEqual(bot._classify_aion_execution_blocker(reason), "profit_quality")
         for reason in ("malformed_orderbook", "fake_book", "duplicate_position", "daily_loss_guard"):
             self.assertEqual(bot._classify_aion_execution_blocker(reason), "hard_safety")
+
+    def test_sports_probability_block_demotes_to_cost_with_executable_edge(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA-PROB-EDGE",
+            "series_ticker": "KXNBA",
+            "status": "open",
+            "title": "NBA game winner",
+            "yes_bid": 0.45,
+            "yes_ask": 0.47,
+            "no_bid": 0.53,
+            "no_ask": 0.55,
+            "liquidity_dollars": 60,
+            "game_thesis_confidence": 72,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=12,
+            no_top_size=14,
+            liquidity=60,
+            edge_after_cost=0.026,
+            sports_execution_fill_probability=0.61,
+            sports_execution_quality_score=61,
+            game_thesis_confidence=72,
+            sports_regime="favorable",
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            decision = bot._sports_probability_cost_decision(
+                market,
+                q=q,
+                family="KXNBA",
+                probability_context={
+                    "final_signal": "weak",
+                    "final_conviction_score": 0.18,
+                    "block_reason": "probability_mispricing_block",
+                    "implied_probability": {"spread_adjusted_probability": 0.47},
+                    "fair_value": {"fair_probability": 0.54},
+                    "edge": {"divergence": 0.026},
+                },
+                selected_side="yes",
+                selected_price=0.47,
+                spread=0.02,
+                liquidity=60,
+                edge_after_cost=0.026,
+                fill_probability=0.61,
+                execution_quality_score=61,
+                context="unit_probability",
+            )
+
+        self.assertTrue(decision["allowed"])
+        self.assertFalse(decision["hard_reject"])
+        self.assertEqual(decision["action"], "override")
+        self.assertLess(decision["rank_adjustment"], 0.0)
+        self.assertLess(decision["size_multiplier"], 1.0)
+        self.assertIn("[SPORTS-PROBABILITY-OVERRIDE]", logs.getvalue())
+
+    def test_sports_probability_block_preserves_true_invalid_price_block(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA-PROB-BROKEN",
+            "series_ticker": "KXNBA",
+            "status": "open",
+            "title": "NBA game winner",
+            "yes_bid": None,
+            "yes_ask": None,
+            "no_bid": None,
+            "no_ask": None,
+        }
+        q = SimpleNamespace(ticker=market["ticker"], family="KXNBA", selected_side="yes", selected_price=None)
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            decision = bot._sports_probability_cost_decision(
+                market,
+                q=q,
+                family="KXNBA",
+                probability_context={
+                    "final_signal": "weak",
+                    "block_reason": "probability_mispricing_block",
+                    "implied_probability": {},
+                    "fair_value": {},
+                },
+                selected_side="yes",
+                selected_price=None,
+                context="unit_probability",
+            )
+
+        self.assertFalse(decision["allowed"])
+        self.assertTrue(decision["hard_reject"])
+        self.assertEqual(decision["action"], "block")
+        self.assertEqual(decision["reason"], "selected_price_missing_or_invalid")
+        self.assertIn("[SPORTS-PROBABILITY-BLOCK]", logs.getvalue())
+        self.assertIn("[AION-PROBABILITY-BLOCKER]", logs.getvalue())
+
+    def test_entry_timing_probability_block_no_longer_vetoes_valid_sports_candidate(self):
+        bot = self._make_bot()
+        old_realm_vv = kw.AION_USE_REALM_VV_ENTRY_ENGINE
+        old_probability_blocks = kw.REALM_XXIII_ALLOW_BLOCKS
+        kw.AION_USE_REALM_VV_ENTRY_ENGINE = False
+        kw.REALM_XXIII_ALLOW_BLOCKS = True
+        self.addCleanup(setattr, kw, "AION_USE_REALM_VV_ENTRY_ENGINE", old_realm_vv)
+        self.addCleanup(setattr, kw, "REALM_XXIII_ALLOW_BLOCKS", old_probability_blocks)
+        bot.market_psychology_profiles = {}
+        bot.last_live_select_summary = {}
+        bot.phase55_current_select_pass_marker = "unit_probability"
+        bot.phase55_select_pass_counter = 0
+        bot.cycle_count = 1
+        bot.phase55_rolling_price_history = {}
+        bot.phase55_rolling_price_marker_cache = {}
+        bot.phase55_market_history_cache = {}
+        bot._get_websocket_snapshot = lambda *args, **kwargs: {}
+        bot.compute_live_sports_momentum = lambda *args, **kwargs: {"momentum_score": 0.10, "directional_bias": "up", "volatility_state": "normal"}
+        bot.get_market_min_entry_liquidity = lambda market_arg: 1
+        bot.get_market_liquidity_priority = lambda *args, **kwargs: {
+            "top_book_state": "both_non_zero",
+            "both_sides_quoted": True,
+            "has_real_liquidity": True,
+            "yes_top_size": 12,
+            "no_top_size": 14,
+            "liquidity_final": 60,
+        }
+        bot._get_sports_adaptive_spread_threshold = lambda *args, **kwargs: {"adaptive_threshold": 0.18, "block_reason": "unit_test"}
+        bot._get_personality_snapshot = lambda **kwargs: {"profile": {}, "regime": {}, "adaptive_thresholds": {}, "memory": {}, "priority_score": 0.0}
+        bot._get_probability_snapshot = lambda **kwargs: {
+            "final_signal": "weak",
+            "final_conviction_score": 0.18,
+            "block_reason": "probability_mispricing_block",
+            "implied_probability": {"spread_adjusted_probability": 0.47, "yes_probability": 0.47},
+            "fair_value": {"fair_probability": 0.54, "uncertainty_score": 0.32},
+            "edge": {"divergence": 0.026, "edge_category": "positive"},
+            "mispricing": {"divergence": 0.026, "mispricing_type": "sports_edge"},
+        }
+        bot._get_capital_snapshot = lambda: {"capital_state": "NORMAL", "aggression_level": 0.35, "aggression_mode": "normal", "risk_multiplier": 1.0, "soft_circuit_active": False}
+        bot._get_external_snapshot = lambda: {"event_risk": {}, "active_catalysts": [], "execution_caution": False}
+        bot._get_evolution_snapshot = lambda: {}
+        bot._get_phase55_stochastic_context = lambda *args, **kwargs: {
+            "stochastic_inputs_available": True,
+            "stochastic_k": 62,
+            "stochastic_d": 58,
+            "previous_stochastic_k": 55,
+            "previous_stochastic_d": 57,
+            "stochastic_source": "unit_test",
+            "history_points": 6,
+            "required_points": 6,
+            "history_reason": "unit_test",
+            "timing_history_key": "unit_probability",
+            "history_appended": False,
+            "history_append_reason": "unit_test",
+            "cycle_id": "unit",
+        }
+        market = {
+            "ticker": "KXNBA-PROB-TIMING",
+            "series_ticker": "KXNBA",
+            "status": "open",
+            "title": "NBA game winner",
+            "yes_bid": 0.45,
+            "yes_ask": 0.47,
+            "no_bid": 0.53,
+            "no_ask": 0.55,
+            "liquidity_dollars": 60,
+            "micro_pullback": True,
+            "game_thesis_confidence": 72,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA",
+            side="yes",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=12,
+            no_top_size=14,
+            liquidity=60,
+            edge_after_cost=0.026,
+            sports_execution_fill_probability=0.61,
+            sports_execution_quality_score=61,
+            game_thesis_confidence=72,
+            sports_regime="favorable",
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            observation = bot.get_entry_timing_observation(market, q, "KXNBA")
+
+        self.assertTrue(observation["probability_block_demoted"])
+        self.assertFalse(observation["probability_execution_blocked"])
+        self.assertNotEqual(observation["phase55_status"], "probability_block")
+        self.assertEqual(observation["phase55_status"], "entry_ready")
+        self.assertLess(observation["sports_probability_size_multiplier"], 1.0)
+
+    def test_dynamic_entry_size_applies_sports_probability_downsize(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA-PROB-SIZE",
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.48,
+            yes_bid=0.46,
+            yes_ask=0.48,
+            no_bid=0.52,
+            no_ask=0.54,
+            yes_top_size=20,
+            no_top_size=20,
+            liquidity=80,
+            sports_probability_size_multiplier=0.50,
+            sports_probability_rank_adjustment=-2.5,
+            sports_probability_action="override",
+            sports_probability_reason="probability_block_demoted_to_cost",
+            sports_probability_edge_after_cost=0.02,
+            sports_probability_fill_probability=0.58,
+            sports_probability_execution_quality_score=58,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            resolved = bot._resolve_dynamic_live_entry_size(
+                q,
+                explicit_size=10,
+                payload={"ticker": q.ticker, "family": q.family, "count": 10, "selected_side": "yes", "selected_price": 0.48},
+                ev_context={"ticker": q.ticker, "family": q.family, "sports_probability_size_multiplier": 0.50},
+                source="unit_probability_size",
+            )
+
+        self.assertGreaterEqual(resolved, 1)
+        self.assertLess(resolved, 10)
+
+    def test_realm_vv_edge_floor_probability_block_becomes_sports_probability_cost(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA-PROB-REALM",
+            "series_ticker": "KXNBA",
+            "status": "open",
+            "title": "NBA game winner",
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA",
+            selected_side="yes",
+            selected_price=0.47,
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=10,
+            no_top_size=10,
+            liquidity=50,
+        )
+        tradeability = {
+            "selected_price_dollars": 0.47,
+            "selected_price": 0.47,
+            "selected_price_cents": 47,
+            "selected_side": "yes",
+            "quote_ready": True,
+            "orderbook_ready": True,
+            "selected_side_has_price": True,
+            "selected_side_has_liquidity": True,
+            "depth_available": True,
+            "tradeable": False,
+            "blocker_class": None,
+            "blocker": None,
+            "blocker_detail": None,
+            "unsafe_price_status": "safe",
+            "spread_classification": "CAUTION_WAIT",
+            "spread_bucket": "wide_but_possible",
+            "spread_cents": 2,
+            "liquidity": 50,
+            "yes_bid_cents": 45,
+            "yes_ask_cents": 47,
+            "no_bid_cents": 53,
+            "no_ask_cents": 55,
+            "yes_top_size": 10,
+            "no_top_size": 10,
+            "edge_after_cost": 0.001,
+            "confidence_score": 0.82,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot.resolve_realm_vv_entry_engine(
+                q,
+                canonical_payload={
+                    "ticker": q.ticker,
+                    "edge_after_cost": 0.001,
+                    "final_edge": 0.001,
+                    "canonical_tradeability": tradeability,
+                },
+                orderbook_context={"ticker": q.ticker, "selected_side": "yes"},
+                decision_context={
+                    "market": market,
+                    "ticker": q.ticker,
+                    "family": "KXNBA",
+                    "profile": "safe",
+                    "selected_side": "yes",
+                    "edge_after_cost": 0.001,
+                    "confidence": 0.82,
+                    "canonical_tradeability": tradeability,
+                    "live_arm_ok": True,
+                },
+            )
+
+        self.assertEqual(result["phase55_status"], "entry_ready")
+        self.assertTrue(result["tradeable"])
+        self.assertIsNone(result["blocker"])
+        self.assertIn("[SPORTS-PROBABILITY-OVERRIDE]", logs.getvalue())
+        self.assertEqual(getattr(q, "sports_probability_action"), "override")
+
+    def test_realm_vv_no_edge_probability_skip_uses_non_legacy_reason(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA-PROB-NOEDGE",
+            "series_ticker": "KXNBA",
+            "status": "open",
+            "title": "NBA player points",
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA",
+            selected_side="no",
+            selected_price=0.96,
+            no_bid=0.94,
+            no_ask=0.96,
+            no_top_size=1,
+            liquidity=0,
+        )
+        tradeability = {
+            "selected_price_dollars": 0.96,
+            "selected_price": 0.96,
+            "selected_price_cents": 96,
+            "selected_side": "no",
+            "quote_ready": True,
+            "orderbook_ready": True,
+            "selected_side_has_price": True,
+            "selected_side_has_liquidity": True,
+            "depth_available": True,
+            "tradeable": False,
+            "blocker_class": None,
+            "blocker": None,
+            "blocker_detail": None,
+            "unsafe_price_status": "safe",
+            "spread_classification": "CAUTION_WAIT",
+            "spread_bucket": "wide_but_possible",
+            "spread_cents": 2,
+            "liquidity": 0,
+            "no_bid_cents": 94,
+            "no_ask_cents": 96,
+            "no_top_size": 1,
+            "edge_after_cost": 0.0,
+            "confidence_score": 0.24,
+            "fill_probability": 0.28,
+            "execution_quality_score": 24,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot.resolve_realm_vv_entry_engine(
+                q,
+                canonical_payload={
+                    "ticker": q.ticker,
+                    "edge_after_cost": 0.0,
+                    "final_edge": 0.0,
+                    "canonical_tradeability": tradeability,
+                },
+                orderbook_context={"ticker": q.ticker, "selected_side": "no"},
+                decision_context={
+                    "market": market,
+                    "ticker": q.ticker,
+                    "family": "KXNBA",
+                    "profile": "safe",
+                    "selected_side": "no",
+                    "edge_after_cost": 0.0,
+                    "confidence": 0.24,
+                    "canonical_tradeability": tradeability,
+                    "live_arm_ok": True,
+                },
+            )
+
+        self.assertFalse(result["tradeable"])
+        self.assertEqual(result["phase55_status"], "insufficient_sports_execution_evidence")
+        self.assertEqual(result["blocker"], "insufficient_sports_execution_evidence")
+        self.assertNotEqual(result["phase55_status"], "probability_block")
+        self.assertIn("[SPORTS-PROBABILITY-BLOCK]", logs.getvalue())
 
     def test_sports_smart_entry_still_blocks_broken_spread_book(self):
         bot = self._make_bot()
