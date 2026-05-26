@@ -6548,6 +6548,14 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
             "sports_execution_quality_score",
             "sports_execution_rank_adjustment",
             "sports_execution_size_multiplier",
+            "sports_ml_probability_context",
+            "sports_ml_base_probability",
+            "sports_ml_probability",
+            "sports_ml_final_probability",
+            "sports_ml_edge_estimate",
+            "sports_ml_rank_adjustment",
+            "sports_ml_size_multiplier",
+            "sports_ml_fallback_used",
         ):
             value = payload.get(field)
             if value is None and q is not None:
@@ -8832,6 +8840,26 @@ def _build_sports_lane_quality(self, item=None, *, market=None):
         )
     sports_execution_rank_adjustment = self.to_float(sports_execution_context.get("rank_adjustment"), 0.0) if sports_execution_context.get("allowed") else 0.0
     sports_execution_size_multiplier = self.to_float(sports_execution_context.get("size_multiplier"), 1.0) if sports_execution_context.get("allowed") else 1.0
+    sports_ml_context = item.get("sports_ml_probability_context") if isinstance(item.get("sports_ml_probability_context"), dict) else {}
+    if not sports_ml_context and q is not None:
+        candidate_context = getattr(q, "sports_ml_probability_context", None)
+        if isinstance(candidate_context, dict):
+            sports_ml_context = candidate_context
+    if not sports_ml_context and hasattr(self, "_get_sports_ml_probability_adjustment"):
+        try:
+            sports_ml_context = self._get_sports_ml_probability_adjustment(
+                item,
+                market=market,
+                family=family,
+                base_probability=max(0.01, min(0.99, selected_price + final_edge)) if selected_price is not None else None,
+                base_edge=final_edge,
+                source="sports_lane_quality",
+                log=False,
+            )
+        except Exception:
+            sports_ml_context = {}
+    sports_ml_rank_adjustment = self.to_float(sports_ml_context.get("rank_adjustment"), 0.0) if isinstance(sports_ml_context, dict) else 0.0
+    sports_ml_size_multiplier = self.to_float(sports_ml_context.get("size_multiplier"), 1.0) if isinstance(sports_ml_context, dict) else 1.0
     weak_reasons = []
     if final_edge <= 0.0:
         weak_reasons.append("no_positive_edge")
@@ -8903,6 +8931,10 @@ def _build_sports_lane_quality(self, item=None, *, market=None):
         adjustment += sports_execution_rank_adjustment
         execution_reason = "sports_execution_quality_boost" if sports_execution_rank_adjustment > 0.0 else "sports_execution_quality_penalty"
         reason = f"{reason}+{execution_reason}" if reason else execution_reason
+    if abs(sports_ml_rank_adjustment) >= 0.01:
+        adjustment += sports_ml_rank_adjustment
+        ml_reason = "sports_ml_probability_boost" if sports_ml_rank_adjustment > 0.0 else "sports_ml_probability_penalty"
+        reason = f"{reason}+{ml_reason}" if reason else ml_reason
     conviction_payload = {
         "ticker": ticker,
         "family": family,
@@ -8926,6 +8958,13 @@ def _build_sports_lane_quality(self, item=None, *, market=None):
         "sports_execution_fill_probability": sports_execution_context.get("fill_probability"),
         "sports_execution_rank_adjustment": round(sports_execution_rank_adjustment, 4),
         "sports_execution_size_multiplier": round(sports_execution_size_multiplier, 4),
+        "sports_ml_base_probability": sports_ml_context.get("base_probability") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_probability": sports_ml_context.get("ml_probability") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_final_probability": sports_ml_context.get("final_probability") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_edge_estimate": sports_ml_context.get("edge_estimate") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_rank_adjustment": round(sports_ml_rank_adjustment, 4),
+        "sports_ml_size_multiplier": round(sports_ml_size_multiplier, 4),
+        "sports_ml_fallback_used": sports_ml_context.get("fallback_used") if isinstance(sports_ml_context, dict) else None,
         "decision": decision,
         "reason": reason,
     }
@@ -8965,6 +9004,14 @@ def _build_sports_lane_quality(self, item=None, *, market=None):
         "sports_execution_quality_score": sports_execution_context.get("execution_quality_score"),
         "sports_execution_rank_adjustment": round(sports_execution_rank_adjustment, 4),
         "sports_execution_size_multiplier": round(sports_execution_size_multiplier, 4),
+        "sports_ml_probability_context": sports_ml_context if isinstance(sports_ml_context, dict) else {},
+        "sports_ml_base_probability": sports_ml_context.get("base_probability") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_probability": sports_ml_context.get("ml_probability") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_final_probability": sports_ml_context.get("final_probability") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_edge_estimate": sports_ml_context.get("edge_estimate") if isinstance(sports_ml_context, dict) else None,
+        "sports_ml_rank_adjustment": round(sports_ml_rank_adjustment, 4),
+        "sports_ml_size_multiplier": round(sports_ml_size_multiplier, 4),
+        "sports_ml_fallback_used": sports_ml_context.get("fallback_used") if isinstance(sports_ml_context, dict) else None,
         "strong": strong,
         "allocation_adjustment": round(adjustment, 4),
         "decision": decision,
@@ -9048,6 +9095,14 @@ def _build_lane_allocation_context(self, item=None, *, market=None):
             "sports_regime_rank_adjustment",
             "sports_regime_size_multiplier",
             "sports_regime_aggression_multiplier",
+            "sports_ml_probability_context",
+            "sports_ml_base_probability",
+            "sports_ml_probability",
+            "sports_ml_final_probability",
+            "sports_ml_edge_estimate",
+            "sports_ml_rank_adjustment",
+            "sports_ml_size_multiplier",
+            "sports_ml_fallback_used",
         ):
             try:
                 setattr(q, attr_name, context.get(attr_name))
@@ -10104,6 +10159,14 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
         "sports_probability_edge_after_cost",
         "sports_probability_fill_probability",
         "sports_probability_execution_quality_score",
+        "sports_ml_probability_context",
+        "sports_ml_base_probability",
+        "sports_ml_probability",
+        "sports_ml_final_probability",
+        "sports_ml_edge_estimate",
+        "sports_ml_rank_adjustment",
+        "sports_ml_size_multiplier",
+        "sports_ml_fallback_used",
         "sports_graph_context",
         "sports_graph_game_id",
         "sports_graph_role",
@@ -10554,6 +10617,47 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
                 marker=("SPORTS-PROBABILITY-SIZE-DYNAMIC", context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None), int(time.time() // 180)),
                 cooldown_seconds=180.0,
             )
+    sports_ml_multiplier = self.to_float(
+        context.get("sports_ml_size_multiplier"),
+        self.to_float(payload.get("sports_ml_size_multiplier"), None),
+    )
+    if (
+        sports_ml_multiplier is not None
+        and sports_ml_multiplier > 0.0
+        and abs(sports_ml_multiplier - 1.0) >= 0.01
+        and unified_multiplier is None
+    ):
+        before_ml_size = chosen
+        ml_multiplier = max(0.75, min(1.15, float(sports_ml_multiplier)))
+        chosen = max(1, min(hard_max, int(round(chosen * ml_multiplier))))
+        if chosen != before_ml_size:
+            chosen_label = "sports_ml_probability_size_adjustment"
+            context["sports_ml_size_multiplier_applied"] = round(ml_multiplier, 4)
+            try:
+                print(
+                    "[SPORTS-ML] "
+                    + json.dumps(
+                        {
+                            "source": source or "dynamic_live_entry_size",
+                            "ticker": context.get("ticker") or payload.get("ticker") or getattr(q, "ticker", None),
+                            "family": context.get("family") or payload.get("family") or getattr(q, "family", None),
+                            "requested_size": before_ml_size,
+                            "adjusted_size": chosen,
+                            "base_probability": context.get("sports_ml_base_probability") or payload.get("sports_ml_base_probability"),
+                            "ml_probability": context.get("sports_ml_probability") or payload.get("sports_ml_probability"),
+                            "final_probability": context.get("sports_ml_final_probability") or payload.get("sports_ml_final_probability"),
+                            "edge_estimate": context.get("sports_ml_edge_estimate") or payload.get("sports_ml_edge_estimate"),
+                            "rank_adjustment": context.get("sports_ml_rank_adjustment") or payload.get("sports_ml_rank_adjustment"),
+                            "sports_ml_size_multiplier": round(ml_multiplier, 4),
+                            "fallback_used": context.get("sports_ml_fallback_used") or payload.get("sports_ml_fallback_used"),
+                            "reason": "sports_ml_dynamic_size_adjustment",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
     if (
         sports_graph_multiplier is not None
         and sports_graph_multiplier > 0.0
@@ -20223,6 +20327,24 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
         allocation.get("sports_execution_quality_score"),
         self.to_float(sports_execution_context.get("execution_quality_score"), None),
     )
+    sports_ml_context = allocation.get("sports_ml_probability_context") if isinstance(allocation.get("sports_ml_probability_context"), dict) else {}
+    sports_ml_rank_adjustment = self.to_float(
+        allocation.get("sports_ml_rank_adjustment"),
+        self.to_float(sports_ml_context.get("rank_adjustment"), 0.0),
+    ) or 0.0
+    sports_ml_size_multiplier = self.to_float(
+        allocation.get("sports_ml_size_multiplier"),
+        self.to_float(sports_ml_context.get("size_multiplier"), 1.0),
+    ) or 1.0
+    sports_ml_final_probability = self.to_float(
+        allocation.get("sports_ml_final_probability"),
+        self.to_float(sports_ml_context.get("final_probability"), None),
+    )
+    sports_ml_edge_estimate = self.to_float(
+        allocation.get("sports_ml_edge_estimate"),
+        self.to_float(sports_ml_context.get("edge_estimate"), None),
+    )
+    sports_ml_fallback_used = bool(allocation.get("sports_ml_fallback_used") or sports_ml_context.get("fallback_used"))
     sports_graph_context = allocation.get("sports_graph_context") if isinstance(allocation.get("sports_graph_context"), dict) else {}
     sports_graph_rank_adjustment = self.to_float(
         allocation.get("sports_graph_rank_adjustment"),
@@ -20290,6 +20412,7 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     sports_live_regime_component = sports_regime_rank_adjustment if lane == "SPORTS" else 0.0
     sports_live_spread_component = sports_spread_rank_adjustment if lane == "SPORTS" else 0.0
     sports_live_execution_component = sports_execution_rank_adjustment if lane == "SPORTS" else 0.0
+    sports_live_ml_component = sports_ml_rank_adjustment if lane == "SPORTS" else 0.0
     sports_live_graph_component = sports_graph_rank_adjustment if lane == "SPORTS" else 0.0
     memory_component = max(
         -10.0,
@@ -20305,6 +20428,7 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     regime_component = max(-6.0, min(8.0, sports_live_regime_component))
     sports_spread_component = max(-8.0, min(1.0, sports_live_spread_component))
     sports_execution_component = max(-4.0, min(4.5, sports_live_execution_component))
+    sports_ml_component = max(-4.0, min(4.0, sports_live_ml_component))
     graph_component = max(-5.0, min(7.0, sports_live_graph_component))
     confidence_component = min(8.0, confidence * 0.08)
     target_component = 0.0
@@ -20322,7 +20446,7 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     duration = self._build_capital_duration_context(lane=lane, allocation=allocation, item=item, market=market)
     capital_lock_penalty = self.to_float(duration.get("capital_lock_penalty"), 0.0) or 0.0
     turnover_boost = self.to_float(duration.get("capital_turnover_boost"), 0.0) or 0.0
-    unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + sports_execution_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
+    unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + sports_execution_component + sports_ml_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
     if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
         unified_score -= 30.0
     unified_score = round(max(0.0, min(100.0, unified_score)), 4)
@@ -20428,6 +20552,35 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
                 marker=("SPORTS-FILL-UNIFIED", source, ticker, int(time.time() // 180)),
                 cooldown_seconds=180.0,
             )
+    if lane == "SPORTS" and sports_ml_size_multiplier > 0.0:
+        pre_ml_size_multiplier = size_multiplier
+        size_multiplier = max(0.35, min(1.65, size_multiplier * max(0.75, min(1.15, sports_ml_size_multiplier))))
+        if abs(sports_ml_size_multiplier - 1.0) >= 0.01:
+            try:
+                print(
+                    "[SPORTS-ML] "
+                    + json.dumps(
+                        {
+                            "source": source,
+                            "ticker": ticker,
+                            "family": family,
+                            "base_probability": sports_ml_context.get("base_probability"),
+                            "ml_probability": sports_ml_context.get("ml_probability"),
+                            "final_probability": self._safe_round(sports_ml_final_probability, 4, None),
+                            "edge_estimate": self._safe_round(sports_ml_edge_estimate, 5, None),
+                            "rank_adjustment": round(sports_ml_rank_adjustment, 4),
+                            "base_size_multiplier": round(pre_ml_size_multiplier, 4),
+                            "sports_ml_size_multiplier": round(sports_ml_size_multiplier, 4),
+                            "final_size_multiplier": round(size_multiplier, 4),
+                            "fallback_used": sports_ml_fallback_used,
+                            "reason": sports_ml_context.get("reason") or "sports_ml_size_adaptation",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
     if lane == "SPORTS" and sports_graph_size_multiplier > 0.0:
         pre_graph_size_multiplier = size_multiplier
         size_multiplier = max(0.35, min(1.65, size_multiplier * sports_graph_size_multiplier))
@@ -20466,6 +20619,8 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
         reasons.append("sports_spread_adaptive_penalty")
     if lane == "SPORTS" and sports_execution_context.get("has_signal"):
         reasons.append("sports_execution_quality")
+    if lane == "SPORTS" and sports_ml_context and not sports_ml_fallback_used:
+        reasons.append("sports_ml_probability")
     if lane == "SPORTS" and sports_graph_context:
         reasons.append("sports_graph_lag" if sports_graph_lag_detected else "sports_graph_relationship")
     if duration.get("fast_turnover_boost"):
@@ -20513,6 +20668,14 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
         "sports_execution_fill_probability": self._safe_round(sports_execution_fill_probability, 4, None) if lane == "SPORTS" else None,
         "sports_execution_quality_score": self._safe_round(sports_execution_quality_score, 4, None) if lane == "SPORTS" else None,
         "sports_execution_context": sports_execution_context if lane == "SPORTS" else {},
+        "sports_ml_probability_context": sports_ml_context if lane == "SPORTS" else {},
+        "sports_ml_base_probability": sports_ml_context.get("base_probability") if lane == "SPORTS" else None,
+        "sports_ml_probability": sports_ml_context.get("ml_probability") if lane == "SPORTS" else None,
+        "sports_ml_final_probability": self._safe_round(sports_ml_final_probability, 4, None) if lane == "SPORTS" else None,
+        "sports_ml_edge_estimate": self._safe_round(sports_ml_edge_estimate, 5, None) if lane == "SPORTS" else None,
+        "sports_ml_rank_adjustment": round(sports_ml_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
+        "sports_ml_size_multiplier": round(sports_ml_size_multiplier, 4) if lane == "SPORTS" else None,
+        "sports_ml_fallback_used": sports_ml_fallback_used if lane == "SPORTS" else None,
         "sports_graph_rank_adjustment": round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else 0.0,
         "sports_graph_size_multiplier": round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None,
         "sports_graph_role": sports_graph_role if lane == "SPORTS" else None,
@@ -20568,6 +20731,14 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
             ("sports_execution_size_multiplier", round(sports_execution_size_multiplier, 4) if lane == "SPORTS" else None),
             ("sports_execution_fill_probability", self._safe_round(sports_execution_fill_probability, 4, None) if lane == "SPORTS" else None),
             ("sports_execution_quality_score", self._safe_round(sports_execution_quality_score, 4, None) if lane == "SPORTS" else None),
+            ("sports_ml_probability_context", sports_ml_context if lane == "SPORTS" else None),
+            ("sports_ml_base_probability", sports_ml_context.get("base_probability") if lane == "SPORTS" else None),
+            ("sports_ml_probability", sports_ml_context.get("ml_probability") if lane == "SPORTS" else None),
+            ("sports_ml_final_probability", self._safe_round(sports_ml_final_probability, 4, None) if lane == "SPORTS" else None),
+            ("sports_ml_edge_estimate", self._safe_round(sports_ml_edge_estimate, 5, None) if lane == "SPORTS" else None),
+            ("sports_ml_rank_adjustment", round(sports_ml_rank_adjustment, 4) if lane == "SPORTS" else None),
+            ("sports_ml_size_multiplier", round(sports_ml_size_multiplier, 4) if lane == "SPORTS" else None),
+            ("sports_ml_fallback_used", sports_ml_fallback_used if lane == "SPORTS" else None),
             ("sports_graph_context", sports_graph_context if lane == "SPORTS" else None),
             ("sports_graph_rank_adjustment", round(sports_graph_rank_adjustment, 4) if lane == "SPORTS" else None),
             ("sports_graph_size_multiplier", round(sports_graph_size_multiplier, 4) if lane == "SPORTS" else None),

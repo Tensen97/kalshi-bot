@@ -70,6 +70,11 @@ except Exception:
     ProbabilityEngine = None
 
 try:
+    from probability.sports_ml import get_sports_ml_probability_adjustment as sports_ml_probability_adjustment
+except Exception:
+    sports_ml_probability_adjustment = None
+
+try:
     from risk.capital_engine import CapitalEngine
 except Exception:
     CapitalEngine = None
@@ -4877,6 +4882,37 @@ class KalshiSniperBot:
     def _sports_probability_cost_decision(self, *args, **kwargs):
         return _call_sports_live_intelligence("_sports_probability_cost_decision", self, *args, **kwargs)
 
+    def _get_sports_ml_probability_adjustment(self, *args, **kwargs):
+        if sports_ml_probability_adjustment is None:
+            return {"allowed": True, "hard_reject": False, "fallback_used": True, "rank_adjustment": 0.0, "size_multiplier": 1.0, "reason": "module_unavailable"}
+        context = sports_ml_probability_adjustment(*args, **kwargs)
+        q = None
+        item = args[0] if args else kwargs.get("candidate")
+        if isinstance(item, (list, tuple)) and len(item) > 1:
+            q = item[1]
+        elif isinstance(item, dict):
+            q = item.get("q") or item.get("candidate")
+        else:
+            q = item
+        if q is not None and isinstance(context, dict):
+            for attr_name, attr_value in (
+                ("sports_ml_probability_context", context),
+                ("sports_ml_base_probability", context.get("base_probability")),
+                ("sports_ml_probability", context.get("ml_probability")),
+                ("sports_ml_final_probability", context.get("final_probability")),
+                ("sports_ml_edge_estimate", context.get("edge_estimate")),
+                ("sports_ml_rank_adjustment", context.get("rank_adjustment")),
+                ("sports_ml_size_multiplier", context.get("size_multiplier")),
+                ("sports_ml_fallback_used", context.get("fallback_used")),
+            ):
+                if attr_value is None:
+                    continue
+                try:
+                    setattr(q, attr_name, attr_value)
+                except Exception:
+                    pass
+        return context
+
     def _sports_spread_price_value(self, *args, **kwargs):
         return _call_sports_live_intelligence("_sports_spread_price_value", self, *args, **kwargs)
 
@@ -5617,6 +5653,8 @@ class KalshiSniperBot:
             sports_graph_context = sports_graph_context if isinstance(sports_graph_context, dict) else {}
             sports_ladder_context = self._learning_archive_value(sources, "sports_ladder_context")
             sports_ladder_context = sports_ladder_context if isinstance(sports_ladder_context, dict) else {}
+            sports_ml_context = self._learning_archive_value(sources, "sports_ml_probability_context")
+            sports_ml_context = sports_ml_context if isinstance(sports_ml_context, dict) else {}
             price = self._learning_archive_float(
                 self._learning_archive_value(
                     sources,
@@ -5719,6 +5757,35 @@ class KalshiSniperBot:
                 "sports_ladder_size_cap": self._learning_archive_float(
                     self._learning_archive_value(sources, "sports_ladder_size_cap")
                     or sports_ladder_context.get("size_cap")
+                ),
+                "sports_ml_probability_context": sports_ml_context,
+                "sports_ml_base_probability": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ml_base_probability")
+                    or sports_ml_context.get("base_probability")
+                ),
+                "sports_ml_probability": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ml_probability")
+                    or sports_ml_context.get("ml_probability")
+                ),
+                "sports_ml_final_probability": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ml_final_probability")
+                    or sports_ml_context.get("final_probability")
+                ),
+                "sports_ml_edge_estimate": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ml_edge_estimate")
+                    or sports_ml_context.get("edge_estimate")
+                ),
+                "sports_ml_rank_adjustment": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ml_rank_adjustment")
+                    or sports_ml_context.get("rank_adjustment")
+                ),
+                "sports_ml_size_multiplier": self._learning_archive_float(
+                    self._learning_archive_value(sources, "sports_ml_size_multiplier")
+                    or sports_ml_context.get("size_multiplier")
+                ),
+                "sports_ml_fallback_used": bool(
+                    self._learning_archive_value(sources, "sports_ml_fallback_used")
+                    or sports_ml_context.get("fallback_used")
                 ),
             }
             if event_type in {"candidate_seen", "trade_opened"}:
@@ -48664,7 +48731,7 @@ class KalshiSniperBot:
                 selected_quote_for_submission,
                 size=ev_contract_size,
                 lane="aggressive_positive_edge",
-                payload_override=aggressive_fastpath_payload_override,
+                payload_override=aggressive_fastpath_payload_override or payload_preview,
             )
             submit_reason = str(result.get("reason") or "unknown")
             self._emit_aion_final_execution_truth(

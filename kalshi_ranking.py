@@ -821,6 +821,18 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             structural_edge_context=structural_edge_context,
             source=source,
         )
+        if hasattr(bot, "_get_sports_ml_probability_adjustment"):
+            ml_probability_context = bot._get_sports_ml_probability_adjustment(
+                item,
+                market=market,
+                family=family,
+                base_probability=ev_context.get("estimated_win_probability") or ev_context.get("calibrated_probability"),
+                base_edge=ev_context.get("ev_edge") or ev_context.get("expected_roi") or ev_context.get("expected_value"),
+                source=source,
+                log=True,
+            )
+        else:
+            ml_probability_context = {"rank_adjustment": 0.0, "size_multiplier": 1.0}
         momentum_context = get_momentum_rank_adjustment(
             bot,
             item,
@@ -841,6 +853,7 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             + bot.to_float(elite_signal_context.get("boost"), 0.0)
             + bot.to_float(sports_edge_context.get("boost"), 0.0)
             + bot._ev_rank_adjustment(ev_context)
+            + bot.to_float(ml_probability_context.get("rank_adjustment"), 0.0)
             + bot.to_float(momentum_context.get("adjustment"), 0.0)
         )
         decorated.append((total_score, -index, item))
