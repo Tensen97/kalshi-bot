@@ -331,6 +331,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "SPORTS-GRAPH-CONFLICT",
     "SPORTS-SPREAD",
     "SPORTS-SPREAD-ADAPT",
+    "SPORTS-SPREAD-BLOCK",
+    "SPORTS-SPREAD-COST",
+    "SPORTS-SPREAD-DOWNSIZE",
+    "SPORTS-SPREAD-OVERRIDE",
     "SPORTS-SPREAD-SKIP",
     "SPORTS-SPREAD-PASS",
     "SPORTS-SPREAD-EXECUTE",
@@ -8902,8 +8906,27 @@ class KalshiSniperBot:
         elif spread_value <= adaptive_limit:
             reason = "adaptive_wide_spread_tolerance"
         else:
-            hard_reject = True
-            reason = "spread_above_adaptive_tolerance"
+            survivable_wide_spread = bool(
+                selected_price_ready
+                and book_signal
+                and not boundary_book
+                and spread_value <= absurd_limit
+                and (
+                    edge_value > 0.0
+                    or thesis_confidence >= 70.0
+                    or sports_regime in {"favorable", "hot"}
+                    or sports_momentum_class in {"strong_positive", "moderate_positive"}
+                    or sports_memory_rank > 0.0
+                    or ladder_role in {"primary", "secondary", "live"}
+                )
+            )
+            if survivable_wide_spread:
+                reason = "wide_spread_demoted_to_execution_cost"
+                adaptive_reasons.append("wide_spread_cost_not_veto")
+                adaptive_limit = max(adaptive_limit, min(absurd_limit, spread_value))
+            else:
+                hard_reject = True
+                reason = "spread_above_adaptive_tolerance"
         allowed = bool(not hard_reject)
         excess_ratio = 0.0
         if spread_value is not None and adaptive_limit > strict_threshold:
@@ -8969,6 +8992,40 @@ class KalshiSniperBot:
                     "SPORTS-SPREAD",
                     result,
                     marker=("SPORTS-SPREAD", context, ticker or family, marker_bucket),
+                )
+            if allowed and spread_value is not None and spread_value > strict_threshold:
+                cost_tag = "SPORTS-SPREAD-OVERRIDE" if reason == "wide_spread_demoted_to_execution_cost" else "SPORTS-SPREAD-COST"
+                self._emit_sports_spread_log(
+                    cost_tag,
+                    {
+                        **result,
+                        "old_threshold": result.get("strict_threshold"),
+                        "edge_after_cost": result.get("edge_after_cost"),
+                        "fill_probability": quote_diag.get("selected_fill_probability") or quote_diag.get("fill_probability"),
+                        "execution_action": "cost_downsize_not_block",
+                    },
+                    marker=(cost_tag, context, ticker or family, reason, marker_bucket),
+                )
+                if result.get("size_multiplier") is not None and self.to_float(result.get("size_multiplier"), 1.0) < 1.0:
+                    self._emit_sports_spread_log(
+                        "SPORTS-SPREAD-DOWNSIZE",
+                        {
+                            **result,
+                            "old_threshold": result.get("strict_threshold"),
+                            "size_multiplier": result.get("size_multiplier"),
+                            "execution_action": "trade_smaller_for_spread_cost",
+                        },
+                        marker=("SPORTS-SPREAD-DOWNSIZE", context, ticker or family, marker_bucket),
+                    )
+            elif not allowed:
+                self._emit_sports_spread_log(
+                    "SPORTS-SPREAD-BLOCK",
+                    {
+                        **result,
+                        "old_threshold": result.get("strict_threshold"),
+                        "execution_action": "true_book_or_price_block",
+                    },
+                    marker=("SPORTS-SPREAD-BLOCK", context, ticker or family, reason, marker_bucket),
                 )
         return result
 
@@ -30386,6 +30443,7 @@ class KalshiSniperBot:
         recent_delta = None
         high_prob_ok = False
         adaptive_allow = False
+        sports_smart_spread_context = None
         recent_prices = []
         session_adjustment = self._get_live_session_entry_adjustment(adaptive_entry=False, borderline=False)
         price_source_fields_checked = [
@@ -30535,7 +30593,8 @@ class KalshiSniperBot:
                 )
             high_prob_ok = bool(spread <= high_prob_spread_limit)
             timing_history_key = self._build_phase55_timing_history_key(market or {"ticker": ticker}, q, family=family)
-            rolling_history = list(self.phase55_rolling_price_history.get(str(timing_history_key or "").strip(), []))
+            rolling_history_map = getattr(self, "phase55_rolling_price_history", {})
+            rolling_history = list((rolling_history_map if isinstance(rolling_history_map, dict) else {}).get(str(timing_history_key or "").strip(), []))
             recent_prices = [float(price) for price in rolling_history[-4:] if price is not None]
             if len(recent_prices) >= 2:
                 recent_delta = recent_prices[-1] - recent_prices[0]
@@ -30545,7 +30604,46 @@ class KalshiSniperBot:
                 edge = "good"
                 reason = "junk_bond_neutral_momentum" if recent_delta is None else "junk_bond"
             elif not high_prob_ok:
-                reason = "spread_too_wide"
+                if self.is_sports_family(family, ticker=ticker):
+                    sports_smart_spread_context = self._sports_adaptive_spread_decision(
+                        market or {"ticker": ticker, "series_ticker": family},
+                        q=q,
+                        family=family,
+                        spread=spread,
+                        liquidity=payload.get("liquidity") or payload.get("liquidity_depth") or getattr(q, "liquidity", None),
+                        quote_diag={
+                            "ticker": ticker,
+                            "family": family,
+                            "selected_side": selected_side,
+                            "selected_price": selected_price_value,
+                            "selected_price_dollars": selected_price_value,
+                            "selected_price_cents": selected_price_cents,
+                            "yes_bid": yes_bid,
+                            "yes_ask": yes_ask,
+                            "no_bid": no_bid,
+                            "no_ask": no_ask,
+                            "yes_top_size": payload.get("yes_top_size") or getattr(q, "yes_top_size", None),
+                            "no_top_size": payload.get("no_top_size") or getattr(q, "no_top_size", None),
+                            "liquidity": payload.get("liquidity") or payload.get("liquidity_depth") or getattr(q, "liquidity", None),
+                            "edge_after_cost": payload.get("edge_after_cost") or payload.get("sports_edge_after_cost") or getattr(q, "edge_after_cost", None),
+                            "sports_edge_after_cost": payload.get("sports_edge_after_cost") or payload.get("edge_after_cost") or getattr(q, "sports_edge_after_cost", None),
+                            "selected_fill_probability": payload.get("selected_fill_probability") or getattr(q, "selected_fill_probability", None),
+                            "game_thesis_confidence": payload.get("game_thesis_confidence") or getattr(q, "game_thesis_confidence", None),
+                            "sports_regime": payload.get("sports_regime") or getattr(q, "sports_regime", None),
+                            "sports_momentum_classification": payload.get("sports_momentum_classification") or getattr(q, "sports_momentum_classification", None),
+                            "sports_ladder_role": payload.get("sports_ladder_role") or getattr(q, "sports_ladder_role", None),
+                        },
+                        context="smart_entry_gate",
+                    )
+                    if sports_smart_spread_context.get("allowed"):
+                        allowed = True
+                        adaptive_allow = True
+                        edge = "good"
+                        reason = "sports_wide_spread_cost_smart_entry_pass"
+                    else:
+                        reason = str(sports_smart_spread_context.get("reason") or "sports_spread_book_block")
+                else:
+                    reason = "spread_too_wide"
             else:
                 adaptive_allow, adaptive_details = self._should_adaptive_allow_momentum_warning(
                     ticker,
@@ -30631,6 +30729,7 @@ class KalshiSniperBot:
             "spread": spread,
             "spread_source": spread_source,
             "spread_missing_fields": spread_missing_fields,
+            "sports_spread_context": sports_smart_spread_context,
             "yes_ask": yes_ask,
             "yes_bid": yes_bid,
             "no_ask": no_ask,
@@ -30650,7 +30749,8 @@ class KalshiSniperBot:
         if yes_ask is None or yes_ask < KALSHI_CONTRACT_MIN_PRICE or yes_ask > KALSHI_CONTRACT_MAX_PRICE or spread is None or spread < 0 or spread > 0.045:
             return False, {"ticker": ticker, "family": family, "yes_ask": yes_ask, "spread": spread, "recent_delta": recent_delta}
         timing_history_key = self._build_phase55_timing_history_key(market, q, family=family)
-        rolling_history = list(self.phase55_rolling_price_history.get(str(timing_history_key or "").strip(), []))
+        rolling_history_map = getattr(self, "phase55_rolling_price_history", {})
+        rolling_history = list((rolling_history_map if isinstance(rolling_history_map, dict) else {}).get(str(timing_history_key or "").strip(), []))
         recent_prices = [float(price) for price in rolling_history[-4:] if price is not None]
         if len(recent_prices) >= 2:
             recent_delta = recent_prices[-1] - recent_prices[0]
@@ -54781,6 +54881,79 @@ class KalshiSniperBot:
             or decision_spread_info.get("soft_spread_relief")
             or decision_spread_info.get("final_submit_allowed_by_realm_vv")
         )
+        sports_spread_cost_context = {}
+        sports_spread_cost_demoted = False
+        sports_spread_true_block = False
+        is_sports_decision_family = bool(self._is_sports_market_or_family(family) and family != "KXBTC15M")
+        if is_sports_decision_family:
+            sports_spread_quote_diag = dict(sports_threshold_quote_diag or {})
+            for diag_key, diag_value in (
+                ("selected_side", getattr(q, "selected_side", None) or getattr(q, "side", None)),
+                ("selected_price", getattr(q, "selected_price", None)),
+                ("yes_bid", getattr(q, "yes_bid", None)),
+                ("yes_ask", getattr(q, "yes_ask", None)),
+                ("no_bid", getattr(q, "no_bid", None)),
+                ("no_ask", getattr(q, "no_ask", None)),
+                ("yes_top_size", getattr(q, "yes_top_size", None)),
+                ("no_top_size", getattr(q, "no_top_size", None)),
+                ("edge_after_cost", getattr(q, "edge_after_cost", None) or market.get("edge_after_cost") if isinstance(market, dict) else None),
+                ("sports_edge_after_cost", getattr(q, "sports_edge_after_cost", None) or market.get("sports_edge_after_cost") if isinstance(market, dict) else None),
+                ("game_thesis_confidence", getattr(q, "game_thesis_confidence", None) or market.get("game_thesis_confidence") if isinstance(market, dict) else None),
+                ("sports_regime", getattr(q, "sports_regime", None) or market.get("sports_regime") if isinstance(market, dict) else None),
+                ("sports_momentum_classification", getattr(q, "sports_momentum_classification", None) or market.get("sports_momentum_classification") if isinstance(market, dict) else None),
+                ("sports_memory_rank_adjustment", getattr(q, "sports_memory_rank_adjustment", None) or market.get("sports_memory_rank_adjustment") if isinstance(market, dict) else None),
+                ("sports_memory_size_multiplier", getattr(q, "sports_memory_size_multiplier", None) or market.get("sports_memory_size_multiplier") if isinstance(market, dict) else None),
+                ("sports_ladder_role", getattr(q, "sports_ladder_role", None) or market.get("sports_ladder_role") if isinstance(market, dict) else None),
+            ):
+                if diag_value not in (None, "", [], {}):
+                    sports_spread_quote_diag.setdefault(diag_key, diag_value)
+            sports_spread_cost_context = self._sports_adaptive_spread_decision(
+                market,
+                q=q,
+                family=family,
+                spread=spread,
+                liquidity=getattr(q, "liquidity", None),
+                quote_diag=sports_spread_quote_diag,
+                context="final_decision_wide_spread",
+                emit_log=True,
+            )
+            debug_context["sports_spread_cost_context"] = sports_spread_cost_context
+            debug_context["sports_spread_rank_adjustment"] = sports_spread_cost_context.get("rank_adjustment")
+            debug_context["sports_spread_size_multiplier"] = sports_spread_cost_context.get("size_multiplier")
+            for attr_name, attr_value in (
+                ("sports_spread_context", sports_spread_cost_context),
+                ("sports_spread_rank_adjustment", sports_spread_cost_context.get("rank_adjustment")),
+                ("sports_spread_size_multiplier", sports_spread_cost_context.get("size_multiplier")),
+                ("sports_spread_threshold", sports_spread_cost_context.get("threshold_used")),
+            ):
+                if attr_value is None:
+                    continue
+                try:
+                    setattr(q, attr_name, attr_value)
+                except Exception:
+                    pass
+            sports_spread_cost_demoted = bool(
+                spread is not None
+                and spread >= 0.0
+                and self.to_float(spread, 0.0) > self.to_float(decision_spread_limit, MAX_ENTRY_SPREAD)
+                and sports_spread_cost_context.get("allowed")
+            )
+            sports_spread_true_block = bool(
+                spread is not None
+                and self.to_float(spread, 0.0) > self.to_float(decision_spread_limit, MAX_ENTRY_SPREAD)
+                and not sports_spread_cost_context.get("allowed")
+                and sports_spread_cost_context.get("hard_reject")
+            )
+            if sports_spread_cost_demoted:
+                decision_spread_relief = True
+                decision_spread_limit = max(
+                    self.to_float(decision_spread_limit, MAX_ENTRY_SPREAD),
+                    self.to_float(sports_spread_cost_context.get("threshold_used"), decision_spread_limit),
+                    self.to_float(spread, decision_spread_limit),
+                )
+                debug_context["wide_spread_demoted_to_cost"] = True
+            elif sports_spread_true_block:
+                debug_context["wide_spread_true_block_reason"] = sports_spread_cost_context.get("reason")
         early_crypto_ladder_candidate = bool(
             self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q)
         )
@@ -54794,7 +54967,23 @@ class KalshiSniperBot:
         )
         if spread < 0 or (spread > decision_spread_limit and not decision_spread_relief and not crypto_spread_deferred_to_lane_gate):
             print("[LIVE-SELECT-DEBUG] final_spread_reject_reason=wide_spread")
-            debug_context["hard_reject_reason"] = "wide_spread"
+            debug_context["hard_reject_reason"] = (
+                str(sports_spread_cost_context.get("reason") or "wide_spread")
+                if sports_spread_true_block
+                else "wide_spread"
+            )
+            if sports_spread_true_block:
+                self._emit_sports_spread_log(
+                    "SPORTS-SPREAD-BLOCK",
+                    {
+                        **sports_spread_cost_context,
+                        "old_threshold": round(float(MAX_ENTRY_SPREAD), 4),
+                        "edge_after_cost": sports_spread_cost_context.get("edge_after_cost"),
+                        "final_decision_state": "SKIP",
+                        "exact_blocker": debug_context["hard_reject_reason"],
+                    },
+                    marker=("SPORTS-SPREAD-BLOCK-FINAL", ticker, sports_spread_cost_context.get("reason"), int(time.time() // 180)),
+                )
             return {
                 "decision": "SKIP",
                 "decision_reason": "hard_filter_reject",
@@ -55341,6 +55530,25 @@ class KalshiSniperBot:
             + elite_signal_boost
             + sports_edge_rank_boost
         )
+        sports_spread_cost_rank_adjustment = (
+            self.to_float(sports_spread_cost_context.get("rank_adjustment"), 0.0)
+            if isinstance(sports_spread_cost_context, dict) and sports_spread_cost_context.get("allowed")
+            else 0.0
+        )
+        if sports_spread_cost_rank_adjustment:
+            pre_session_original_score = round(pre_session_original_score + sports_spread_cost_rank_adjustment, 4)
+            self._emit_sports_spread_log(
+                "SPORTS-SPREAD-COST",
+                {
+                    **sports_spread_cost_context,
+                    "old_threshold": sports_spread_cost_context.get("strict_threshold"),
+                    "edge_after_cost": sports_spread_cost_context.get("edge_after_cost"),
+                    "fill_probability": sports_spread_cost_context.get("fill_probability"),
+                    "score_effect": round(sports_spread_cost_rank_adjustment, 4),
+                    "execution_action": "spread_cost_rank_adjustment",
+                },
+                marker=("SPORTS-SPREAD-COST-SCORE", ticker, int(time.time() // 180)),
+            )
         pre_session_total_score = pre_session_original_score + momentum_adjustment
         if self.get_market_discovery_category(family) == "sports":
             print(
@@ -55412,6 +55620,12 @@ class KalshiSniperBot:
             "sports_priority": round(sports_priority_score, 4),
             "sports_edge": round(sports_edge_score, 4),
             "sports_edge_rank_boost": round(sports_edge_rank_boost, 4),
+            "sports_spread_cost": round(sports_spread_cost_rank_adjustment, 4),
+            "sports_spread_size_multiplier": (
+                round(self.to_float(sports_spread_cost_context.get("size_multiplier"), 1.0), 4)
+                if isinstance(sports_spread_cost_context, dict) and sports_spread_cost_context
+                else None
+            ),
             "sports_edge_tags": list(sports_edge_rank_context.get("tags") or []) if isinstance(sports_edge_rank_context, dict) else [],
             "sports_momentum": round(momentum_adjustment, 4),
             "family_performance": round(family_perf_adjustment, 4),
@@ -55526,6 +55740,71 @@ class KalshiSniperBot:
             0.0,
             self.to_float(aggression_settings.get("effective_edge_threshold"), AION_SPORTS_MIN_EDGE_AFTER_COST),
         )
+        sports_spread_execution_context = {}
+        sports_spread_fill_probability = None
+        sports_spread_execution_score = None
+        if sports_spread_cost_demoted and self._is_sports_market_or_family(family):
+            execution_quote_diag = dict(sports_threshold_quote_diag or {})
+            execution_quote_diag.update(
+                {
+                    "selected_side": getattr(q, "selected_side", None) or getattr(q, "side", None),
+                    "selected_price": getattr(q, "selected_price", None),
+                    "yes_bid": getattr(q, "yes_bid", None),
+                    "yes_ask": getattr(q, "yes_ask", None),
+                    "no_bid": getattr(q, "no_bid", None),
+                    "no_ask": getattr(q, "no_ask", None),
+                    "yes_top_size": getattr(q, "yes_top_size", None),
+                    "no_top_size": getattr(q, "no_top_size", None),
+                    "edge_after_cost": sports_edge_after_cost,
+                    "sports_edge_after_cost": sports_edge_after_cost,
+                }
+            )
+            sports_spread_execution_context = self._sports_execution_quality_decision(
+                market,
+                q=q,
+                family=family,
+                spread=spread,
+                quote_diag=execution_quote_diag,
+                context="final_decision_spread_cost",
+                emit_log=True,
+            )
+            sports_spread_fill_probability = self.to_float(sports_spread_execution_context.get("fill_probability"), None)
+            sports_spread_execution_score = self.to_float(sports_spread_execution_context.get("execution_quality_score"), None)
+            debug_context["sports_spread_execution_context"] = sports_spread_execution_context
+        sports_wide_spread_cost_override = bool(
+            sports_spread_cost_demoted
+            and self._is_sports_market_or_family(family)
+            and market
+            and orderbook_ok
+            and sports_quote_ready
+            and sports_edge_after_cost is not None
+            and sports_edge_after_cost > 0.0
+            and (
+                sports_edge_after_cost >= sports_positive_edge_min
+                or self.to_float(sports_spread_execution_score, 0.0) >= 55.0
+                or self.to_float(sports_spread_fill_probability, 0.0) >= 0.45
+            )
+            and decision_reason in {"low_score", "timing_penalty", "poor_spread_score", "edge_below_threshold", "unsafe_spread", "spread_wait", "caution_wide_spread", "tradeability_blocked", "hard_filter_reject"}
+            and debug_context.get("hard_reject_reason") not in {"low_liquidity_score", "structurally_illiquid"}
+        )
+        if sports_wide_spread_cost_override:
+            decision = "BUY"
+            decision_reason = "sports_wide_spread_cost_override"
+            debug_context["wide_spread_final_veto_removed"] = True
+            self._emit_sports_spread_log(
+                "SPORTS-SPREAD-OVERRIDE",
+                {
+                    **sports_spread_cost_context,
+                    "old_threshold": sports_spread_cost_context.get("strict_threshold"),
+                    "edge_after_cost": round(self.to_float(sports_edge_after_cost, 0.0), 4),
+                    "fill_probability": None if sports_spread_fill_probability is None else round(sports_spread_fill_probability, 4),
+                    "execution_quality_score": None if sports_spread_execution_score is None else round(sports_spread_execution_score, 4),
+                    "size_multiplier": sports_spread_cost_context.get("size_multiplier"),
+                    "final_decision_state": "BUY",
+                    "execution_action": "wide_spread_demoted_to_cost_and_buy",
+                },
+                marker=("SPORTS-SPREAD-OVERRIDE-FINAL", ticker, int(time.time() // 180)),
+            )
         sports_positive_edge_override = bool(
             self._is_sports_market_or_family(family)
             and market
@@ -73046,9 +73325,29 @@ class KalshiSniperBot:
                 "spread_above_threshold",
                 "spread_wait",
             }
-            if crypto_final_submit_lane:
+            if crypto_final_submit_lane or self.is_sports_family(selected_family, ticker=auto_live_ticker):
                 smart_entry_stale_blockers.add("spread_too_wide")
             if not smart_allowed and canonical_realm_vv_lane_survives and smart_reason in smart_entry_stale_blockers:
+                if smart_reason == "spread_too_wide" and self.is_sports_family(selected_family, ticker=auto_live_ticker):
+                    self._emit_sports_spread_log(
+                        "SPORTS-SPREAD-OVERRIDE",
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "context": "smart_entry_gate_final_submit",
+                            "spread": controlled_spread_value,
+                            "threshold_before": round(float(MAX_ENTRY_SPREAD), 4),
+                            "edge_after_cost": self.to_float(
+                                (quote_readiness_diagnostic or {}).get("edge_after_cost"),
+                                self.to_float((payload_preview or {}).get("edge_after_cost"), 0.0),
+                            ),
+                            "fill_probability": (payload_preview or {}).get("selected_fill_probability"),
+                            "size_multiplier": (payload_preview or {}).get("sports_spread_size_multiplier"),
+                            "reason": "smart_entry_wide_spread_demoted_to_submit_cost",
+                            "execution_action": "final_submit_survives_spread_cost",
+                        },
+                        marker=("SPORTS-SPREAD-OVERRIDE", "smart_entry_gate_final_submit", auto_live_ticker),
+                    )
                 print(
                     "[AION-FAKE-BLOCKER-DELETED] "
                     + json.dumps(

@@ -4346,6 +4346,354 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertLess(context["sports_spread_size_multiplier"], 1.0)
         self.assertGreater(context["unified_score"], 0.0)
 
+    def test_sports_smart_entry_demotes_wide_spread_to_cost(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA1HTOTAL-WIDE-SMART",
+            "series_ticker": "KXNBA1HTOTAL",
+            "status": "open",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 0.40,
+            "yes_ask": 0.58,
+            "no_bid": 0.42,
+            "no_ask": 0.60,
+            "volume": 20,
+            "liquidity_dollars": 40,
+            "open_interest": 100,
+            "edge_after_cost": 0.025,
+            "game_thesis_confidence": 74,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.58,
+            yes_bid=0.40,
+            yes_ask=0.58,
+            no_bid=0.42,
+            no_ask=0.60,
+            yes_top_size=8,
+            no_top_size=8,
+            liquidity=40,
+            volume=20,
+            edge_after_cost=0.025,
+            game_thesis_confidence=74,
+            sports_regime="favorable",
+        )
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 8,
+            "no_top_size": 8,
+            "both_sides_quoted": True,
+            "liquidity_final": 40,
+        }
+        bot._get_sports_adaptive_spread_threshold = lambda *args, **kwargs: {
+            "adaptive_threshold": kw.MAX_ENTRY_SPREAD,
+            "block_reason": "unit_smart_spread_cost",
+        }
+        bot._get_live_session_entry_adjustment = lambda **kwargs: {"adaptive_block": False}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allowed, reason, details = bot._evaluate_smart_entry_gate(
+                market,
+                q,
+                payload={
+                    "selected_side": "yes",
+                    "selected_price": 0.58,
+                    "selected_price_dollars": 0.58,
+                    "selected_price_cents": 58,
+                    "liquidity": 40,
+                    "edge_after_cost": 0.025,
+                    "game_thesis_confidence": 74,
+                    "sports_regime": "favorable",
+                },
+            )
+
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "sports_wide_spread_cost_smart_entry_pass")
+        self.assertTrue(details["adaptive_allow"])
+        self.assertTrue(details["sports_spread_context"]["allowed"])
+        self.assertLess(details["sports_spread_context"]["size_multiplier"], 1.0)
+
+    def test_sports_smart_entry_still_blocks_broken_spread_book(self):
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXNBA1HTOTAL-BROKEN-SMART",
+            "series_ticker": "KXNBA1HTOTAL",
+            "status": "open",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 0.05,
+            "yes_ask": 0.90,
+            "no_bid": 0.10,
+            "no_ask": 0.95,
+            "volume": 10,
+            "liquidity_dollars": 10,
+            "open_interest": 60,
+            "edge_after_cost": 0.02,
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.90,
+            yes_bid=0.05,
+            yes_ask=0.90,
+            no_bid=0.10,
+            no_ask=0.95,
+            yes_top_size=2,
+            no_top_size=2,
+            liquidity=10,
+            volume=10,
+            edge_after_cost=0.02,
+        )
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 2,
+            "no_top_size": 2,
+            "both_sides_quoted": True,
+            "liquidity_final": 10,
+        }
+        bot._get_sports_adaptive_spread_threshold = lambda *args, **kwargs: {
+            "adaptive_threshold": kw.MAX_ENTRY_SPREAD,
+            "block_reason": "unit_smart_spread_block",
+        }
+        bot._get_live_session_entry_adjustment = lambda **kwargs: {"adaptive_block": False}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            allowed, reason, details = bot._evaluate_smart_entry_gate(
+                market,
+                q,
+                payload={
+                    "selected_side": "yes",
+                    "selected_price": 0.90,
+                    "selected_price_dollars": 0.90,
+                    "selected_price_cents": 90,
+                    "liquidity": 10,
+                    "edge_after_cost": 0.02,
+                },
+            )
+
+        self.assertFalse(allowed)
+        self.assertNotEqual(reason, "spread_too_wide")
+        self.assertIn(reason, {"spread_absurd_unusable", "spread_above_adaptive_tolerance"})
+        self.assertTrue(details["sports_spread_context"]["hard_reject"])
+
+    def test_sports_final_scoring_demotes_wide_spread_to_cost(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-WIDE-FINAL",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.60,
+            yes_bid=0.40,
+            yes_ask=0.60,
+            no_bid=0.40,
+            no_ask=0.60,
+            yes_top_size=10,
+            no_top_size=10,
+            liquidity=50,
+            volume=50,
+            edge_after_cost=0.035,
+            game_thesis_confidence=74,
+            sports_regime="favorable",
+            sports_momentum_classification="strong_positive",
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": q.family,
+            "status": "open",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 0.40,
+            "yes_ask": 0.60,
+            "no_bid": 0.40,
+            "no_ask": 0.60,
+            "yes_top_size": 10,
+            "no_top_size": 10,
+            "volume": 50,
+            "liquidity_dollars": 50,
+            "open_interest": 120,
+            "edge_after_cost": 0.035,
+            "game_thesis_confidence": 74,
+            "sports_regime": "favorable",
+            "sports_momentum_classification": "strong_positive",
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 10,
+            "no_top_size": 10,
+            "both_sides_quoted": True,
+            "has_real_liquidity": True,
+            "liquidity_final": 50,
+            "score": 0.8,
+        }
+        bot._get_sports_adaptive_spread_threshold = lambda *args, **kwargs: {
+            "adaptive_threshold": kw.MAX_ENTRY_SPREAD,
+            "block_reason": "spread_cost_test",
+        }
+        bot._diagnose_quote_readiness_context = lambda **kwargs: {
+            "quote_ready": True,
+            "quote_missing": False,
+            "spread": 0.20,
+            "spread_bucket": "extreme_wide",
+            "selected_side": "yes",
+            "selected_price": 0.60,
+            "selected_price_dollars": 0.60,
+            "yes_bid": 0.40,
+            "yes_ask": 0.60,
+            "no_bid": 0.40,
+            "no_ask": 0.60,
+            "yes_top_size": 10,
+            "no_top_size": 10,
+            "edge_after_cost": 0.035,
+            "sports_edge_after_cost": 0.035,
+            "source_of_quote_data": "direct_fields",
+        }
+        bot._resolve_unsafe_price_detail = lambda **kwargs: {
+            "unsafe_price_status": "caution_wide_spread",
+            "unsafe_resolution_reason": "unit_wide_spread_cost",
+        }
+        bot._resolve_effective_liquidity_signal = lambda *args, **kwargs: {
+            "liquidity_final": 50,
+            "effective_source": "unit_topbook",
+            "fallback_used": False,
+            "effective_top_size": 10,
+        }
+        bot._build_aion_market_priority_profile = lambda **kwargs: {
+            "market_priority_score": 8,
+            "priority_tier": 1,
+            "execution_probability": 0.7,
+            "execution_quality_profile": {
+                "execution_quality_score": 60,
+                "spread_bucket": "wide_but_possible",
+                "quote_ready": True,
+                "unsafe_price_status": "caution_wide_spread",
+                "top_book_depth": 20,
+                "execution_probability": 0.7,
+            },
+            "crypto_priority": False,
+        }
+        bot._build_aion_scan_rebalancer_profile = lambda **kwargs: {"scan_weight": 1.0}
+        bot.compute_sports_post_cost_edge = lambda **kwargs: {
+            "sports_edge_after_cost": 0.035,
+            "quote_ready": True,
+            "final_edge": 0.035,
+        }
+        bot.compute_live_sports_momentum = lambda *args, **kwargs: {
+            "momentum_score": 0.25,
+            "directional_bias": "favorite",
+            "volatility_state": "normal",
+        }
+        bot._get_sports_edge_score = lambda *args, **kwargs: {"score": 72, "components": {}}
+        bot._get_elite_public_signal_match = lambda **kwargs: {"boost": 0}
+        bot._build_sports_edge_ranking_context = lambda **kwargs: {"boost": 4, "tags": ["UNIT_WIDE_COST"]}
+        bot._evaluate_market_psychology = lambda **kwargs: {
+            "blocked": False,
+            "shadow_only": True,
+            "adjusted_score": kwargs.get("original_score", 0.0),
+            "original_score": kwargs.get("original_score", 0.0),
+            "psychology_delta": 0.0,
+        }
+        bot._evaluate_live_edge_quality = lambda **kwargs: {
+            "confidence_weight": 0.0,
+            "confidence_score": 0.7,
+            "regime_state": "ok",
+            "momentum_alignment": 0.0,
+            "continuity_quality": 0.0,
+            "spread_stability": 0.0,
+            "liquidity_stability": 0.0,
+            "directional_consistency": 0.0,
+        }
+        bot._realm_xxxii_shadow_arb_audit = lambda *args, **kwargs: {"hard_block": False}
+        bot._record_shadow_arb_validation = lambda *args, **kwargs: {}
+        bot._record_live_reject_telemetry = lambda *args, **kwargs: None
+        bot._record_execution_failure_audit = lambda *args, **kwargs: None
+        bot._record_live_near_pass = lambda *args, **kwargs: None
+        bot.is_targeted_series_market = lambda market_arg: False
+        bot._get_live_session_entry_adjustment = lambda **kwargs: {"score_penalty": 0.0, "mode": "unit", "reason": "unit"}
+        bot.get_minutes_to_event = lambda market_arg: 15
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot.score_final_candidate_decision(market, q, 0.20, q.family)
+
+        self.assertNotEqual(result["debug_context"].get("hard_reject_reason"), "wide_spread")
+        self.assertTrue(result["debug_context"].get("wide_spread_demoted_to_cost"))
+        self.assertEqual(result["decision"], "BUY")
+        self.assertLess(result["score_breakdown"]["sports_spread_cost"], 0.0)
+        self.assertLess(getattr(q, "sports_spread_size_multiplier"), 1.0)
+
+    def test_sports_final_scoring_still_blocks_broken_spread_book(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNBA1HTOTAL-BROKEN-FINAL",
+            family="KXNBA1HTOTAL",
+            selected_side="yes",
+            selected_price=0.90,
+            yes_bid=0.05,
+            yes_ask=0.90,
+            no_bid=0.10,
+            no_ask=0.95,
+            yes_top_size=2,
+            no_top_size=2,
+            liquidity=10,
+            volume=10,
+            edge_after_cost=0.02,
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": q.family,
+            "status": "open",
+            "title": "NBA first half total over 112.5",
+            "yes_bid": 0.05,
+            "yes_ask": 0.90,
+            "no_bid": 0.10,
+            "no_ask": 0.95,
+            "yes_top_size": 2,
+            "no_top_size": 2,
+            "volume": 10,
+            "liquidity_dollars": 10,
+            "edge_after_cost": 0.02,
+        }
+        bot.get_market_liquidity_priority = lambda market_arg: {
+            "top_book_state": "both_non_zero",
+            "yes_top_size": 2,
+            "no_top_size": 2,
+            "both_sides_quoted": True,
+            "liquidity_final": 10,
+        }
+        bot._get_sports_adaptive_spread_threshold = lambda *args, **kwargs: {
+            "adaptive_threshold": kw.MAX_ENTRY_SPREAD,
+            "block_reason": "spread_cost_test",
+        }
+        bot._diagnose_quote_readiness_context = lambda **kwargs: {
+            "quote_ready": True,
+            "quote_missing": False,
+            "spread": 0.85,
+            "spread_bucket": "unsafe",
+            "selected_side": "yes",
+            "selected_price": 0.90,
+            "selected_price_dollars": 0.90,
+            "yes_bid": 0.05,
+            "yes_ask": 0.90,
+            "no_bid": 0.10,
+            "no_ask": 0.95,
+            "yes_top_size": 2,
+            "no_top_size": 2,
+            "edge_after_cost": 0.02,
+            "sports_edge_after_cost": 0.02,
+            "source_of_quote_data": "direct_fields",
+        }
+        bot._record_execution_failure_audit = lambda *args, **kwargs: None
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot.score_final_candidate_decision(market, q, 0.85, q.family)
+
+        self.assertEqual(result["decision"], "SKIP")
+        self.assertNotEqual(result["debug_context"].get("hard_reject_reason"), "wide_spread")
+        self.assertIn(
+            result["debug_context"].get("hard_reject_reason"),
+            {"spread_absurd_unusable", "spread_above_adaptive_tolerance"},
+        )
+
     def test_sports_side_selection_uses_execution_fill_quality(self):
         bot = self._make_bot()
         market = {
