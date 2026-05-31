@@ -64,6 +64,11 @@ AION_MAX_SINGLE_POSITION_PCT = _sports_env_float("AION_MAX_SINGLE_POSITION_PCT",
 AION_ELITE_SINGLE_POSITION_PCT = _sports_env_float("AION_ELITE_SINGLE_POSITION_PCT", 0.10)
 AION_ELITE_SIZE_MIN_SCORE = _sports_env_float("AION_ELITE_SIZE_MIN_SCORE", 85.0)
 AION_LONGSHOT_MAX_POSITION_PCT = _sports_env_float("AION_LONGSHOT_MAX_POSITION_PCT", 0.01)
+AION_CONVICTION_SIZING_ENABLED = _sports_env_bool("AION_CONVICTION_SIZING_ENABLED", True)
+AION_CONVICTION_WEAK_MULTIPLIER = _sports_env_float("AION_CONVICTION_WEAK_MULTIPLIER", 0.5)
+AION_CONVICTION_STRONG_MULTIPLIER = _sports_env_float("AION_CONVICTION_STRONG_MULTIPLIER", 1.5)
+AION_CONVICTION_ELITE_MULTIPLIER = _sports_env_float("AION_CONVICTION_ELITE_MULTIPLIER", 2.0)
+AION_CONVICTION_STRONG_CONFIDENCE = _sports_env_float("AION_CONVICTION_STRONG_CONFIDENCE", 85.0)
 
 
 def bind_runtime_globals(source):
@@ -10889,6 +10894,11 @@ def _aion_position_sizing_evidence(self, q=None, *, context=None, payload=None, 
         "execution_score": None if execution_score is None else round(float(execution_score), 4),
         "fill_probability": None if fill_probability is None else round(float(fill_probability), 6),
         "spread": None if spread is None else round(float(spread), 6),
+        "confidence": None if confidence is None else round(float(confidence) * 100.0, 4),
+        "positive_edge": bool(positive_edge),
+        "sufficient_execution": bool(sufficient_execution),
+        "liquidity_ok": bool(liquidity_ok),
+        "cold_memory": bool(cold_memory),
         "memory_regime": memory_regime or None,
         "memory_rank": round(float(memory_rank), 4),
         "longshot": bool(longshot),
@@ -11035,6 +11045,208 @@ def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, sele
                         "size": int(adjusted),
                         "account_pct": details["account_pct"],
                         "evidence": details["evidence"],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    return adjusted, details
+
+
+def _emit_aion_conviction_summary(self, *, force=False):
+    try:
+        stats = getattr(self, "_aion_conviction_sizing_summary", None)
+        if not isinstance(stats, dict):
+            return
+        now = time.time()
+        last = self.to_float(getattr(self, "_aion_conviction_sizing_summary_last", 0.0), 0.0) or 0.0
+        if not force and now - last < 120.0:
+            return
+        tiers = ("weak", "average", "strong", "elite")
+        counts = {tier: int(stats.get(tier, {}).get("count", 0) or 0) for tier in tiers}
+        if not any(counts.values()):
+            return
+        avg_size_by_tier = {}
+        for tier in tiers:
+            count = counts[tier]
+            size_sum = self.to_float(stats.get(tier, {}).get("size_sum"), 0.0) or 0.0
+            avg_size_by_tier[tier] = round(float(size_sum) / float(count), 4) if count else 0.0
+        print(
+            "[AION-CONVICTION-SUMMARY] "
+            + json.dumps(
+                {
+                    "weak_count": counts["weak"],
+                    "average_count": counts["average"],
+                    "strong_count": counts["strong"],
+                    "elite_count": counts["elite"],
+                    "avg_size_by_tier": avg_size_by_tier,
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        self._aion_conviction_sizing_summary_last = now
+        self._aion_conviction_sizing_summary = {}
+    except Exception:
+        pass
+
+
+def _record_aion_conviction_tier(self, tier, adjusted_size):
+    try:
+        stats = getattr(self, "_aion_conviction_sizing_summary", None)
+        if not isinstance(stats, dict):
+            stats = {}
+            self._aion_conviction_sizing_summary = stats
+        bucket = stats.setdefault(str(tier or "average"), {"count": 0, "size_sum": 0.0})
+        bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+        bucket["size_sum"] = float(bucket.get("size_sum", 0.0) or 0.0) + float(adjusted_size or 0)
+        _emit_aion_conviction_summary(self)
+    except Exception:
+        pass
+
+
+def _apply_conviction_sizing(self, q=None, *, planned_size=None, selected_price=None, payload=None, ev_context=None, quality_context=None, hard_max=None, source=None):
+    if not _aion_sizing_env_bool("AION_CONVICTION_SIZING_ENABLED", AION_CONVICTION_SIZING_ENABLED):
+        return planned_size, None
+    planned = int(self.to_float(planned_size, 0) or 0)
+    if planned <= 0:
+        return planned, None
+    payload = payload if isinstance(payload, dict) else {}
+    context = ev_context if isinstance(ev_context, dict) else {}
+    evidence = _aion_position_sizing_evidence(self, q, context=context, payload=payload, quality_context=quality_context)
+    confidence = self.to_float(evidence.get("confidence"), None)
+    score = self.to_float(evidence.get("score"), 0.0) or 0.0
+    edge = self.to_float(evidence.get("edge"), None)
+    spread = self.to_float(evidence.get("spread"), None)
+    cold_memory = bool(evidence.get("cold_memory"))
+    longshot = bool(evidence.get("longshot"))
+    positive_edge = bool(evidence.get("positive_edge"))
+    elite_evidence = bool(evidence.get("elite"))
+
+    weak_multiplier = _aion_sizing_env_float(
+        "AION_CONVICTION_WEAK_MULTIPLIER",
+        AION_CONVICTION_WEAK_MULTIPLIER,
+        lower=0.1,
+        upper=1.0,
+    )
+    strong_multiplier = _aion_sizing_env_float(
+        "AION_CONVICTION_STRONG_MULTIPLIER",
+        AION_CONVICTION_STRONG_MULTIPLIER,
+        lower=1.0,
+        upper=3.0,
+    )
+    elite_multiplier = _aion_sizing_env_float(
+        "AION_CONVICTION_ELITE_MULTIPLIER",
+        AION_CONVICTION_ELITE_MULTIPLIER,
+        lower=strong_multiplier,
+        upper=4.0,
+    )
+    strong_confidence = _aion_sizing_env_float(
+        "AION_CONVICTION_STRONG_CONFIDENCE",
+        AION_CONVICTION_STRONG_CONFIDENCE,
+        lower=50.0,
+        upper=100.0,
+    )
+    tight_spread = bool(spread is None or spread <= 0.03)
+    wide_spread = bool(spread is not None and spread >= 0.07)
+
+    tier = "average"
+    multiplier = 1.0
+    reason = "average_evidence"
+    if cold_memory:
+        tier = "weak"
+        multiplier = weak_multiplier
+        reason = "cold_or_noisy_memory"
+    elif wide_spread:
+        tier = "weak"
+        multiplier = weak_multiplier
+        reason = "wide_spread_history_penalty"
+    elif confidence is not None and confidence < 70.0:
+        tier = "weak"
+        multiplier = weak_multiplier
+        reason = "low_confidence_history_penalty"
+    elif edge is not None and edge < 0.0:
+        tier = "weak"
+        multiplier = weak_multiplier
+        reason = "negative_edge"
+    elif elite_evidence and confidence is not None and confidence >= max(88.0, strong_confidence) and tight_spread:
+        tier = "elite"
+        multiplier = elite_multiplier
+        reason = "elite_multi_signal_conviction"
+    elif confidence is not None and confidence >= strong_confidence and tight_spread and not cold_memory:
+        tier = "strong"
+        multiplier = strong_multiplier
+        reason = "high_confidence_tight_book"
+    elif confidence is not None and confidence >= 75.0 and tight_spread and positive_edge:
+        tier = "strong"
+        multiplier = min(strong_multiplier, 1.25)
+        reason = "positive_edge_confidence"
+
+    if longshot and tier in {"strong", "elite"} and not elite_evidence:
+        tier = "average"
+        multiplier = 1.0
+        reason = "longshot_requires_elite_evidence"
+
+    max_contract_bound = max(1, int(hard_max or MAX_LIVE_ORDER_SIZE or planned))
+    adjusted = max(1, min(max_contract_bound, int(round(float(planned) * float(multiplier)))))
+    details = {
+        "ticker": evidence.get("ticker"),
+        "family": evidence.get("family"),
+        "score": round(float(score), 4),
+        "edge": None if edge is None else round(float(edge), 6),
+        "confidence": None if confidence is None else round(float(confidence), 4),
+        "spread": None if spread is None else round(float(spread), 6),
+        "original_size": int(planned),
+        "adjusted_size": int(adjusted),
+        "conviction_tier": tier,
+        "reason": reason,
+    }
+    try:
+        context["conviction_sizing"] = dict(details)
+        context["conviction_tier"] = tier
+        if q is not None:
+            setattr(q, "conviction_sizing", dict(details))
+            setattr(q, "conviction_tier", tier)
+            setattr(q, "conviction_sizing_adjusted_size", int(adjusted))
+    except Exception:
+        pass
+
+    _record_aion_conviction_tier(self, tier, adjusted)
+    should_log = bool(tier != "average" or adjusted != planned)
+    if should_log:
+        try:
+            print(
+                "[AION-CONVICTION-SIZING] "
+                + json.dumps(
+                    {
+                        "ticker": details["ticker"],
+                        "score": details["score"],
+                        "edge": details["edge"],
+                        "confidence": details["confidence"],
+                        "original_size": details["original_size"],
+                        "adjusted_size": details["adjusted_size"],
+                        "conviction_tier": details["conviction_tier"],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    if tier == "elite":
+        try:
+            print(
+                "[AION-ELITE-OPPORTUNITY] "
+                + json.dumps(
+                    {
+                        "ticker": details["ticker"],
+                        "score": details["score"],
+                        "edge": details["edge"],
+                        "confidence": details["confidence"],
+                        "size": int(adjusted),
+                        "evidence": evidence.get("evidence"),
                     },
                     sort_keys=True,
                     default=str,
@@ -11900,6 +12112,26 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
                 )
             except Exception:
                 pass
+    if chosen > 0:
+        before_conviction_size = int(chosen)
+        chosen, conviction_context = _apply_conviction_sizing(
+            self,
+            q,
+            planned_size=chosen,
+            selected_price=selected_price,
+            payload=payload,
+            ev_context=context,
+            quality_context=quality_context,
+            hard_max=hard_max,
+            source=source,
+        )
+        if conviction_context:
+            try:
+                context["conviction_sizing"] = dict(conviction_context)
+            except Exception:
+                pass
+            if int(chosen) != before_conviction_size:
+                chosen_label = str(conviction_context.get("reason") or "conviction_sizing")
     if chosen > 0:
         before_position_intelligence = int(chosen)
         chosen, sizing_context = _apply_position_sizing_intelligence(

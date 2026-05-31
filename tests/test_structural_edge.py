@@ -2376,8 +2376,47 @@ class StructuralEdgeTests(unittest.TestCase):
                 source="unit_test_sports_memory",
             )
 
-        self.assertEqual(resolved, 3)
+        self.assertEqual(resolved, 2)
         self.assertGreaterEqual(resolved, 1)
+        self.assertEqual(getattr(q, "conviction_tier", None), "weak")
+
+    def test_conviction_sizing_boosts_high_confidence_tight_book(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNCAABBGAME-CONFIDENCE-STRONG",
+            family="KXNCAABBGAME",
+            selected_side="yes",
+            selected_price=0.40,
+            yes_bid=0.39,
+            yes_ask=0.40,
+            no_bid=0.60,
+            no_ask=0.61,
+            yes_top_size=100,
+            no_top_size=100,
+            confidence=88.0,
+            spread=0.01,
+            orderbook_ready=True,
+            quote_ready=True,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            resolved = bot._resolve_dynamic_live_entry_size(
+                q,
+                explicit_size=4,
+                payload={
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "count": 4,
+                    "selected_side": "yes",
+                    "selected_price": 0.40,
+                    "confidence": 88.0,
+                    "spread": 0.01,
+                },
+                ev_context={"ticker": q.ticker, "family": q.family, "ev_tier": "B"},
+                source="unit_test_conviction_strong",
+            )
+
+        self.assertEqual(resolved, 6)
+        self.assertEqual(getattr(q, "conviction_tier", None), "strong")
 
     def test_quality_calibration_allows_exceptional_hr_quality(self):
         bot = self._make_bot()
