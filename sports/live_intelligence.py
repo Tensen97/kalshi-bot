@@ -56,6 +56,14 @@ AION_BEST_RUNG_STRONG_EVIDENCE_MIN_SCORE = _sports_env_float(
     "AION_BEST_RUNG_STRONG_EVIDENCE_MIN_SCORE",
     70.0,
 )
+AION_POSITION_SIZING_INTELLIGENCE_ENABLED = _sports_env_bool(
+    "AION_POSITION_SIZING_INTELLIGENCE_ENABLED",
+    True,
+)
+AION_MAX_SINGLE_POSITION_PCT = _sports_env_float("AION_MAX_SINGLE_POSITION_PCT", 0.05)
+AION_ELITE_SINGLE_POSITION_PCT = _sports_env_float("AION_ELITE_SINGLE_POSITION_PCT", 0.10)
+AION_ELITE_SIZE_MIN_SCORE = _sports_env_float("AION_ELITE_SIZE_MIN_SCORE", 85.0)
+AION_LONGSHOT_MAX_POSITION_PCT = _sports_env_float("AION_LONGSHOT_MAX_POSITION_PCT", 0.01)
 
 
 def bind_runtime_globals(source):
@@ -10583,6 +10591,460 @@ def _get_orderbook_imbalance_adjustment(self, item=None, *, market=None, q=None,
     )
 
 
+def _aion_sizing_env_bool(name, default):
+    return _sports_env_bool(name, globals().get(name, default))
+
+
+def _aion_sizing_env_float(name, default, *, lower=None, upper=None):
+    value = _sports_env_float(name, globals().get(name, default))
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = float(default)
+    if lower is not None:
+        value = max(float(lower), value)
+    if upper is not None:
+        value = min(float(upper), value)
+    return value
+
+
+def _aion_sizing_account_value(self, context=None, payload=None):
+    context = context if isinstance(context, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+
+    def _normal(value, *, cents=False):
+        numeric = self.to_float(value, None)
+        if numeric is None or numeric <= 0.0:
+            return None
+        if cents:
+            numeric = numeric / 100.0
+        return round(float(numeric), 4)
+
+    def _from_mapping(mapping):
+        mapping = mapping if isinstance(mapping, dict) else {}
+        for field in (
+            "portfolio_value",
+            "account_value",
+            "account_balance",
+            "available_balance_dollars",
+            "balance_dollars",
+            "available_balance",
+            "available_cash",
+            "cash_balance",
+            "bankroll",
+            "kelly_bankroll",
+            "available_bankroll",
+        ):
+            value = _normal(mapping.get(field), cents=False)
+            if value is not None:
+                return value
+        for field in ("balance_cents", "available_balance_cents", "cash_balance_cents"):
+            value = _normal(mapping.get(field), cents=True)
+            if value is not None:
+                return value
+        return None
+
+    snapshots = [context, payload, entry_context]
+    for attr_name in (
+        "last_fractional_kelly_bankroll_snapshot",
+        "last_capital_snapshot",
+        "last_realm_xxiv_summary",
+        "last_realm_xviii_summary",
+        "last_portfolio_snapshot",
+        "portfolio_snapshot",
+        "last_balance_snapshot",
+        "live_balance",
+        "balance",
+        "account_balance",
+    ):
+        try:
+            snapshot = getattr(self, attr_name, None)
+        except Exception:
+            snapshot = None
+        if isinstance(snapshot, dict):
+            snapshots.append(snapshot)
+    if hasattr(self, "_get_capital_snapshot"):
+        try:
+            snapshots.append(self._get_capital_snapshot() or {})
+        except Exception:
+            pass
+    for snapshot in snapshots:
+        value = _from_mapping(snapshot)
+        if value is not None:
+            return value
+
+    for attr_name in (
+        "portfolio_value",
+        "account_value",
+        "account_balance",
+        "available_balance_dollars",
+        "balance_dollars",
+        "available_balance",
+        "available_cash",
+        "cash_balance",
+        "live_available_balance",
+        "last_available_balance",
+        "live_cash_balance",
+    ):
+        try:
+            value = _normal(getattr(self, attr_name, None), cents=False)
+        except Exception:
+            value = None
+        if value is not None:
+            return value
+    return None
+
+
+def _aion_position_sizing_evidence(self, q=None, *, context=None, payload=None, quality_context=None):
+    context = context if isinstance(context, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    quality_context = quality_context if isinstance(quality_context, dict) else {}
+    entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+
+    def _get(*keys):
+        for key in keys:
+            if key in context and context.get(key) is not None:
+                return context.get(key)
+            if key in payload and payload.get(key) is not None:
+                return payload.get(key)
+            if key in entry_context and entry_context.get(key) is not None:
+                return entry_context.get(key)
+            if key in quality_context and quality_context.get(key) is not None:
+                return quality_context.get(key)
+            if q is not None:
+                try:
+                    value = getattr(q, key, None)
+                except Exception:
+                    value = None
+                if value is not None:
+                    return value
+        return None
+
+    def _price(value):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        if 1.0 < numeric <= 100.0:
+            numeric = numeric / 100.0
+        return numeric if 0.0 < numeric < 1.0 else None
+
+    ticker = str(_get("ticker") or "").strip()
+    family = str(_get("family") or (self.get_market_family({"ticker": ticker}) if ticker else "") or "").strip().upper()
+    side = self._normalize_live_side(_get("selected_side", "side"))
+    selected_price = _price(_get("selected_price_dollars", "selected_price", "price"))
+    if selected_price is None:
+        selected_price = _price(payload.get("yes_price") if side == "yes" else payload.get("no_price") if side == "no" else None)
+    model_probability = self.to_float(
+        _get(
+            "model_probability",
+            "estimated_win_probability",
+            "sports_ml_final_probability",
+            "sports_ml_probability",
+            "sports_ml_base_probability",
+            "probability",
+            "confidence_probability",
+        ),
+        None,
+    )
+    implied_probability = self.to_float(_get("implied_probability", "market_implied_probability"), selected_price)
+    edge = self.to_float(
+        _get(
+            "edge_after_cost",
+            "sports_probability_edge_after_cost",
+            "sports_edge_after_cost",
+            "ev_edge",
+            "expected_roi",
+            "sports_ml_edge_estimate",
+        ),
+        None,
+    )
+    expected_value = self.to_float(_get("expected_value"), None)
+    score = self.to_float(
+        _get(
+            "unified_opportunity_score",
+            "unified_score",
+            "execution_quality_score",
+            "sports_execution_quality_score",
+            "sports_probability_execution_quality_score",
+            "allocation_score",
+            "raw_score",
+            "adjusted_score",
+        ),
+        0.0,
+    ) or 0.0
+    execution_score = self.to_float(
+        _get("sports_execution_quality_score", "sports_probability_execution_quality_score", "execution_quality_score"),
+        None,
+    )
+    fill_probability = self.to_float(
+        _get("sports_execution_fill_probability", "sports_probability_fill_probability", "fill_probability"),
+        None,
+    )
+    confidence = self.to_float(
+        _get("confidence", "game_thesis_confidence", "expectancy_score", "sports_conviction_score"),
+        None,
+    )
+    if confidence is not None and confidence > 1.0:
+        confidence = confidence / 100.0
+    elite_confidence = self.to_float(_get("ELITE_EDGE_CONFIDENCE", "elite_edge_confidence"), 0.0) or 0.0
+    spread = self.to_float(_get("spread"), None)
+    top_size = self.to_float(_get("top_size", "yes_top_size" if side == "yes" else "no_top_size"), None)
+    liquidity = self.to_float(_get("liquidity_depth", "liquidity"), None)
+    memory_rank = self.to_float(
+        _get("sports_memory_rank_adjustment", "family_memory_rank_adjustment", "family_rank_adjustment"),
+        0.0,
+    ) or 0.0
+    memory_regime = str(_get("sports_memory_regime", "sports_regime", "family_regime") or "").strip().lower()
+    market_text = " ".join(
+        str(value or "")
+        for value in (
+            ticker,
+            family,
+            _get("market_type"),
+            _get("market_title", "title", "name"),
+            _get("sports_ladder_role"),
+            _get("sports_ladder_leg_type"),
+        )
+    ).lower()
+    probability_floor = model_probability if model_probability is not None else implied_probability
+    longshot = bool(
+        (selected_price is not None and selected_price <= 0.05)
+        or (probability_floor is not None and probability_floor <= 0.05)
+        or (
+            selected_price is not None
+            and selected_price <= 0.10
+            and any(token in market_text for token in ("far_tail", "tail", "derivative", "5+", "6+", "7+", "10+", "15+", "20+"))
+        )
+    )
+    positive_edge = bool(
+        (edge is not None and edge >= 0.02)
+        or (expected_value is not None and expected_value > 0.0)
+        or (
+            model_probability is not None
+            and implied_probability is not None
+            and model_probability >= implied_probability + 0.025
+        )
+    )
+    sufficient_execution = bool(
+        (execution_score is not None and execution_score >= 78.0)
+        or (fill_probability is not None and fill_probability >= 0.70)
+        or bool(quality_context.get("book_executable") and quality_context.get("liquidity_supports_size"))
+    )
+    min_score = _aion_sizing_env_float("AION_ELITE_SIZE_MIN_SCORE", AION_ELITE_SIZE_MIN_SCORE, lower=1.0)
+    confidence_support = bool(
+        (confidence is not None and confidence >= 0.72)
+        or elite_confidence >= 82.0
+        or score >= min_score
+    )
+    strong_memory = bool(memory_rank >= 1.0 or "hot" in memory_regime or "profitable" in memory_regime)
+    cold_memory = bool("cold" in memory_regime or "noisy" in memory_regime or "loss" in memory_regime)
+    spread_ok = bool(spread is None or spread <= 0.06)
+    liquidity_ok = bool(
+        (top_size is not None and top_size >= 5.0)
+        or (liquidity is not None and liquidity >= 20.0)
+        or bool(quality_context.get("liquidity_supports_size"))
+    )
+    elite = bool(
+        score >= min_score
+        and positive_edge
+        and sufficient_execution
+        and confidence_support
+        and spread_ok
+        and liquidity_ok
+        and not cold_memory
+    )
+    if longshot and elite:
+        longshot_edge = self.to_float(edge, 0.0) or 0.0
+        elite = bool(
+            (longshot_edge >= 0.08 or strong_memory or elite_confidence >= 90.0)
+            and liquidity_ok
+            and spread_ok
+        )
+    evidence = []
+    if score:
+        evidence.append(f"score={round(float(score), 2)}")
+    if edge is not None:
+        evidence.append(f"edge={round(float(edge), 4)}")
+    if execution_score is not None:
+        evidence.append(f"exec={round(float(execution_score), 2)}")
+    if fill_probability is not None:
+        evidence.append(f"fill={round(float(fill_probability), 3)}")
+    if elite_confidence:
+        evidence.append(f"elite_conf={round(float(elite_confidence), 2)}")
+    if memory_rank:
+        evidence.append(f"memory_rank={round(float(memory_rank), 2)}")
+    if longshot:
+        evidence.append("longshot")
+    if cold_memory:
+        evidence.append(f"memory={memory_regime}")
+    return {
+        "ticker": ticker or None,
+        "family": family or None,
+        "selected_price": selected_price,
+        "score": round(float(score), 4),
+        "edge": None if edge is None else round(float(edge), 6),
+        "model_probability": None if model_probability is None else round(float(model_probability), 6),
+        "implied_probability": None if implied_probability is None else round(float(implied_probability), 6),
+        "execution_score": None if execution_score is None else round(float(execution_score), 4),
+        "fill_probability": None if fill_probability is None else round(float(fill_probability), 6),
+        "spread": None if spread is None else round(float(spread), 6),
+        "memory_regime": memory_regime or None,
+        "memory_rank": round(float(memory_rank), 4),
+        "longshot": bool(longshot),
+        "elite": bool(elite),
+        "evidence": ",".join(evidence[:7]) or "none",
+    }
+
+
+def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, selected_price=None, payload=None, ev_context=None, quality_context=None, hard_max=None, source=None):
+    if not _aion_sizing_env_bool("AION_POSITION_SIZING_INTELLIGENCE_ENABLED", AION_POSITION_SIZING_INTELLIGENCE_ENABLED):
+        return planned_size, None
+    planned = int(self.to_float(planned_size, 0) or 0)
+    if planned <= 0:
+        return planned, None
+    payload = payload if isinstance(payload, dict) else {}
+    context = ev_context if isinstance(ev_context, dict) else {}
+    evidence = _aion_position_sizing_evidence(self, q, context=context, payload=payload, quality_context=quality_context)
+    price = self.to_float(selected_price, None)
+    if price is None:
+        price = evidence.get("selected_price")
+    if price is None or price <= 0.0:
+        return planned, None
+    if 1.0 < price <= 100.0:
+        price = price / 100.0
+    if not (0.0 < price < 1.0):
+        return planned, None
+
+    account_value = _aion_sizing_account_value(self, context=context, payload=payload)
+    if account_value is None or account_value <= 0.0:
+        details = {
+            "ticker": evidence.get("ticker"),
+            "family": evidence.get("family"),
+            "planned_size": int(planned),
+            "adjusted_size": int(planned),
+            "account_value": None,
+            "max_allowed": None,
+            "score": evidence.get("score"),
+            "reason": "account_value_unavailable",
+        }
+        try:
+            context["position_sizing_intelligence"] = details
+        except Exception:
+            pass
+        return planned, details
+
+    standard_pct = _aion_sizing_env_float("AION_MAX_SINGLE_POSITION_PCT", AION_MAX_SINGLE_POSITION_PCT, lower=0.001, upper=1.0)
+    elite_pct = _aion_sizing_env_float("AION_ELITE_SINGLE_POSITION_PCT", AION_ELITE_SINGLE_POSITION_PCT, lower=standard_pct, upper=1.0)
+    longshot_pct = _aion_sizing_env_float("AION_LONGSHOT_MAX_POSITION_PCT", AION_LONGSHOT_MAX_POSITION_PCT, lower=0.001, upper=standard_pct)
+    standard_dollars = max(float(price), float(account_value) * standard_pct)
+    elite_dollars = max(standard_dollars, float(account_value) * elite_pct)
+    longshot_dollars = max(float(price), float(account_value) * longshot_pct)
+    max_contract_bound = max(1, int(hard_max or MAX_LIVE_ORDER_SIZE or planned))
+
+    def _contracts_for(dollars):
+        return max(1, min(max_contract_bound, int(float(dollars) / float(price))))
+
+    if evidence.get("elite"):
+        max_dollars = elite_dollars
+        max_allowed = _contracts_for(max_dollars)
+        reason = "elite_account_pct_cap" if planned > max_allowed else "elite_within_account_pct_cap"
+    elif evidence.get("longshot"):
+        max_dollars = longshot_dollars
+        max_allowed = _contracts_for(max_dollars)
+        reason = "longshot_account_pct_cap" if planned > max_allowed else "longshot_within_account_pct_cap"
+    else:
+        max_dollars = standard_dollars
+        max_allowed = _contracts_for(max_dollars)
+        reason = "standard_account_pct_cap_requires_elite" if planned > max_allowed else "within_account_pct_cap"
+    adjusted = max(1, min(planned, int(max_allowed), max_contract_bound))
+    planned_notional = float(planned) * float(price)
+    adjusted_notional = float(adjusted) * float(price)
+    details = {
+        "ticker": evidence.get("ticker"),
+        "family": evidence.get("family"),
+        "planned_size": int(planned),
+        "adjusted_size": int(adjusted),
+        "account_value": round(float(account_value), 4),
+        "max_allowed": int(max_allowed),
+        "max_allowed_dollars": round(float(max_dollars), 4),
+        "selected_price": round(float(price), 6),
+        "planned_notional": round(planned_notional, 4),
+        "adjusted_notional": round(adjusted_notional, 4),
+        "account_pct": round(adjusted_notional / max(float(account_value), 0.000001), 6),
+        "score": evidence.get("score"),
+        "reason": reason,
+        "elite": bool(evidence.get("elite")),
+        "longshot": bool(evidence.get("longshot")),
+        "evidence": evidence.get("evidence"),
+    }
+    try:
+        context["position_sizing_intelligence"] = details
+        if q is not None:
+            setattr(q, "position_sizing_intelligence", dict(details))
+            setattr(q, "position_sizing_adjusted_size", int(adjusted))
+            setattr(q, "position_sizing_reason", reason)
+    except Exception:
+        pass
+    should_log = bool(adjusted < planned or evidence.get("elite") or planned_notional >= standard_dollars * 0.80)
+    if should_log:
+        try:
+            print(
+                "[AION-SIZING-INTELLIGENCE] "
+                + json.dumps(
+                    {
+                        "ticker": details["ticker"],
+                        "family": details["family"],
+                        "planned_size": details["planned_size"],
+                        "adjusted_size": details["adjusted_size"],
+                        "account_value": details["account_value"],
+                        "max_allowed": details["max_allowed"],
+                        "score": details["score"],
+                        "reason": details["reason"],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    if adjusted < planned:
+        try:
+            print(
+                "[AION-SIZING-DOWNGRADE] "
+                + json.dumps(
+                    {
+                        "ticker": details["ticker"],
+                        "original_size": int(planned),
+                        "adjusted_size": int(adjusted),
+                        "reason": reason,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    elif evidence.get("elite") and adjusted_notional > standard_dollars + 0.000001:
+        try:
+            print(
+                "[AION-SIZING-ELITE-ALLOW] "
+                + json.dumps(
+                    {
+                        "ticker": details["ticker"],
+                        "size": int(adjusted),
+                        "account_pct": details["account_pct"],
+                        "evidence": details["evidence"],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    return adjusted, details
+
+
 def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payload=None, ev_context=None, source=None):
     hard_max = max(1, int(MAX_LIVE_ORDER_SIZE or 1))
     base_size = max(1, min(hard_max, int(AION_AGGRESSIVE_MAX_CONTRACTS or 1)))
@@ -10636,8 +11098,12 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
         "expected_value",
         "expected_roi",
         "ev_edge",
+        "edge_after_cost",
         "estimated_win_probability",
+        "model_probability",
         "market_implied_probability",
+        "implied_probability",
+        "confidence",
         "selected_side",
         "side",
         "selected_price",
@@ -10681,6 +11147,8 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
         "sports_execution_context",
         "sports_execution_fill_probability",
         "sports_execution_quality_score",
+        "fill_probability",
+        "execution_quality_score",
         "sports_execution_rank_adjustment",
         "sports_execution_size_multiplier",
         "sports_probability_context",
@@ -10727,6 +11195,8 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
         "sports_ladder_size_cap",
         "sports_ladder_game_exposure_cap",
         "unified_opportunity_score",
+        "unified_score",
+        "allocation_score",
         "unified_size_multiplier",
         "capital_duration_size_multiplier",
         "capital_lock_penalty",
@@ -11430,6 +11900,26 @@ def _resolve_dynamic_live_entry_size(self, q=None, *, explicit_size=None, payloa
                 )
             except Exception:
                 pass
+    if chosen > 0:
+        before_position_intelligence = int(chosen)
+        chosen, sizing_context = _apply_position_sizing_intelligence(
+            self,
+            q,
+            planned_size=chosen,
+            selected_price=selected_price,
+            payload=payload,
+            ev_context=context,
+            quality_context=quality_context,
+            hard_max=hard_max,
+            source=source,
+        )
+        if sizing_context:
+            try:
+                context["position_sizing_intelligence"] = dict(sizing_context)
+            except Exception:
+                pass
+            if int(chosen) != before_position_intelligence:
+                chosen_label = str(sizing_context.get("reason") or "position_sizing_intelligence")
     original = self.to_float(explicit_size, None)
     if original is None:
         original = self.to_float(payload.get("count"), None)

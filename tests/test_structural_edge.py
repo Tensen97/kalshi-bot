@@ -4021,6 +4021,159 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreaterEqual(resolved * q.selected_price, 1.0)
         self.assertLessEqual(resolved * q.selected_price, kw.AION_WEAK_MAX_DOLLAR_EXPOSURE)
 
+    def test_position_sizing_caps_non_elite_to_account_percentage(self):
+        bot = self._make_bot()
+        bot.available_cash = 100.0
+        q = SimpleNamespace(
+            ticker="KXNCAABSPREAD-OKLA-CITADEL",
+            family="KXNCAABSPREAD",
+            ev_tier="A",
+            ELITE_EDGE_CONFIDENCE=42.0,
+            STRUCTURAL_EDGE_SCORE=44.0,
+            CROSS_MARKET_EDGE_SCORE=25.0,
+            expected_value=0.002,
+            selected_side="yes",
+            selected_price=0.51,
+            yes_bid=0.50,
+            yes_ask=0.51,
+            no_bid=0.49,
+            no_ask=0.50,
+            yes_top_size=100,
+            no_top_size=100,
+            spread=0.01,
+            orderbook_ready=True,
+            quote_ready=True,
+            unified_opportunity_score=64.0,
+        )
+
+        resolved = bot._resolve_dynamic_live_entry_size(
+            q,
+            explicit_size=30,
+            payload={"ticker": q.ticker, "count": 30, "selected_side": "yes", "selected_price": 0.51},
+            ev_context={
+                "ticker": q.ticker,
+                "family": q.family,
+                "ev_tier": "A",
+                "ELITE_EDGE_CONFIDENCE": 42.0,
+                "STRUCTURAL_EDGE_SCORE": 44.0,
+                "CROSS_MARKET_EDGE_SCORE": 25.0,
+                "expected_value": 0.002,
+                "unified_opportunity_score": 64.0,
+            },
+        )
+
+        self.assertGreaterEqual(resolved, 1)
+        self.assertLessEqual(resolved * q.selected_price, 5.0)
+        self.assertEqual(getattr(q, "position_sizing_reason", None), "standard_account_pct_cap_requires_elite")
+
+    def test_position_sizing_keeps_longshots_tiny_without_elite_evidence(self):
+        bot = self._make_bot()
+        bot.available_cash = 100.0
+        q = SimpleNamespace(
+            ticker="KXMLBHRRBI-TAIL-5PLUS",
+            family="KXMLBHRRBI",
+            ev_tier="B",
+            ELITE_EDGE_CONFIDENCE=36.0,
+            STRUCTURAL_EDGE_SCORE=35.0,
+            CROSS_MARKET_EDGE_SCORE=22.0,
+            expected_value=0.001,
+            selected_side="yes",
+            selected_price=0.03,
+            yes_bid=0.02,
+            yes_ask=0.03,
+            no_bid=0.97,
+            no_ask=0.98,
+            yes_top_size=500,
+            no_top_size=500,
+            spread=0.01,
+            orderbook_ready=True,
+            quote_ready=True,
+            sports_ladder_role="tail",
+            unified_opportunity_score=61.0,
+        )
+
+        resolved = bot._resolve_dynamic_live_entry_size(
+            q,
+            explicit_size=150,
+            payload={"ticker": q.ticker, "count": 150, "selected_side": "yes", "selected_price": 0.03},
+            ev_context={
+                "ticker": q.ticker,
+                "family": q.family,
+                "ev_tier": "B",
+                "ELITE_EDGE_CONFIDENCE": 36.0,
+                "STRUCTURAL_EDGE_SCORE": 35.0,
+                "CROSS_MARKET_EDGE_SCORE": 22.0,
+                "expected_value": 0.001,
+                "sports_ladder_role": "tail",
+                "unified_opportunity_score": 61.0,
+            },
+        )
+
+        self.assertGreaterEqual(resolved, 1)
+        self.assertLessEqual(resolved * q.selected_price, 1.0)
+        self.assertEqual(getattr(q, "position_sizing_reason", None), "longshot_account_pct_cap")
+
+    def test_position_sizing_allows_elite_above_standard_but_caps_at_elite_percentage(self):
+        bot = self._make_bot()
+        bot.available_cash = 100.0
+        q = SimpleNamespace(
+            ticker="KXMLBSTRIKEOUT-ELITE-TEST",
+            family="KXMLBSTRIKEOUT",
+            ev_tier="S",
+            ev_sizing_multiplier=1.0,
+            conviction_size_multiplier=1.0,
+            elite_edge_size_multiplier=8.0,
+            ELITE_EDGE_CONFIDENCE=92.0,
+            STRUCTURAL_EDGE_SCORE=94.0,
+            CROSS_MARKET_EDGE_SCORE=86.0,
+            expected_roi=0.11,
+            expected_value=0.038,
+            ev_edge=0.055,
+            estimated_win_probability=0.31,
+            market_implied_probability=0.20,
+            selected_side="yes",
+            selected_price=0.20,
+            yes_bid=0.19,
+            yes_ask=0.21,
+            no_bid=0.79,
+            no_ask=0.81,
+            yes_top_size=180,
+            no_top_size=200,
+            spread=0.02,
+            orderbook_ready=True,
+            quote_ready=True,
+            unified_opportunity_score=93.0,
+            sports_execution_quality_score=88.0,
+            sports_execution_fill_probability=0.82,
+        )
+
+        resolved = bot._resolve_dynamic_live_entry_size(
+            q,
+            explicit_size=1,
+            payload={"ticker": q.ticker, "count": 1, "selected_side": "yes", "selected_price": 0.20},
+            ev_context={
+                "ticker": q.ticker,
+                "family": q.family,
+                "ev_tier": "S",
+                "ELITE_EDGE_CONFIDENCE": 92.0,
+                "STRUCTURAL_EDGE_SCORE": 94.0,
+                "CROSS_MARKET_EDGE_SCORE": 86.0,
+                "elite_edge_size_multiplier": 8.0,
+                "expected_roi": 0.11,
+                "expected_value": 0.038,
+                "ev_edge": 0.055,
+                "estimated_win_probability": 0.31,
+                "market_implied_probability": 0.20,
+                "unified_opportunity_score": 93.0,
+                "sports_execution_quality_score": 88.0,
+                "sports_execution_fill_probability": 0.82,
+            },
+        )
+
+        self.assertGreater(resolved * q.selected_price, 5.0)
+        self.assertLessEqual(resolved * q.selected_price, 10.0)
+        self.assertIn(getattr(q, "position_sizing_reason", None), {"elite_account_pct_cap", "elite_within_account_pct_cap"})
+
     def test_capital_duration_penalizes_future_sports_but_allows_elite(self):
         bot = self._make_bot()
         far_start = (datetime.now(timezone.utc) + timedelta(minutes=240)).isoformat()
