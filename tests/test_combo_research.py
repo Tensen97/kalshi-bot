@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -73,6 +74,104 @@ def _candidate(ticker, family, price, confidence, edge):
     }
 
 
+def _reset_history_cache():
+    combo_research._HISTORICAL_CACHE.update({"loaded_at": 0.0, "path": None, "payload": None})
+
+
+def _write_history_summary(conn, summary_type, key, records, wins, losses, weighted_win_rate=None):
+    outcomes = int(wins) + int(losses)
+    weighted_count = float(outcomes)
+    if weighted_win_rate is None:
+        weighted_win_rate = wins / max(outcomes, 1)
+    payload = {
+        "record_count": records,
+        "outcome_count": outcomes,
+        "win_count": wins,
+        "loss_count": losses,
+        "weighted_count": weighted_count,
+        "weighted_win_rate": round(weighted_win_rate, 6),
+        "weighted_avg_estimated_pnl": 0.08,
+    }
+    conn.execute(
+        """
+        INSERT INTO sports_history_summaries (
+            summary_key, summary_type, bucket_name, record_count,
+            outcome_count, win_count, loss_count, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"{summary_type}:{key}",
+            summary_type,
+            key,
+            records,
+            outcomes,
+            wins,
+            losses,
+            json.dumps(payload, sort_keys=True),
+        ),
+    )
+
+
+def _create_history_db(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE sports_history_records (
+            family TEXT,
+            ticker TEXT,
+            market_title TEXT,
+            outcome TEXT,
+            recency_weight REAL,
+            source_time TEXT
+        );
+        CREATE TABLE sports_history_summaries (
+            summary_key TEXT PRIMARY KEY,
+            summary_type TEXT,
+            bucket_name TEXT,
+            record_count INTEGER,
+            outcome_count INTEGER,
+            win_count INTEGER,
+            loss_count INTEGER,
+            payload_json TEXT
+        );
+        """
+    )
+    _write_history_summary(conn, "family", "KXNBASPREAD", 120, 78, 42, 0.65)
+    _write_history_summary(conn, "family", "KXMLBMONEYLINE", 100, 61, 39, 0.61)
+    _write_history_summary(conn, "odds_bucket", "35_45", 200, 122, 78, 0.61)
+    _write_history_summary(conn, "odds_bucket", "45_60", 220, 119, 101, 0.54)
+    _write_history_summary(conn, "side_bucket", "underdog", 180, 108, 72, 0.60)
+    _write_history_summary(conn, "side_bucket", "mid_price", 200, 110, 90, 0.55)
+    _write_history_summary(conn, "family_odds_bucket", "KXNBASPREAD|35_45", 80, 52, 28, 0.65)
+    _write_history_summary(conn, "family_odds_bucket", "KXMLBMONEYLINE|45_60", 70, 42, 28, 0.60)
+    for idx in range(40):
+        conn.execute(
+            "INSERT INTO sports_history_records VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "KXNBASPREAD",
+                f"KXNBASPREAD-HIST-SAS7-{idx}",
+                "SAS spread +7",
+                "yes" if idx < 27 else "no",
+                1.0,
+                "2026-05-01T00:00:00Z",
+            ),
+        )
+    for idx in range(30):
+        conn.execute(
+            "INSERT INTO sports_history_records VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "KXMLBMONEYLINE",
+                f"KXMLBMONEYLINE-HIST-NYY-{idx}",
+                "Yankees moneyline",
+                "yes" if idx < 18 else "no",
+                1.0,
+                "2026-05-01T00:00:00Z",
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
 def _candidate_missing_explicit_side(ticker, family, price, confidence, edge):
     candidate = _candidate(ticker, family, price, confidence, edge)
     candidate["q"].selected_side = None
@@ -83,6 +182,12 @@ def _candidate_missing_explicit_side(ticker, family, price, confidence, edge):
 
 
 class ComboResearchTests(unittest.TestCase):
+    def setUp(self):
+        _reset_history_cache()
+
+    def tearDown(self):
+        _reset_history_cache()
+
     def _patch_runtime(self, output_path):
         return patch.multiple(
             combo_research,
@@ -267,6 +372,56 @@ class ComboResearchTests(unittest.TestCase):
             self.assertIn("KXNBASPREAD-26MAY30SASOKC-SAS7", used_tickers)
             self.assertNotIn("KXNBASPREAD-26MAY30SASOKC-SAS1", used_tickers)
             self.assertNotIn("KXNBASPREAD-26MAY30SASOKC-SAS3", used_tickers)
+
+    def test_combo_research_enriches_records_with_historical_scores(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "aion_combo_research.jsonl"
+            history_path = Path(tmp_dir) / "aion_sports_history.sqlite"
+            _create_history_db(history_path)
+            env = {
+                "COMBO_RESEARCH_ENABLED": "true",
+                "COMBO_RESEARCH_SIM_STAKE": "1",
+                "COMBO_RESEARCH_MAX_LEGS": "2",
+                "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+            }
+            candidates = [
+                _candidate("KXNBASPREAD-26MAY30SASOKC-SAS7", "KXNBASPREAD", 0.38, 0.69, 0.06),
+                _candidate("KXMLBMONEYLINE-26MAY30NYYBOS-NYY", "KXMLBMONEYLINE", 0.52, 0.66, 0.04),
+            ]
+            candidates[0]["market"]["event_ticker"] = "KXNBASPREAD-26MAY30SASOKC"
+            candidates[0]["market"]["game_id"] = "nba:sas_okc"
+            candidates[0]["market"]["title"] = "SAS spread +7"
+            candidates[1]["market"]["event_ticker"] = "KXMLBMONEYLINE-26MAY30NYYBOS"
+            candidates[1]["market"]["game_id"] = "mlb:nyy_bos"
+            candidates[1]["market"]["title"] = "Yankees moneyline"
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                self._patch_runtime(output_path),
+                patch.object(combo_research, "_historical_db_path", lambda: history_path),
+            ):
+                summary = combo_research.run_combo_research_cycle(
+                    bot=_Bot(),
+                    candidates=candidates,
+                    trade_readiness_records=[],
+                    markets=[],
+                    selected_ticker="KXNBASPREAD-26MAY30SASOKC-SAS7",
+                    source="test",
+                )
+
+            self.assertTrue(summary["historical_lookup_available"])
+            self.assertEqual(summary["historical_record_count"], 70)
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            combo = next(record for record in records if record["event_type"] == "combo_built")
+            self.assertIsNotNone(combo["historical_combo_estimated_hit_rate"])
+            self.assertTrue(combo["historical_combo_size_performance"]["available"])
+            for leg in combo["legs"]:
+                self.assertIn("historical", leg)
+                self.assertIsNotNone(leg["historical_family_hit_rate"])
+                self.assertIsNotNone(leg["historical_side_hit_rate"])
+                self.assertIsNotNone(leg["historical_ladder_rung_hit_rate"])
+                self.assertIsNotNone(leg["historical_similar_price_hit_rate"])
+                self.assertIsNotNone(leg["historical_score"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ COMBO_RESEARCH_FILENAME = "aion_combo_research.jsonl"
 MAX_CANDIDATE_POOL = 10
 MAX_COMBOS_PER_LEG_COUNT = 12
 COMBO_THESIS_REJECT_LOG_LIMIT = 12
+COMBO_HISTORICAL_LOG_LIMIT = 8
+COMBO_HISTORICAL_CACHE_SECONDS = 300.0
 OBSIDIAN_EXPORT_MIN_SECONDS = 900.0
 SPORTS_TOKENS = (
     "SPORT",
@@ -54,6 +57,11 @@ SPORTS_TOKENS = (
 CRYPTO_TOKENS = ("CRYPTO", "BTC", "ETH", "SOL", "DOGE", "XBT", "BITCOIN", "ETHEREUM")
 
 _LAST_OBSIDIAN_EXPORT_TS = 0.0
+_HISTORICAL_CACHE = {
+    "loaded_at": 0.0,
+    "path": None,
+    "payload": None,
+}
 
 
 @dataclass(frozen=True)
@@ -288,6 +296,226 @@ def _compact_thesis_text(value):
     text = re.sub(r"[^A-Z0-9#]+", "_", text)
     text = re.sub(r"_+", "_", text).strip("_")
     return text[:140] or "UNKNOWN"
+
+
+def _historical_db_path():
+    try:
+        return Path(runtime_memory_file("aion_sports_history.sqlite"))
+    except Exception:
+        return Path("runtime") / "memory" / "aion_sports_history.sqlite"
+
+
+def _sqlite_readonly_uri(path):
+    return f"file:{Path(path).resolve().as_posix()}?mode=ro&immutable=1"
+
+
+def _history_price_bucket(price):
+    price = _as_probability(price)
+    if price is None:
+        return "unknown"
+    if price < 0.20:
+        return "under_20"
+    if price <= 0.35:
+        return "20_35"
+    if price <= 0.45:
+        return "35_45"
+    if price <= 0.60:
+        return "45_60"
+    if price <= 0.80:
+        return "60_80"
+    return "over_80"
+
+
+def _history_side_bucket(yes_probability):
+    bucket = _history_price_bucket(yes_probability)
+    if bucket in {"under_20", "20_35", "35_45"}:
+        return "underdog"
+    if bucket in {"60_80", "over_80"}:
+        return "favorite"
+    if bucket == "45_60":
+        return "mid_price"
+    return "unknown"
+
+
+def _historical_ladder_rung_key(ticker=None, title=None):
+    text = str(ticker or "").upper().strip()
+    last_segment = text.rsplit("-", 1)[-1] if text else ""
+    match = re.search(r"([A-Z]{1,12})?(\d{1,4})(?:\.\d+)?$", last_segment)
+    if match:
+        return f"rung_{int(match.group(2))}"
+    title_text = str(title or "").upper()
+    match = re.search(r"\b(?:OVER|UNDER|BY|WIN(?:S)? BY|TOTAL|SPREAD)?\s*(\d{1,4})(?:\.\d+)?\+?\b", title_text)
+    if match:
+        return f"rung_{int(match.group(1))}"
+    return None
+
+
+def _empty_history_stats():
+    return {
+        "record_count": 0,
+        "outcome_count": 0,
+        "yes_count": 0,
+        "no_count": 0,
+        "weighted_count": 0.0,
+        "weighted_yes": 0.0,
+        "weighted_no": 0.0,
+    }
+
+
+def _update_history_stats(stats, outcome, weight=1.0):
+    stats["record_count"] = int(stats.get("record_count", 0) or 0) + 1
+    outcome = str(outcome or "").strip().lower()
+    if outcome not in {"yes", "no"}:
+        return stats
+    weight = _to_float(weight, 1.0) or 1.0
+    stats["outcome_count"] = int(stats.get("outcome_count", 0) or 0) + 1
+    stats["weighted_count"] = float(stats.get("weighted_count", 0.0) or 0.0) + weight
+    if outcome == "yes":
+        stats["yes_count"] = int(stats.get("yes_count", 0) or 0) + 1
+        stats["weighted_yes"] = float(stats.get("weighted_yes", 0.0) or 0.0) + weight
+    else:
+        stats["no_count"] = int(stats.get("no_count", 0) or 0) + 1
+        stats["weighted_no"] = float(stats.get("weighted_no", 0.0) or 0.0) + weight
+    return stats
+
+
+def _history_stats_from_summary_row(row):
+    row = dict(row or {})
+    payload = {}
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+    except Exception:
+        payload = {}
+    outcome_count = int(row.get("outcome_count") or payload.get("outcome_count") or 0)
+    win_count = int(row.get("win_count") or payload.get("win_count") or 0)
+    loss_count = int(row.get("loss_count") or payload.get("loss_count") or 0)
+    weighted_count = _to_float(payload.get("weighted_count"), 0.0) or 0.0
+    weighted_win_rate = _as_probability(payload.get("weighted_win_rate"))
+    weighted_yes = weighted_win_rate * weighted_count if weighted_win_rate is not None else 0.0
+    weighted_no = max(0.0, weighted_count - weighted_yes) if weighted_win_rate is not None else 0.0
+    return {
+        "record_count": int(row.get("record_count") or payload.get("record_count") or 0),
+        "outcome_count": outcome_count,
+        "yes_count": win_count,
+        "no_count": loss_count,
+        "weighted_count": round(weighted_count, 6),
+        "weighted_yes": round(weighted_yes, 6),
+        "weighted_no": round(weighted_no, 6),
+        "weighted_avg_estimated_pnl": _to_float(payload.get("weighted_avg_estimated_pnl"), None),
+    }
+
+
+def _history_side_rate(stats, side):
+    stats = stats if isinstance(stats, dict) else {}
+    outcome_count = int(stats.get("outcome_count") or 0)
+    side = _normalize_side(side)
+    if outcome_count <= 0 or side not in {"YES", "NO"}:
+        return None
+    wins = int(stats.get("yes_count" if side == "YES" else "no_count") or 0)
+    return round(max(0.0, min(1.0, wins / max(outcome_count, 1))), 6)
+
+
+def _history_weighted_side_rate(stats, side):
+    stats = stats if isinstance(stats, dict) else {}
+    weighted_count = _to_float(stats.get("weighted_count"), 0.0) or 0.0
+    side = _normalize_side(side)
+    if weighted_count <= 0.0 or side not in {"YES", "NO"}:
+        return None
+    wins = _to_float(stats.get("weighted_yes" if side == "YES" else "weighted_no"), 0.0) or 0.0
+    return round(max(0.0, min(1.0, wins / max(weighted_count, 0.0001))), 6)
+
+
+def _history_rate_payload(stats, side):
+    rate = _history_weighted_side_rate(stats, side)
+    if rate is None:
+        rate = _history_side_rate(stats, side)
+    if rate is None:
+        return {"hit_rate": None, "sample_size": 0, "record_count": int((stats or {}).get("record_count") or 0)}
+    return {
+        "hit_rate": rate,
+        "sample_size": int((stats or {}).get("outcome_count") or 0),
+        "record_count": int((stats or {}).get("record_count") or 0),
+    }
+
+
+def _load_historical_combo_intelligence(force=False):
+    path = _historical_db_path()
+    now = time.time()
+    cached = _HISTORICAL_CACHE.get("payload")
+    if (
+        not force
+        and isinstance(cached, dict)
+        and _HISTORICAL_CACHE.get("path") == str(path)
+        and now - float(_HISTORICAL_CACHE.get("loaded_at") or 0.0) <= COMBO_HISTORICAL_CACHE_SECONDS
+    ):
+        return cached
+    if not path.exists():
+        payload = {"available": False, "path": str(path), "reason": "historical_db_missing"}
+        _HISTORICAL_CACHE.update({"loaded_at": now, "path": str(path), "payload": payload})
+        return payload
+
+    summaries = {}
+    rung_summaries = {}
+    try:
+        conn = sqlite3.connect(_sqlite_readonly_uri(path), uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "sports_history_records" not in tables or "sports_history_summaries" not in tables:
+            payload = {
+                "available": False,
+                "path": str(path),
+                "reason": "historical_schema_missing_tables",
+                "tables": sorted(tables),
+            }
+            _HISTORICAL_CACHE.update({"loaded_at": now, "path": str(path), "payload": payload})
+            return payload
+        record_count = int(conn.execute("SELECT COUNT(*) FROM sports_history_records").fetchone()[0] or 0)
+        summary_count = int(conn.execute("SELECT COUNT(*) FROM sports_history_summaries").fetchone()[0] or 0)
+        oldest = conn.execute("SELECT MIN(source_time) FROM sports_history_records").fetchone()[0]
+        newest = conn.execute("SELECT MAX(source_time) FROM sports_history_records").fetchone()[0]
+        for row in conn.execute(
+            """
+            SELECT summary_key, summary_type, bucket_name, record_count, outcome_count,
+                   win_count, loss_count, payload_json
+            FROM sports_history_summaries
+            """
+        ).fetchall():
+            summaries[str(row["summary_key"])] = _history_stats_from_summary_row(row)
+        for row in conn.execute(
+            """
+            SELECT family, ticker, market_title, outcome, recency_weight
+            FROM sports_history_records
+            WHERE outcome IN ('yes', 'no')
+            """
+        ).fetchall():
+            family = str(row["family"] or "").strip().upper()
+            rung_key = _historical_ladder_rung_key(row["ticker"], row["market_title"])
+            if not family or not rung_key:
+                continue
+            key = f"{family}|{rung_key}"
+            stats = rung_summaries.setdefault(key, _empty_history_stats())
+            _update_history_stats(stats, row["outcome"], row["recency_weight"])
+        conn.close()
+        payload = {
+            "available": True,
+            "path": str(path),
+            "record_count": record_count,
+            "summary_count": summary_count,
+            "oldest_source_time": oldest,
+            "newest_source_time": newest,
+            "summaries": summaries,
+            "rung_summaries": rung_summaries,
+            "reason": "loaded",
+        }
+    except sqlite3.Error as exc:
+        payload = {"available": False, "path": str(path), "reason": f"sqlite_error:{exc.__class__.__name__}"}
+    except Exception as exc:
+        payload = {"available": False, "path": str(path), "reason": f"historical_lookup_error:{exc.__class__.__name__}"}
+    _HISTORICAL_CACHE.update({"loaded_at": now, "path": str(path), "payload": payload})
+    return payload
 
 
 def _candidate_meta_value(item, q, market, expectancy_summary, readiness, *keys):
@@ -714,6 +942,185 @@ def _combo_memory_adjustment(item, q, expectancy_summary, readiness):
     return round(max(-10.0, min(14.0, total)), 6)
 
 
+def _historical_confidence(sample_size):
+    sample_size = max(0.0, _to_float(sample_size, 0.0) or 0.0)
+    if sample_size <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, math.log1p(sample_size) / math.log1p(5000.0)))
+
+
+def _historical_component_score(hit_rate, price, sample_size):
+    hit_rate = _as_probability(hit_rate)
+    price = _as_price(price)
+    if hit_rate is None or price is None:
+        return None
+    expected_roi = (hit_rate / max(price, 0.01)) - 1.0
+    confidence = _historical_confidence(sample_size)
+    score = 0.5 + max(-0.35, min(0.35, expected_roi * 0.18))
+    score += max(-0.10, min(0.10, (hit_rate - price) * 0.35))
+    score = 0.5 + ((score - 0.5) * max(0.20, confidence))
+    return {
+        "score": round(max(0.0, min(1.0, score)), 6),
+        "expected_roi": round(expected_roi, 6),
+        "confidence": round(confidence, 6),
+    }
+
+
+def _historical_leg_lookup(leg, historical_context):
+    if not isinstance(historical_context, dict) or not historical_context.get("available"):
+        return {
+            "available": False,
+            "source": "aion_sports_history.sqlite",
+            "reason": historical_context.get("reason") if isinstance(historical_context, dict) else "historical_context_unavailable",
+        }
+    summaries = historical_context.get("summaries") if isinstance(historical_context.get("summaries"), dict) else {}
+    rung_summaries = historical_context.get("rung_summaries") if isinstance(historical_context.get("rung_summaries"), dict) else {}
+    family = str(leg.get("family") or "").strip().upper()
+    side = _normalize_side(leg.get("side"))
+    selected_price = _as_price(leg.get("price"))
+    if not family or side not in {"YES", "NO"} or selected_price is None:
+        return {
+            "available": False,
+            "source": "aion_sports_history.sqlite",
+            "reason": "missing_family_side_or_price",
+        }
+    yes_probability = selected_price if side == "YES" else (1.0 - selected_price)
+    yes_probability = max(0.0001, min(0.9999, yes_probability))
+    selected_price_bucket = _history_price_bucket(selected_price)
+    yes_probability_bucket = _history_price_bucket(yes_probability)
+    side_bucket = _history_side_bucket(yes_probability)
+    rung_key = _historical_ladder_rung_key(leg.get("ticker"), leg.get("market_title") or leg.get("market"))
+
+    family_stats = summaries.get(f"family:{family}", {})
+    side_stats = summaries.get(f"side_bucket:{side_bucket}", {})
+    similar_price_stats = summaries.get(f"odds_bucket:{yes_probability_bucket}", {})
+    family_price_stats = summaries.get(f"family_odds_bucket:{family}|{yes_probability_bucket}", {})
+    rung_stats = rung_summaries.get(f"{family}|{rung_key}", {}) if rung_key else {}
+
+    family_payload = _history_rate_payload(family_stats, side)
+    side_payload = _history_rate_payload(side_stats, side)
+    similar_price_payload = _history_rate_payload(similar_price_stats, side)
+    family_price_payload = _history_rate_payload(family_price_stats, side)
+    rung_payload = _history_rate_payload(rung_stats, side)
+
+    components = [
+        ("family", family_payload, 0.22),
+        ("side", side_payload, 0.18),
+        ("ladder_rung", rung_payload if rung_payload.get("sample_size") else family_price_payload, 0.30),
+        ("similar_price", similar_price_payload, 0.18),
+        ("family_price", family_price_payload, 0.12),
+    ]
+    weighted_rate = 0.0
+    weighted_total = 0.0
+    total_samples = 0
+    for _label, payload, base_weight in components:
+        hit_rate = _as_probability(payload.get("hit_rate"))
+        sample_size = int(payload.get("sample_size") or 0)
+        if hit_rate is None or sample_size <= 0:
+            continue
+        confidence = _historical_confidence(sample_size)
+        weight = base_weight * max(0.15, confidence)
+        weighted_rate += hit_rate * weight
+        weighted_total += weight
+        total_samples += sample_size
+    blended_hit_rate = round(weighted_rate / weighted_total, 6) if weighted_total > 0.0 else None
+    component_score = _historical_component_score(blended_hit_rate, selected_price, total_samples)
+    if component_score is None:
+        historical_score = 0.5
+        historical_expected_roi = None
+        confidence = 0.0
+    else:
+        historical_score = component_score["score"]
+        historical_expected_roi = component_score["expected_roi"]
+        confidence = component_score["confidence"]
+    return {
+        "available": True,
+        "source": "aion_sports_history.sqlite",
+        "db_path": historical_context.get("path"),
+        "db_record_count": historical_context.get("record_count"),
+        "family_hit_rate": family_payload.get("hit_rate"),
+        "family_sample_size": family_payload.get("sample_size"),
+        "side_hit_rate": side_payload.get("hit_rate"),
+        "side_sample_size": side_payload.get("sample_size"),
+        "ladder_rung_hit_rate": rung_payload.get("hit_rate") if rung_payload.get("sample_size") else family_price_payload.get("hit_rate"),
+        "ladder_rung_sample_size": rung_payload.get("sample_size") if rung_payload.get("sample_size") else family_price_payload.get("sample_size"),
+        "ladder_rung_key": rung_key,
+        "ladder_rung_method": "family_rung" if rung_payload.get("sample_size") else "family_price_bucket_proxy",
+        "similar_price_hit_rate": similar_price_payload.get("hit_rate"),
+        "similar_price_sample_size": similar_price_payload.get("sample_size"),
+        "family_price_hit_rate": family_price_payload.get("hit_rate"),
+        "family_price_sample_size": family_price_payload.get("sample_size"),
+        "selected_price_bucket": selected_price_bucket,
+        "yes_probability_bucket": yes_probability_bucket,
+        "side_bucket": side_bucket,
+        "blended_hit_rate": blended_hit_rate,
+        "expected_roi": historical_expected_roi,
+        "score": historical_score,
+        "confidence": confidence,
+        "sample_size": int(total_samples),
+    }
+
+
+def _enrich_pool_with_historical_context(pool, historical_context, source):
+    enriched = []
+    scored = 0
+    top_scores = []
+    for leg in pool or []:
+        item = dict(leg)
+        historical = _historical_leg_lookup(item, historical_context)
+        item["historical"] = historical
+        item["historical_family_hit_rate"] = historical.get("family_hit_rate")
+        item["historical_side_hit_rate"] = historical.get("side_hit_rate")
+        item["historical_ladder_rung_hit_rate"] = historical.get("ladder_rung_hit_rate")
+        item["historical_similar_price_hit_rate"] = historical.get("similar_price_hit_rate")
+        item["historical_blended_hit_rate"] = historical.get("blended_hit_rate")
+        item["historical_expected_roi"] = historical.get("expected_roi")
+        item["historical_score"] = historical.get("score")
+        item["historical_sample_size"] = historical.get("sample_size")
+        if historical.get("available") and historical.get("blended_hit_rate") is not None:
+            scored += 1
+            top_scores.append(
+                {
+                    "ticker": item.get("ticker"),
+                    "family": item.get("family"),
+                    "score": historical.get("score"),
+                    "hit_rate": historical.get("blended_hit_rate"),
+                    "expected_roi": historical.get("expected_roi"),
+                    "sample_size": historical.get("sample_size"),
+                }
+            )
+        enriched.append(item)
+    top_scores.sort(
+        key=lambda row: (
+            _to_float(row.get("score"), 0.0) or 0.0,
+            _to_float(row.get("expected_roi"), -99.0) or -99.0,
+            _to_float(row.get("sample_size"), 0.0) or 0.0,
+        ),
+        reverse=True,
+    )
+    _emit(
+        "AION-COMBO-HISTORICAL-SCORE",
+        {
+            "source": source,
+            "available": bool(historical_context.get("available")) if isinstance(historical_context, dict) else False,
+            "candidate_count": len(enriched),
+            "scored_count": scored,
+            "db_record_count": historical_context.get("record_count") if isinstance(historical_context, dict) else None,
+            "reason": historical_context.get("reason") if isinstance(historical_context, dict) else "historical_context_unavailable",
+            "top_scores": top_scores[:COMBO_HISTORICAL_LOG_LIMIT],
+        },
+    )
+    enriched.sort(
+        key=lambda leg: (
+            _to_float(leg.get("historical_score"), 0.5) or 0.5,
+            _to_float(leg.get("quality_rank"), 0.0) or 0.0,
+            _to_float(leg.get("edge") if leg.get("edge") is not None else -1.0, -1.0) or -1.0,
+        ),
+        reverse=True,
+    )
+    return enriched
+
+
 def _thesis_representative_score(leg):
     quality = float(leg.get("quality_rank") or 0.0)
     edge = _as_edge(leg.get("edge"))
@@ -725,10 +1132,14 @@ def _thesis_representative_score(leg):
     liquidity = _to_float(_first_value(leg.get("liquidity"), leg.get("volume")), 0.0) or 0.0
     top_size = _to_float(leg.get("top_size"), 0.0) or 0.0
     memory = _to_float(leg.get("memory_rank_adjustment"), 0.0) or 0.0
+    historical_score = _to_float(leg.get("historical_score"), 0.5) or 0.5
+    historical_roi = _to_float(leg.get("historical_expected_roi"), 0.0) or 0.0
     edge_component = 0.0 if edge is None else max(-16.0, min(34.0, edge * 280.0))
     confidence_component = (confidence if confidence is not None else 0.5) * 12.0
     fill_component = (fill_probability if fill_probability is not None else 0.5) * 6.0
     execution_component = execution_quality * 7.0
+    historical_component = max(-8.0, min(8.0, (historical_score - 0.5) * 22.0))
+    historical_roi_component = max(-4.0, min(5.0, historical_roi * 2.5))
     spread_component = 0.0
     if spread is not None:
         if spread <= 0.02:
@@ -752,6 +1163,8 @@ def _thesis_representative_score(leg):
         + liquidity_component
         + top_size_component
         + memory
+        + historical_component
+        + historical_roi_component
     )
     return round(max(0.0, min(140.0, score)), 6)
 
@@ -983,6 +1396,7 @@ def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets,
                 "ticker": ticker,
                 "market": ticker,
                 "market_key": _event_or_market_key(ticker, market),
+                "market_title": str((market or {}).get("title") or (market or {}).get("market_title") or "").strip() if isinstance(market, dict) else "",
                 "family": family or "UNKNOWN",
                 "thesis_key": thesis_key,
                 "side": side,
@@ -1067,7 +1481,57 @@ def _combo_score(legs):
     avg_quality = sum(float(leg.get("quality_rank") or 0.0) for leg in legs) / max(len(legs), 1)
     avg_confidence = sum(float(leg.get("confidence") if leg.get("confidence") is not None else 0.5) for leg in legs) / max(len(legs), 1)
     avg_edge = sum(float(leg.get("edge") if leg.get("edge") is not None else 0.0) for leg in legs) / max(len(legs), 1)
-    return round(avg_quality + (avg_confidence * 0.25) + (avg_edge * 4.0), 6)
+    avg_history = sum(float(leg.get("historical_score") if leg.get("historical_score") is not None else 0.5) for leg in legs) / max(len(legs), 1)
+    avg_history_roi = sum(float(leg.get("historical_expected_roi") if leg.get("historical_expected_roi") is not None else 0.0) for leg in legs) / max(len(legs), 1)
+    return round(
+        avg_quality
+        + (avg_confidence * 0.25)
+        + (avg_edge * 4.0)
+        + ((avg_history - 0.5) * 0.28)
+        + max(-0.12, min(0.18, avg_history_roi * 0.04)),
+        6,
+    )
+
+
+def _combo_historical_payload(legs, estimated_payout, stake):
+    rates = [
+        _as_probability(leg.get("historical_blended_hit_rate"))
+        for leg in legs
+        if _as_probability(leg.get("historical_blended_hit_rate")) is not None
+    ]
+    scores = [
+        _to_float(leg.get("historical_score"), None)
+        for leg in legs
+        if _to_float(leg.get("historical_score"), None) is not None
+    ]
+    sample_sizes = [
+        int(_to_float(leg.get("historical_sample_size"), 0) or 0)
+        for leg in legs
+    ]
+    if len(rates) != len(legs):
+        return {
+            "available": False,
+            "reason": "missing_leg_historical_rate",
+            "leg_count": len(legs),
+            "scored_legs": len(rates),
+            "sample_size": sum(sample_sizes),
+        }
+    hit_rate = 1.0
+    for rate in rates:
+        hit_rate *= max(0.0001, min(0.9999, rate))
+    stake = _to_float(stake, 1.0) or 1.0
+    estimated_payout = _to_float(estimated_payout, 0.0) or 0.0
+    expected_profit = (hit_rate * estimated_payout) - stake
+    return {
+        "available": True,
+        "method": "independent_product_of_historical_leg_rates",
+        "leg_count": len(legs),
+        "scored_legs": len(rates),
+        "sample_size": sum(sample_sizes),
+        "estimated_hit_rate": round(hit_rate, 8),
+        "estimated_roi": round(expected_profit / max(stake, 0.0001), 6),
+        "average_leg_historical_score": round(sum(scores) / max(len(scores), 1), 6) if scores else None,
+    }
 
 
 def _build_combo_record(legs, leg_count, config, timestamp, source, diversity_mode):
@@ -1085,6 +1549,7 @@ def _build_combo_record(legs, leg_count, config, timestamp, source, diversity_mo
     estimated_payout = config.sim_stake / max(price_product, 0.0001)
     avg_edge = sum(float(leg.get("edge") if leg.get("edge") is not None else 0.0) for leg in legs) / max(len(legs), 1)
     avg_confidence = sum(float(leg.get("confidence") if leg.get("confidence") is not None else 0.5) for leg in legs) / max(len(legs), 1)
+    historical_combo = _combo_historical_payload(legs, estimated_payout, config.sim_stake)
     return {
         "event_type": "combo_built",
         "timestamp": timestamp,
@@ -1104,6 +1569,10 @@ def _build_combo_record(legs, leg_count, config, timestamp, source, diversity_mo
         "average_edge": round(avg_edge, 6),
         "average_confidence": round(avg_confidence, 6),
         "combo_score": _combo_score(legs),
+        "historical_combo_score": historical_combo.get("average_leg_historical_score"),
+        "historical_combo_estimated_hit_rate": historical_combo.get("estimated_hit_rate"),
+        "historical_combo_estimated_roi": historical_combo.get("estimated_roi"),
+        "historical_combo_size_performance": historical_combo,
         "result_status": "pending",
         "eventual_result": None,
         "win": None,
@@ -1517,6 +1986,17 @@ def _attach_diversity_summary(summary, thesis_summary, config):
     return summary
 
 
+def _attach_historical_summary(summary, historical_context):
+    if not isinstance(summary, dict):
+        return summary
+    historical_context = historical_context if isinstance(historical_context, dict) else {}
+    summary["historical_lookup_available"] = bool(historical_context.get("available"))
+    summary["historical_db_path"] = historical_context.get("path")
+    summary["historical_record_count"] = historical_context.get("record_count")
+    summary["historical_lookup_reason"] = historical_context.get("reason")
+    return summary
+
+
 def run_combo_research_cycle(
     *,
     bot,
@@ -1558,6 +2038,22 @@ def run_combo_research_cycle(
         expectancy_summary_by_ticker,
         source=source,
     )
+    historical_context = _load_historical_combo_intelligence()
+    _emit(
+        "AION-COMBO-HISTORICAL-LOOKUP",
+        {
+            "timestamp": timestamp,
+            "source": source,
+            "available": bool(historical_context.get("available")),
+            "path": historical_context.get("path"),
+            "record_count": historical_context.get("record_count"),
+            "summary_count": historical_context.get("summary_count"),
+            "oldest_source_time": historical_context.get("oldest_source_time"),
+            "newest_source_time": historical_context.get("newest_source_time"),
+            "reason": historical_context.get("reason"),
+        },
+    )
+    pool = _enrich_pool_with_historical_context(pool, historical_context, source)
     _emit(
         "AION-COMBO-RESEARCH-CANDIDATES",
         {
@@ -1586,6 +2082,9 @@ def run_combo_research_cycle(
                     "confidence": item.get("confidence"),
                     "execution_score": item.get("candidate_score"),
                     "quality_rank": item.get("quality_rank"),
+                    "historical_score": item.get("historical_score"),
+                    "historical_hit_rate": item.get("historical_blended_hit_rate"),
+                    "historical_expected_roi": item.get("historical_expected_roi"),
                 }
                 for item in pool[:8]
             ],
@@ -1613,6 +2112,7 @@ def run_combo_research_cycle(
                 candidate_count=len(pool),
                 skip_reason="insufficient_sports_candidates",
             )
+        summary = _attach_historical_summary(summary, historical_context)
         _emit("AION-COMBO-RESEARCH-SUMMARY", summary)
         _maybe_export_obsidian_summary(summary)
         return summary
@@ -1640,7 +2140,7 @@ def run_combo_research_cycle(
                 candidate_count=len(pool),
                 skip_reason="insufficient_distinct_thesis_candidates",
             )
-        summary = _attach_diversity_summary(summary, thesis_summary, config)
+        summary = _attach_historical_summary(_attach_diversity_summary(summary, thesis_summary, config), historical_context)
         _emit("AION-COMBO-RESEARCH-SUMMARY", summary)
         _maybe_export_obsidian_summary(summary)
         return summary
@@ -1661,6 +2161,8 @@ def run_combo_research_cycle(
                     "estimated_payout": record.get("estimated_payout"),
                     "stake": record.get("simulated_stake"),
                     "diversity_mode": record.get("diversity_mode"),
+                    "historical_combo_estimated_hit_rate": record.get("historical_combo_estimated_hit_rate"),
+                    "historical_combo_estimated_roi": record.get("historical_combo_estimated_roi"),
                 },
             )
             _emit(
@@ -1687,6 +2189,9 @@ def run_combo_research_cycle(
                     "simulated_stake": record.get("simulated_stake"),
                     "estimated_payout": record.get("estimated_payout"),
                     "combo_score": record.get("combo_score"),
+                    "historical_combo_score": record.get("historical_combo_score"),
+                    "historical_combo_estimated_hit_rate": record.get("historical_combo_estimated_hit_rate"),
+                    "historical_combo_estimated_roi": record.get("historical_combo_estimated_roi"),
                     "jsonl_path": str(config.output_path),
                 },
             )
@@ -1699,7 +2204,7 @@ def run_combo_research_cycle(
         candidate_count=len(pool),
         skip_reason=skip_reason,
     )
-    summary = _attach_diversity_summary(summary, thesis_summary, config)
+    summary = _attach_historical_summary(_attach_diversity_summary(summary, thesis_summary, config), historical_context)
     _emit("AION-COMBO-RESEARCH-SUMMARY", summary)
     _maybe_export_obsidian_summary(summary)
     return summary
