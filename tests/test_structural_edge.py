@@ -1451,6 +1451,161 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(submitted, [valid_q.ticker])
         self.assertIn({"ticker": duplicate_q.ticker, "reason": "duplicate_position_guard"}, result["skipped_legs"])
 
+    def test_best_rung_selection_suppresses_far_tail_ladder_spam(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        game_context = {
+            "game_id": "nba:kxnba_okcsas",
+            "thesis_type": "favorite_dominance",
+            "thesis_confidence": 84.0,
+            "strong": True,
+            "primary_candidate": "KXNBASPREAD-OKCSAS-015",
+        }
+
+        def candidate(ticker, threshold, price, score, edge):
+            q = SimpleNamespace(
+                ticker=ticker,
+                family="KXNBASPREAD",
+                selected_side="yes",
+                selected_price=price,
+                yes_top_size=80,
+            )
+            return {
+                "ticker": ticker,
+                "family": q.family,
+                "lane": "SPORTS",
+                "q": q,
+                "market": {
+                    "ticker": ticker,
+                    "series_ticker": q.family,
+                    "event_ticker": "KXNBA-OKCSAS",
+                    "title": f"Thunder win by more than {threshold}",
+                },
+                "allocation": {
+                    "lane": "SPORTS",
+                    "ticker": ticker,
+                    "family": q.family,
+                    "selected_side": "yes",
+                    "selected_price": price,
+                    "top_size": 80,
+                    "allocation_score": score,
+                    "unified_opportunity_score": score,
+                    "edge_after_cost": edge,
+                    "edge": edge,
+                    "spread": 0.02,
+                    "liquidity": 220,
+                    "sports_execution_quality_score": 88.0,
+                    "sports_execution_fill_probability": 0.76,
+                    "family_profit_memory_adjustment": 2.0,
+                    "sports_memory_rank_adjustment": 1.5,
+                    "decision": "ALLOW_STRONG_SPORT",
+                    "game_id": game_context["game_id"],
+                    "game_thesis_type": game_context["thesis_type"],
+                    "game_thesis_confidence": game_context["thesis_confidence"],
+                    "game_thesis_context": dict(game_context),
+                },
+            }
+
+        bot.last_dual_lane_buy_candidates = [
+            candidate("KXNBASPREAD-OKCSAS-015", "1.5", 0.48, 94.0, 0.050),
+            candidate("KXNBASPREAD-OKCSAS-025", "2.5", 0.38, 92.0, 0.046),
+            candidate("KXNBASPREAD-OKCSAS-055", "5.5", 0.18, 89.0, 0.035),
+            candidate("KXNBASPREAD-OKCSAS-155", "15.5", 0.04, 86.0, 0.030),
+            candidate("KXNBASPREAD-OKCSAS-215", "21.5", 0.02, 84.0, 0.020),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            plan = bot._build_sports_ladder_plan(
+                bot.last_dual_lane_buy_candidates,
+                primary_ticker="KXNBASPREAD-OKCSAS-015",
+                source="unit_test_best_rung_far_tail",
+            )
+
+        selected_tickers = [leg["ticker"] for leg in plan["legs"]]
+        rejected_tickers = set(plan["best_rung_summary"]["rejected_tickers"])
+        self.assertIn("KXNBASPREAD-OKCSAS-015", selected_tickers)
+        self.assertIn("KXNBASPREAD-OKCSAS-025", selected_tickers)
+        self.assertNotIn("KXNBASPREAD-OKCSAS-155", selected_tickers)
+        self.assertNotIn("KXNBASPREAD-OKCSAS-215", selected_tickers)
+        self.assertIn("KXNBASPREAD-OKCSAS-155", rejected_tickers)
+        self.assertIn("KXNBASPREAD-OKCSAS-215", rejected_tickers)
+
+    def test_best_rung_selection_groups_live_style_spread_suffixes_without_titles(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        game_context = {
+            "game_id": "nba:kxnbaspread_26may30sasokc",
+            "thesis_type": "high_scoring_environment",
+            "thesis_confidence": 86.0,
+            "strong": True,
+            "primary_candidate": "KXNBASPREAD-26MAY30SASOKC-SAS7",
+        }
+
+        def candidate(ticker, price, score, edge):
+            q = SimpleNamespace(
+                ticker=ticker,
+                family="KXNBASPREAD",
+                selected_side="yes",
+                selected_price=price,
+                yes_top_size=70,
+            )
+            return {
+                "ticker": ticker,
+                "family": q.family,
+                "lane": "SPORTS",
+                "q": q,
+                "market": {
+                    "ticker": ticker,
+                    "series_ticker": q.family,
+                    "event_ticker": "KXNBASPREAD-26MAY30SASOKC",
+                },
+                "allocation": {
+                    "lane": "SPORTS",
+                    "ticker": ticker,
+                    "family": q.family,
+                    "selected_side": "yes",
+                    "selected_price": price,
+                    "top_size": 70,
+                    "allocation_score": score,
+                    "unified_opportunity_score": score,
+                    "edge_after_cost": edge,
+                    "edge": edge,
+                    "spread": 0.02,
+                    "liquidity": 240,
+                    "sports_execution_quality_score": 88.0,
+                    "sports_execution_fill_probability": 0.74,
+                    "family_profit_memory_adjustment": 2.0,
+                    "sports_memory_rank_adjustment": 1.5,
+                    "decision": "ALLOW_STRONG_SPORT",
+                    "game_id": game_context["game_id"],
+                    "game_thesis_type": game_context["thesis_type"],
+                    "game_thesis_confidence": game_context["thesis_confidence"],
+                    "game_thesis_context": dict(game_context),
+                },
+            }
+
+        bot.last_dual_lane_buy_candidates = [
+            candidate("KXNBASPREAD-26MAY30SASOKC-SAS4", 0.75, 89.0, 0.042),
+            candidate("KXNBASPREAD-26MAY30SASOKC-SAS7", 0.36, 94.0, 0.050),
+            candidate("KXNBASPREAD-26MAY30SASOKC-SAS9", 0.36, 92.0, 0.046),
+            candidate("KXNBASPREAD-26MAY30SASOKC-SAS15", 0.03, 85.0, 0.025),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            plan = bot._build_sports_ladder_plan(
+                bot.last_dual_lane_buy_candidates,
+                primary_ticker="KXNBASPREAD-26MAY30SASOKC-SAS7",
+                source="unit_test_best_rung_live_suffix",
+            )
+
+        selected_tickers = [leg["ticker"] for leg in plan["legs"]]
+        rejected_tickers = set(plan["best_rung_summary"]["rejected_tickers"])
+        self.assertEqual(plan["best_rung_summary"]["group_count"], 1)
+        self.assertEqual(plan["best_rung_summary"]["ladder_group_count"], 1)
+        self.assertLessEqual(len(selected_tickers), 2)
+        self.assertNotIn("KXNBASPREAD-26MAY30SASOKC-SAS15", selected_tickers)
+        self.assertIn("KXNBASPREAD-26MAY30SASOKC-SAS15", rejected_tickers)
+
     def test_sports_ladder_game_exposure_cap_blocks_only_ladder(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()

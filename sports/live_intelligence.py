@@ -22,6 +22,42 @@ except Exception:
     run_combo_research_cycle = None
 
 
+def _sports_env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sports_env_int(name, default=0):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return int(default)
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _sports_env_float(name, default=0.0):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+AION_BEST_RUNG_ENABLED = _sports_env_bool("AION_BEST_RUNG_ENABLED", True)
+AION_BEST_RUNG_DEFAULT_KEEP = _sports_env_int("AION_BEST_RUNG_DEFAULT_KEEP", 1)
+AION_BEST_RUNG_MAX_KEEP = _sports_env_int("AION_BEST_RUNG_MAX_KEEP", 2)
+AION_BEST_RUNG_STRONG_EVIDENCE_MIN_SCORE = _sports_env_float(
+    "AION_BEST_RUNG_STRONG_EVIDENCE_MIN_SCORE",
+    70.0,
+)
+
+
 def bind_runtime_globals(source):
     if not isinstance(source, dict):
         return
@@ -6000,6 +6036,480 @@ def _sports_ladder_existing_game_exposure(self, game_id=None):
     return int(total)
 
 
+def _sports_best_rung_read(row=None, q=None, *field_names):
+    row = row if isinstance(row, dict) else {}
+    allocation = row.get("allocation") if isinstance(row.get("allocation"), dict) else {}
+    candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else {}
+    market = row.get("market") if isinstance(row.get("market"), dict) else {}
+    q = q or row.get("q") or candidate.get("q")
+    sources = (allocation, candidate, row, market)
+    for field_name in field_names:
+        for source in sources:
+            value = source.get(field_name)
+            if value is not None and value != "":
+                return value
+        if q is not None:
+            try:
+                value = getattr(q, field_name, None)
+            except Exception:
+                value = None
+            if value is not None and value != "":
+                return value
+    return None
+
+
+def _sports_best_rung_probability(self, value):
+    number = self.to_float(value, None)
+    if number is None:
+        return None
+    if number > 1.0 and number <= 100.0:
+        number /= 100.0
+    if number < 0.0:
+        return None
+    if number > 1.0:
+        return None
+    return max(0.0, min(1.0, float(number)))
+
+
+def _sports_best_rung_side(row=None):
+    side = str(
+        _sports_best_rung_read(
+            row,
+            None,
+            "selected_side",
+            "preferred_side",
+            "side",
+            "buy_side",
+            "intended_side",
+        )
+        or ""
+    ).strip().lower()
+    return side if side in {"yes", "no"} else ""
+
+
+def _sports_best_rung_price_probability(self, row=None):
+    row = row if isinstance(row, dict) else {}
+    side = _sports_best_rung_side(row)
+    field_names = ["selected_price", "price", "entry_price", "cost", "limit_price"]
+    if side == "yes":
+        field_names.extend(["yes_price", "yes_ask", "best_yes_ask"])
+    elif side == "no":
+        field_names.extend(["no_price", "no_ask", "best_no_ask"])
+    field_names.extend(["implied_probability", "market_implied_probability"])
+    return _sports_best_rung_probability(self, _sports_best_rung_read(row, None, *field_names))
+
+
+def _sports_best_rung_top_size(self, row=None):
+    row = row if isinstance(row, dict) else {}
+    side = _sports_best_rung_side(row)
+    candidates = [
+        _sports_best_rung_read(row, None, "top_size", "selected_top_size", "size", "quantity"),
+    ]
+    if side == "yes":
+        candidates.extend([
+            _sports_best_rung_read(row, None, "yes_top_size", "yes_size", "yes_ask_size", "best_yes_ask_size"),
+        ])
+    elif side == "no":
+        candidates.extend([
+            _sports_best_rung_read(row, None, "no_top_size", "no_size", "no_ask_size", "best_no_ask_size"),
+        ])
+    best = 0.0
+    for value in candidates:
+        number = self.to_float(value, None)
+        if number is not None:
+            best = max(best, float(number))
+    return best
+
+
+def _sports_best_rung_text_key(text):
+    text = str(text or "").upper()
+    text = re.sub(r"\b([A-Z]{2,12})\d{1,4}(?:\.\d+)?\b", r"\1#", text)
+    text = re.sub(r"\b\d{1,4}(?:\.\d+)?\b", "#", text)
+    text = re.sub(r"\b\d{1,2}[A-Z]{3}\d{1,2}\b", "#", text)
+    text = re.sub(r"[^A-Z0-9#]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text[:120] or "UNKNOWN"
+
+
+def _sports_best_rung_group_key(self, row=None):
+    row = row if isinstance(row, dict) else {}
+    allocation = row.get("allocation") if isinstance(row.get("allocation"), dict) else {}
+    candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else {}
+    market = row.get("market") if isinstance(row.get("market"), dict) else {}
+    q = row.get("q") or candidate.get("q")
+    game_context = allocation.get("game_thesis_context") if isinstance(allocation.get("game_thesis_context"), dict) else {}
+    ticker = str(row.get("ticker") or candidate.get("ticker") or allocation.get("ticker") or getattr(q, "ticker", "") or market.get("ticker") or "").strip()
+    family = str(row.get("family") or candidate.get("family") or allocation.get("family") or market.get("series_ticker") or "").strip().upper()
+    sport = str(
+        allocation.get("sport")
+        or market.get("sport")
+        or getattr(q, "sport", "")
+        or family[:5]
+        or "SPORTS"
+    ).strip().upper()
+    game_id = str(
+        allocation.get("game_id")
+        or game_context.get("game_id")
+        or getattr(q, "game_id", "")
+        or market.get("event_ticker")
+        or ""
+    ).strip().upper()
+    leg_type = str(row.get("leg_type") or self._sports_ladder_leg_type(family=family, ticker=ticker, market=market, q=q) or "sports_related").strip().lower()
+    market_type = str(
+        allocation.get("market_type")
+        or market.get("market_type")
+        or getattr(q, "market_type", "")
+        or leg_type
+    ).strip().upper()
+    side = _sports_best_rung_side(row) or "any"
+    subject = str(
+        allocation.get("player_name")
+        or allocation.get("player")
+        or allocation.get("team_name")
+        or allocation.get("team")
+        or market.get("player_name")
+        or market.get("player")
+        or market.get("team_name")
+        or market.get("team")
+        or getattr(q, "player_name", "")
+        or getattr(q, "player", "")
+        or getattr(q, "team_name", "")
+        or getattr(q, "team", "")
+        or ""
+    ).strip()
+    if not subject:
+        try:
+            subject = self._quality_market_text(family=family, ticker=ticker, market=market, q=q)
+        except Exception:
+            subject = ""
+    if not subject:
+        subject = " ".join(
+            str(value or "").strip()
+            for value in (
+                market.get("title"),
+                market.get("subtitle"),
+                market.get("name"),
+                getattr(q, "title", ""),
+            )
+            if str(value or "").strip()
+        )
+    if not subject:
+        subject = ticker
+    subject_key = _sports_best_rung_text_key(subject)
+    return "|".join([sport or "SPORTS", game_id or "NO_GAME", family or "NO_FAMILY", market_type or leg_type, leg_type, side, subject_key])
+
+
+def _sports_best_rung_tail_metrics(self, row=None):
+    row = row if isinstance(row, dict) else {}
+    price_probability = _sports_best_rung_price_probability(self, row)
+    model_probability = _sports_best_rung_probability(
+        self,
+        _sports_best_rung_read(
+            row,
+            None,
+            "model_probability",
+            "sports_ml_final_probability",
+            "sports_ml_probability",
+            "sports_ml_base_probability",
+            "probability",
+            "win_probability",
+        )
+    )
+    implied_probability = _sports_best_rung_probability(
+        self,
+        _sports_best_rung_read(row, None, "implied_probability", "market_implied_probability")
+    )
+    probability_values = [
+        value for value in (price_probability, implied_probability, model_probability)
+        if value is not None and value > 0.0
+    ]
+    tail_probability = min(probability_values) if probability_values else None
+    far_tail = bool(tail_probability is not None and tail_probability <= 0.05)
+    return {
+        "price_probability": price_probability,
+        "model_probability": model_probability,
+        "implied_probability": implied_probability,
+        "tail_probability": tail_probability,
+        "far_tail": far_tail,
+    }
+
+
+def _sports_best_rung_score(self, row=None):
+    row = row if isinstance(row, dict) else {}
+    allocation = row.get("allocation") if isinstance(row.get("allocation"), dict) else {}
+    candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else {}
+    ladder_score = self.to_float(row.get("ladder_score"), None)
+    if ladder_score is None:
+        ladder_score = self.to_float(allocation.get("unified_opportunity_score"), self.to_float(candidate.get("candidate_score"), 0.0)) or 0.0
+    unified_score = self.to_float(row.get("unified_score"), self.to_float(allocation.get("unified_opportunity_score"), ladder_score)) or 0.0
+    base_score = max(float(ladder_score or 0.0), float(unified_score or 0.0) * 0.92)
+    edge = self.to_float(
+        _sports_best_rung_read(
+            row,
+            None,
+            "edge_after_cost",
+            "sports_edge_after_cost",
+            "post_cost_edge",
+            "sports_ml_edge_estimate",
+            "edge",
+            "EV",
+            "ev",
+            "expected_value",
+        ),
+        0.0,
+    ) or 0.0
+    if abs(edge) > 1.0 and abs(edge) <= 100.0:
+        edge /= 100.0
+    execution_quality = self.to_float(
+        _sports_best_rung_read(
+            row,
+            None,
+            "sports_execution_quality_score",
+            "execution_quality_score",
+            "quality_score",
+            "candidate_score",
+        ),
+        None,
+    )
+    if execution_quality is not None and execution_quality <= 1.0:
+        execution_quality *= 100.0
+    fill_probability = self.to_float(
+        _sports_best_rung_read(row, None, "sports_execution_fill_probability", "fill_probability", "fill_prob"),
+        None,
+    )
+    if fill_probability is not None and fill_probability <= 1.0:
+        fill_probability *= 100.0
+    spread = self.to_float(_sports_best_rung_read(row, None, "spread", "executable_spread"), None)
+    liquidity = self.to_float(_sports_best_rung_read(row, None, "liquidity", "liquidity_dollars", "volume"), 0.0) or 0.0
+    top_size = _sports_best_rung_top_size(self, row)
+    memory_component = sum(
+        self.to_float(_sports_best_rung_read(row, None, field_name), 0.0) or 0.0
+        for field_name in (
+            "sports_memory_rank_adjustment",
+            "family_profit_memory_adjustment",
+            "sports_regime_rank_adjustment",
+            "sports_graph_rank_adjustment",
+        )
+    )
+    book_quality = self.to_float(row.get("book_quality"), self.to_float(allocation.get("book_quality"), None))
+    edge_component = max(-18.0, min(36.0, edge * 300.0))
+    quality_component = max(0.0, min(10.0, (execution_quality or 0.0) * 0.10))
+    fill_component = max(0.0, min(6.0, (fill_probability or 0.0) * 0.06))
+    if spread is None:
+        spread_component = 0.0
+    elif spread <= 0.02:
+        spread_component = 10.0
+    elif spread <= 0.05:
+        spread_component = 7.0
+    elif spread <= 0.08:
+        spread_component = 4.0
+    elif spread <= 0.12:
+        spread_component = 1.5
+    else:
+        spread_component = -6.0
+    liquidity_component = min(8.0, math.log1p(max(0.0, liquidity)) * 1.15)
+    top_size_component = min(5.0, math.log1p(max(0.0, top_size)) * 1.35)
+    memory_component = max(-8.0, min(12.0, memory_component))
+    book_component = 0.0 if book_quality is None else max(0.0, min(6.0, float(book_quality) * 6.0))
+    tail_metrics = _sports_best_rung_tail_metrics(self, row)
+    tail_probability = tail_metrics.get("tail_probability")
+    tail_penalty = 0.0
+    if tail_probability is not None:
+        if tail_probability <= 0.01:
+            tail_penalty = 30.0
+        elif tail_probability <= 0.02:
+            tail_penalty = 24.0
+        elif tail_probability <= 0.03:
+            tail_penalty = 18.0
+        elif tail_probability <= 0.05:
+            tail_penalty = 12.0
+    if tail_penalty > 0.0 and edge >= 0.10 and liquidity >= 30.0 and (spread is None or spread <= 0.08):
+        tail_penalty *= 0.35
+    missing_price_penalty = 18.0 if tail_metrics.get("price_probability") is None else 0.0
+    score = (
+        base_score * 0.52
+        + edge_component
+        + quality_component
+        + fill_component
+        + spread_component
+        + liquidity_component
+        + top_size_component
+        + memory_component
+        + book_component
+        - tail_penalty
+        - missing_price_penalty
+    )
+    return {
+        "score": round(max(0.0, min(120.0, score)), 4),
+        "base_score": round(base_score, 4),
+        "edge": round(edge, 6),
+        "execution_quality": round(execution_quality, 4) if execution_quality is not None else None,
+        "fill_probability": round(fill_probability, 4) if fill_probability is not None else None,
+        "spread": round(spread, 6) if spread is not None else None,
+        "liquidity": round(liquidity, 4),
+        "top_size": round(top_size, 4),
+        "memory_component": round(memory_component, 4),
+        "tail_probability": round(tail_probability, 6) if tail_probability is not None else None,
+        "far_tail": bool(tail_metrics.get("far_tail")),
+        "price_probability": round(tail_metrics.get("price_probability"), 6) if tail_metrics.get("price_probability") is not None else None,
+    }
+
+
+def _sports_best_rung_has_strong_evidence(self, row=None, *, best_score=0.0, group_size=1):
+    row = row if isinstance(row, dict) else {}
+    details = row.get("best_rung_details") if isinstance(row.get("best_rung_details"), dict) else _sports_best_rung_score(self, row)
+    score = self.to_float(details.get("score"), 0.0) or 0.0
+    edge = self.to_float(details.get("edge"), 0.0) or 0.0
+    spread = self.to_float(details.get("spread"), None)
+    liquidity = self.to_float(details.get("liquidity"), 0.0) or 0.0
+    top_size = self.to_float(details.get("top_size"), 0.0) or 0.0
+    min_score = float(AION_BEST_RUNG_STRONG_EVIDENCE_MIN_SCORE or 70.0)
+    score_floor = min_score + (4.0 if int(group_size or 1) >= 5 else 0.0)
+    close_to_best = score >= (self.to_float(best_score, score) or score) - (8.0 if int(group_size or 1) >= 5 else 14.0)
+    real_liquidity = liquidity >= 20.0 or top_size >= 3.0
+    spread_ok = spread is None or spread <= 0.12
+    if details.get("far_tail"):
+        return bool(
+            score >= score_floor + 6.0
+            and close_to_best
+            and edge >= 0.10
+            and real_liquidity
+            and (spread is None or spread <= 0.08)
+        )
+    return bool(score >= score_floor and close_to_best and real_liquidity and spread_ok)
+
+
+def _apply_sports_best_rung_selection(self, rows=None, *, source="sports_ladder"):
+    rows = [row for row in (rows or []) if isinstance(row, dict)]
+    summary = {
+        "enabled": bool(AION_BEST_RUNG_ENABLED),
+        "group_count": 0,
+        "kept_count": len(rows),
+        "rejected_count": 0,
+        "kept_tickers": [row.get("ticker") for row in rows],
+        "rejected_tickers": [],
+    }
+    if not AION_BEST_RUNG_ENABLED or len(rows) <= 1:
+        return rows, summary
+    default_keep = max(1, int(AION_BEST_RUNG_DEFAULT_KEEP or 1))
+    max_keep = max(default_keep, int(AION_BEST_RUNG_MAX_KEEP or default_keep))
+    groups = {}
+    for row in rows:
+        group_key = _sports_best_rung_group_key(self, row)
+        details = _sports_best_rung_score(self, row)
+        row["best_rung_group_key"] = group_key
+        row["best_rung_score"] = details.get("score")
+        row["best_rung_details"] = details
+        groups.setdefault(group_key, []).append(row)
+
+    kept_tickers = set()
+    rejected_rows = []
+    group_summaries = []
+    for group_key, group_rows in groups.items():
+        ranked = sorted(
+            group_rows,
+            key=lambda row: (
+                self.to_float(row.get("best_rung_score"), 0.0) or 0.0,
+                self.to_float(row.get("ladder_score"), 0.0) or 0.0,
+            ),
+            reverse=True,
+        )
+        best_row = ranked[0]
+        best_score = self.to_float(best_row.get("best_rung_score"), 0.0) or 0.0
+        group_kept = []
+        group_rejected = []
+        seen_tickers = set()
+        for rank, row in enumerate(ranked, start=1):
+            ticker = str(row.get("ticker") or "").strip()
+            row["best_rung_rank"] = rank
+            row["best_rung_group_size"] = len(ranked)
+            if ticker in seen_tickers:
+                reason = "duplicate_ticker_in_ladder_group"
+                group_rejected.append((row, reason))
+                continue
+            seen_tickers.add(ticker)
+            if rank <= default_keep:
+                reason = "top_best_rung"
+                group_kept.append((row, reason))
+                continue
+            if rank <= max_keep and _sports_best_rung_has_strong_evidence(self, row, best_score=best_score, group_size=len(ranked)):
+                reason = "strong_second_rung"
+                group_kept.append((row, reason))
+                continue
+            details = row.get("best_rung_details") if isinstance(row.get("best_rung_details"), dict) else {}
+            if details.get("far_tail"):
+                reason = "far_tail_not_clearly_superior"
+            elif rank > max_keep:
+                reason = "outside_best_rung_cap"
+            else:
+                reason = "weaker_ladder_extension"
+            group_rejected.append((row, reason))
+
+        for row, reason in group_kept:
+            ticker = str(row.get("ticker") or "").strip()
+            kept_tickers.add(ticker)
+            row["best_rung_decision"] = "keep"
+            row["best_rung_reason"] = reason
+        for row, reason in group_rejected:
+            row["best_rung_decision"] = "reject"
+            row["best_rung_reason"] = reason
+            rejected_rows.append(row)
+
+        if len(ranked) > 1:
+            group_summary = {
+                "group_key": group_key[:180],
+                "group_size": len(ranked),
+                "kept_count": len(group_kept),
+                "rejected_count": len(group_rejected),
+                "best_ticker": best_row.get("ticker"),
+                "best_score": round(best_score, 4),
+            }
+            group_summaries.append(group_summary)
+            self._emit_sports_ladder_log(
+                "AION-BEST-RUNG-GROUP",
+                group_summary,
+                marker=("AION-BEST-RUNG-GROUP", source, group_key, int(time.time() // 180)),
+            )
+            for row, reason in group_kept:
+                self._emit_sports_ladder_log(
+                    "AION-BEST-RUNG-KEEP",
+                    {
+                        "ticker": row.get("ticker"),
+                        "group_key": group_key[:180],
+                        "rung_rank": row.get("best_rung_rank"),
+                        "reason": reason,
+                    },
+                    marker=("AION-BEST-RUNG-KEEP", source, row.get("ticker"), group_key, int(time.time() // 180)),
+                )
+            better_ticker = best_row.get("ticker")
+            for row, reason in group_rejected:
+                self._emit_sports_ladder_log(
+                    "AION-BEST-RUNG-REJECT",
+                    {
+                        "ticker": row.get("ticker"),
+                        "group_key": group_key[:180],
+                        "rung_rank": row.get("best_rung_rank"),
+                        "reason": reason,
+                        "better_ticker": better_ticker,
+                    },
+                    marker=("AION-BEST-RUNG-REJECT", source, row.get("ticker"), group_key, int(time.time() // 180)),
+                )
+
+    kept_rows = [row for row in rows if str(row.get("ticker") or "").strip() in kept_tickers]
+    summary = {
+        "enabled": True,
+        "group_count": len(groups),
+        "ladder_group_count": len(group_summaries),
+        "kept_count": len(kept_rows),
+        "rejected_count": len(rejected_rows),
+        "kept_tickers": [row.get("ticker") for row in kept_rows],
+        "rejected_tickers": [row.get("ticker") for row in rejected_rows],
+        "groups": group_summaries[:10],
+    }
+    self.last_sports_best_rung_summary = summary
+    return kept_rows, summary
+
+
 def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, source="sports_ladder"):
     if not AION_SPORTS_LADDER_ENABLED:
         return {"enabled": False, "reason": "sports_ladder_disabled"}
@@ -6128,6 +6638,7 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
             ),
         )
     rows = sorted(selected_group.get("rows") or [], key=lambda row: row.get("ladder_score", 0.0), reverse=True)
+    rows, best_rung_summary = _apply_sports_best_rung_selection(self, rows, source=source)
     if not rows:
         return {"enabled": True, "reason": "no_ladder_rows"}
     context = selected_group.get("context") if isinstance(selected_group.get("context"), dict) else {}
@@ -6180,6 +6691,14 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
         "primary_candidate": legs[0].get("ticker") if legs else None,
         "secondary_candidates": [leg.get("ticker") for leg in legs[1:]],
         "related_candidates": [row.get("ticker") for row in rows],
+        "best_rung_summary": {
+            "enabled": bool((best_rung_summary or {}).get("enabled")),
+            "group_count": (best_rung_summary or {}).get("group_count"),
+            "ladder_group_count": (best_rung_summary or {}).get("ladder_group_count"),
+            "kept_count": (best_rung_summary or {}).get("kept_count"),
+            "rejected_count": (best_rung_summary or {}).get("rejected_count"),
+            "rejected_tickers": ((best_rung_summary or {}).get("rejected_tickers") or [])[:12],
+        },
         "max_game_contracts": int(AION_SPORTS_LADDER_MAX_GAME_CONTRACTS or 1),
         "legs": legs,
         "reason": "strong_game_thesis_ladder",
@@ -6193,6 +6712,10 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
                 "ticker": leg.get("ticker"),
                 "role": leg.get("role"),
                 "leg_type": leg.get("leg_type"),
+                "best_rung_group_key": leg.get("best_rung_group_key"),
+                "best_rung_rank": leg.get("best_rung_rank"),
+                "best_rung_score": leg.get("best_rung_score"),
+                "best_rung_reason": leg.get("best_rung_reason"),
                 "sports_graph_role": leg.get("sports_graph_role"),
                 "sports_graph_lag_detected": leg.get("sports_graph_lag_detected"),
                 "sports_graph_rank_adjustment": leg.get("sports_graph_rank_adjustment"),
@@ -6217,6 +6740,9 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
                     "ticker": leg.get("ticker"),
                     "role": leg.get("role"),
                     "leg_type": leg.get("leg_type"),
+                    "best_rung_rank": leg.get("best_rung_rank"),
+                    "best_rung_score": leg.get("best_rung_score"),
+                    "best_rung_reason": leg.get("best_rung_reason"),
                     "sports_graph_role": leg.get("sports_graph_role"),
                     "sports_graph_lag_detected": leg.get("sports_graph_lag_detected"),
                     "sports_graph_rank_adjustment": leg.get("sports_graph_rank_adjustment"),
@@ -6226,6 +6752,7 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
                 }
                 for leg in legs
             ],
+            "best_rung_summary": plan.get("best_rung_summary"),
             "max_game_contracts": plan.get("max_game_contracts"),
             "reason": plan.get("reason"),
         },
