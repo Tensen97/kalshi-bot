@@ -2,8 +2,13 @@
 
 import hashlib
 import json
+import math
 import os
 import time
+
+
+CANONICAL_ORDER_ENDPOINT = "/trade-api/v2/portfolio/orders"
+CANONICAL_ORDER_ENDPOINT_KIND = "legacy"
 
 
 def _env_bool(name, default=True):
@@ -35,6 +40,394 @@ def ensure_live_client_order_id(payload):
     return payload
 
 
+def _price_to_cents(value):
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    cents = int(round(numeric * 100.0)) if numeric <= 1.0 else int(round(numeric))
+    return max(1, min(99, cents))
+
+
+def _compact_response_body(body, limit=1200):
+    if body is None:
+        return None
+    try:
+        text = json.dumps(body, sort_keys=True, default=str)
+    except Exception:
+        text = str(body)
+    if len(text) <= int(limit or 1200):
+        return body
+    return text[: int(limit or 1200)] + "...[truncated]"
+
+
+def _exchange_rejection_reason(response):
+    response = response if isinstance(response, dict) else {}
+    body = response.get("body") if isinstance(response.get("body"), dict) else {}
+    error = body.get("error") if isinstance(body.get("error"), dict) else {}
+    code = str(error.get("code") or "").strip()
+    if code:
+        return code
+    return response.get("reason") or "request_failed"
+
+
+def _cash_value_to_dollars(value, *, cents=False):
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric < 0:
+        return None
+    if cents:
+        numeric = numeric / 100.0
+    return round(float(numeric), 4)
+
+
+def _find_mapping_field(mapping, field_names):
+    mapping = mapping if isinstance(mapping, dict) else {}
+    for field_name in field_names:
+        if field_name in mapping and mapping.get(field_name) not in (None, ""):
+            return field_name, mapping.get(field_name)
+    for value in mapping.values():
+        if isinstance(value, dict):
+            found_name, found_value = _find_mapping_field(value, field_names)
+            if found_name:
+                return found_name, found_value
+    return None, None
+
+
+def fetch_live_available_cash(bot):
+    dollar_fields = (
+        "available_balance_dollars",
+        "available_cash_dollars",
+        "buying_power_dollars",
+        "cash_balance_dollars",
+        "balance_dollars",
+    )
+    cent_fields = (
+        "available_balance_cents",
+        "available_cash_cents",
+        "buying_power_cents",
+        "cash_balance_cents",
+        "balance_cents",
+        "available_balance",
+        "buying_power",
+        "cash_balance",
+        "balance",
+    )
+    try:
+        result = bot._live_request_json("GET", "/trade-api/v2/portfolio/balance", timeout=5)
+    except Exception as exc:
+        result = {"ok": False, "reason": f"balance_fetch_exception:{exc.__class__.__name__}", "body": None}
+    body = result.get("body") if isinstance(result, dict) else {}
+    if isinstance(body, dict):
+        field_name, raw_value = _find_mapping_field(body, dollar_fields)
+        available_cash = _cash_value_to_dollars(raw_value, cents=False)
+        source = f"portfolio_balance.{field_name}" if field_name else None
+        if available_cash is None:
+            field_name, raw_value = _find_mapping_field(body, cent_fields)
+            available_cash = _cash_value_to_dollars(raw_value, cents=True)
+            source = f"portfolio_balance.{field_name}" if field_name else None
+        if available_cash is not None:
+            try:
+                bot.live_balance = body
+                bot.last_live_available_balance = available_cash
+                bot.available_cash = available_cash
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "available_cash": available_cash,
+                "source": source or "portfolio_balance",
+                "status_code": result.get("status_code"),
+                "body_keys": sorted(body.keys()),
+            }
+    for attr_name in (
+        "available_cash",
+        "available_balance",
+        "live_available_balance",
+        "last_live_available_balance",
+        "last_available_balance",
+    ):
+        try:
+            raw_value = getattr(bot, attr_name, None)
+        except Exception:
+            raw_value = None
+        available_cash = _cash_value_to_dollars(raw_value, cents=False)
+        if available_cash is not None:
+            return {
+                "ok": True,
+                "available_cash": available_cash,
+                "source": f"attribute.{attr_name}",
+                "status_code": result.get("status_code") if isinstance(result, dict) else None,
+                "body_keys": sorted(body.keys()) if isinstance(body, dict) else [],
+                "stale_fallback": True,
+            }
+    return {
+        "ok": False,
+        "available_cash": None,
+        "source": None,
+        "reason": result.get("reason") if isinstance(result, dict) else "balance_unavailable",
+        "status_code": result.get("status_code") if isinstance(result, dict) else None,
+        "body_keys": sorted(body.keys()) if isinstance(body, dict) else [],
+    }
+
+
+def apply_cash_aware_live_sizing(bot, request_payload, validation):
+    request_payload = dict(request_payload or {})
+    validation = validation if isinstance(validation, dict) else {}
+    action = str(request_payload.get("action") or "").strip().lower()
+    if action != "buy":
+        return {"ok": True, "payload": request_payload, "cash_sizing": {"checked": False, "reason": "non_buy_order"}}
+    selected_price_cents = validation.get("price_cents") or request_payload.get("yes_price") or request_payload.get("no_price")
+    selected_price_cents = _price_to_cents(selected_price_cents)
+    planned_count = request_payload.get("count")
+    try:
+        planned_count = int(planned_count)
+    except (TypeError, ValueError):
+        planned_count = 0
+    if selected_price_cents is None or planned_count < 1:
+        return {
+            "ok": False,
+            "reason": "cash_sizing_invalid_price_or_count",
+            "payload": request_payload,
+            "cash_sizing": {
+                "selected_price_cents": selected_price_cents,
+                "planned_count": planned_count,
+            },
+        }
+    balance = fetch_live_available_cash(bot)
+    available_cash = balance.get("available_cash")
+    buffer_cents = max(0, _env_int("AION_CASH_SIZING_BUFFER_CENTS", 0))
+    if available_cash is None:
+        print(
+            "[AION-CASH-SIZING-SKIP] "
+            + json.dumps(
+                {
+                    "ticker": request_payload.get("ticker"),
+                    "selected_side": request_payload.get("side"),
+                    "selected_price_cents": selected_price_cents,
+                    "planned_count": planned_count,
+                    "max_affordable_count": 0,
+                    "available_cash": None,
+                    "estimated_cost": round((selected_price_cents * planned_count) / 100.0, 4),
+                    "reason": "cash_balance_unavailable_pre_submit",
+                    "balance_reason": balance.get("reason"),
+                    "balance_status_code": balance.get("status_code"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return {
+            "ok": False,
+            "reason": "cash_balance_unavailable_pre_submit",
+            "payload": request_payload,
+            "cash_sizing": balance,
+        }
+    available_cash_cents = max(0, int(math.floor(float(available_cash) * 100.0 + 1e-9)))
+    spendable_cash_cents = max(0, available_cash_cents - buffer_cents)
+    max_affordable_count = int(spendable_cash_cents // max(1, int(selected_price_cents)))
+    estimated_cost = round((selected_price_cents * planned_count) / 100.0, 4)
+    if max_affordable_count < 1:
+        print(
+            "[AION-CASH-SIZING-SKIP] "
+            + json.dumps(
+                {
+                    "ticker": request_payload.get("ticker"),
+                    "selected_side": request_payload.get("side"),
+                    "selected_price_cents": selected_price_cents,
+                    "planned_count": planned_count,
+                    "max_affordable_count": max_affordable_count,
+                    "available_cash": available_cash,
+                    "estimated_cost": estimated_cost,
+                    "cash_buffer_cents": buffer_cents,
+                    "balance_source": balance.get("source"),
+                    "reason": "insufficient_cash_pre_submit",
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return {
+            "ok": False,
+            "reason": "insufficient_cash_pre_submit",
+            "payload": request_payload,
+            "cash_sizing": {
+                "available_cash": available_cash,
+                "selected_price_cents": selected_price_cents,
+                "planned_count": planned_count,
+                "max_affordable_count": max_affordable_count,
+                "estimated_cost": estimated_cost,
+                "cash_buffer_cents": buffer_cents,
+                "balance_source": balance.get("source"),
+            },
+        }
+    if max_affordable_count < planned_count:
+        adjusted_payload = dict(request_payload)
+        adjusted_payload["count"] = max_affordable_count
+        print(
+            "[AION-CASH-SIZING-ADJUSTED] "
+            + json.dumps(
+                {
+                    "ticker": request_payload.get("ticker"),
+                    "selected_price_cents": selected_price_cents,
+                    "original_count": planned_count,
+                    "adjusted_count": max_affordable_count,
+                    "available_cash": available_cash,
+                    "estimated_cost": estimated_cost,
+                    "adjusted_estimated_cost": round((selected_price_cents * max_affordable_count) / 100.0, 4),
+                    "cash_buffer_cents": buffer_cents,
+                    "balance_source": balance.get("source"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+        return {
+            "ok": True,
+            "payload": adjusted_payload,
+            "cash_sizing": {
+                "adjusted": True,
+                "available_cash": available_cash,
+                "selected_price_cents": selected_price_cents,
+                "planned_count": planned_count,
+                "max_affordable_count": max_affordable_count,
+                "estimated_cost": estimated_cost,
+                "adjusted_estimated_cost": round((selected_price_cents * max_affordable_count) / 100.0, 4),
+                "cash_buffer_cents": buffer_cents,
+                "balance_source": balance.get("source"),
+            },
+        }
+    return {
+        "ok": True,
+        "payload": request_payload,
+        "cash_sizing": {
+            "checked": True,
+            "available_cash": available_cash,
+            "selected_price_cents": selected_price_cents,
+            "planned_count": planned_count,
+            "max_affordable_count": max_affordable_count,
+            "estimated_cost": estimated_cost,
+            "cash_buffer_cents": buffer_cents,
+            "balance_source": balance.get("source"),
+        },
+    }
+
+
+def aion_intent_to_order_payload_fields(intent, selected_price, endpoint_kind=CANONICAL_ORDER_ENDPOINT_KIND):
+    intent = intent if isinstance(intent, dict) else {"side": intent}
+    endpoint_kind = str(endpoint_kind or CANONICAL_ORDER_ENDPOINT_KIND).strip().lower()
+    side = str(intent.get("selected_side") or intent.get("side") or "").strip().lower()
+    action = str(intent.get("action") or "buy").strip().lower()
+    if action in {"exit", "close"}:
+        action = "sell"
+    if endpoint_kind != CANONICAL_ORDER_ENDPOINT_KIND:
+        return None
+    if side not in {"yes", "no"} or action not in {"buy", "sell"}:
+        return None
+    price_cents = _price_to_cents(selected_price)
+    if price_cents is None:
+        return None
+    fields = {
+        "side": side,
+        "action": action,
+    }
+    fields["yes_price" if side == "yes" else "no_price"] = price_cents
+    return fields
+
+
+def validate_canonical_order_payload(payload, endpoint_kind=CANONICAL_ORDER_ENDPOINT_KIND):
+    payload = payload if isinstance(payload, dict) else {}
+    endpoint_kind = str(endpoint_kind or CANONICAL_ORDER_ENDPOINT_KIND).strip().lower()
+    if endpoint_kind != CANONICAL_ORDER_ENDPOINT_KIND:
+        return {"ok": False, "reason": "unsupported_endpoint_kind", "payload_keys": sorted(payload.keys())}
+    ticker = str(payload.get("ticker") or "").strip()
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    side = str(payload.get("side") or "").strip().lower()
+    action = str(payload.get("action") or "").strip().lower()
+    count = payload.get("count")
+    price_keys = [
+        key
+        for key in ("yes_price", "no_price", "yes_price_dollars", "no_price_dollars", "price", "buy_max_cost")
+        if payload.get(key) not in (None, "")
+    ]
+    if not ticker:
+        return {"ok": False, "reason": "missing_ticker", "payload_keys": sorted(payload.keys())}
+    if not client_order_id:
+        return {"ok": False, "reason": "missing_client_order_id", "payload_keys": sorted(payload.keys())}
+    if side not in {"yes", "no"}:
+        return {"ok": False, "reason": "invalid_side", "payload_keys": sorted(payload.keys())}
+    if action not in {"buy", "sell"}:
+        return {"ok": False, "reason": "invalid_action", "payload_keys": sorted(payload.keys())}
+    if len(price_keys) != 1:
+        return {
+            "ok": False,
+            "reason": "exactly_one_legacy_price_field_required",
+            "price_keys": price_keys,
+            "payload_keys": sorted(payload.keys()),
+        }
+    expected_price_key = "yes_price" if side == "yes" else "no_price"
+    if price_keys[0] != expected_price_key:
+        return {
+            "ok": False,
+            "reason": "price_field_does_not_match_side",
+            "price_keys": price_keys,
+            "expected_price_key": expected_price_key,
+            "payload_keys": sorted(payload.keys()),
+        }
+    price_value = payload.get(expected_price_key)
+    if isinstance(price_value, bool) or not isinstance(price_value, int) or not (1 <= int(price_value) <= 99):
+        return {
+            "ok": False,
+            "reason": "invalid_integer_cents_price",
+            "price_key": expected_price_key,
+            "price_value": price_value,
+            "payload_keys": sorted(payload.keys()),
+        }
+    if isinstance(count, bool) or not isinstance(count, int) or int(count) < 1:
+        return {"ok": False, "reason": "invalid_integer_count", "count": count, "payload_keys": sorted(payload.keys())}
+    return {
+        "ok": True,
+        "reason": "schema_valid",
+        "payload_keys": sorted(payload.keys()),
+        "price_key": expected_price_key,
+        "price_cents": int(price_value),
+        "count": int(count),
+    }
+
+
+def _emit_payload_schema_block(endpoint, endpoint_kind, payload, validation):
+    try:
+        print(
+            "[AION-PAYLOAD-SCHEMA-BLOCK] "
+            + json.dumps(
+                {
+                    "endpoint": endpoint,
+                    "endpoint_kind": endpoint_kind,
+                    "ticker": (payload or {}).get("ticker") if isinstance(payload, dict) else None,
+                    "client_order_id": (payload or {}).get("client_order_id") if isinstance(payload, dict) else None,
+                    "side": (payload or {}).get("side") if isinstance(payload, dict) else None,
+                    "action": (payload or {}).get("action") if isinstance(payload, dict) else None,
+                    "count": (payload or {}).get("count") if isinstance(payload, dict) else None,
+                    "reason": (validation or {}).get("reason"),
+                    "price_keys": (validation or {}).get("price_keys"),
+                    "payload_keys": (validation or {}).get("payload_keys"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
+    except Exception:
+        pass
+
+
 def normalize_legacy_order_payload(
     bot,
     payload,
@@ -52,17 +445,23 @@ def normalize_legacy_order_payload(
     count = int(max(1, min(int(bot.to_float(payload.get("count"), 1) or 1), int(max_live_order_size or 1))))
     price_cents = payload.get("yes_price") if side == "yes" else payload.get("no_price")
     price_dollars = payload.get("selected_price_dollars") or payload.get("selected_price") or payload.get("price")
-    if price_cents in (None, "", 0, 0.0):
+    price_cents = _price_to_cents(price_cents)
+    if price_cents is None:
         normalized_price = bot.normalize_contract_price(price_dollars, ticker=ticker, source="legacy_order_payload")
         if normalized_price is None:
             return None
-        price_cents = int(round(float(normalized_price) * 100.0))
-    price_cents = max(1, min(99, int(round(float(price_cents)))))
-    normalized_price = round(price_cents / 100.0, 4)
+        price_cents = _price_to_cents(normalized_price)
+    if price_cents is None:
+        return None
+    order_fields = aion_intent_to_order_payload_fields(
+        {"side": side, "action": action},
+        price_cents,
+        CANONICAL_ORDER_ENDPOINT_KIND,
+    )
+    if not order_fields:
+        return None
     order = {
         "ticker": ticker,
-        "side": side,
-        "action": action,
         "client_order_id": payload["client_order_id"],
         "count": count,
         "type": "limit",
@@ -71,12 +470,7 @@ def normalize_legacy_order_payload(
         "reduce_only": bool(payload.get("reduce_only", False)),
         "self_trade_prevention_type": "taker_at_cross",
     }
-    if side == "yes":
-        order["yes_price"] = price_cents
-        order["yes_price_dollars"] = f"{normalized_price:.4f}"
-    else:
-        order["no_price"] = price_cents
-        order["no_price_dollars"] = f"{normalized_price:.4f}"
+    order.update(order_fields)
     return order
 
 
@@ -90,10 +484,9 @@ def normalize_event_order_payload(
     legacy_payload = dict(legacy_payload or {})
     side = str(legacy_payload.get("side") or default_live_order_side).strip().lower()
     action = str(legacy_payload.get("action") or default_live_order_action).strip().lower()
+    raw_price = legacy_payload.get("yes_price") if side == "yes" else legacy_payload.get("no_price")
     selected_price = bot.normalize_contract_price(
-        legacy_payload.get("yes_price_dollars")
-        if side == "yes"
-        else legacy_payload.get("no_price_dollars"),
+        round(float(raw_price) / 100.0, 4) if raw_price not in (None, "") else None,
         ticker=legacy_payload.get("ticker"),
         source="event_order_payload",
     )
@@ -213,55 +606,133 @@ def place_live_order(bot, payload):
     legacy_payload = bot._normalize_legacy_order_payload(payload)
     if not legacy_payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
-    event_payload = bot._normalize_event_order_payload(legacy_payload)
-    attempts = []
-    request_plan = []
-    if event_payload:
-        request_plan.append(("/trade-api/v2/portfolio/events/orders", event_payload, "events_v2"))
-    request_plan.append(("/trade-api/v2/portfolio/orders", legacy_payload, "legacy"))
-    for path, request_payload, endpoint_kind in request_plan:
-        print(
-            "[ORDER-SUBMIT] "
-            + json.dumps(
-                {
-                    "ticker": legacy_payload.get("ticker"),
-                    "side": legacy_payload.get("side"),
-                    "endpoint": path,
-                    "endpoint_kind": endpoint_kind,
-                    "client_order_id": legacy_payload.get("client_order_id"),
-                },
-                sort_keys=True,
-                default=str,
-            )
-        )
-        response = bot._live_request_json("POST", path, json_payload=request_payload, timeout=20)
-        attempts.append({
-            "path": path,
+    path = CANONICAL_ORDER_ENDPOINT
+    endpoint_kind = CANONICAL_ORDER_ENDPOINT_KIND
+    request_payload = legacy_payload
+    validation = validate_canonical_order_payload(request_payload, endpoint_kind)
+    if not validation.get("ok"):
+        _emit_payload_schema_block(path, endpoint_kind, request_payload, validation)
+        return {
+            "submitted": False,
+            "reason": validation.get("reason") or "malformed_payload",
+            "payload": request_payload,
+            "endpoint": path,
             "endpoint_kind": endpoint_kind,
-            "status_code": response.get("status_code"),
-            "reason": response.get("reason"),
-            "body": response.get("body"),
-        })
-        if response.get("ok"):
-            return {
-                "submitted": True,
-                "reason": "submitted",
+            "validation": validation,
+        }
+    cash_sizing = apply_cash_aware_live_sizing(bot, request_payload, validation)
+    if not cash_sizing.get("ok"):
+        return {
+            "submitted": False,
+            "reason": cash_sizing.get("reason") or "cash_sizing_block",
+            "payload": cash_sizing.get("payload") or request_payload,
+            "endpoint": path,
+            "endpoint_kind": endpoint_kind,
+            "cash_sizing": cash_sizing.get("cash_sizing"),
+        }
+    request_payload = cash_sizing.get("payload") if isinstance(cash_sizing.get("payload"), dict) else request_payload
+    legacy_payload = request_payload
+    validation = validate_canonical_order_payload(request_payload, endpoint_kind)
+    if not validation.get("ok"):
+        _emit_payload_schema_block(path, endpoint_kind, request_payload, validation)
+        return {
+            "submitted": False,
+            "reason": validation.get("reason") or "malformed_payload_after_cash_sizing",
+            "payload": request_payload,
+            "endpoint": path,
+            "endpoint_kind": endpoint_kind,
+            "validation": validation,
+            "cash_sizing": cash_sizing.get("cash_sizing"),
+        }
+    selected_price_key = validation.get("price_key")
+    selected_price = request_payload.get(selected_price_key)
+    print(
+        "[ORDER-SUBMIT] "
+        + json.dumps(
+            {
+                "method": "POST",
                 "endpoint": path,
                 "endpoint_kind": endpoint_kind,
-                "payload": legacy_payload,
-                "request_payload": request_payload,
-                "response": response.get("body"),
+                "ticker": legacy_payload.get("ticker"),
+                "client_order_id": legacy_payload.get("client_order_id"),
+                "selected_side": legacy_payload.get("side"),
+                "action": legacy_payload.get("action"),
+                "selected_price_cents": selected_price,
+                "count": legacy_payload.get("count"),
+                "payload_keys": sorted(request_payload.keys()),
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
+    response = bot._live_request_json("POST", path, json_payload=request_payload, timeout=20)
+    rejection_reason = _exchange_rejection_reason(response)
+    attempt = {
+        "method": "POST",
+        "path": path,
+        "endpoint": path,
+        "endpoint_kind": endpoint_kind,
+        "status_code": response.get("status_code"),
+        "reason": rejection_reason,
+        "http_reason": response.get("reason"),
+        "body": response.get("body"),
+        "request_payload_keys": sorted(request_payload.keys()),
+        "ticker": request_payload.get("ticker"),
+        "client_order_id": request_payload.get("client_order_id"),
+        "selected_side": request_payload.get("side"),
+        "selected_price_cents": selected_price,
+        "count": request_payload.get("count"),
+        "buy_max_cost": request_payload.get("buy_max_cost"),
+    }
+    attempts = [attempt]
+    if response.get("ok"):
+        return {
+            "submitted": True,
+            "reason": "submitted",
+            "endpoint": path,
+            "endpoint_kind": endpoint_kind,
+            "payload": legacy_payload,
+            "request_payload": request_payload,
+            "response": response.get("body"),
+            "status_code": response.get("status_code"),
+            "attempts": attempts,
+            "cash_sizing": cash_sizing.get("cash_sizing"),
+        }
+    print(
+        "[ORDER-REJECT] "
+        + json.dumps(
+            {
+                "method": "POST",
+                "endpoint": path,
+                "endpoint_kind": endpoint_kind,
                 "status_code": response.get("status_code"),
-                "attempts": attempts,
-            }
-        if response.get("status_code") in {401, 403}:
-            break
+                "reason": rejection_reason,
+                "http_reason": response.get("reason"),
+                "response_body": _compact_response_body(response.get("body")),
+                "ticker": request_payload.get("ticker"),
+                "client_order_id": request_payload.get("client_order_id"),
+                "selected_side": request_payload.get("side"),
+                "selected_price_cents": selected_price,
+                "count": request_payload.get("count"),
+                "buy_max_cost": request_payload.get("buy_max_cost"),
+                "outbound_payload_keys": sorted(request_payload.keys()),
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
     return {
         "submitted": False,
-        "reason": attempts[-1].get("reason") if attempts else "request_not_sent",
+        "reason": rejection_reason,
+        "http_reason": response.get("reason"),
         "payload": legacy_payload,
-        "status_code": attempts[-1].get("status_code") if attempts else None,
+        "request_payload": request_payload,
+        "endpoint": path,
+        "endpoint_kind": endpoint_kind,
+        "status_code": response.get("status_code"),
+        "response_body": response.get("body"),
         "attempts": attempts,
+        "cash_sizing": cash_sizing.get("cash_sizing"),
     }
 
 
@@ -928,15 +1399,19 @@ def submit_live_order(
     legacy_payload = bot._normalize_legacy_order_payload(payload)
     if not legacy_payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
-    selected_price = (
-        legacy_payload.get("yes_price_dollars")
+    selected_price_cents = (
+        legacy_payload.get("yes_price")
         if legacy_payload.get("side") == "yes"
-        else legacy_payload.get("no_price_dollars")
+        else legacy_payload.get("no_price")
     )
-    payload["price"] = bot.normalize_contract_price(
-        selected_price,
-        ticker=payload.get("ticker"),
-        source="submit_live_order.result_price",
+    payload["price"] = (
+        round(int(selected_price_cents) / 100.0, 4)
+        if selected_price_cents not in (None, "")
+        else bot.normalize_contract_price(
+            payload.get("selected_price") or payload.get("price"),
+            ticker=payload.get("ticker"),
+            source="submit_live_order.result_price",
+        )
     )
     payload["side"] = side if side in {"yes", "no"} else legacy_payload.get("side")
     for field in (

@@ -4967,6 +4967,230 @@ class KalshiSniperBot:
             yes_ask = min(1.0, 1.0 - float(no_bid))
         return yes_bid, yes_ask, no_bid, no_ask
 
+    def _aion_quote_price_to_dollars(self, value, *, allow_zero=False):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        try:
+            numeric = float(numeric)
+            if 1.0 < numeric <= 100.0:
+                numeric = numeric / 100.0
+            if not math.isfinite(numeric):
+                return None
+        except (TypeError, ValueError):
+            return None
+        if allow_zero:
+            if 0.0 <= numeric < 1.0:
+                return round(numeric, 4)
+        elif 0.0 < numeric < 1.0:
+            return round(numeric, 4)
+        return None
+
+    def _aion_selected_executable_price_from_book(
+        self,
+        *,
+        selected_side,
+        yes_bid=None,
+        yes_ask=None,
+        no_bid=None,
+        no_ask=None,
+        preferred_source="ask",
+    ):
+        side = self._aion_normalize_live_side(selected_side)
+        if side not in {"yes", "no"}:
+            return None
+        preferred_source = str(preferred_source or "ask").strip().lower() or "ask"
+        yes_bid_value = self._aion_quote_price_to_dollars(yes_bid, allow_zero=True)
+        yes_ask_value = self._aion_quote_price_to_dollars(yes_ask)
+        no_bid_value = self._aion_quote_price_to_dollars(no_bid, allow_zero=True)
+        no_ask_value = self._aion_quote_price_to_dollars(no_ask)
+
+        direct_price = yes_ask_value if side == "yes" else no_ask_value
+        direct_field = "yes_ask" if side == "yes" else "no_ask"
+        if preferred_source != "ask":
+            bid_price = yes_bid_value if side == "yes" else no_bid_value
+            bid_field = "yes_bid" if side == "yes" else "no_bid"
+            if bid_price is not None and KALSHI_CONTRACT_MIN_PRICE <= bid_price <= KALSHI_CONTRACT_MAX_PRICE:
+                return {
+                    "price": round(float(bid_price), 4),
+                    "price_cents": int(round(float(bid_price) * 100.0)),
+                    "source": "bid",
+                    "source_field": bid_field,
+                    "yes_bid": yes_bid_value,
+                    "yes_ask": yes_ask_value,
+                    "no_bid": no_bid_value,
+                    "no_ask": no_ask_value,
+                }
+        if direct_price is not None and KALSHI_CONTRACT_MIN_PRICE <= direct_price <= KALSHI_CONTRACT_MAX_PRICE:
+            return {
+                "price": round(float(direct_price), 4),
+                "price_cents": int(round(float(direct_price) * 100.0)),
+                "source": "ask",
+                "source_field": direct_field,
+                "yes_bid": yes_bid_value,
+                "yes_ask": yes_ask_value,
+                "no_bid": no_bid_value,
+                "no_ask": no_ask_value,
+            }
+
+        if side == "yes" and no_bid_value is not None:
+            equivalent_price = round(1.0 - float(no_bid_value), 4)
+            equivalent_field = "no_bid"
+        elif side == "no" and yes_bid_value is not None:
+            equivalent_price = round(1.0 - float(yes_bid_value), 4)
+            equivalent_field = "yes_bid"
+        else:
+            return None
+        if KALSHI_CONTRACT_MIN_PRICE <= equivalent_price <= KALSHI_CONTRACT_MAX_PRICE:
+            return {
+                "price": equivalent_price,
+                "price_cents": int(round(equivalent_price * 100.0)),
+                "source": "opposite_side_equivalent",
+                "source_field": equivalent_field,
+                "yes_bid": yes_bid_value,
+                "yes_ask": yes_ask_value,
+                "no_bid": no_bid_value,
+                "no_ask": no_ask_value,
+            }
+        return None
+
+    def _aion_coerce_orderbook_endpoint_source(self, orderbook_payload, *, ticker=None, family=None):
+        source = self._coerce_aion_orderbook_source(orderbook_payload)
+        if not isinstance(source, dict):
+            source = {}
+        if ticker:
+            source.setdefault("ticker", ticker)
+        if family:
+            source.setdefault("family", family)
+        try:
+            yes_levels, yes_levels_source = self._extract_orderbook_side_levels_with_source(source, "yes")
+            no_levels, no_levels_source = self._extract_orderbook_side_levels_with_source(source, "no")
+        except Exception:
+            yes_levels, yes_levels_source = [], "none"
+            no_levels, no_levels_source = [], "none"
+        try:
+            yes_top = self._extract_orderbook_fp_top_level(source, "yes")
+        except Exception:
+            yes_top = {}
+        try:
+            no_top = self._extract_orderbook_fp_top_level(source, "no")
+        except Exception:
+            no_top = {}
+        if self.to_float(yes_top.get("price"), None) is None:
+            try:
+                yes_top = self._extract_orderbook_top_level(yes_levels)
+            except Exception:
+                yes_top = {}
+        if self.to_float(no_top.get("price"), None) is None:
+            try:
+                no_top = self._extract_orderbook_top_level(no_levels)
+            except Exception:
+                no_top = {}
+
+        yes_bid = self._aion_quote_price_to_dollars(
+            source.get("yes_bid_dollars", source.get("yes_bid", yes_top.get("price"))),
+            allow_zero=True,
+        )
+        no_bid = self._aion_quote_price_to_dollars(
+            source.get("no_bid_dollars", source.get("no_bid", no_top.get("price"))),
+            allow_zero=True,
+        )
+        yes_ask = self._aion_quote_price_to_dollars(source.get("yes_ask_dollars", source.get("yes_ask")))
+        no_ask = self._aion_quote_price_to_dollars(source.get("no_ask_dollars", source.get("no_ask")))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+        for key, value in (
+            ("yes_bid", yes_bid),
+            ("yes_bid_dollars", yes_bid),
+            ("yes_ask", yes_ask),
+            ("yes_ask_dollars", yes_ask),
+            ("no_bid", no_bid),
+            ("no_bid_dollars", no_bid),
+            ("no_ask", no_ask),
+            ("no_ask_dollars", no_ask),
+            ("yes_top_size", self.to_float(yes_top.get("size"), None)),
+            ("no_top_size", self.to_float(no_top.get("size"), None)),
+        ):
+            if value not in (None, "", [], {}):
+                source[key] = value
+        if isinstance(yes_levels, list) and yes_levels:
+            source.setdefault("yes", yes_levels)
+        if isinstance(no_levels, list) and no_levels:
+            source.setdefault("no", no_levels)
+        source["source_path"] = "orderbook_endpoint"
+        source["orderbook_endpoint_yes_source"] = yes_levels_source
+        source["orderbook_endpoint_no_source"] = no_levels_source
+        source["orderbook_exists"] = bool(source.get("orderbook") or source.get("orderbook_fp") or yes_levels or no_levels or yes_bid is not None or no_bid is not None)
+        source["normalized_orderbook_present"] = bool(yes_bid is not None or yes_ask is not None or no_bid is not None or no_ask is not None)
+        return source
+
+    def _emit_aion_price_hydration_event(self, tag, **payload):
+        try:
+            compact = {
+                "ticker": payload.get("ticker"),
+                "family": payload.get("family"),
+                "selection_stage": payload.get("selection_stage"),
+                "selected_side": payload.get("selected_side"),
+                "selected_price_cents": payload.get("selected_price_cents"),
+                "selected_price_dollars": payload.get("selected_price_dollars"),
+                "selected_price_source": payload.get("selected_price_source"),
+                "source_field": payload.get("source_field"),
+                "missing_source": payload.get("missing_source"),
+                "yes_bid": payload.get("yes_bid"),
+                "yes_ask": payload.get("yes_ask"),
+                "no_bid": payload.get("no_bid"),
+                "no_ask": payload.get("no_ask"),
+                "refresh_attempted": bool(payload.get("refresh_attempted")),
+                "final_reason": payload.get("final_reason"),
+            }
+            print(f"[{tag}] " + json.dumps(compact, sort_keys=True, default=str))
+        except Exception:
+            pass
+
+    def _emit_aion_selected_price_rejected_compact(self, **payload):
+        try:
+            now = time.time()
+            ticker = str(payload.get("ticker") or "UNKNOWN")
+            family = str(payload.get("family") or "UNKNOWN")
+            stage = str(payload.get("selection_stage") or "unknown")
+            side = str(payload.get("selected_side") or "none")
+            reason = str(payload.get("final_reason") or payload.get("blocker") or "unknown")
+            key = (ticker, family, stage, side, reason)
+            throttle = getattr(self, "_aion_selected_price_reject_throttle", None)
+            if not isinstance(throttle, dict):
+                throttle = {}
+                self._aion_selected_price_reject_throttle = throttle
+            state = throttle.get(key, {})
+            last_emit = float(state.get("last_emit", 0.0) or 0.0)
+            suppressed = int(state.get("suppressed", 0) or 0)
+            if last_emit and (now - last_emit) < 60.0:
+                state["suppressed"] = suppressed + 1
+                throttle[key] = state
+                return
+            throttle[key] = {"last_emit": now, "suppressed": 0}
+            compact = {
+                "ticker": ticker if ticker != "UNKNOWN" else None,
+                "family": family,
+                "selection_stage": stage,
+                "selected_side": payload.get("selected_side"),
+                "selected_price_cents": payload.get("selected_price_cents"),
+                "selected_price_dollars": payload.get("selected_price_dollars"),
+                "selected_price_source": payload.get("selected_price_source"),
+                "missing_source": payload.get("missing_source"),
+                "yes_bid": payload.get("yes_bid"),
+                "yes_ask": payload.get("yes_ask"),
+                "no_bid": payload.get("no_bid"),
+                "no_ask": payload.get("no_ask"),
+                "refresh_attempted": bool(payload.get("refresh_attempted")),
+                "final_reason": reason,
+                "suppressed_count": suppressed,
+            }
+            print("[AION-SELECTED-PRICE-REJECTED] " + json.dumps(compact, sort_keys=True, default=str))
+        except Exception:
+            pass
+
     def _aion_normalize_live_side(self, side):
         side = str(side or "").strip().lower()
         return side if side in {"yes", "no"} else None
@@ -5060,6 +5284,8 @@ class KalshiSniperBot:
         yes_ask = _price(_pick(yes_ask, quote_diag.get("yes_ask"), quote_diag.get("yes_ask_dollars"), market.get("yes_ask_dollars"), market.get("yes_ask"), _q_get("yes_ask", "yes_ask_dollars")))
         no_bid = _bid_price(_pick(no_bid, quote_diag.get("no_bid"), quote_diag.get("no_bid_dollars"), market.get("no_bid_dollars"), market.get("no_bid"), _q_get("no_bid", "no_bid_dollars")))
         no_ask = _price(_pick(no_ask, quote_diag.get("no_ask"), quote_diag.get("no_ask_dollars"), market.get("no_ask_dollars"), market.get("no_ask"), _q_get("no_ask", "no_ask_dollars")))
+        yes_ask_source = "ask" if yes_ask is not None else None
+        no_ask_source = "ask" if no_ask is not None else None
         try:
             yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
         except Exception:
@@ -5068,6 +5294,10 @@ class KalshiSniperBot:
         yes_ask = _price(yes_ask)
         no_bid = _bid_price(no_bid)
         no_ask = _price(no_ask)
+        if yes_ask_source is None and yes_ask is not None and no_bid is not None:
+            yes_ask_source = "opposite_side_equivalent"
+        if no_ask_source is None and no_ask is not None and yes_bid is not None:
+            no_ask_source = "opposite_side_equivalent"
 
         yes_top_size = _size(_pick(yes_top_size, quote_diag.get("yes_top_size"), quote_diag.get("yes_ask_size"), market.get("yes_top_size"), market.get("yes_ask_size"), market.get("yes_ask_size_fp"), _q_get("yes_top_size", "yes_ask_size")))
         no_top_size = _size(_pick(no_top_size, quote_diag.get("no_top_size"), quote_diag.get("no_ask_size"), market.get("no_top_size"), market.get("no_ask_size"), market.get("no_ask_size_fp"), _q_get("no_top_size", "no_ask_size")))
@@ -5088,8 +5318,10 @@ class KalshiSniperBot:
         )
         if selected_price_hint is not None and preferred_side == "yes" and yes_ask is None:
             yes_ask = selected_price_hint
+            yes_ask_source = "selected_price_hint"
         if selected_price_hint is not None and preferred_side == "no" and no_ask is None:
             no_ask = selected_price_hint
+            no_ask_source = "selected_price_hint"
 
         def _prob(value):
             numeric = self.to_float(value, None)
@@ -5179,6 +5411,7 @@ class KalshiSniperBot:
             return -max(0.08, momentum_strength), "opposed"
 
         def _side_snapshot(side, bid, ask, top_size):
+            ask_source = yes_ask_source if side == "yes" else no_ask_source
             side_edge, edge_source = _edge(side, ask)
             spread = None
             if bid is not None and ask is not None and ask >= bid:
@@ -5230,6 +5463,7 @@ class KalshiSniperBot:
                 "bid": bid,
                 "ask": ask,
                 "selected_price": ask,
+                "selected_price_source": ask_source,
                 "spread": spread,
                 "top_size": top_size,
                 "liquidity": side_liquidity,
@@ -5312,6 +5546,7 @@ class KalshiSniperBot:
             "preferred_side": preferred_side,
             "selected_side": selected["side"] if selected else None,
             "selected_price": selected["selected_price"] if selected else None,
+            "selected_price_source": selected["selected_price_source"] if selected else None,
             "selected_top_size": selected["top_size"] if selected else None,
             "selected_edge_after_cost": selected["edge_after_cost"] if selected else None,
             "selected_final_score": selected["final_score"] if selected else None,
@@ -20485,10 +20720,22 @@ class KalshiSniperBot:
             )
             return self.to_float(normalized, None)
 
-        raw_yes_bid = source_dict.get("yes_bid_dollars", source_dict.get("yes_bid"))
-        raw_yes_ask = source_dict.get("yes_ask_dollars", source_dict.get("yes_ask"))
-        raw_no_bid = source_dict.get("no_bid_dollars", source_dict.get("no_bid"))
-        raw_no_ask = source_dict.get("no_ask_dollars", source_dict.get("no_ask"))
+        raw_yes_bid = source_dict.get(
+            "yes_bid_dollars",
+            source_dict.get("yes_bid", source_dict.get("best_yes_bid", source_dict.get("yes_top_price"))),
+        )
+        raw_yes_ask = source_dict.get(
+            "yes_ask_dollars",
+            source_dict.get("yes_ask", source_dict.get("best_yes_ask")),
+        )
+        raw_no_bid = source_dict.get(
+            "no_bid_dollars",
+            source_dict.get("no_bid", source_dict.get("best_no_bid", source_dict.get("no_top_price"))),
+        )
+        raw_no_ask = source_dict.get(
+            "no_ask_dollars",
+            source_dict.get("no_ask", source_dict.get("best_no_ask")),
+        )
 
         yes_bid = _normalized_price(raw_yes_bid, "yes_bid")
         yes_ask = _normalized_price(raw_yes_ask, "yes_ask")
@@ -24303,8 +24550,13 @@ class KalshiSniperBot:
                 self.sports_only_log_markers = markers
             except Exception:
                 pass
-        key = (tag, ticker or family or lane or "UNKNOWN", reason)
-        if not force and (now - float(markers.get(key, 0.0) or 0.0)) < AION_ADVISORY_LOG_INTERVAL_SECONDS:
+        if tag == "AION-SPORTS-ONLY-ALLOW":
+            key = (tag, family or lane or "SPORTS", reason)
+            interval = max(float(AION_ADVISORY_LOG_INTERVAL_SECONDS), 120.0)
+        else:
+            key = (tag, ticker or family or lane or "UNKNOWN", reason)
+            interval = float(AION_ADVISORY_LOG_INTERVAL_SECONDS)
+        if not force and (now - float(markers.get(key, 0.0) or 0.0)) < interval:
             return
         markers[key] = now
         print(
@@ -49441,6 +49693,43 @@ class KalshiSniperBot:
             selected_price_dollars = round(int(selected_price_cents) / 100.0, 4)
         if selected_side not in ("yes", "no") and resolved_side in ("yes", "no"):
             selected_side = resolved_side
+        if (selected_price_dollars is None or selected_price_cents is None) and selected_side in {"yes", "no"}:
+            executable_price = self._aion_selected_executable_price_from_book(
+                selected_side=selected_side,
+                yes_bid=yes_bid_dollars,
+                yes_ask=yes_ask_dollars,
+                no_bid=no_bid_dollars,
+                no_ask=no_ask_dollars,
+                preferred_source=price_source,
+            )
+            if executable_price:
+                selected_price_dollars = executable_price.get("price")
+                selected_price_cents = executable_price.get("price_cents")
+                orderbook_resolution["selected_price"] = selected_price_dollars
+                orderbook_resolution["selected_price_dollars"] = selected_price_dollars
+                orderbook_resolution["selected_price_cents"] = selected_price_cents
+                orderbook_resolution["chosen_price"] = selected_price_dollars
+                orderbook_resolution["chosen_price_dollars"] = selected_price_dollars
+                orderbook_resolution["chosen_price_cents"] = selected_price_cents
+                orderbook_resolution["selected_price_source"] = executable_price.get("source")
+                orderbook_resolution["selected_price_source_used"] = executable_price.get("source")
+                self._emit_aion_price_hydration_event(
+                    "AION-PRICE-HYDRATION-RECOVERED",
+                    ticker=ticker or None,
+                    family=family,
+                    selection_stage=selection_stage,
+                    selected_side=selected_side,
+                    selected_price_cents=selected_price_cents,
+                    selected_price_dollars=selected_price_dollars,
+                    selected_price_source=executable_price.get("source"),
+                    source_field=executable_price.get("source_field"),
+                    yes_bid=yes_bid_dollars,
+                    yes_ask=yes_ask_dollars,
+                    no_bid=no_bid_dollars,
+                    no_ask=no_ask_dollars,
+                    refresh_attempted=bool(orderbook_resolution.get("price_hydration_refresh_attempted")),
+                    final_reason="canonical_tradeability_equivalent_price_recovered",
+                )
         price_bounds_pass = bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99)
         spread_cents = None
         if yes_bid_cents is not None and yes_ask_cents is not None:
@@ -49471,7 +49760,11 @@ class KalshiSniperBot:
             or orderbook_resolution.get("selected_price_source")
             or "unknown"
         ).strip().lower() or "unknown"
-        derived_price_used = bool(derived_price_source.endswith("_fallback") or derived_price_source.startswith("derived_"))
+        derived_price_used = bool(
+            derived_price_source.endswith("_fallback")
+            or derived_price_source.startswith("derived_")
+            or derived_price_source in {"opposite_side_equivalent", "bid_equivalent"}
+        )
         spread_bucket = str(
             quote_diag.get("spread_bucket")
             or orderbook_resolution.get("spread_bucket")
@@ -50289,8 +50582,17 @@ class KalshiSniperBot:
             )
             if fallback_side not in {"yes", "no"}:
                 fallback_side = "yes" if yes_ask is not None else "no" if no_ask is not None else None
-            fallback_price = yes_ask if fallback_side == "yes" else no_ask if fallback_side == "no" else None
-            fallback_price = self.to_float(fallback_price, None)
+            fallback_executable = self._aion_selected_executable_price_from_book(
+                selected_side=fallback_side,
+                yes_bid=yes_bid,
+                yes_ask=yes_ask,
+                no_bid=no_bid,
+                no_ask=no_ask,
+                preferred_source="ask",
+            )
+            fallback_price = self.to_float(fallback_executable.get("price") if fallback_executable else None, None)
+            fallback_price_source = fallback_executable.get("source") if fallback_executable else None
+            fallback_price_cents = fallback_executable.get("price_cents") if fallback_executable else None
             fallback_price_in_bounds = bool(
                 fallback_price is not None
                 and KALSHI_CONTRACT_MIN_PRICE <= fallback_price <= KALSHI_CONTRACT_MAX_PRICE
@@ -50340,6 +50642,10 @@ class KalshiSniperBot:
                 "no_top_size": no_top_size,
                 "selected_side": fallback_side,
                 "selected_price": fallback_price if fallback_price_in_bounds else None,
+                "selected_price_dollars": fallback_price if fallback_price_in_bounds else None,
+                "selected_price_cents": fallback_price_cents if fallback_price_in_bounds else None,
+                "selected_price_source": fallback_price_source,
+                "selected_price_source_used": fallback_price_source,
                 "orderbook_keys": sorted(str(key) for key in source.keys())[:64],
                 "best_action": "buy_yes" if fallback_side == "yes" else "buy_no" if fallback_side == "no" else None,
             }
@@ -50413,7 +50719,13 @@ class KalshiSniperBot:
             "no_ask_dollars": orderbook_resolution.get("no_ask_dollars"),
             "selected_side": orderbook_resolution.get("selected_side"),
             "selected_price": orderbook_resolution.get("selected_price"),
-            "payload_price_source": str(price_source or "ask").strip().lower() or "ask",
+            "selected_price_dollars": orderbook_resolution.get("selected_price_dollars"),
+            "selected_price_cents": orderbook_resolution.get("selected_price_cents"),
+            "selected_price_source": orderbook_resolution.get("selected_price_source"),
+            "selected_price_source_used": orderbook_resolution.get("selected_price_source_used"),
+            "payload_price_source": orderbook_resolution.get("selected_price_source_used") or str(price_source or "ask").strip().lower() or "ask",
+            "price_hydration_refresh_attempted": bool(orderbook_resolution.get("price_hydration_refresh_attempted")),
+            "price_hydration_recovered": bool(orderbook_resolution.get("price_hydration_recovered")),
             "blocker_reason": orderbook_resolution.get("orderbook_missing_reason") if not bool(orderbook_resolution.get("orderbook_ready")) else None,
             "orderbook_keys": orderbook_resolution.get("orderbook_keys"),
             "best_action": orderbook_resolution.get("best_action"),
@@ -50634,6 +50946,15 @@ class KalshiSniperBot:
             else:
                 bid_value = canonical_source.get("no_bid")
                 ask_value = canonical_source.get("no_ask")
+            if preferred_source == "ask":
+                derived_ask = bool(canonical_source.get("derived_yes_ask" if side == "yes" else "derived_no_ask"))
+                ask_numeric = self.to_float(ask_value, None)
+                if (
+                    derived_ask
+                    and ask_numeric is not None
+                    and KALSHI_CONTRACT_MIN_PRICE <= ask_numeric <= KALSHI_CONTRACT_MAX_PRICE
+                ):
+                    return round(float(ask_numeric), 4), "opposite_side_equivalent", bid_value, ask_value
             resolved_price, resolved_source = _select_side_price_with_fallback(
                 side=side,
                 bid_value=bid_value,
@@ -50782,48 +51103,135 @@ class KalshiSniperBot:
                 continue
             break
 
-        if selected_source_dict is None and allow_refresh and raw_ticker:
+        price_hydration_refresh_attempted = False
+        price_hydration_recovered = False
+        if selected_source_dict is None and allow_refresh and raw_ticker and resolved_side in {"yes", "no"}:
             orderbook_fetch_called = True
+            price_hydration_refresh_attempted = True
+            self._emit_aion_price_hydration_event(
+                "AION-PRICE-HYDRATION-REFRESH",
+                ticker=raw_ticker or None,
+                family=family,
+                selection_stage=selection_stage,
+                selected_side=resolved_side,
+                selected_price_source=selected_price_source or effective_price_source,
+                missing_source=selected_price_source or effective_price_source,
+                yes_bid=yes_bid_dollars,
+                yes_ask=yes_ask_dollars,
+                no_bid=no_bid_dollars,
+                no_ask=no_ask_dollars,
+                refresh_attempted=True,
+                final_reason="selected_price_missing_before_refresh",
+            )
             try:
-                fresh_market_detail = self.get_live_market_detail(raw_ticker)
+                fresh_orderbook = self.get_live_market_orderbook(raw_ticker)
             except Exception as exc:
                 fetch_error = f"orderbook_api_failed:{exc.__class__.__name__}"
-                fresh_market_detail = None
-            if isinstance(fresh_market_detail, dict) and fresh_market_detail:
+                fresh_orderbook = None
+            if isinstance(fresh_orderbook, dict) and fresh_orderbook:
                 orderbook_fetch_success = True
-                fresh_source = self._coerce_aion_orderbook_source(fresh_market_detail)
-                source_candidates.insert(0, ("fresh_market_detail", fresh_source))
+                fresh_source = self._aion_coerce_orderbook_endpoint_source(
+                    fresh_orderbook,
+                    ticker=raw_ticker,
+                    family=family,
+                )
+                source_candidates.insert(0, ("fresh_orderbook_endpoint", fresh_source))
                 if _source_has_orderbook_signal(fresh_source):
                     yes_bid_dollars = self.to_float(fresh_source.get("yes_bid_dollars", fresh_source.get("yes_bid")), None)
                     yes_ask_dollars = self.to_float(fresh_source.get("yes_ask_dollars", fresh_source.get("yes_ask")), None)
                     no_bid_dollars = self.to_float(fresh_source.get("no_bid_dollars", fresh_source.get("no_bid")), None)
                     no_ask_dollars = self.to_float(fresh_source.get("no_ask_dollars", fresh_source.get("no_ask")), None)
+                    try:
+                        yes_bid_dollars, yes_ask_dollars, no_bid_dollars, no_ask_dollars = self._infer_missing_binary_quotes(
+                            yes_bid_dollars,
+                            yes_ask_dollars,
+                            no_bid_dollars,
+                            no_ask_dollars,
+                        )
+                    except Exception:
+                        pass
                     yes_bid = yes_bid_dollars
                     yes_ask = yes_ask_dollars
                     no_bid = no_bid_dollars
                     no_ask = no_ask_dollars
-                    if resolved_side == "no":
-                        selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
-                            fresh_source,
-                            "no",
-                            preferred_source=str(price_source).strip().lower() or "bid",
-                        )
-                    elif resolved_side == "yes":
-                        selected_price, selected_price_source, _, _ = _resolve_side_price_for_source(
-                            fresh_source,
-                            "yes",
-                            preferred_source=str(price_source).strip().lower() or "bid",
-                        )
-                    selected_price = self.to_float(selected_price, None)
-                    if selected_price is not None and selected_price > 0.0:
-                        selected_price_raw, selected_price_dollars, selected_price_cents, selected_price_block_reason = _normalize_selected_price_snapshot(selected_price)
-                        if selected_price_dollars is not None:
-                            selected_price = selected_price_dollars
-                        selected_source_label = "fresh_market_detail"
+                    executable_price = self._aion_selected_executable_price_from_book(
+                        selected_side=resolved_side,
+                        yes_bid=yes_bid_dollars,
+                        yes_ask=yes_ask_dollars,
+                        no_bid=no_bid_dollars,
+                        no_ask=no_ask_dollars,
+                        preferred_source=effective_price_source,
+                    )
+                    if executable_price:
+                        selected_price = executable_price.get("price")
+                        selected_price_source = executable_price.get("source")
+                        selected_price_raw = selected_price
+                        selected_price_dollars = selected_price
+                        selected_price_cents = executable_price.get("price_cents")
+                        selected_source_label = "fresh_orderbook_endpoint"
                         selected_source_dict = dict(fresh_source)
+                        selected_source_dict.update(
+                            {
+                                "selected_side": resolved_side,
+                                "selected_price": selected_price,
+                                "selected_price_dollars": selected_price_dollars,
+                                "selected_price_cents": selected_price_cents,
+                                "selected_price_source_used": selected_price_source,
+                            }
+                        )
                         orderbook_keys = sorted(list(fresh_source.keys()))[:64]
+                        price_hydration_recovered = True
+                        fetch_error = None
+                        self._emit_aion_price_hydration_event(
+                            "AION-PRICE-HYDRATION-RECOVERED",
+                            ticker=raw_ticker or None,
+                            family=family,
+                            selection_stage=selection_stage,
+                            selected_side=resolved_side,
+                            selected_price_cents=selected_price_cents,
+                            selected_price_dollars=selected_price,
+                            selected_price_source=selected_price_source,
+                            source_field=executable_price.get("source_field"),
+                            yes_bid=yes_bid_dollars,
+                            yes_ask=yes_ask_dollars,
+                            no_bid=no_bid_dollars,
+                            no_ask=no_ask_dollars,
+                            refresh_attempted=True,
+                            final_reason="live_orderbook_selected_price_recovered",
+                        )
+                    else:
+                        self._emit_aion_price_hydration_event(
+                            "AION-PRICE-HYDRATION-FAILED",
+                            ticker=raw_ticker or None,
+                            family=family,
+                            selection_stage=selection_stage,
+                            selected_side=resolved_side,
+                            selected_price_source=selected_price_source or effective_price_source,
+                            missing_source=selected_price_source or effective_price_source,
+                            yes_bid=yes_bid_dollars,
+                            yes_ask=yes_ask_dollars,
+                            no_bid=no_bid_dollars,
+                            no_ask=no_ask_dollars,
+                            refresh_attempted=True,
+                            final_reason="no_executable_selected_side_price_after_refresh",
+                        )
             else:
                 fetch_error = fetch_error or "empty_orderbook"
+                self._emit_aion_price_hydration_event(
+                    "AION-PRICE-HYDRATION-FAILED",
+                    ticker=raw_ticker or None,
+                    family=family,
+                    selection_stage=selection_stage,
+                    selected_side=resolved_side,
+                    selected_price_source=selected_price_source or effective_price_source,
+                    missing_source=selected_price_source or effective_price_source,
+                    yes_bid=yes_bid_dollars,
+                    yes_ask=yes_ask_dollars,
+                    no_bid=no_bid_dollars,
+                    no_ask=no_ask_dollars,
+                    refresh_attempted=True,
+                    final_reason=fetch_error,
+                )
 
         def _side_candidate_snapshot(side_name):
             side_name = "no" if str(side_name).lower() == "no" else "yes"
@@ -51089,7 +51497,7 @@ class KalshiSniperBot:
             selected_price_raw, selected_price_dollars, selected_price_cents, selected_price_block_reason = _normalize_selected_price_snapshot(selected_price)
             if selected_price_dollars is not None:
                 selected_price = selected_price_dollars
-                selected_price_source = "two_sided_side_selection"
+                selected_price_source = side_selection.get("selected_price_source") or "two_sided_side_selection"
                 selected_price_in_bounds = bool(selected_price_cents is not None and 1 <= int(selected_price_cents) <= 99)
             selected_top_size_from_compare = self.to_float(side_selection.get("selected_top_size"), None)
             if resolved_side == "yes":
@@ -51120,6 +51528,7 @@ class KalshiSniperBot:
                     "selected_side": resolved_side,
                     "selected_price": selected_price,
                     "selected_price_cents": selected_price_cents,
+                    "selected_price_source_used": selected_price_source,
                     "normalized_orderbook_present": True,
                     "orderbook_exists": True,
                 }
@@ -51190,40 +51599,73 @@ class KalshiSniperBot:
                 pass
         if (
             selected_source_dict is not None
-            and selected_price is not None
-            and selected_price > 0.0
-            and not selected_price_in_bounds
+            and (
+                selected_price is None
+                or selected_price <= 0.0
+                or not selected_price_in_bounds
+            )
             and allow_refresh
             and raw_ticker
+            and resolved_side in {"yes", "no"}
+            and not price_hydration_refresh_attempted
         ):
-            refresh_eligible_labels = {"market", "candidate", "quote_diag", "cache", "fresh_market_detail"}
-            if selected_source_label in refresh_eligible_labels:
+            refresh_eligible_labels = {"market", "candidate", "quote_diag", "cache", "fresh_market_detail", "fresh_orderbook_endpoint"}
+            if selected_source_label in refresh_eligible_labels or str(selected_source_label or "").startswith("cache"):
                 orderbook_fetch_called = True
+                price_hydration_refresh_attempted = True
+                self._emit_aion_price_hydration_event(
+                    "AION-PRICE-HYDRATION-REFRESH",
+                    ticker=raw_ticker or None,
+                    family=family,
+                    selection_stage=selection_stage,
+                    selected_side=resolved_side,
+                    selected_price_cents=selected_price_cents,
+                    selected_price_dollars=selected_price,
+                    selected_price_source=selected_price_source or effective_price_source,
+                    missing_source=selected_price_source or effective_price_source,
+                    yes_bid=yes_bid_dollars,
+                    yes_ask=yes_ask_dollars,
+                    no_bid=no_bid_dollars,
+                    no_ask=no_ask_dollars,
+                    refresh_attempted=True,
+                    final_reason="selected_price_unusable_before_refresh",
+                )
                 try:
-                    fresh_market_detail = self.get_live_market_detail(raw_ticker)
+                    fresh_orderbook = self.get_live_market_orderbook(raw_ticker)
                 except Exception as exc:
                     fetch_error = f"orderbook_api_failed:{exc.__class__.__name__}"
-                    fresh_market_detail = None
-                if isinstance(fresh_market_detail, dict) and fresh_market_detail:
+                    fresh_orderbook = None
+                if isinstance(fresh_orderbook, dict) and fresh_orderbook:
                     orderbook_fetch_success = True
-                    fresh_source = self._coerce_aion_orderbook_source(fresh_market_detail)
-                    source_candidates.insert(0, ("fresh_market_detail_refresh", fresh_source))
+                    fresh_source = self._aion_coerce_orderbook_endpoint_source(
+                        fresh_orderbook,
+                        ticker=raw_ticker,
+                        family=family,
+                    )
+                    source_candidates.insert(0, ("fresh_orderbook_endpoint_refresh", fresh_source))
                     if _source_has_orderbook_signal(fresh_source):
                         fresh_yes_bid_dollars = self.to_float(fresh_source.get("yes_bid_dollars", fresh_source.get("yes_bid")), None)
                         fresh_yes_ask_dollars = self.to_float(fresh_source.get("yes_ask_dollars", fresh_source.get("yes_ask")), None)
                         fresh_no_bid_dollars = self.to_float(fresh_source.get("no_bid_dollars", fresh_source.get("no_bid")), None)
                         fresh_no_ask_dollars = self.to_float(fresh_source.get("no_ask_dollars", fresh_source.get("no_ask")), None)
-                        fresh_selected_price = None
-                        if resolved_side == "no":
-                            fresh_selected_price = fresh_no_ask_dollars if effective_price_source == "ask" else fresh_no_bid_dollars
-                            if fresh_selected_price is None:
-                                fresh_selected_price = self._extract_orderbook_side_price_hint(fresh_source, "no")
-                        elif resolved_side == "yes":
-                            fresh_selected_price = fresh_yes_ask_dollars if effective_price_source == "ask" else fresh_yes_bid_dollars
-                            if fresh_selected_price is None:
-                                fresh_selected_price = self._extract_orderbook_side_price_hint(fresh_source, "yes")
-                        fresh_selected_price = self.to_float(fresh_selected_price, None)
-                        if fresh_selected_price is not None and fresh_selected_price > 0.0:
+                        try:
+                            fresh_yes_bid_dollars, fresh_yes_ask_dollars, fresh_no_bid_dollars, fresh_no_ask_dollars = self._infer_missing_binary_quotes(
+                                fresh_yes_bid_dollars,
+                                fresh_yes_ask_dollars,
+                                fresh_no_bid_dollars,
+                                fresh_no_ask_dollars,
+                            )
+                        except Exception:
+                            pass
+                        executable_price = self._aion_selected_executable_price_from_book(
+                            selected_side=resolved_side,
+                            yes_bid=fresh_yes_bid_dollars,
+                            yes_ask=fresh_yes_ask_dollars,
+                            no_bid=fresh_no_bid_dollars,
+                            no_ask=fresh_no_ask_dollars,
+                            preferred_source=effective_price_source,
+                        )
+                        if executable_price:
                             yes_bid_dollars = fresh_yes_bid_dollars
                             yes_ask_dollars = fresh_yes_ask_dollars
                             no_bid_dollars = fresh_no_bid_dollars
@@ -51232,17 +51674,83 @@ class KalshiSniperBot:
                             yes_ask = yes_ask_dollars
                             no_bid = no_bid_dollars
                             no_ask = no_ask_dollars
-                            selected_price = fresh_selected_price
-                            selected_source_label = "fresh_market_detail_refresh"
+                            selected_price = executable_price.get("price")
+                            selected_price_source = executable_price.get("source")
+                            selected_price_raw = selected_price
+                            selected_price_dollars = selected_price
+                            selected_price_cents = executable_price.get("price_cents")
+                            selected_source_label = "fresh_orderbook_endpoint_refresh"
                             selected_source_dict = dict(fresh_source)
+                            selected_source_dict.update(
+                                {
+                                    "selected_side": resolved_side,
+                                    "selected_price": selected_price,
+                                    "selected_price_dollars": selected_price_dollars,
+                                    "selected_price_cents": selected_price_cents,
+                                    "selected_price_source_used": selected_price_source,
+                                }
+                            )
                             orderbook_keys = sorted(list(fresh_source.keys()))[:64]
                             selected_price_in_bounds = bool(
                                 KALSHI_CONTRACT_MIN_PRICE <= selected_price <= KALSHI_CONTRACT_MAX_PRICE
                             )
                             if selected_price_in_bounds:
+                                price_hydration_recovered = True
                                 fetch_error = None
+                                self._emit_aion_price_hydration_event(
+                                    "AION-PRICE-HYDRATION-RECOVERED",
+                                    ticker=raw_ticker or None,
+                                    family=family,
+                                    selection_stage=selection_stage,
+                                    selected_side=resolved_side,
+                                    selected_price_cents=selected_price_cents,
+                                    selected_price_dollars=selected_price,
+                                    selected_price_source=selected_price_source,
+                                    source_field=executable_price.get("source_field"),
+                                    yes_bid=yes_bid_dollars,
+                                    yes_ask=yes_ask_dollars,
+                                    no_bid=no_bid_dollars,
+                                    no_ask=no_ask_dollars,
+                                    refresh_attempted=True,
+                                    final_reason="live_orderbook_selected_price_recovered",
+                                )
+                        else:
+                            self._emit_aion_price_hydration_event(
+                                "AION-PRICE-HYDRATION-FAILED",
+                                ticker=raw_ticker or None,
+                                family=family,
+                                selection_stage=selection_stage,
+                                selected_side=resolved_side,
+                                selected_price_cents=selected_price_cents,
+                                selected_price_dollars=selected_price,
+                                selected_price_source=selected_price_source or effective_price_source,
+                                missing_source=selected_price_source or effective_price_source,
+                                yes_bid=fresh_yes_bid_dollars,
+                                yes_ask=fresh_yes_ask_dollars,
+                                no_bid=fresh_no_bid_dollars,
+                                no_ask=fresh_no_ask_dollars,
+                                refresh_attempted=True,
+                                final_reason="no_executable_selected_side_price_after_refresh",
+                            )
                 elif fetch_error is None:
                     fetch_error = "empty_orderbook"
+                    self._emit_aion_price_hydration_event(
+                        "AION-PRICE-HYDRATION-FAILED",
+                        ticker=raw_ticker or None,
+                        family=family,
+                        selection_stage=selection_stage,
+                        selected_side=resolved_side,
+                        selected_price_cents=selected_price_cents,
+                        selected_price_dollars=selected_price,
+                        selected_price_source=selected_price_source or effective_price_source,
+                        missing_source=selected_price_source or effective_price_source,
+                        yes_bid=yes_bid_dollars,
+                        yes_ask=yes_ask_dollars,
+                        no_bid=no_bid_dollars,
+                        no_ask=no_ask_dollars,
+                        refresh_attempted=True,
+                        final_reason=fetch_error,
+                    )
 
         orderbook_ready = bool(selected_source_dict and selected_price_in_bounds)
         selected_side_has_price = bool(
@@ -51381,27 +51889,22 @@ class KalshiSniperBot:
                         selection_stage=selection_stage,
                         selected_price=selected_price,
                     )
-                    try:
-                        print(
-                            "[AION-SELECTED-PRICE-REJECTED] "
-                            + json.dumps(
-                                {
-                                    "ticker": raw_ticker or None,
-                                    "family": family,
-                                    "trace_id": quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
-                                    "selected_side": resolved_side,
-                                    "selected_price_cents": selected_price_cents,
-                                    "selected_price_dollars": selected_price,
-                                    "selected_price_source": selected_price_source or effective_price_source,
-                                    "blocker": price_bounds_reason,
-                                    "selection_stage": selection_stage,
-                                },
-                                sort_keys=True,
-                                default=str,
-                            )
-                        )
-                    except Exception:
-                        pass
+                    self._emit_aion_selected_price_rejected_compact(
+                        ticker=raw_ticker or None,
+                        family=family,
+                        selected_side=resolved_side,
+                        selected_price_cents=selected_price_cents,
+                        selected_price_dollars=selected_price,
+                        selected_price_source=selected_price_source or effective_price_source,
+                        missing_source=selected_price_source or effective_price_source,
+                        yes_bid=yes_bid_dollars,
+                        yes_ask=yes_ask_dollars,
+                        no_bid=no_bid_dollars,
+                        no_ask=no_ask_dollars,
+                        refresh_attempted=bool(price_hydration_refresh_attempted),
+                        final_reason=orderbook_missing_reason or price_bounds_reason,
+                        selection_stage=selection_stage,
+                    )
                 print(
                     "[AION-PRICE-VALIDATION-MODE] "
                     + json.dumps(
@@ -51677,8 +52180,10 @@ class KalshiSniperBot:
             "no_bid_dollars": no_bid_dollars,
             "no_ask_dollars": no_ask_dollars,
             "fetch_error": fetch_error,
-            "selected_price_source": str(price_source or "ask").strip().lower() or "ask",
-            "selected_price_source_used": selected_price_source,
+            "selected_price_source": selected_price_source or str(price_source or "ask").strip().lower() or "ask",
+            "selected_price_source_used": selected_price_source or effective_price_source,
+            "price_hydration_refresh_attempted": bool(price_hydration_refresh_attempted),
+            "price_hydration_recovered": bool(price_hydration_recovered),
             "recoverable": bool(recovery_decision.get("recoverable")) if isinstance(recovery_decision, dict) else False,
             "recovery_attempts": int(recovery_decision.get("retry_attempts", 0) or 0) if isinstance(recovery_decision, dict) else 0,
             "recovered": bool(recovery_decision.get("recovered")) if isinstance(recovery_decision, dict) else False,
@@ -51856,14 +52361,51 @@ class KalshiSniperBot:
                 selected_price = (
                     orderbook_resolution.get("yes_ask") if effective_price_source == "ask" else orderbook_resolution.get("yes_bid")
                 )
-                if selected_price is None:
+                if selected_price is None and effective_price_source != "ask":
                     selected_price = self._extract_orderbook_side_price_hint(orderbook_resolution, "yes")
             else:
                 selected_price = (
                     orderbook_resolution.get("no_ask") if effective_price_source == "ask" else orderbook_resolution.get("no_bid")
                 )
-                if selected_price is None:
+                if selected_price is None and effective_price_source != "ask":
                     selected_price = self._extract_orderbook_side_price_hint(orderbook_resolution, "no")
+        if selected_price is None:
+            executable_price = self._aion_selected_executable_price_from_book(
+                selected_side=payload_validation_side,
+                yes_bid=orderbook_resolution.get("yes_bid_dollars", orderbook_resolution.get("yes_bid")),
+                yes_ask=orderbook_resolution.get("yes_ask_dollars", orderbook_resolution.get("yes_ask")),
+                no_bid=orderbook_resolution.get("no_bid_dollars", orderbook_resolution.get("no_bid")),
+                no_ask=orderbook_resolution.get("no_ask_dollars", orderbook_resolution.get("no_ask")),
+                preferred_source=effective_price_source,
+            )
+            if executable_price:
+                selected_price = executable_price.get("price")
+                selected_price_cents = executable_price.get("price_cents")
+                orderbook_resolution["selected_price"] = selected_price
+                orderbook_resolution["selected_price_dollars"] = selected_price
+                orderbook_resolution["selected_price_cents"] = selected_price_cents
+                orderbook_resolution["chosen_price"] = selected_price
+                orderbook_resolution["chosen_price_dollars"] = selected_price
+                orderbook_resolution["chosen_price_cents"] = selected_price_cents
+                orderbook_resolution["selected_price_source"] = executable_price.get("source")
+                orderbook_resolution["selected_price_source_used"] = executable_price.get("source")
+                self._emit_aion_price_hydration_event(
+                    "AION-PRICE-HYDRATION-RECOVERED",
+                    ticker=ticker,
+                    family=family,
+                    selection_stage=selection_stage or "build_live_order_payload",
+                    selected_side=payload_validation_side,
+                    selected_price_cents=selected_price_cents,
+                    selected_price_dollars=selected_price,
+                    selected_price_source=executable_price.get("source"),
+                    source_field=executable_price.get("source_field"),
+                    yes_bid=orderbook_resolution.get("yes_bid"),
+                    yes_ask=orderbook_resolution.get("yes_ask"),
+                    no_bid=orderbook_resolution.get("no_bid"),
+                    no_ask=orderbook_resolution.get("no_ask"),
+                    refresh_attempted=bool(orderbook_resolution.get("price_hydration_refresh_attempted")),
+                    final_reason="payload_equivalent_price_recovered",
+                )
         selected_price = self.to_float(selected_price, None)
         if selected_price_cents is None and selected_price not in (None, 0, 0.0):
             try:
@@ -53197,27 +53739,22 @@ class KalshiSniperBot:
                         selection_stage=selection_stage,
                         selected_price=price_numeric,
                     )
-                    try:
-                        print(
-                            "[AION-SELECTED-PRICE-REJECTED] "
-                            + json.dumps(
-                                {
-                                    "ticker": selected_ticker,
-                                    "family": family,
-                                    "trace_id": quote_diag.get("trace_id") or quote_diag.get("canonical_execution_state", {}).get("trace_id"),
-                                    "selected_side": orderbook_resolution.get("selected_side") or getattr(quote_payload, "selected_side", None) or getattr(quote_payload, "side", None),
-                                    "selected_price_cents": orderbook_resolution.get("selected_price_cents"),
-                                    "selected_price_dollars": price_numeric,
-                                    "selected_price_source": orderbook_resolution.get("selected_price_source_used") or price_source,
-                                    "blocker": payload_missing_reason,
-                                    "selection_stage": selection_stage,
-                                },
-                                sort_keys=True,
-                                default=str,
-                            )
-                        )
-                    except Exception:
-                        pass
+                    self._emit_aion_selected_price_rejected_compact(
+                        ticker=selected_ticker,
+                        family=family,
+                        selected_side=orderbook_resolution.get("selected_side") or getattr(quote_payload, "selected_side", None) or getattr(quote_payload, "side", None),
+                        selected_price_cents=orderbook_resolution.get("selected_price_cents"),
+                        selected_price_dollars=price_numeric,
+                        selected_price_source=orderbook_resolution.get("selected_price_source_used") or price_source,
+                        missing_source=orderbook_resolution.get("selected_price_source_used") or price_source,
+                        yes_bid=orderbook_resolution.get("yes_bid"),
+                        yes_ask=orderbook_resolution.get("yes_ask"),
+                        no_bid=orderbook_resolution.get("no_bid"),
+                        no_ask=orderbook_resolution.get("no_ask"),
+                        refresh_attempted=bool(orderbook_resolution.get("price_hydration_refresh_attempted")),
+                        final_reason=payload_missing_reason,
+                        selection_stage=selection_stage,
+                    )
                 elif str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
                     payload_missing_reason = "invalid_action"
                 else:

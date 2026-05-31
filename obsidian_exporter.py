@@ -24,10 +24,35 @@ OBSIDIAN_FOLDERS = (
     "Hypotheses",
     "Telemetry",
     "Evolution",
+    "Constellation",
 )
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
 _WHITESPACE_RE = re.compile(r"\s+")
+
+_CANONICAL_CONCEPT_ALIASES = {
+    "Adaptive Confidence": "Constellation/Adaptive Confidence",
+    "Candidate Selection": "Constellation/Candidate Selection",
+    "Entry Timing": "Constellation/Entry Timing",
+    "Execution": "Constellation/Execution Intelligence",
+    "Execution Intelligence": "Constellation/Execution Intelligence",
+    "Execution Logic": "Constellation/Execution Intelligence",
+    "Exit Logic": "Constellation/Exit Logic",
+    "Family Memory": "Constellation/Family Memory",
+    "Kalshi Bot": "Constellation/AION Core",
+    "Liquidity": "Constellation/Liquidity",
+    "Market Telemetry": "Constellation/Telemetry",
+    "MLB": "Constellation/MLB",
+    "Momentum": "Constellation/Momentum",
+    "NBA": "Constellation/NBA",
+    "Order Execution": "Constellation/Execution Intelligence",
+    "Spread Dynamics": "Constellation/Spread Dynamics",
+    "Sports": "Constellation/Sports",
+    "Telemetry": "Constellation/Telemetry",
+    "Trade Outcomes": "Constellation/Exit Logic",
+}
+
+_SPORTS_FAMILY_MARKERS = ("NBA", "MLB", "NCAAB", "NCAAF", "NFL", "NHL", "ATP", "WTA", "TENNIS")
 
 
 def _utc_now():
@@ -105,6 +130,83 @@ def _wikilink(value):
         return None
     text = text.replace("[", "").replace("]", "")
     return f"[[{text}]]"
+
+
+def _normalize_related_node(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    direct = _CANONICAL_CONCEPT_ALIASES.get(text)
+    if direct:
+        return direct
+    family_text = text.upper()
+    if family_text.startswith("KX") and family_text.replace("_", "").replace("-", "").isalnum():
+        return f"Constellation/{family_text} Family"
+    return text
+
+
+def _family_concept_nodes(family):
+    family_text = str(family or "").strip().upper()
+    nodes = []
+    if any(marker in family_text for marker in _SPORTS_FAMILY_MARKERS):
+        nodes.append("Sports")
+    if "NBA" in family_text:
+        nodes.append("NBA")
+    if "MLB" in family_text:
+        nodes.append("MLB")
+    if "WNBA" in family_text:
+        nodes.append("WNBA")
+    if "NHL" in family_text:
+        nodes.append("NHL")
+    if "NCAAB" in family_text:
+        nodes.append("NCAAB")
+    if "ATP" in family_text or "ITF" in family_text or "TENNIS" in family_text:
+        nodes.append("Tennis")
+    return nodes
+
+
+def _facts_contain(facts, needles):
+    if not isinstance(facts, dict):
+        return False
+    haystack = " ".join(str(key).lower() for key in facts.keys())
+    return any(needle in haystack for needle in needles)
+
+
+def _canonical_related_nodes(related=None, facts=None, family=None, include=None):
+    facts = facts if isinstance(facts, dict) else {}
+    nodes = []
+
+    def add(value):
+        value = _normalize_related_node(value)
+        if value and value not in nodes:
+            nodes.append(value)
+
+    for value in include or []:
+        add(value)
+    for value in related or []:
+        add(value)
+    for value in _family_concept_nodes(family or facts.get("family")):
+        add(value)
+
+    if _facts_contain(facts, ("liquidity", "top_book", "topbook", "top_size", "depth", "book")):
+        add("Liquidity")
+    if _facts_contain(facts, ("spread", "bid", "ask")):
+        add("Spread Dynamics")
+    if _facts_contain(facts, ("entry_timing", "timing")):
+        add("Entry Timing")
+    if _facts_contain(facts, ("exit", "pnl", "result", "hold")):
+        add("Exit Logic")
+    if _facts_contain(facts, ("candidate", "selection", "selected")):
+        add("Candidate Selection")
+    if _facts_contain(facts, ("confidence", "score", "ev", "probability", "conviction")):
+        add("Adaptive Confidence")
+    if _facts_contain(facts, ("momentum", "regime")):
+        add("Momentum")
+    if _facts_contain(facts, ("quote", "telemetry", "pattern", "maker", "imbalance", "survivability")):
+        add("Telemetry")
+    if _facts_contain(facts, ("action", "side", "price", "execution")):
+        add("Execution Intelligence")
+    return nodes
 
 
 def _compact_fact_value(value):
@@ -248,7 +350,7 @@ def append_session_intelligence(event_type=None, facts=None, timestamp=None, sou
     day = timestamp[:10] if len(timestamp) >= 10 else datetime.now(timezone.utc).date().isoformat()
     relative_path = Path("Sessions") / f"{sanitize_filename(day)} Session.md"
     facts = _compact_facts(facts)
-    related_links = [_wikilink(item) for item in (related or ["Kalshi Bot", "Telemetry"])]
+    related_links = [_wikilink(item) for item in _canonical_related_nodes(related or ["Telemetry"], facts=facts)]
     related_links = [item for item in related_links if item]
     initial = (
         _frontmatter(
@@ -276,7 +378,12 @@ def record_family_observation(family, facts=None, observation=None, timestamp=No
     timestamp = str(timestamp or _utc_now())
     family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
     facts = _compact_facts(facts)
-    related_nodes = related or ["Sports", "Entry Timing", "Liquidity"]
+    related_nodes = _canonical_related_nodes(
+        related or ["Family Memory", "Entry Timing", "Liquidity"],
+        facts=facts,
+        family=family,
+        include=["Family Memory"],
+    )
     related_links = [_wikilink(item) for item in related_nodes]
     related_links = [item for item in related_links if item]
     relative_path = Path("Families") / f"{sanitize_filename(family)}.md"
@@ -333,7 +440,15 @@ def record_trade_outcome(
     facts = _compact_facts(facts)
     unique = sanitize_filename(f"{timestamp}-{ticker}-{result or status}", max_length=150)
     relative_path = Path("Trades") / f"{unique}.md"
-    related = [_wikilink(family), _wikilink("Execution"), _wikilink("Exit Logic")]
+    related = [
+        _wikilink(item)
+        for item in _canonical_related_nodes(
+            [family, "Execution Intelligence", "Exit Logic"],
+            facts=facts,
+            family=family,
+            include=["Liquidity", "Spread Dynamics"],
+        )
+    ]
     related = [item for item in related if item]
     content = (
         _frontmatter(
@@ -375,10 +490,12 @@ def record_pattern_observation(pattern=None, facts=None, timestamp=None, family=
     family = str(family or "").strip().upper()
     facts = _compact_facts(facts)
     relative_path = Path("Patterns") / f"{sanitize_filename(pattern)}.md"
-    related_nodes = list(related or [])
-    if family:
-        related_nodes.append(family)
-    related_nodes.extend(["Telemetry", "Liquidity"])
+    related_nodes = _canonical_related_nodes(
+        list(related or []) + ([family] if family else []),
+        facts=facts,
+        family=family,
+        include=["Telemetry", "Liquidity", "Spread Dynamics"],
+    )
     links = [_wikilink(item) for item in dict.fromkeys(related_nodes)]
     links = [item for item in links if item]
     initial = (
@@ -408,7 +525,7 @@ def record_hypothesis(hypothesis=None, facts=None, timestamp=None, related=None,
         return _status(False, "missing_hypothesis")
     facts = _compact_facts(facts)
     relative_path = Path("Hypotheses") / f"{sanitize_filename(hypothesis, max_length=100)}.md"
-    links = [_wikilink(item) for item in (related or ["Kalshi Bot", "Evolution"])]
+    links = [_wikilink(item) for item in _canonical_related_nodes(related or ["Telemetry"], facts=facts)]
     links = [item for item in links if item]
     initial = (
         _frontmatter(
