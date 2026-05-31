@@ -228,15 +228,13 @@ def _market_lookup(markets):
 
 
 def _event_or_market_key(ticker, market):
+    # Duplicate protection is market-level; same-event correlation is research data, not a duplicate market.
     if isinstance(market, dict):
         for key in (
-            "event_ticker",
-            "event_id",
-            "game_id",
-            "match_id",
-            "series_ticker",
-            "market_slug",
             "ticker",
+            "market_ticker",
+            "id",
+            "market_slug",
         ):
             value = str(market.get(key) or "").strip()
             if value:
@@ -322,6 +320,165 @@ def _selected_side(item, q, expectancy_summary, readiness):
             _get(q, "selected_side"),
             _get(q, "side"),
         )
+    )
+
+
+def _side_field_snapshot(item, q, expectancy_summary, readiness):
+    allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+    return {
+        "item_selected_side": item.get("selected_side"),
+        "item_side": item.get("side"),
+        "item_preferred_side": item.get("preferred_side"),
+        "allocation_selected_side": allocation.get("selected_side"),
+        "allocation_side": allocation.get("side"),
+        "allocation_preferred_side": allocation.get("preferred_side"),
+        "expectancy_selected_side": expectancy_summary.get("selected_side") if isinstance(expectancy_summary, dict) else None,
+        "expectancy_side": expectancy_summary.get("side") if isinstance(expectancy_summary, dict) else None,
+        "readiness_side": readiness.get("side") if isinstance(readiness, dict) else None,
+        "q_selected_side": _get(q, "selected_side"),
+        "q_side": _get(q, "side"),
+    }
+
+
+def _side_fields_present(side_fields):
+    return sorted([key for key, value in (side_fields or {}).items() if value not in (None, "")])
+
+
+def _quote_snapshot(item, q, market, expectancy_summary, readiness):
+    allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+
+    def _quote_value(*keys):
+        for key in keys:
+            value = None
+            for container in (allocation, expectancy_summary, readiness, market):
+                if isinstance(container, dict):
+                    value = container.get(key)
+                    if value not in (None, ""):
+                        return value
+            value = _get(q, key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    return {
+        "selected_price": _as_price(
+            _first_value(
+                _quote_value("selected_price"),
+                _quote_value("selected_price_dollars"),
+                _quote_value("price"),
+            )
+        ),
+        "yes_bid": _as_price(_quote_value("yes_bid", "yes_bid_dollars")),
+        "yes_ask": _as_price(_quote_value("yes_ask", "yes_ask_dollars")),
+        "no_bid": _as_price(_quote_value("no_bid", "no_bid_dollars")),
+        "no_ask": _as_price(_quote_value("no_ask", "no_ask_dollars")),
+        "yes_top_size": _to_float(_quote_value("yes_top_size", "yes_ask_size"), None),
+        "no_top_size": _to_float(_quote_value("no_top_size", "no_ask_size"), None),
+        "spread": _to_float(_first_value(item.get("spread"), _quote_value("spread")), None),
+    }
+
+
+def _safe_price_match_side(quote_snapshot):
+    selected_price = quote_snapshot.get("selected_price")
+    if selected_price is None:
+        return None, None
+    matches = []
+    for side, key in (("YES", "yes_ask"), ("NO", "no_ask")):
+        side_price = quote_snapshot.get(key)
+        if side_price is None:
+            continue
+        if abs(float(selected_price) - float(side_price)) <= 0.0001:
+            matches.append((side, side_price))
+    if len(matches) == 1:
+        return matches[0]
+    return None, None
+
+
+def _derive_side_from_canonical_selector(bot, item, q, market, family, expectancy_summary, readiness):
+    selector = getattr(bot, "_aion_select_bidirectional_side", None)
+    if not callable(selector):
+        return None, None, {"reason": "canonical_selector_unavailable"}
+    side_fields = _side_field_snapshot(item, q, expectancy_summary, readiness)
+    preferred_side = _normalize_side(_first_value(*side_fields.values()))
+    quote_diag = {}
+    allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+    for container in (allocation, item, expectancy_summary, readiness):
+        if isinstance(container, dict):
+            for key in (
+                "selected_price",
+                "selected_price_dollars",
+                "price",
+                "estimated_win_probability",
+                "probability",
+                "calibrated_probability",
+                "model_probability",
+                "edge_after_cost",
+                "sports_edge_after_cost",
+                "edge",
+                "yes_edge_after_cost",
+                "no_edge_after_cost",
+                "yes_probability",
+                "no_probability",
+                "yes_bid",
+                "yes_ask",
+                "no_bid",
+                "no_ask",
+                "yes_top_size",
+                "no_top_size",
+                "liquidity",
+                "liquidity_depth",
+            ):
+                if key not in quote_diag and container.get(key) not in (None, ""):
+                    quote_diag[key] = container.get(key)
+    try:
+        selection = selector(
+            ticker=item.get("ticker") or _get(q, "ticker"),
+            family=family,
+            lane=item.get("lane") or "SPORTS",
+            market=market,
+            q=q,
+            quote_diag=quote_diag,
+            preferred_side=preferred_side.lower() if preferred_side else None,
+            source="combo_research_admission",
+            emit_log=False,
+        ) or {}
+    except Exception as exc:
+        return None, None, {"reason": "canonical_selector_exception", "error": exc.__class__.__name__}
+    side = _normalize_side(selection.get("selected_side"))
+    price = _as_price(selection.get("selected_price"))
+    if side in {"YES", "NO"} and price is not None:
+        return side, price, {
+            "reason": selection.get("reason") or "canonical_selector",
+            "selected_side": side,
+            "selected_price": price,
+            "selected_price_source": selection.get("selected_price_source"),
+            "yes_ask": selection.get("yes_ask"),
+            "no_ask": selection.get("no_ask"),
+            "yes_top_size": selection.get("yes_top_size"),
+            "no_top_size": selection.get("no_top_size"),
+        }
+    return None, None, {
+        "reason": selection.get("reason") or "canonical_selector_no_side",
+        "selected_side": selection.get("selected_side"),
+        "selected_price": selection.get("selected_price"),
+    }
+
+
+def _emit_candidate_reject(*, ticker, family, reject_reason, side_fields, quote_snapshot, source_function, source, selector_trace=None):
+    _emit(
+        "AION-COMBO-CANDIDATE-REJECT",
+        {
+            "ticker": ticker,
+            "family": family,
+            "reject_reason": reject_reason,
+            "source": source,
+            "source_function": source_function,
+            "condition": "selected_side_missing" if reject_reason == "missing_side" else reject_reason,
+            "side_fields_present": _side_fields_present(side_fields),
+            "side_fields": {key: value for key, value in (side_fields or {}).items() if value not in (None, "")},
+            "orderbook": {key: value for key, value in (quote_snapshot or {}).items() if value is not None},
+            "selector_trace": {key: value for key, value in (selector_trace or {}).items() if value not in (None, "")},
+        },
     )
 
 
@@ -423,7 +580,7 @@ def _edge_norm(edge):
     return max(0.0, min(1.0, 0.5 + float(edge) * 8.0))
 
 
-def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets, expectancy_summary_by_ticker=None):
+def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets, expectancy_summary_by_ticker=None, source=None):
     readiness_by_ticker = _readiness_lookup(trade_readiness_records)
     markets_by_ticker = _market_lookup(markets)
     expectancy_by_ticker = expectancy_summary_by_ticker if isinstance(expectancy_summary_by_ticker, dict) else {}
@@ -461,13 +618,56 @@ def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets,
         if not isinstance(expectancy_summary, dict) or not expectancy_summary:
             expectancy_item = (item.get("expectancy_item") if isinstance(item.get("expectancy_item"), dict) else {})
             expectancy_summary = expectancy_item.get("expectancy_summary") if isinstance(expectancy_item.get("expectancy_summary"), dict) else {}
+        side_fields = _side_field_snapshot(item, q, expectancy_summary, readiness)
+        quote_snapshot = _quote_snapshot(item, q, market, expectancy_summary, readiness)
         side = _selected_side(item, q, expectancy_summary, readiness)
+        side_source = "explicit"
+        selector_trace = {}
+        derived_price = None
+        if side not in {"YES", "NO"}:
+            side, derived_price, selector_trace = _derive_side_from_canonical_selector(
+                bot,
+                item,
+                q,
+                market,
+                family,
+                expectancy_summary,
+                readiness,
+            )
+            if side in {"YES", "NO"}:
+                side_source = "canonical_side_selector"
+            else:
+                side, derived_price = _safe_price_match_side(quote_snapshot)
+                if side in {"YES", "NO"}:
+                    side_source = "selected_price_unique_quote_match"
         price = _selected_price(side, item, q, expectancy_summary, readiness)
+        if price is None and derived_price is not None:
+            price = derived_price
         if side not in {"YES", "NO"}:
             reject_reasons["missing_side"] += 1
+            _emit_candidate_reject(
+                ticker=ticker,
+                family=family or "UNKNOWN",
+                reject_reason="missing_side",
+                side_fields=side_fields,
+                quote_snapshot=quote_snapshot,
+                source_function="combo_research._normalize_candidate_pool",
+                source=source,
+                selector_trace=selector_trace,
+            )
             continue
         if price is None:
             reject_reasons["missing_price"] += 1
+            _emit_candidate_reject(
+                ticker=ticker,
+                family=family or "UNKNOWN",
+                reject_reason="missing_price",
+                side_fields=side_fields,
+                quote_snapshot=quote_snapshot,
+                source_function="combo_research._normalize_candidate_pool",
+                source=source,
+                selector_trace=selector_trace,
+            )
             continue
 
         probability = _candidate_probability(item, q, expectancy_summary, readiness)
@@ -486,6 +686,9 @@ def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets,
                 "market_key": _event_or_market_key(ticker, market),
                 "family": family or "UNKNOWN",
                 "side": side,
+                "side_source": side_source,
+                "side_selection_reason": selector_trace.get("reason"),
+                "selected_price_source": selector_trace.get("selected_price_source"),
                 "price": round(price, 6),
                 "probability": round(probability, 6) if probability is not None else None,
                 "confidence": round(confidence, 6) if confidence is not None else None,
@@ -1029,6 +1232,7 @@ def run_combo_research_cycle(
         trade_readiness_records,
         markets,
         expectancy_summary_by_ticker,
+        source=source,
     )
     _emit(
         "AION-COMBO-RESEARCH-CANDIDATES",
@@ -1046,9 +1250,15 @@ def run_combo_research_cycle(
                     "ticker": item.get("ticker"),
                     "family": item.get("family"),
                     "side": item.get("side"),
+                    "selected_side": item.get("side"),
+                    "preferred_side": None,
+                    "side_source": item.get("side_source"),
+                    "side_selection_reason": item.get("side_selection_reason"),
                     "price": item.get("price"),
+                    "probability": item.get("probability"),
                     "edge": item.get("edge"),
                     "confidence": item.get("confidence"),
+                    "execution_score": item.get("candidate_score"),
                     "quality_rank": item.get("quality_rank"),
                 }
                 for item in pool[:8]
@@ -1099,6 +1309,7 @@ def run_combo_research_cycle(
                             "ticker": leg.get("ticker"),
                             "family": leg.get("family"),
                             "side": leg.get("side"),
+                            "side_source": leg.get("side_source"),
                             "price": leg.get("price"),
                             "probability": leg.get("probability"),
                             "confidence": leg.get("confidence"),

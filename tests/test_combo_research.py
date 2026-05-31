@@ -28,6 +28,24 @@ class _Bot:
     def _is_sports_market_or_family(family):
         return str(family or "").upper() in {"NBA", "MLB", "NFL", "NHL", "SPORTS"}
 
+    @staticmethod
+    def _aion_select_bidirectional_side(*, q=None, quote_diag=None, preferred_side=None, **_kwargs):
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        selected_side = preferred_side or quote_diag.get("selected_side") or "yes"
+        if str(selected_side).lower() == "no":
+            selected_price = quote_diag.get("no_ask") or getattr(q, "no_ask", None)
+        else:
+            selected_price = quote_diag.get("yes_ask") or getattr(q, "yes_ask", None)
+            selected_side = "yes"
+        return {
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "selected_price_source": "ask",
+            "reason": "test_canonical_selector",
+            "yes_ask": getattr(q, "yes_ask", None),
+            "no_ask": getattr(q, "no_ask", None),
+        }
+
 
 def _candidate(ticker, family, price, confidence, edge):
     quote = _Quote(ticker, price, confidence, edge)
@@ -53,6 +71,15 @@ def _candidate(ticker, family, price, confidence, edge):
         },
         "decision_reason": "test_buy",
     }
+
+
+def _candidate_missing_explicit_side(ticker, family, price, confidence, edge):
+    candidate = _candidate(ticker, family, price, confidence, edge)
+    candidate["q"].selected_side = None
+    candidate["q"].side = None
+    candidate["allocation"].pop("selected_side", None)
+    candidate["allocation"].pop("side", None)
+    return candidate
 
 
 class ComboResearchTests(unittest.TestCase):
@@ -122,7 +149,64 @@ class ComboResearchTests(unittest.TestCase):
             self.assertEqual(summary["candidate_count"], 1)
             self.assertEqual(summary["skip_reason"], "insufficient_sports_candidates")
 
+    def test_combo_research_derives_missing_side_with_canonical_selector(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "aion_combo_research.jsonl"
+            env = {
+                "COMBO_RESEARCH_ENABLED": "true",
+                "COMBO_RESEARCH_SIM_STAKE": "1",
+                "COMBO_RESEARCH_MAX_LEGS": "2",
+                "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+            }
+            with patch.dict(os.environ, env, clear=False), self._patch_runtime(output_path):
+                summary = combo_research.run_combo_research_cycle(
+                    bot=_Bot(),
+                    candidates=[
+                        _candidate_missing_explicit_side("KXNBA-SIDE-1", "NBA", 0.54, 0.67, 0.04),
+                        _candidate_missing_explicit_side("KXMLB-SIDE-1", "MLB", 0.50, 0.64, 0.035),
+                    ],
+                    trade_readiness_records=[],
+                    markets=[],
+                    selected_ticker="KXNBA-SIDE-1",
+                    source="test",
+                )
+
+            self.assertEqual(summary["candidate_count"], 2)
+            self.assertEqual(summary["built_this_cycle"], 1)
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            combo = next(record for record in records if record["event_type"] == "combo_built")
+            self.assertTrue(all(leg["side"] == "YES" for leg in combo["legs"]))
+            self.assertTrue(all(leg["side_source"] == "canonical_side_selector" for leg in combo["legs"]))
+
+    def test_combo_research_allows_distinct_markets_from_same_event(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "aion_combo_research.jsonl"
+            env = {
+                "COMBO_RESEARCH_ENABLED": "true",
+                "COMBO_RESEARCH_SIM_STAKE": "1",
+                "COMBO_RESEARCH_MAX_LEGS": "2",
+                "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+            }
+            candidates = [
+                _candidate_missing_explicit_side("KXNBA-SAME-EVENT-1", "NBA", 0.54, 0.67, 0.04),
+                _candidate_missing_explicit_side("KXNBA-SAME-EVENT-2", "NBA", 0.50, 0.64, 0.035),
+            ]
+            for candidate in candidates:
+                candidate["market"]["event_ticker"] = "EV-SAME-GAME"
+                candidate["market"]["game_id"] = "nba:same_game"
+            with patch.dict(os.environ, env, clear=False), self._patch_runtime(output_path):
+                summary = combo_research.run_combo_research_cycle(
+                    bot=_Bot(),
+                    candidates=candidates,
+                    trade_readiness_records=[],
+                    markets=[],
+                    selected_ticker="KXNBA-SAME-EVENT-1",
+                    source="test",
+                )
+
+            self.assertEqual(summary["candidate_count"], 2)
+            self.assertEqual(summary["built_this_cycle"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-
