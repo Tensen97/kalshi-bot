@@ -16,6 +16,11 @@ import time
 from collections import Counter, deque
 from datetime import datetime, timezone
 
+try:
+    from combo_research import run_combo_research_cycle
+except Exception:
+    run_combo_research_cycle = None
+
 
 def bind_runtime_globals(source):
     if not isinstance(source, dict):
@@ -11209,6 +11214,22 @@ def find_best_live_ticker(self, markets=None):
     trade_readiness_records = []
     trade_readiness_shadow_record = None
     trade_readiness_best_prefilter_candidate = None
+    try:
+        cycle_aggression_profile = _normalize_aion_aggression_profile(globals().get("AION_AGGRESSION_PROFILE", "balanced"))
+        cycle_aggression_settings = _aion_aggression_profile_settings(
+            cycle_aggression_profile,
+            family=None,
+            context="find_best_live_ticker",
+        )
+        effective_score_threshold = max(
+            0.0,
+            self.to_float(
+                cycle_aggression_settings.get("effective_score_threshold"),
+                PHASE5_BUY_SCORE_THRESHOLD,
+            ),
+        )
+    except Exception:
+        effective_score_threshold = PHASE5_BUY_SCORE_THRESHOLD
 
     def emit_full_select_cycle_timing():
         print(
@@ -18199,6 +18220,34 @@ def find_best_live_ticker(self, markets=None):
     )
     final_selected_family = selected[3] if selected else None
     final_selected_ticker = getattr(selected[1], "ticker", None) if selected else None
+    if callable(run_combo_research_cycle):
+        try:
+            run_combo_research_cycle(
+                bot=self,
+                candidates=lane_buy_candidates,
+                trade_readiness_records=trade_readiness_records,
+                markets=markets,
+                expectancy_summary_by_ticker=expectancy_summary_by_ticker,
+                selected_ticker=final_selected_ticker,
+                source="sports_live_intelligence.find_best_live_ticker",
+            )
+        except Exception as combo_research_exc:
+            try:
+                print(
+                    "[AION-COMBO-RESEARCH-SUMMARY] "
+                    + json.dumps(
+                        {
+                            "enabled": True,
+                            "source": "sports_live_intelligence.find_best_live_ticker",
+                            "error": combo_research_exc.__class__.__name__,
+                            "reason": "combo_research_cycle_failed",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
     print(
         f"[LIVE-SPORTS-PRIORITY-SUMMARY] sports_candidates_seen={sports_priority_summary.get('sports_candidates_seen', 0)} "
         f"sports_candidates_boosted={sports_priority_summary.get('sports_candidates_boosted', 0)} "
