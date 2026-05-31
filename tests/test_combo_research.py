@@ -172,6 +172,62 @@ def _create_history_db(path):
     conn.close()
 
 
+def _create_positive_discovery_history_db(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE sports_history_records (
+            family TEXT,
+            ticker TEXT,
+            market_title TEXT,
+            outcome TEXT,
+            recency_weight REAL,
+            source_time TEXT
+        );
+        CREATE TABLE sports_history_summaries (
+            summary_key TEXT PRIMARY KEY,
+            summary_type TEXT,
+            bucket_name TEXT,
+            record_count INTEGER,
+            outcome_count INTEGER,
+            win_count INTEGER,
+            loss_count INTEGER,
+            payload_json TEXT
+        );
+        """
+    )
+    _write_history_summary(conn, "family", "NBA", 1000, 900, 100, 0.90)
+    _write_history_summary(conn, "family", "MLB", 1000, 860, 140, 0.86)
+    _write_history_summary(conn, "family", "NFL", 1000, 60, 940, 0.06)
+    _write_history_summary(conn, "odds_bucket", "60_80", 2000, 1760, 240, 0.88)
+    _write_history_summary(conn, "odds_bucket", "35_45", 1000, 80, 920, 0.08)
+    _write_history_summary(conn, "side_bucket", "favorite", 2000, 1740, 260, 0.87)
+    _write_history_summary(conn, "side_bucket", "underdog", 1000, 70, 930, 0.07)
+    _write_history_summary(conn, "family_odds_bucket", "NBA|60_80", 1000, 900, 100, 0.90)
+    _write_history_summary(conn, "family_odds_bucket", "MLB|60_80", 1000, 860, 140, 0.86)
+    _write_history_summary(conn, "family_odds_bucket", "NFL|35_45", 1000, 60, 940, 0.06)
+    for family, title, wins, losses in (
+        ("NBA", "NBA strong rung 1", 90, 10),
+        ("MLB", "MLB strong rung 1", 86, 14),
+        ("NFL", "NFL bad rung 1", 6, 94),
+    ):
+        total = wins + losses
+        for idx in range(total):
+            conn.execute(
+                "INSERT INTO sports_history_records VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    family,
+                    f"{family}-HIST-1-{idx}",
+                    title,
+                    "yes" if idx < wins else "no",
+                    1.0,
+                    "2026-05-01T00:00:00Z",
+                ),
+            )
+    conn.commit()
+    conn.close()
+
+
 def _candidate_missing_explicit_side(ticker, family, price, confidence, edge):
     candidate = _candidate(ticker, family, price, confidence, edge)
     candidate["q"].selected_side = None
@@ -262,6 +318,7 @@ class ComboResearchTests(unittest.TestCase):
                 "COMBO_RESEARCH_SIM_STAKE": "1",
                 "COMBO_RESEARCH_MAX_LEGS": "2",
                 "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+                "AION_COMBO_MIN_HISTORICAL_SAMPLE_SIZE": "10",
             }
             with patch.dict(os.environ, env, clear=False), self._patch_runtime(output_path):
                 summary = combo_research.run_combo_research_cycle(
@@ -291,6 +348,7 @@ class ComboResearchTests(unittest.TestCase):
                 "COMBO_RESEARCH_SIM_STAKE": "1",
                 "COMBO_RESEARCH_MAX_LEGS": "2",
                 "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+                "AION_COMBO_MIN_HISTORICAL_SAMPLE_SIZE": "10",
             }
             candidates = [
                 _candidate_missing_explicit_side("KXNBA-SAME-EVENT-1", "NBA", 0.54, 0.67, 0.04),
@@ -383,6 +441,7 @@ class ComboResearchTests(unittest.TestCase):
                 "COMBO_RESEARCH_SIM_STAKE": "1",
                 "COMBO_RESEARCH_MAX_LEGS": "2",
                 "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+                "AION_COMBO_MIN_HISTORICAL_SAMPLE_SIZE": "10",
             }
             candidates = [
                 _candidate("KXNBASPREAD-26MAY30SASOKC-SAS7", "KXNBASPREAD", 0.38, 0.69, 0.06),
@@ -422,6 +481,64 @@ class ComboResearchTests(unittest.TestCase):
                 self.assertIsNotNone(leg["historical_ladder_rung_hit_rate"])
                 self.assertIsNotNone(leg["historical_similar_price_hit_rate"])
                 self.assertIsNotNone(leg["historical_score"])
+
+    def test_positive_discovery_promotes_positive_and_rejects_negative_combos(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "aion_combo_research.jsonl"
+            history_path = Path(tmp_dir) / "aion_sports_history.sqlite"
+            _create_positive_discovery_history_db(history_path)
+            env = {
+                "COMBO_RESEARCH_ENABLED": "true",
+                "COMBO_RESEARCH_SIM_STAKE": "1",
+                "COMBO_RESEARCH_MAX_LEGS": "3",
+                "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+                "AION_COMBO_POSITIVE_DISCOVERY_ENABLED": "true",
+                "AION_COMBO_MIN_HISTORICAL_ROI": "0",
+                "AION_COMBO_MIN_HISTORICAL_SAMPLE_SIZE": "10",
+                "AION_COMBO_MAX_LIVE_READY_LEGS": "2",
+                "AION_COMBO_ALLOW_NEGATIVE_DIAGNOSTICS": "true",
+            }
+            candidates = [
+                _candidate("KXNBA-POS-1", "NBA", 0.65, 0.70, 0.05),
+                _candidate("KXMLB-POS-1", "MLB", 0.65, 0.69, 0.045),
+                _candidate("KXNFL-NEG-1", "NFL", 0.45, 0.64, 0.02),
+            ]
+            candidates[0]["market"]["title"] = "NBA strong rung 1"
+            candidates[1]["market"]["title"] = "MLB strong rung 1"
+            candidates[2]["market"]["title"] = "NFL bad rung 1"
+
+            with (
+                patch.dict(os.environ, env, clear=False),
+                self._patch_runtime(output_path),
+                patch.object(combo_research, "_historical_db_path", lambda: history_path),
+            ):
+                summary = combo_research.run_combo_research_cycle(
+                    bot=_Bot(),
+                    candidates=candidates,
+                    trade_readiness_records=[],
+                    markets=[],
+                    selected_ticker="KXNBA-POS-1",
+                    source="test",
+                )
+
+            self.assertEqual(summary["built_this_cycle"], 1)
+            self.assertEqual(summary["positive_discovery_promoted_count"], 1)
+            self.assertGreater(summary["positive_discovery_rejected_negative_count"], 0)
+            self.assertGreater(summary["positive_discovery_best_roi"], 0)
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            built = [record for record in records if record["event_type"] == "combo_built"]
+            diagnostics = [record for record in records if record["event_type"] == "combo_diagnostic_reject"]
+            self.assertEqual(len(built), 1)
+            self.assertTrue(diagnostics)
+            promoted = built[0]
+            self.assertEqual(promoted["combo_discovery_status"], "promoted_positive")
+            self.assertEqual(promoted["leg_count"], 2)
+            self.assertGreater(promoted["historical_combo_estimated_roi"], 0)
+            self.assertEqual(
+                {leg["ticker"] for leg in promoted["legs"]},
+                {"KXNBA-POS-1", "KXMLB-POS-1"},
+            )
+            self.assertTrue(all(record["event_type"] != "order_submit" for record in records))
 
 
 if __name__ == "__main__":

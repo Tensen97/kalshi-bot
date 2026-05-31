@@ -36,6 +36,9 @@ MAX_COMBOS_PER_LEG_COUNT = 12
 COMBO_THESIS_REJECT_LOG_LIMIT = 12
 COMBO_HISTORICAL_LOG_LIMIT = 8
 COMBO_HISTORICAL_CACHE_SECONDS = 300.0
+COMBO_POSITIVE_LOG_LIMIT = 8
+COMBO_NEGATIVE_REJECT_LOG_LIMIT = 8
+COMBO_DIAGNOSTIC_RECORD_LIMIT = 8
 OBSIDIAN_EXPORT_MIN_SECONDS = 900.0
 SPORTS_TOKENS = (
     "SPORT",
@@ -74,6 +77,11 @@ class ComboResearchConfig:
     require_distinct_thesis: bool
     allow_smaller_distinct_combos: bool
     max_legs_per_thesis: int
+    positive_discovery_enabled: bool
+    min_historical_roi: float
+    min_historical_sample_size: int
+    max_live_ready_legs: int
+    allow_negative_diagnostics: bool
 
 
 def _utc_now():
@@ -131,6 +139,11 @@ def get_combo_research_config():
         require_distinct_thesis=_env_bool("AION_COMBO_REQUIRE_DISTINCT_THESIS", True),
         allow_smaller_distinct_combos=_env_bool("AION_COMBO_ALLOW_SMALLER_DISTINCT_COMBOS", True),
         max_legs_per_thesis=max(1, _env_int("AION_COMBO_MAX_LEGS_PER_THESIS", 1)),
+        positive_discovery_enabled=_env_bool("AION_COMBO_POSITIVE_DISCOVERY_ENABLED", True),
+        min_historical_roi=_env_float("AION_COMBO_MIN_HISTORICAL_ROI", 0.0),
+        min_historical_sample_size=max(1, _env_int("AION_COMBO_MIN_HISTORICAL_SAMPLE_SIZE", 5000)),
+        max_live_ready_legs=max(2, min(5, _env_int("AION_COMBO_MAX_LIVE_READY_LEGS", 2))),
+        allow_negative_diagnostics=_env_bool("AION_COMBO_ALLOW_NEGATIVE_DIAGNOSTICS", True),
     )
 
 
@@ -1573,11 +1586,238 @@ def _build_combo_record(legs, leg_count, config, timestamp, source, diversity_mo
         "historical_combo_estimated_hit_rate": historical_combo.get("estimated_hit_rate"),
         "historical_combo_estimated_roi": historical_combo.get("estimated_roi"),
         "historical_combo_size_performance": historical_combo,
+        "historical_sample_size": historical_combo.get("sample_size"),
+        "payout_multiple": round(estimated_payout / max(config.sim_stake, 0.0001), 6),
         "result_status": "pending",
         "eventual_result": None,
         "win": None,
         "roi": None,
     }
+
+
+def _combo_positive_metric(record, field, default=None):
+    value = _to_float(record.get(field), None) if isinstance(record, dict) else None
+    if value is not None:
+        return value
+    perf = record.get("historical_combo_size_performance") if isinstance(record, dict) else {}
+    if not isinstance(perf, dict):
+        return default
+    perf_field = {
+        "historical_combo_estimated_roi": "estimated_roi",
+        "historical_combo_estimated_hit_rate": "estimated_hit_rate",
+        "historical_sample_size": "sample_size",
+    }.get(field, field)
+    value = _to_float(perf.get(perf_field), None)
+    return value if value is not None else default
+
+
+def _combo_positive_reject_reason(record, config):
+    perf = record.get("historical_combo_size_performance") if isinstance(record, dict) else {}
+    perf = perf if isinstance(perf, dict) else {}
+    leg_count = int(record.get("leg_count") or 0)
+    thesis_count = int(_to_float(record.get("thesis_count"), 0) or 0)
+    roi = _combo_positive_metric(record, "historical_combo_estimated_roi", None)
+    hit_rate = _combo_positive_metric(record, "historical_combo_estimated_hit_rate", None)
+    sample_size = int(_combo_positive_metric(record, "historical_sample_size", 0) or 0)
+    payout = _to_float(record.get("payout_multiple"), None)
+    if payout is None:
+        payout = _to_float(record.get("estimated_payout"), 0.0) or 0.0
+
+    if not perf.get("available") or roi is None:
+        return "historical_combo_roi_unavailable"
+    if sample_size < int(config.min_historical_sample_size or 1):
+        return "historical_sample_below_min"
+    if leg_count and thesis_count and thesis_count < leg_count:
+        return "duplicate_thesis_combo"
+    if roi < float(config.min_historical_roi):
+        return "historical_roi_below_min"
+
+    clear_multi_leg_roi = max(float(config.min_historical_roi) + 0.05, 0.05)
+    if leg_count > int(config.max_live_ready_legs) and roi < clear_multi_leg_roi:
+        return "multi_leg_roi_not_clearly_positive"
+
+    if payout > 1000.0 and roi < 0.25:
+        return "extreme_payout_requires_stronger_roi"
+    if payout > 100.0 and roi < 0.10:
+        return "high_payout_requires_stronger_roi"
+    if hit_rate is not None and hit_rate < 0.01 and roi < 0.15:
+        return "low_hit_rate_lottery_profile"
+    return None
+
+
+def _combo_positive_discovery_score(record, config):
+    roi = _combo_positive_metric(record, "historical_combo_estimated_roi", 0.0) or 0.0
+    hit_rate = _combo_positive_metric(record, "historical_combo_estimated_hit_rate", 0.0) or 0.0
+    hist_score = _to_float(record.get("historical_combo_score"), 0.5) or 0.5
+    sample_size = _combo_positive_metric(record, "historical_sample_size", 0.0) or 0.0
+    payout = _to_float(record.get("payout_multiple"), None)
+    if payout is None:
+        payout = _to_float(record.get("estimated_payout"), 0.0) or 0.0
+    leg_count = int(record.get("leg_count") or 0)
+    thesis_count = int(_to_float(record.get("thesis_count"), 0) or 0)
+    thesis_ratio = min(1.0, thesis_count / max(leg_count, 1))
+    sample_component = min(1.0, math.log1p(max(sample_size, 0.0)) / math.log1p(250000.0))
+    if payout <= 0.0:
+        payout_component = 0.0
+    elif payout <= 3.0:
+        payout_component = 1.0
+    elif payout <= 10.0:
+        payout_component = 0.85
+    elif payout <= 50.0:
+        payout_component = 0.55
+    elif payout <= 100.0:
+        payout_component = 0.35
+    else:
+        payout_component = 0.10
+    leg_component = 1.0 if leg_count <= 2 else max(0.0, 0.75 - ((leg_count - 3) * 0.25))
+    score = (
+        max(0.0, roi) * 100.0
+        + sample_component * 9.0
+        + hit_rate * 12.0
+        + hist_score * 8.0
+        + payout_component * 5.0
+        + thesis_ratio * 4.0
+        + leg_component * 4.0
+    )
+    return round(score, 6)
+
+
+def _combo_discovery_compact(record, reason=None):
+    return {
+        "combo_id": record.get("combo_id"),
+        "leg_count": record.get("leg_count"),
+        "thesis_count": record.get("thesis_count"),
+        "tickers": [leg.get("ticker") for leg in record.get("legs", [])],
+        "historical_roi": record.get("historical_combo_estimated_roi"),
+        "historical_hit_rate": record.get("historical_combo_estimated_hit_rate"),
+        "historical_score": record.get("historical_combo_score"),
+        "sample_size": record.get("historical_sample_size"),
+        "payout_multiple": record.get("payout_multiple"),
+        **({"reason": reason} if reason else {}),
+    }
+
+
+def _combo_diagnostic_record(record, reason, timestamp, source):
+    return {
+        "event_type": "combo_diagnostic_reject",
+        "timestamp": timestamp,
+        "source": source,
+        "combo_id": record.get("combo_id"),
+        "combo_key": record.get("combo_key"),
+        "combo_discovery_status": "diagnostic_only",
+        "reject_reason": reason,
+        "leg_count": record.get("leg_count"),
+        "thesis_count": record.get("thesis_count"),
+        "tickers": [leg.get("ticker") for leg in record.get("legs", [])],
+        "historical_combo_estimated_roi": record.get("historical_combo_estimated_roi"),
+        "historical_combo_estimated_hit_rate": record.get("historical_combo_estimated_hit_rate"),
+        "historical_combo_score": record.get("historical_combo_score"),
+        "historical_sample_size": record.get("historical_sample_size"),
+        "estimated_payout": record.get("estimated_payout"),
+        "payout_multiple": record.get("payout_multiple"),
+    }
+
+
+def _apply_positive_combo_discovery(records, config, historical_context, timestamp, source):
+    records = list(records or [])
+    if not config.positive_discovery_enabled:
+        summary = {
+            "enabled": False,
+            "raw_combo_count": len(records),
+            "scored_count": 0,
+            "positive_count": len(records),
+            "rejected_negative_count": 0,
+            "promoted_count": len(records),
+        }
+        _emit("AION-COMBO-DISCOVERY-SUMMARY", summary)
+        return records, [], summary
+    if not isinstance(historical_context, dict) or not historical_context.get("available"):
+        summary = {
+            "enabled": True,
+            "raw_combo_count": len(records),
+            "scored_count": 0,
+            "positive_count": len(records),
+            "rejected_negative_count": 0,
+            "promoted_count": len(records),
+            "bypass_reason": "historical_context_unavailable",
+        }
+        _emit("AION-COMBO-DISCOVERY-SUMMARY", summary)
+        return records, [], summary
+
+    promoted = []
+    diagnostics = []
+    rejected = []
+    scored_count = 0
+    best = None
+    for record in records:
+        record = dict(record)
+        perf = record.get("historical_combo_size_performance")
+        if isinstance(perf, dict) and perf.get("available"):
+            scored_count += 1
+        reason = _combo_positive_reject_reason(record, config)
+        if reason:
+            rejected.append((reason, record))
+            continue
+        record["combo_discovery_status"] = "promoted_positive"
+        record["positive_discovery_score"] = _combo_positive_discovery_score(record, config)
+        record["positive_discovery_reason"] = "historical_roi_positive"
+        record["positive_discovery_thresholds"] = {
+            "min_historical_roi": float(config.min_historical_roi),
+            "min_historical_sample_size": int(config.min_historical_sample_size),
+            "max_live_ready_legs": int(config.max_live_ready_legs),
+        }
+        promoted.append(record)
+        if best is None or (
+            _combo_positive_metric(record, "historical_combo_estimated_roi", -99.0),
+            _combo_positive_discovery_score(record, config),
+        ) > (
+            _combo_positive_metric(best, "historical_combo_estimated_roi", -99.0),
+            _combo_positive_discovery_score(best, config),
+        ):
+            best = record
+
+    promoted.sort(
+        key=lambda record: (
+            _to_float(record.get("historical_combo_estimated_roi"), -99.0) or -99.0,
+            _combo_positive_discovery_score(record, config),
+            _to_float(record.get("historical_combo_estimated_hit_rate"), 0.0) or 0.0,
+            -int(record.get("leg_count") or 99),
+        ),
+        reverse=True,
+    )
+
+    for record in promoted[:COMBO_POSITIVE_LOG_LIMIT]:
+        _emit("AION-COMBO-POSITIVE-CANDIDATE", _combo_discovery_compact(record))
+    for reason, record in rejected[:COMBO_NEGATIVE_REJECT_LOG_LIMIT]:
+        _emit("AION-COMBO-NEGATIVE-REJECT", _combo_discovery_compact(record, reason=reason))
+    if config.allow_negative_diagnostics:
+        diagnostics = [
+            _combo_diagnostic_record(record, reason, timestamp, source)
+            for reason, record in rejected[:COMBO_DIAGNOSTIC_RECORD_LIMIT]
+        ]
+
+    roi_values = [
+        _combo_positive_metric(record, "historical_combo_estimated_roi", None)
+        for record in promoted
+    ]
+    hit_values = [
+        _combo_positive_metric(record, "historical_combo_estimated_hit_rate", None)
+        for record in promoted
+    ]
+    summary = {
+        "enabled": True,
+        "raw_combo_count": len(records),
+        "scored_count": scored_count,
+        "positive_count": len(promoted),
+        "rejected_negative_count": len(rejected),
+        "promoted_count": len(promoted),
+        "diagnostic_count": len(diagnostics),
+        "best_roi": round(max(roi_values), 6) if roi_values else None,
+        "best_hit_rate": round(max(hit_values), 8) if hit_values else None,
+        "best_combo_id": best.get("combo_id") if isinstance(best, dict) else None,
+    }
+    _emit("AION-COMBO-DISCOVERY-SUMMARY", summary)
+    return promoted, diagnostics, summary
 
 
 def _build_virtual_combos(pool, config, timestamp, source, existing_open_keys):
@@ -2147,7 +2387,18 @@ def run_combo_research_cycle(
 
     existing_records = _read_jsonl(config.output_path)
     open_keys = _open_combo_keys(existing_records)
-    combo_records = _build_virtual_combos(diversified_pool, config, timestamp, source, open_keys)
+    raw_combo_records = _build_virtual_combos(diversified_pool, config, timestamp, source, open_keys)
+    combo_records, diagnostic_records, discovery_summary = _apply_positive_combo_discovery(
+        raw_combo_records,
+        config,
+        historical_context,
+        timestamp,
+        source,
+    )
+    diagnostic_this_cycle = 0
+    for diagnostic_record in diagnostic_records:
+        if _append_jsonl(config.output_path, diagnostic_record):
+            diagnostic_this_cycle += 1
     built_this_cycle = 0
     for record in combo_records:
         if _append_jsonl(config.output_path, record):
@@ -2161,6 +2412,7 @@ def run_combo_research_cycle(
                     "estimated_payout": record.get("estimated_payout"),
                     "stake": record.get("simulated_stake"),
                     "diversity_mode": record.get("diversity_mode"),
+                    "combo_discovery_status": record.get("combo_discovery_status"),
                     "historical_combo_estimated_hit_rate": record.get("historical_combo_estimated_hit_rate"),
                     "historical_combo_estimated_roi": record.get("historical_combo_estimated_roi"),
                 },
@@ -2192,11 +2444,18 @@ def run_combo_research_cycle(
                     "historical_combo_score": record.get("historical_combo_score"),
                     "historical_combo_estimated_hit_rate": record.get("historical_combo_estimated_hit_rate"),
                     "historical_combo_estimated_roi": record.get("historical_combo_estimated_roi"),
+                    "historical_sample_size": record.get("historical_sample_size"),
+                    "combo_discovery_status": record.get("combo_discovery_status"),
                     "jsonl_path": str(config.output_path),
                 },
             )
 
-    skip_reason = None if built_this_cycle else "no_new_clean_combos"
+    if built_this_cycle:
+        skip_reason = None
+    elif discovery_summary.get("enabled") and discovery_summary.get("raw_combo_count"):
+        skip_reason = "no_positive_historical_roi_combos"
+    else:
+        skip_reason = "no_new_clean_combos"
     summary = _summary_from_records(
         config.output_path,
         built_this_cycle=built_this_cycle,
@@ -2205,6 +2464,16 @@ def run_combo_research_cycle(
         skip_reason=skip_reason,
     )
     summary = _attach_historical_summary(_attach_diversity_summary(summary, thesis_summary, config), historical_context)
+    summary["positive_discovery_enabled"] = bool(discovery_summary.get("enabled"))
+    summary["positive_discovery_raw_combo_count"] = int(discovery_summary.get("raw_combo_count") or 0)
+    summary["positive_discovery_scored_count"] = int(discovery_summary.get("scored_count") or 0)
+    summary["positive_discovery_positive_count"] = int(discovery_summary.get("positive_count") or 0)
+    summary["positive_discovery_rejected_negative_count"] = int(discovery_summary.get("rejected_negative_count") or 0)
+    summary["positive_discovery_promoted_count"] = int(discovery_summary.get("promoted_count") or 0)
+    summary["positive_discovery_diagnostic_count"] = int(diagnostic_this_cycle)
+    summary["positive_discovery_best_roi"] = discovery_summary.get("best_roi")
+    summary["positive_discovery_best_hit_rate"] = discovery_summary.get("best_hit_rate")
+    summary["positive_discovery_best_combo_id"] = discovery_summary.get("best_combo_id")
     _emit("AION-COMBO-RESEARCH-SUMMARY", summary)
     _maybe_export_obsidian_summary(summary)
     return summary
