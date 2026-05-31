@@ -194,6 +194,8 @@ class ComboResearchTests(unittest.TestCase):
             for candidate in candidates:
                 candidate["market"]["event_ticker"] = "EV-SAME-GAME"
                 candidate["market"]["game_id"] = "nba:same_game"
+            candidates[0]["market"]["title"] = "Spurs spread ladder"
+            candidates[1]["market"]["title"] = "Spurs game total ladder"
             with patch.dict(os.environ, env, clear=False), self._patch_runtime(output_path):
                 summary = combo_research.run_combo_research_cycle(
                     bot=_Bot(),
@@ -206,6 +208,65 @@ class ComboResearchTests(unittest.TestCase):
 
             self.assertEqual(summary["candidate_count"], 2)
             self.assertEqual(summary["built_this_cycle"], 1)
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            combo = next(record for record in records if record["event_type"] == "combo_built")
+            self.assertEqual(combo["thesis_count"], 2)
+
+    def test_combo_research_uses_best_representative_per_thesis(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "aion_combo_research.jsonl"
+            env = {
+                "COMBO_RESEARCH_ENABLED": "true",
+                "COMBO_RESEARCH_SIM_STAKE": "1",
+                "COMBO_RESEARCH_MAX_LEGS": "3",
+                "COMBO_RESEARCH_MIN_CANDIDATES": "2",
+                "AION_COMBO_REQUIRE_DISTINCT_THESIS": "true",
+                "AION_COMBO_ALLOW_SMALLER_DISTINCT_COMBOS": "true",
+                "AION_COMBO_MAX_LEGS_PER_THESIS": "1",
+            }
+            candidates = [
+                _candidate("KXNBASPREAD-26MAY30SASOKC-SAS1", "NBA", 0.72, 0.62, 0.018),
+                _candidate("KXNBASPREAD-26MAY30SASOKC-SAS3", "NBA", 0.56, 0.64, 0.03),
+                _candidate("KXNBASPREAD-26MAY30SASOKC-SAS7", "NBA", 0.38, 0.69, 0.06),
+                _candidate("KXMLBMONEYLINE-26MAY30NYYBOS-NYY", "MLB", 0.52, 0.66, 0.04),
+                _candidate("KXTENNISMATCH-26MAY31ALPBET-ALP", "TENNIS", 0.48, 0.65, 0.035),
+            ]
+            for candidate in candidates[:3]:
+                candidate["market"]["event_ticker"] = "KXNBASPREAD-26MAY30SASOKC"
+                candidate["market"]["game_id"] = "nba:sas_okc"
+                rung = candidate["ticker"].rsplit("SAS", 1)[-1]
+                candidate["market"]["title"] = f"SAS spread +{rung}"
+            candidates[3]["market"]["event_ticker"] = "KXMLBMONEYLINE-26MAY30NYYBOS"
+            candidates[3]["market"]["game_id"] = "mlb:nyy_bos"
+            candidates[3]["market"]["title"] = "Yankees moneyline"
+            candidates[4]["market"]["event_ticker"] = "KXTENNISMATCH-26MAY31ALPBET"
+            candidates[4]["market"]["game_id"] = "tennis:alp_bet"
+            candidates[4]["market"]["title"] = "Alp to win tennis match"
+
+            with patch.dict(os.environ, env, clear=False), self._patch_runtime(output_path):
+                summary = combo_research.run_combo_research_cycle(
+                    bot=_Bot(),
+                    candidates=candidates,
+                    trade_readiness_records=[],
+                    markets=[],
+                    selected_ticker="KXNBASPREAD-26MAY30SASOKC-SAS7",
+                    source="test",
+                )
+
+            self.assertEqual(summary["candidate_count"], 5)
+            self.assertEqual(summary["distinct_thesis_count"], 3)
+            self.assertEqual(summary["rejected_same_thesis_count"], 2)
+            self.assertGreater(summary["built_this_cycle"], 0)
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            built = [record for record in records if record["event_type"] == "combo_built"]
+            self.assertTrue(built)
+            for combo in built:
+                thesis_keys = [leg["thesis_key"] for leg in combo["legs"]]
+                self.assertEqual(len(thesis_keys), len(set(thesis_keys)))
+            used_tickers = {leg["ticker"] for combo in built for leg in combo["legs"]}
+            self.assertIn("KXNBASPREAD-26MAY30SASOKC-SAS7", used_tickers)
+            self.assertNotIn("KXNBASPREAD-26MAY30SASOKC-SAS1", used_tickers)
+            self.assertNotIn("KXNBASPREAD-26MAY30SASOKC-SAS3", used_tickers)
 
 
 if __name__ == "__main__":

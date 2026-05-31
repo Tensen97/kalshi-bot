@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ except Exception:  # pragma: no cover - runtime fallback for isolated imports
 COMBO_RESEARCH_FILENAME = "aion_combo_research.jsonl"
 MAX_CANDIDATE_POOL = 10
 MAX_COMBOS_PER_LEG_COUNT = 12
+COMBO_THESIS_REJECT_LOG_LIMIT = 12
 OBSIDIAN_EXPORT_MIN_SECONDS = 900.0
 SPORTS_TOKENS = (
     "SPORT",
@@ -61,6 +63,9 @@ class ComboResearchConfig:
     max_legs: int
     min_candidates: int
     output_path: Path
+    require_distinct_thesis: bool
+    allow_smaller_distinct_combos: bool
+    max_legs_per_thesis: int
 
 
 def _utc_now():
@@ -115,6 +120,9 @@ def get_combo_research_config():
         max_legs=max_legs,
         min_candidates=min_candidates,
         output_path=_default_output_path(),
+        require_distinct_thesis=_env_bool("AION_COMBO_REQUIRE_DISTINCT_THESIS", True),
+        allow_smaller_distinct_combos=_env_bool("AION_COMBO_ALLOW_SMALLER_DISTINCT_COMBOS", True),
+        max_legs_per_thesis=max(1, _env_int("AION_COMBO_MAX_LEGS_PER_THESIS", 1)),
     )
 
 
@@ -270,6 +278,96 @@ def _readiness_lookup(records):
 
 def _text_blob(*values):
     return " ".join(str(value or "") for value in values).upper()
+
+
+def _compact_thesis_text(value):
+    text = str(value or "").upper()
+    text = re.sub(r"\b([A-Z]{2,18})\d{1,4}(?:\.\d+)?\b", r"\1#", text)
+    text = re.sub(r"\b\d{1,4}(?:\.\d+)?\+?\b", "#", text)
+    text = re.sub(r"(?<=[A-Z])#(?=[A-Z])", "#_", text)
+    text = re.sub(r"[^A-Z0-9#]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text[:140] or "UNKNOWN"
+
+
+def _candidate_meta_value(item, q, market, expectancy_summary, readiness, *keys):
+    allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+    containers = (
+        allocation,
+        item if isinstance(item, dict) else {},
+        expectancy_summary if isinstance(expectancy_summary, dict) else {},
+        readiness if isinstance(readiness, dict) else {},
+        market if isinstance(market, dict) else {},
+    )
+    for key in keys:
+        for container in containers:
+            value = container.get(key)
+            if value not in (None, ""):
+                return value
+        value = _get(q, key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _ticker_event_fallback(ticker):
+    ticker = str(ticker or "").strip().upper()
+    parts = [part for part in ticker.split("-") if part]
+    if len(parts) >= 2:
+        return "-".join(parts[:2])
+    return ticker
+
+
+def _derive_combo_thesis_key(item, q, market, family, side, ticker, expectancy_summary, readiness):
+    game_context = {}
+    allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+    if isinstance(allocation.get("game_thesis_context"), dict):
+        game_context = allocation.get("game_thesis_context") or {}
+    event_key = _first_value(
+        _candidate_meta_value(item, q, market, expectancy_summary, readiness, "game_id", "event_id", "event_ticker"),
+        game_context.get("game_id"),
+        _ticker_event_fallback(ticker),
+    )
+    sport = _first_value(
+        _candidate_meta_value(item, q, market, expectancy_summary, readiness, "sport", "league", "category"),
+        family,
+        "SPORTS",
+    )
+    market_type = _first_value(
+        _candidate_meta_value(
+            item,
+            q,
+            market,
+            expectancy_summary,
+            readiness,
+            "market_type",
+            "stat_family",
+            "prop_type",
+            "leg_type",
+            "setup_type",
+        ),
+        family,
+    )
+    explicit_subject = _first_value(
+        _candidate_meta_value(item, q, market, expectancy_summary, readiness, "player_name", "player", "participant_name", "athlete"),
+        _candidate_meta_value(item, q, market, expectancy_summary, readiness, "team_name", "team", "side_name", "participant"),
+    )
+    market_text = _text_blob(
+        _candidate_meta_value(item, q, market, expectancy_summary, readiness, "title", "market_title", "name"),
+        _candidate_meta_value(item, q, market, expectancy_summary, readiness, "subtitle", "event_title"),
+        ticker,
+    )
+    subject_text = explicit_subject or market_text or ticker
+    return "|".join(
+        [
+            _compact_thesis_text(sport),
+            _compact_thesis_text(event_key),
+            _compact_thesis_text(family or "UNKNOWN"),
+            _compact_thesis_text(market_type or family or "UNKNOWN"),
+            _compact_thesis_text(side or "ANY"),
+            _compact_thesis_text(subject_text),
+        ]
+    )
 
 
 def _is_crypto_candidate(bot, ticker, family, market, q):
@@ -580,6 +678,178 @@ def _edge_norm(edge):
     return max(0.0, min(1.0, 0.5 + float(edge) * 8.0))
 
 
+def _side_top_size(side, quote_snapshot, item, q, readiness):
+    side = _normalize_side(side)
+    allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+    values = [
+        allocation.get("top_size"),
+        item.get("top_size"),
+        readiness.get("top_size") if isinstance(readiness, dict) else None,
+    ]
+    if side == "YES":
+        values.extend([quote_snapshot.get("yes_top_size"), _get(q, "yes_top_size"), _get(q, "yes_ask_size")])
+    elif side == "NO":
+        values.extend([quote_snapshot.get("no_top_size"), _get(q, "no_top_size"), _get(q, "no_ask_size")])
+    values.extend([quote_snapshot.get("yes_top_size"), quote_snapshot.get("no_top_size")])
+    best = 0.0
+    for value in values:
+        number = _to_float(value, None)
+        if number is not None:
+            best = max(best, float(number))
+    return best
+
+
+def _combo_memory_adjustment(item, q, expectancy_summary, readiness):
+    total = 0.0
+    for field in (
+        "sports_memory_rank_adjustment",
+        "family_profit_memory_adjustment",
+        "sports_regime_rank_adjustment",
+        "sports_graph_rank_adjustment",
+        "memory_rank_adjustment",
+        "family_rank_adjustment",
+    ):
+        value = _candidate_meta_value(item, q, {}, expectancy_summary, readiness, field)
+        total += _to_float(value, 0.0) or 0.0
+    return round(max(-10.0, min(14.0, total)), 6)
+
+
+def _thesis_representative_score(leg):
+    quality = float(leg.get("quality_rank") or 0.0)
+    edge = _as_edge(leg.get("edge"))
+    confidence = _as_probability(leg.get("confidence"))
+    candidate_score = _score_norm(leg.get("candidate_score"))
+    execution_quality = _score_norm(leg.get("execution_quality_score"))
+    fill_probability = _as_probability(leg.get("fill_probability"))
+    spread = _to_float(leg.get("spread"), None)
+    liquidity = _to_float(_first_value(leg.get("liquidity"), leg.get("volume")), 0.0) or 0.0
+    top_size = _to_float(leg.get("top_size"), 0.0) or 0.0
+    memory = _to_float(leg.get("memory_rank_adjustment"), 0.0) or 0.0
+    edge_component = 0.0 if edge is None else max(-16.0, min(34.0, edge * 280.0))
+    confidence_component = (confidence if confidence is not None else 0.5) * 12.0
+    fill_component = (fill_probability if fill_probability is not None else 0.5) * 6.0
+    execution_component = execution_quality * 7.0
+    spread_component = 0.0
+    if spread is not None:
+        if spread <= 0.02:
+            spread_component = 7.0
+        elif spread <= 0.05:
+            spread_component = 4.5
+        elif spread <= 0.08:
+            spread_component = 2.0
+        elif spread > 0.12:
+            spread_component = -5.0
+    liquidity_component = min(7.0, math.log1p(max(liquidity, 0.0)) * 1.0)
+    top_size_component = min(4.0, math.log1p(max(top_size, 0.0)) * 1.1)
+    score = (
+        quality * 55.0
+        + candidate_score * 18.0
+        + edge_component
+        + confidence_component
+        + fill_component
+        + execution_component
+        + spread_component
+        + liquidity_component
+        + top_size_component
+        + memory
+    )
+    return round(max(0.0, min(140.0, score)), 6)
+
+
+def _apply_combo_thesis_diversity(pool, config, source):
+    pool = [dict(leg) for leg in (pool or []) if isinstance(leg, dict)]
+    if not pool:
+        return [], {
+            "enabled": bool(config.require_distinct_thesis),
+            "thesis_count": 0,
+            "representative_count": 0,
+            "rejected_same_thesis_count": 0,
+        }
+    for leg in pool:
+        if not leg.get("thesis_key"):
+            leg["thesis_key"] = _compact_thesis_text(leg.get("ticker"))
+        leg["thesis_representative_score"] = _thesis_representative_score(leg)
+    if not config.require_distinct_thesis:
+        return pool, {
+            "enabled": False,
+            "thesis_count": len({leg.get("thesis_key") for leg in pool}),
+            "representative_count": len(pool),
+            "rejected_same_thesis_count": 0,
+        }
+
+    max_per_thesis = max(1, int(config.max_legs_per_thesis or 1))
+    grouped = defaultdict(list)
+    for leg in pool:
+        grouped[str(leg.get("thesis_key") or "UNKNOWN")].append(leg)
+
+    representatives = []
+    rejected = []
+    reject_logs = 0
+    for thesis_key, legs in grouped.items():
+        ranked = sorted(
+            legs,
+            key=lambda leg: (
+                float(leg.get("thesis_representative_score") or 0.0),
+                float(leg.get("quality_rank") or 0.0),
+                float(leg.get("edge") if leg.get("edge") is not None else -1.0),
+            ),
+            reverse=True,
+        )
+        kept = ranked[:max_per_thesis]
+        weaker = ranked[max_per_thesis:]
+        representatives.extend(kept)
+        rejected.extend(weaker)
+        if len(ranked) > 1:
+            _emit(
+                "AION-COMBO-THESIS-GROUP",
+                {
+                    "thesis_key": thesis_key[:180],
+                    "group_size": len(ranked),
+                    "representative_ticker": kept[0].get("ticker") if kept else None,
+                    "representative_score": kept[0].get("thesis_representative_score") if kept else None,
+                    "rejected_same_thesis_count": len(weaker),
+                },
+            )
+            representative_ticker = kept[0].get("ticker") if kept else None
+            for leg in weaker:
+                if reject_logs >= COMBO_THESIS_REJECT_LOG_LIMIT:
+                    break
+                reject_logs += 1
+                _emit(
+                    "AION-COMBO-THESIS-REJECT",
+                    {
+                        "ticker": leg.get("ticker"),
+                        "thesis_key": thesis_key[:180],
+                        "reason": "duplicate_thesis_weaker_rung",
+                        "representative_ticker": representative_ticker,
+                    },
+                )
+
+    representatives.sort(
+        key=lambda leg: (
+            float(leg.get("thesis_representative_score") or 0.0),
+            float(leg.get("quality_rank") or 0.0),
+            float(leg.get("edge") if leg.get("edge") is not None else -1.0),
+        ),
+        reverse=True,
+    )
+    return representatives[:MAX_CANDIDATE_POOL], {
+        "enabled": True,
+        "source": source,
+        "thesis_count": len(grouped),
+        "representative_count": len(representatives),
+        "rejected_same_thesis_count": len(rejected),
+        "max_legs_per_thesis": max_per_thesis,
+    }
+
+
+def _combo_thesis_is_clean(legs, config):
+    if not config.require_distinct_thesis:
+        return True
+    thesis_counts = Counter(str(leg.get("thesis_key") or leg.get("ticker") or "") for leg in legs)
+    return bool(thesis_counts and max(thesis_counts.values()) <= max(1, int(config.max_legs_per_thesis or 1)))
+
+
 def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets, expectancy_summary_by_ticker=None, source=None):
     readiness_by_ticker = _readiness_lookup(trade_readiness_records)
     markets_by_ticker = _market_lookup(markets)
@@ -674,6 +944,35 @@ def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets,
         confidence = _candidate_confidence(item, q, expectancy_summary, readiness)
         edge = _candidate_edge(item, q, expectancy_summary, readiness)
         candidate_score = _first_value(item.get("candidate_score"), item.get("score"), readiness.get("candidate_score"))
+        execution_quality_score = _first_value(
+            _candidate_meta_value(
+                item,
+                q,
+                market,
+                expectancy_summary,
+                readiness,
+                "sports_execution_quality_score",
+                "execution_quality_score",
+                "quality_score",
+            ),
+            candidate_score,
+        )
+        fill_probability = _as_probability(
+            _candidate_meta_value(
+                item,
+                q,
+                market,
+                expectancy_summary,
+                readiness,
+                "sports_execution_fill_probability",
+                "fill_probability",
+                "fill_prob",
+            )
+        )
+        top_size = _side_top_size(side, quote_snapshot, item, q, readiness)
+        thesis_key = _derive_combo_thesis_key(item, q, market, family or "UNKNOWN", side, ticker, expectancy_summary, readiness)
+        spread = _to_float(_first_value(item.get("spread"), quote_snapshot.get("spread"), readiness.get("spread")), None)
+        liquidity = _to_float(_first_value(item.get("liquidity"), _get(q, "liquidity"), readiness.get("liquidity")), None)
         score_component = _score_norm(candidate_score)
         confidence_component = confidence if confidence is not None else 0.5
         edge_component = _edge_norm(edge)
@@ -685,6 +984,7 @@ def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets,
                 "market": ticker,
                 "market_key": _event_or_market_key(ticker, market),
                 "family": family or "UNKNOWN",
+                "thesis_key": thesis_key,
                 "side": side,
                 "side_source": side_source,
                 "side_selection_reason": selector_trace.get("reason"),
@@ -694,10 +994,14 @@ def _normalize_candidate_pool(bot, candidates, trade_readiness_records, markets,
                 "confidence": round(confidence, 6) if confidence is not None else None,
                 "edge": round(edge, 6) if edge is not None else None,
                 "candidate_score": round(_to_float(candidate_score, 0.0), 6),
+                "execution_quality_score": round(_to_float(execution_quality_score, 0.0), 6),
+                "fill_probability": round(fill_probability, 6) if fill_probability is not None else None,
                 "quality_rank": quality_rank,
-                "spread": _to_float(item.get("spread"), None),
-                "liquidity": _to_float(_first_value(item.get("liquidity"), _get(q, "liquidity"), readiness.get("liquidity")), None),
+                "spread": spread,
+                "liquidity": liquidity,
                 "volume": _to_float(_first_value(item.get("volume"), _get(q, "volume"), readiness.get("volume")), None),
+                "top_size": round(top_size, 6),
+                "memory_rank_adjustment": _combo_memory_adjustment(item, q, expectancy_summary, readiness),
                 "decision_reason": item.get("decision_reason") or readiness.get("decision_reason"),
             }
         )
@@ -766,7 +1070,7 @@ def _combo_score(legs):
     return round(avg_quality + (avg_confidence * 0.25) + (avg_edge * 4.0), 6)
 
 
-def _build_combo_record(legs, leg_count, config, timestamp, source):
+def _build_combo_record(legs, leg_count, config, timestamp, source, diversity_mode):
     combo_key = _combo_key(legs)
     combo_id = hashlib.sha1(f"{timestamp}|{combo_key}".encode("utf-8")).hexdigest()[:16]
     price_product = 1.0
@@ -788,6 +1092,9 @@ def _build_combo_record(legs, leg_count, config, timestamp, source):
         "combo_id": combo_id,
         "combo_key": combo_key,
         "leg_count": leg_count,
+        "thesis_count": len({leg.get("thesis_key") for leg in legs}),
+        "thesis_keys": sorted({str(leg.get("thesis_key") or "")[:180] for leg in legs}),
+        "diversity_mode": diversity_mode,
         "legs": legs,
         "implied_combo_probability": round(estimated_probability_product, 8) if has_estimated_probability else None,
         "market_implied_combo_probability": round(price_product, 8),
@@ -807,6 +1114,7 @@ def _build_combo_record(legs, leg_count, config, timestamp, source):
 def _build_virtual_combos(pool, config, timestamp, source, existing_open_keys):
     records = []
     max_legs = min(config.max_legs, 5 if len(pool) >= 5 else 4, len(pool))
+    diversity_mode = "distinct_thesis" if config.require_distinct_thesis else "raw_candidate_pool"
     for leg_count in range(2, max_legs + 1):
         if leg_count == 5 and len(pool) < 5:
             continue
@@ -815,13 +1123,15 @@ def _build_virtual_combos(pool, config, timestamp, source, existing_open_keys):
             legs = [dict(leg) for leg in legs_tuple]
             if not _combo_is_clean(legs):
                 continue
+            if not _combo_thesis_is_clean(legs, config):
+                continue
             combo_key = _combo_key(legs)
             if combo_key in existing_open_keys:
                 continue
             scored.append((_combo_score(legs), legs))
         scored.sort(key=lambda item: item[0], reverse=True)
         for _score, legs in scored[:MAX_COMBOS_PER_LEG_COUNT]:
-            records.append(_build_combo_record(legs, leg_count, config, timestamp, source))
+            records.append(_build_combo_record(legs, leg_count, config, timestamp, source, diversity_mode))
     return records
 
 
@@ -1193,6 +1503,20 @@ def _maybe_export_obsidian_summary(summary):
         return None
 
 
+def _attach_diversity_summary(summary, thesis_summary, config):
+    if not isinstance(summary, dict):
+        return summary
+    thesis_summary = thesis_summary if isinstance(thesis_summary, dict) else {}
+    distinct_count = int(thesis_summary.get("representative_count") or thesis_summary.get("thesis_count") or 0)
+    summary["diversity_mode"] = "distinct_thesis" if config.require_distinct_thesis else "raw_candidate_pool"
+    summary["distinct_thesis_count"] = distinct_count
+    summary["thesis_group_count"] = int(thesis_summary.get("thesis_count") or 0)
+    summary["rejected_same_thesis_count"] = int(thesis_summary.get("rejected_same_thesis_count") or 0)
+    if config.require_distinct_thesis and distinct_count < int(config.max_legs or 0):
+        summary["larger_combo_skip_reason"] = "insufficient_distinct_thesis_groups_for_max_legs"
+    return summary
+
+
 def run_combo_research_cycle(
     *,
     bot,
@@ -1243,12 +1567,14 @@ def run_combo_research_cycle(
             "sports_candidate_count": len(pool),
             "min_candidates": config.min_candidates,
             "max_legs": config.max_legs,
+            "distinct_thesis_required": config.require_distinct_thesis,
             "selected_ticker": selected_ticker,
             "reject_reasons": dict(reject_reasons),
             "top_candidates": [
                 {
                     "ticker": item.get("ticker"),
                     "family": item.get("family"),
+                    "thesis_key": item.get("thesis_key"),
                     "side": item.get("side"),
                     "selected_side": item.get("side"),
                     "preferred_side": None,
@@ -1291,13 +1617,52 @@ def run_combo_research_cycle(
         _maybe_export_obsidian_summary(summary)
         return summary
 
+    diversified_pool, thesis_summary = _apply_combo_thesis_diversity(pool, config, source)
+    min_distinct_needed = 2 if config.allow_smaller_distinct_combos else config.min_candidates
+    if len(diversified_pool) < min_distinct_needed:
+        try:
+            output_has_records = config.output_path.exists() and config.output_path.stat().st_size > 0
+        except Exception:
+            output_has_records = False
+        if output_has_records:
+            summary = _summary_from_records(
+                config.output_path,
+                built_this_cycle=0,
+                resolved_this_cycle=resolved_this_cycle,
+                candidate_count=len(pool),
+                skip_reason="insufficient_distinct_thesis_candidates",
+            )
+        else:
+            summary = _empty_summary(
+                config.output_path,
+                built_this_cycle=0,
+                resolved_this_cycle=resolved_this_cycle,
+                candidate_count=len(pool),
+                skip_reason="insufficient_distinct_thesis_candidates",
+            )
+        summary = _attach_diversity_summary(summary, thesis_summary, config)
+        _emit("AION-COMBO-RESEARCH-SUMMARY", summary)
+        _maybe_export_obsidian_summary(summary)
+        return summary
+
     existing_records = _read_jsonl(config.output_path)
     open_keys = _open_combo_keys(existing_records)
-    combo_records = _build_virtual_combos(pool, config, timestamp, source, open_keys)
+    combo_records = _build_virtual_combos(diversified_pool, config, timestamp, source, open_keys)
     built_this_cycle = 0
     for record in combo_records:
         if _append_jsonl(config.output_path, record):
             built_this_cycle += 1
+            _emit(
+                "AION-COMBO-DIVERSIFIED-BUILD",
+                {
+                    "leg_count": record.get("leg_count"),
+                    "thesis_count": record.get("thesis_count"),
+                    "combo_tickers": [leg.get("ticker") for leg in record.get("legs", [])],
+                    "estimated_payout": record.get("estimated_payout"),
+                    "stake": record.get("simulated_stake"),
+                    "diversity_mode": record.get("diversity_mode"),
+                },
+            )
             _emit(
                 "AION-COMBO-RESEARCH-BUILD",
                 {
@@ -1334,6 +1699,7 @@ def run_combo_research_cycle(
         candidate_count=len(pool),
         skip_reason=skip_reason,
     )
+    summary = _attach_diversity_summary(summary, thesis_summary, config)
     _emit("AION-COMBO-RESEARCH-SUMMARY", summary)
     _maybe_export_obsidian_summary(summary)
     return summary
