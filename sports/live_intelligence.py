@@ -6022,9 +6022,15 @@ def _sports_ladder_book_quality(self, allocation=None):
     return quality
 
 
-def _sports_ladder_existing_game_exposure(self, game_id=None):
+def _sports_ladder_existing_game_exposure(self, game_id=None, tickers=None):
     game_id = str(game_id or "").strip()
-    if not game_id:
+    ticker_game_keys = {
+        self._extract_sports_game_key(ticker)
+        for ticker in (tickers or [])
+        if str(ticker or "").strip()
+    }
+    ticker_game_keys.discard("UNKNOWN")
+    if not game_id and not ticker_game_keys:
         return 0
     total = 0
     for position in getattr(self, "live_positions", []) or []:
@@ -6039,7 +6045,11 @@ def _sports_ladder_existing_game_exposure(self, game_id=None):
             or ((entry_context.get("game_thesis_context") or {}).get("game_id") if isinstance(entry_context.get("game_thesis_context"), dict) else "")
             or ""
         ).strip()
-        if position_game_id != game_id:
+        position_ticker = str(position.get("ticker") or "").strip()
+        position_game_key = self._extract_sports_game_key(position_ticker) if position_ticker else ""
+        game_id_match = bool(game_id and position_game_id == game_id)
+        ticker_game_match = bool(position_game_key and position_game_key in ticker_game_keys)
+        if not (game_id_match or ticker_game_match):
             continue
         size = self.to_float(
             position.get("count"),
@@ -6850,8 +6860,9 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
     primary_ticker = str(primary_ticker or "").strip()
     primary_submitted = bool((primary_result or {}).get("submitted")) if isinstance(primary_result, dict) else False
     game_id = str(plan.get("game_id") or "").strip()
+    plan_tickers = [str(leg.get("ticker") or "").strip() for leg in plan.get("legs") or [] if str(leg.get("ticker") or "").strip()]
     game_exposure_cap = max(1, int(plan.get("max_game_contracts") or AION_SPORTS_LADDER_MAX_GAME_CONTRACTS or 1))
-    existing_exposure = self._sports_ladder_existing_game_exposure(game_id)
+    existing_exposure = self._sports_ladder_existing_game_exposure(game_id, tickers=plan_tickers)
     remaining_game_capacity = max(0, game_exposure_cap - existing_exposure)
     submitted = []
     skipped = []

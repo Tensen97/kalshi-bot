@@ -1683,6 +1683,50 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertFalse(result["submitted"])
         self.assertEqual(result["reason"], "game_exposure_cap_reached")
 
+    def test_sports_ladder_game_exposure_cap_counts_api_reconciled_tickers(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(ticker="KXMLBSPREAD-26MAY311920CHCSTL-STL6", family="KXMLBSPREAD", selected_side="yes", selected_price=0.38)
+        game_id = "mlb:kxmlb_chcstl"
+        bot.last_dual_lane_buy_candidates = [
+            {
+                "ticker": q.ticker,
+                "family": q.family,
+                "lane": "SPORTS",
+                "q": q,
+                "market": {"ticker": q.ticker, "series_ticker": q.family, "event_ticker": "KXMLB-26MAY311920CHCSTL", "title": "Cardinals wins by over 5.5 runs?"},
+                "allocation": {
+                    "lane": "SPORTS",
+                    "ticker": q.ticker,
+                    "family": q.family,
+                    "allocation_score": 88.0,
+                    "unified_opportunity_score": 90.0,
+                    "edge": 0.035,
+                    "spread": 0.02,
+                    "liquidity": 160,
+                    "decision": "ALLOW_STRONG_SPORT",
+                    "game_id": game_id,
+                    "game_thesis_type": "favorite_dominance",
+                    "game_thesis_confidence": 82.0,
+                    "game_thesis_context": {"game_id": game_id, "thesis_type": "favorite_dominance", "thesis_confidence": 82.0, "strong": True},
+                },
+            }
+        ]
+        bot.live_positions = [
+            {
+                "ticker": "KXMLBSPREAD-26MAY311920CHCSTL-STL5",
+                "status": "open",
+                "count": kw.AION_SPORTS_LADDER_MAX_GAME_CONTRACTS,
+                "entry_context": None,
+            }
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_sports_ladder_attempts(primary_ticker=q.ticker, primary_result={"submitted": True}, source="unit_test_ladder_cap_api_state")
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "game_exposure_cap_reached")
+
     def test_sports_ladder_daily_loss_guard_blocks_ladder_submit(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
