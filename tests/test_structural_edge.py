@@ -45,6 +45,38 @@ class StructuralEdgeTests(unittest.TestCase):
         kw.AION_SPORTS_ONLY_MODE = bool(enabled)
         self.addCleanup(setattr, kw, "AION_SPORTS_ONLY_MODE", old_mode)
 
+    def _set_position_flip_config(self, *, enabled=True, min_edge_delta=0.08, min_loss=0.05, cooldown=120, allow_reenter=True):
+        old_values = {
+            "AION_POSITION_FLIP_ENABLED": kw.AION_POSITION_FLIP_ENABLED,
+            "AION_POSITION_FLIP_MIN_EDGE_DELTA": kw.AION_POSITION_FLIP_MIN_EDGE_DELTA,
+            "AION_POSITION_FLIP_MIN_UNREALIZED_LOSS": kw.AION_POSITION_FLIP_MIN_UNREALIZED_LOSS,
+            "AION_POSITION_FLIP_COOLDOWN_SECONDS": kw.AION_POSITION_FLIP_COOLDOWN_SECONDS,
+            "AION_POSITION_FLIP_ALLOW_REENTER": kw.AION_POSITION_FLIP_ALLOW_REENTER,
+        }
+        kw.AION_POSITION_FLIP_ENABLED = bool(enabled)
+        kw.AION_POSITION_FLIP_MIN_EDGE_DELTA = float(min_edge_delta)
+        kw.AION_POSITION_FLIP_MIN_UNREALIZED_LOSS = float(min_loss)
+        kw.AION_POSITION_FLIP_COOLDOWN_SECONDS = int(cooldown)
+        kw.AION_POSITION_FLIP_ALLOW_REENTER = bool(allow_reenter)
+        for name, value in old_values.items():
+            self.addCleanup(setattr, kw, name, value)
+
+    def _configure_position_flip_bot(self, bot, family="KXATPCHALLENGERMATCH"):
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.position_flip_cooldowns = {}
+        bot.position_flip_log_markers = {}
+        bot.live_exit_cooldowns = {}
+        bot.live_exit_pending_tickers = set()
+        bot.get_live_entry_metadata = lambda _ticker: {}
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: family
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.0}
+        return bot
+
     def _set_temp_sports_memory(self, bot, tmpdir):
         bot.aion_sports_memory_file = str(Path(tmpdir) / "aion_adaptive_sports_memory.json")
         bot.aion_sports_memory_state = None
@@ -3160,6 +3192,227 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(decision["side"], "no")
         self.assertEqual(decision["reason"], "fast_profit_pct_lock")
         self.assertTrue(decision["profit_lock_pct_exit"])
+
+    def test_position_flip_weakening_yes_with_stronger_no_exits_reduce_only(self):
+        self._set_position_flip_config(allow_reenter=False)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01LANGMO-LANGMO"
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "yes", "entry_price": 0.60, "count": 2, "entry_ts": time.time() - 300}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=20,
+            no_top_size=20,
+            yes_edge_after_cost=-0.04,
+            no_edge_after_cost=0.10,
+        )
+
+        base = bot._evaluate_dynamic_live_exit(position, quotes_by_ticker={ticker: q})
+        decision = bot._evaluate_position_flip(position, base_decision=base, quotes_by_ticker={ticker: q})
+        payload = bot._build_live_exit_order_payload(position, decision)
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "position_flip_opposite_edge")
+        self.assertEqual(decision["position_flip"]["opposite_side"], "no")
+        self.assertAlmostEqual(decision["position_flip"]["edge_delta"], 0.14)
+        self.assertEqual(payload["action"], "sell")
+        self.assertTrue(payload["reduce_only"])
+        self.assertEqual(payload["side"], "yes")
+
+    def test_position_flip_weakening_no_with_stronger_yes_exits_reduce_only(self):
+        self._set_position_flip_config(allow_reenter=False)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01MILAVSKY-LANGMO"
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "no", "entry_price": 0.62, "count": 3, "entry_ts": time.time() - 300}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.54,
+            yes_ask=0.56,
+            no_bid=0.44,
+            no_ask=0.46,
+            yes_top_size=20,
+            no_top_size=20,
+            yes_edge_after_cost=0.12,
+            no_edge_after_cost=-0.03,
+        )
+
+        base = bot._evaluate_dynamic_live_exit(position, quotes_by_ticker={ticker: q})
+        decision = bot._evaluate_position_flip(position, base_decision=base, quotes_by_ticker={ticker: q})
+        payload = bot._build_live_exit_order_payload(position, decision)
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertEqual(decision["reason"], "position_flip_opposite_edge")
+        self.assertEqual(decision["position_flip"]["opposite_side"], "yes")
+        self.assertAlmostEqual(decision["position_flip"]["edge_delta"], 0.15)
+        self.assertEqual(payload["action"], "sell")
+        self.assertTrue(payload["reduce_only"])
+        self.assertEqual(payload["side"], "no")
+
+    def test_position_flip_exit_failure_blocks_opposite_reentry(self):
+        self._set_position_flip_config(allow_reenter=True)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01LANGMO-LANGMO"
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "yes", "entry_price": 0.60, "count": 2, "entry_ts": time.time() - 300}
+        bot.live_positions = [position]
+        bot._get_open_live_positions = lambda: [position]
+        bot.submit_live_exit_order = lambda _position, _decision: {"submitted": False, "reason": "exchange_reject"}
+        reentries = []
+        bot.submit_live_order = lambda *args, **kwargs: reentries.append((args, kwargs)) or {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=20,
+            no_top_size=20,
+            yes_edge_after_cost=-0.04,
+            no_edge_after_cost=0.10,
+        )
+
+        result = bot.run_live_monitor_positions_pass(allow_real_exits=True, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["exit_orders_submitted"], 0)
+        self.assertEqual(result["flip_reentries_submitted"], 0)
+        self.assertEqual(reentries, [])
+        self.assertTrue(result["decisions"][0]["position_flip"])
+        self.assertFalse(result["decisions"][0]["submitted"])
+
+    def test_position_flip_reentry_blocked_until_live_exposure_clears(self):
+        self._set_position_flip_config(allow_reenter=True)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01LANGMO-LANGMO"
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "yes", "entry_price": 0.60, "count": 2, "entry_ts": time.time() - 300}
+        bot.live_positions = [position]
+        bot._get_open_live_positions = lambda: [position]
+        bot.submit_live_exit_order = lambda _position, _decision: {"submitted": True, "reason": "submitted", "response": {"order": {"order_id": "exit-1"}}}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": bot.live_positions}
+        reentries = []
+        bot.submit_live_order = lambda *args, **kwargs: reentries.append((args, kwargs)) or {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=20,
+            no_top_size=20,
+            yes_edge_after_cost=-0.04,
+            no_edge_after_cost=0.10,
+        )
+
+        result = bot.run_live_monitor_positions_pass(allow_real_exits=True, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["exit_orders_submitted"], 1)
+        self.assertEqual(result["flip_reentries_submitted"], 0)
+        self.assertEqual(result["decisions"][0]["reentry_reason"], "exit_not_cleared")
+        self.assertEqual(reentries, [])
+
+    def test_position_flip_reentry_allowed_after_live_exposure_clears(self):
+        self._set_position_flip_config(allow_reenter=True)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01LANGMO-LANGMO"
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "yes", "entry_price": 0.60, "count": 2, "entry_ts": time.time() - 300}
+        bot.live_positions = [position]
+        bot._get_open_live_positions = lambda: [position]
+        bot.submit_live_exit_order = lambda _position, _decision: {"submitted": True, "reason": "submitted", "response": {"order": {"order_id": "exit-1"}}}
+
+        def clear_exposure():
+            bot.live_positions = []
+            return {"ok": True, "positions": []}
+
+        bot.reconcile_live_positions = clear_exposure
+        reentries = []
+        bot.submit_live_order = lambda *args, **kwargs: reentries.append((args, kwargs)) or {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=20,
+            no_top_size=20,
+            yes_edge_after_cost=-0.04,
+            no_edge_after_cost=0.10,
+        )
+
+        result = bot.run_live_monitor_positions_pass(allow_real_exits=True, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["exit_orders_submitted"], 1)
+        self.assertEqual(result["flip_reentries_submitted"], 1)
+        self.assertEqual(result["decisions"][0]["reentry_reason"], "submitted")
+        self.assertEqual(reentries[0][1]["payload_override"]["side"], "no")
+        self.assertEqual(reentries[0][1]["payload_override"]["action"], "buy")
+
+    def test_position_flip_small_edge_changes_do_not_churn(self):
+        self._set_position_flip_config(min_edge_delta=0.08, allow_reenter=False)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01LANGMO-LANGMO"
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "yes", "entry_price": 0.60, "count": 2, "entry_ts": time.time() - 300}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.45,
+            yes_ask=0.47,
+            no_bid=0.53,
+            no_ask=0.55,
+            yes_top_size=20,
+            no_top_size=20,
+            yes_edge_after_cost=0.01,
+            no_edge_after_cost=0.05,
+        )
+
+        base = bot._evaluate_dynamic_live_exit(position, quotes_by_ticker={ticker: q})
+        decision = bot._evaluate_position_flip(position, base_decision=base, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(decision["action"], "hold")
+        self.assertEqual(decision["reason"], "position_flip_edge_delta_threshold_not_met")
+
+    def test_position_flip_cooldown_prevents_repeated_flip_spam(self):
+        self._set_position_flip_config(allow_reenter=False)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01LANGMO-LANGMO"
+        bot.position_flip_cooldowns[ticker] = time.time() + 120
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "yes", "entry_price": 0.60, "count": 2, "entry_ts": time.time() - 300}
+        decision = bot._evaluate_position_flip(position, base_decision={"ticker": ticker, "side": "yes", "action": "hold"}, quotes_by_ticker={ticker: SimpleNamespace(ticker=ticker)})
+
+        self.assertEqual(decision["action"], "hold")
+        self.assertEqual(decision["reason"], "position_flip_cooldown_active")
+
+    def test_position_flip_profitable_hold_is_not_exited(self):
+        self._set_position_flip_config(allow_reenter=False)
+        bot = self._configure_position_flip_bot(self._make_bot())
+        ticker = "KXATPCHALLENGERMATCH-26JUN01LANGMO-LANGMO"
+        position = {"ticker": ticker, "family": "KXATPCHALLENGERMATCH", "side": "yes", "entry_price": 0.45, "count": 2, "entry_ts": time.time() - 300}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.56,
+            yes_ask=0.58,
+            no_bid=0.42,
+            no_ask=0.44,
+            yes_top_size=20,
+            no_top_size=20,
+            yes_edge_after_cost=0.10,
+            no_edge_after_cost=-0.02,
+        )
+
+        decision = bot._evaluate_position_flip(
+            position,
+            base_decision={"ticker": ticker, "side": "yes", "action": "hold", "entry_price": 0.45, "exit_price": 0.56, "count": 2, "unrealized_pnl": 0.22},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "hold")
+        self.assertEqual(decision["reason"], "position_flip_loss_threshold_not_met")
 
     def test_strong_sports_conviction_sizes_and_ranks_higher(self):
         bot = self._make_bot()

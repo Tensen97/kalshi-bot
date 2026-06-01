@@ -1808,6 +1808,11 @@ SPORTS_FAST_TAKE_PROFIT_DOLLARS = _env_float("SPORTS_FAST_TAKE_PROFIT_DOLLARS", 
 SPORTS_FAST_TAKE_PROFIT_PCT = _env_float("SPORTS_FAST_TAKE_PROFIT_PCT", 0.25)
 SPORTS_TRAILING_PROFIT_GIVEBACK_PCT = _env_float("SPORTS_TRAILING_PROFIT_GIVEBACK_PCT", 0.30)
 SPORTS_MAX_PAYOUT_LOCK_PCT = _env_float("SPORTS_MAX_PAYOUT_LOCK_PCT", 0.70)
+AION_POSITION_FLIP_ENABLED = (os.environ.get("AION_POSITION_FLIP_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+AION_POSITION_FLIP_MIN_EDGE_DELTA = _env_float("AION_POSITION_FLIP_MIN_EDGE_DELTA", 0.08)
+AION_POSITION_FLIP_MIN_UNREALIZED_LOSS = _env_float("AION_POSITION_FLIP_MIN_UNREALIZED_LOSS", 0.05)
+AION_POSITION_FLIP_COOLDOWN_SECONDS = int(_env_float("AION_POSITION_FLIP_COOLDOWN_SECONDS", 120))
+AION_POSITION_FLIP_ALLOW_REENTER = (os.environ.get("AION_POSITION_FLIP_ALLOW_REENTER", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_SELECT_BATCH_SIZE = 60
 LIVE_SELECT_MAX_BATCHES = 5
 LIVE_SELECT_MAX_MARKETS = 240
@@ -2429,6 +2434,8 @@ class KalshiSniperBot:
         self.live_exit_cooldowns = {}
         self.live_exit_pending_tickers = set()
         self.live_exit_price_history = {}
+        self.position_flip_cooldowns = {}
+        self.position_flip_log_markers = {}
         self.dynamic_exit_log_markers = {}
         self.live_degenerate_family_reject_history = {}
         self.live_degenerate_family_cooldowns = {}
@@ -43011,6 +43018,304 @@ class KalshiSniperBot:
             sports_max_payout_lock_pct=SPORTS_MAX_PAYOUT_LOCK_PCT,
         )
 
+    def _position_flip_price_value(self, value):
+        numeric = self.to_float(value, None)
+        if numeric is None:
+            return None
+        try:
+            numeric = float(numeric)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        if 1.0 < numeric <= 100.0:
+            numeric = numeric / 100.0
+        if 0.0 <= numeric <= 1.0:
+            return round(float(numeric), 4)
+        return None
+
+    def _emit_position_flip_log(self, tag, payload=None, *, cooldown_key=None, cooldown_seconds=30.0):
+        payload = payload if isinstance(payload, dict) else {}
+        try:
+            markers = getattr(self, "position_flip_log_markers", None)
+            if not isinstance(markers, dict):
+                self.position_flip_log_markers = {}
+                markers = self.position_flip_log_markers
+            marker = str(cooldown_key or f"{tag}:{payload.get('ticker')}:{payload.get('reason')}").strip()
+            now_ts = time.time()
+            if marker and cooldown_seconds and cooldown_seconds > 0:
+                last_ts = self.to_float(markers.get(marker), 0.0) or 0.0
+                if now_ts - last_ts < float(cooldown_seconds):
+                    return
+                markers[marker] = now_ts
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+
+    def _position_flip_side_selection(self, position, q, price_context, side):
+        position = position if isinstance(position, dict) else {}
+        price_context = price_context if isinstance(price_context, dict) else {}
+        ticker = str(position.get("ticker") or self._read_field(q, "ticker", default="") or "").strip()
+        family = str(
+            position.get("family")
+            or self._read_field(q, "family", "series_ticker", default="")
+            or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")
+            or "UNKNOWN"
+        ).strip()
+        return self._aion_select_bidirectional_side(
+            ticker=ticker,
+            family=family,
+            lane="SPORTS" if self._is_sports_market_or_family(family) else None,
+            market={"ticker": ticker, "series_ticker": family, "family": family},
+            q=q,
+            yes_bid=price_context.get("yes_bid"),
+            yes_ask=price_context.get("yes_ask"),
+            no_bid=price_context.get("no_bid"),
+            no_ask=price_context.get("no_ask"),
+            preferred_side=side,
+            source="position_flip",
+            emit_log=False,
+        )
+
+    def _position_flip_edge_delta(self, q, side, opposite_side, side_selection, price_context):
+        def _edge_from_quote(side_name):
+            return self.to_float(
+                self._read_field(
+                    q,
+                    f"{side_name}_edge_after_cost",
+                    f"{side_name}_final_edge",
+                    f"{side_name}_ev_edge",
+                    f"{side_name}_edge",
+                    default=None,
+                ),
+                None,
+            )
+
+        current_edge = _edge_from_quote(side)
+        opposite_edge = _edge_from_quote(opposite_side)
+        if current_edge is not None and opposite_edge is not None:
+            return {
+                "edge_delta": round(float(opposite_edge) - float(current_edge), 6),
+                "current_edge": float(current_edge),
+                "opposite_edge": float(opposite_edge),
+                "edge_source": "explicit_side_edge_after_cost",
+            }
+        side_selection = side_selection if isinstance(side_selection, dict) else {}
+        selected_side = self._normalize_live_side(side_selection.get("selected_side"))
+        selected_edge = self.to_float(side_selection.get("selected_edge_after_cost"), None)
+        if selected_side == opposite_side and selected_edge is not None:
+            current_selector_edge = self.to_float(side_selection.get(f"{side}_edge_after_cost"), None)
+            opposite_selector_edge = self.to_float(side_selection.get(f"{opposite_side}_edge_after_cost"), None)
+            if current_selector_edge is not None and opposite_selector_edge is not None and (
+                abs(float(current_selector_edge)) > 0.000001
+                or abs(float(opposite_selector_edge)) > 0.000001
+            ):
+                return {
+                    "edge_delta": round(float(opposite_selector_edge) - float(current_selector_edge), 6),
+                    "current_edge": float(current_selector_edge),
+                    "opposite_edge": float(opposite_selector_edge),
+                    "edge_source": "selector_side_edge_after_cost",
+                }
+        price_context = price_context if isinstance(price_context, dict) else {}
+        current_mark = self._position_flip_price_value(price_context.get(f"{side}_bid"))
+        opposite_mark = self._position_flip_price_value(price_context.get(f"{opposite_side}_bid"))
+        if current_mark is None and self._position_flip_price_value(price_context.get(f"{opposite_side}_ask")) is not None:
+            current_mark = round(1.0 - self._position_flip_price_value(price_context.get(f"{opposite_side}_ask")), 4)
+        if opposite_mark is None and self._position_flip_price_value(price_context.get(f"{side}_ask")) is not None:
+            opposite_mark = round(1.0 - self._position_flip_price_value(price_context.get(f"{side}_ask")), 4)
+        if current_mark is not None and opposite_mark is not None:
+            return {
+                "edge_delta": round(float(opposite_mark) - float(current_mark), 6),
+                "current_edge": float(current_mark),
+                "opposite_edge": float(opposite_mark),
+                "edge_source": "live_bid_probability_delta",
+            }
+        return {
+            "edge_delta": None,
+            "current_edge": current_edge,
+            "opposite_edge": opposite_edge,
+            "edge_source": "missing_edge_context",
+        }
+
+    def _evaluate_position_flip(self, position, base_decision=None, quotes_by_ticker=None):
+        position = position if isinstance(position, dict) else {}
+        base_decision = base_decision if isinstance(base_decision, dict) else {}
+        ticker = str(base_decision.get("ticker") or position.get("ticker") or "").strip()
+        if not ticker:
+            return {"action": "hold", "reason": "position_flip_missing_ticker"}
+        if not bool(AION_POSITION_FLIP_ENABLED):
+            return {"ticker": ticker, "action": "hold", "reason": "position_flip_disabled"}
+
+        side = self._normalize_live_side(base_decision.get("side") or position.get("side"))
+        if side not in {"yes", "no"}:
+            metadata = self._get_live_exit_position_metadata(position)
+            side = self._normalize_live_side((metadata or {}).get("side"))
+        if side not in {"yes", "no"}:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "reason": "missing_current_side"},
+                cooldown_key=f"flip-skip:{ticker}:missing_current_side",
+            )
+            return {"ticker": ticker, "action": "hold", "reason": "position_flip_missing_side"}
+
+        now_ts = time.time()
+        cooldowns = getattr(self, "position_flip_cooldowns", None)
+        if not isinstance(cooldowns, dict):
+            self.position_flip_cooldowns = {}
+            cooldowns = self.position_flip_cooldowns
+        cooldown_until = self.to_float(cooldowns.get(ticker), 0.0) or 0.0
+        if now_ts < cooldown_until:
+            remaining = round(cooldown_until - now_ts, 3)
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "side": side, "reason": "cooldown_active", "cooldown_remaining": remaining},
+                cooldown_key=f"flip-skip:{ticker}:cooldown",
+            )
+            return {"ticker": ticker, "side": side, "action": "hold", "reason": "position_flip_cooldown_active", "cooldown_remaining": remaining}
+
+        quote_context = self._resolve_live_exit_quote_context(position, quotes_by_ticker=quotes_by_ticker)
+        q = quote_context[0] if isinstance(quote_context, tuple) and quote_context else quote_context
+        if q is None:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "side": side, "reason": "missing_quote"},
+                cooldown_key=f"flip-skip:{ticker}:missing_quote",
+            )
+            return {"ticker": ticker, "side": side, "action": "hold", "reason": "position_flip_missing_quote"}
+
+        price_context = self._get_live_exit_price_context(q, side)
+        price_context = price_context if isinstance(price_context, dict) else {}
+        exit_price = self._position_flip_price_value(base_decision.get("exit_price") or price_context.get("exit_price"))
+        if exit_price is None or exit_price <= 0.0:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "side": side, "reason": "missing_executable_exit_price"},
+                cooldown_key=f"flip-skip:{ticker}:missing_exit",
+            )
+            return {"ticker": ticker, "side": side, "action": "hold", "reason": "position_flip_missing_exit_price"}
+
+        entry_price = self._position_flip_price_value(base_decision.get("entry_price") or position.get("entry_price") or position.get("avg_price"))
+        count = self.to_float(base_decision.get("count") or position.get("count") or position.get("position") or 0.0, 0.0) or 0.0
+        if count < 0:
+            count = abs(count)
+        unrealized_pnl = self.to_float(base_decision.get("unrealized_pnl"), None)
+        if unrealized_pnl is None and entry_price is not None and count > 0:
+            unrealized_pnl = round((float(exit_price) - float(entry_price)) * float(count), 4)
+        min_loss = max(0.0, float(AION_POSITION_FLIP_MIN_UNREALIZED_LOSS or 0.0))
+        if unrealized_pnl is None or float(unrealized_pnl) > -min_loss:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-CHECK",
+                {
+                    "ticker": ticker,
+                    "side": side,
+                    "action": "hold",
+                    "reason": "loss_threshold_not_met",
+                    "unrealized_pnl": unrealized_pnl,
+                    "min_unrealized_loss": min_loss,
+                },
+                cooldown_key=f"flip-check:{ticker}:loss_threshold",
+            )
+            return {"ticker": ticker, "side": side, "action": "hold", "reason": "position_flip_loss_threshold_not_met", "unrealized_pnl": unrealized_pnl}
+
+        opposite_side = "no" if side == "yes" else "yes"
+        side_selection = self._position_flip_side_selection(position, q, price_context, side)
+        selected_side = self._normalize_live_side((side_selection or {}).get("selected_side"))
+        selected_price = self._position_flip_price_value((side_selection or {}).get("selected_price"))
+        opposite_entry_price = selected_price if selected_side == opposite_side else self._position_flip_price_value(price_context.get(f"{opposite_side}_ask"))
+        if selected_side != opposite_side:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-CHECK",
+                {
+                    "ticker": ticker,
+                    "side": side,
+                    "selected_side": selected_side,
+                    "action": "hold",
+                    "reason": "selector_did_not_flip",
+                    "unrealized_pnl": unrealized_pnl,
+                },
+                cooldown_key=f"flip-check:{ticker}:selector_did_not_flip",
+            )
+            return {"ticker": ticker, "side": side, "action": "hold", "reason": "position_flip_selector_did_not_flip", "selected_side": selected_side}
+        if opposite_entry_price is None or not (0.0 < float(opposite_entry_price) < 1.0):
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "side": side, "opposite_side": opposite_side, "reason": "missing_opposite_entry_price"},
+                cooldown_key=f"flip-skip:{ticker}:missing_opposite_entry_price",
+            )
+            return {"ticker": ticker, "side": side, "action": "hold", "reason": "position_flip_missing_opposite_price"}
+
+        edge_context = self._position_flip_edge_delta(q, side, opposite_side, side_selection, price_context)
+        edge_delta = self.to_float(edge_context.get("edge_delta"), None)
+        min_edge_delta = max(0.0, float(AION_POSITION_FLIP_MIN_EDGE_DELTA or 0.0))
+        if edge_delta is None or float(edge_delta) < min_edge_delta:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-CHECK",
+                {
+                    "ticker": ticker,
+                    "side": side,
+                    "opposite_side": opposite_side,
+                    "action": "hold",
+                    "reason": "edge_delta_threshold_not_met",
+                    "edge_delta": edge_delta,
+                    "min_edge_delta": min_edge_delta,
+                    "edge_source": edge_context.get("edge_source"),
+                    "unrealized_pnl": unrealized_pnl,
+                },
+                cooldown_key=f"flip-check:{ticker}:edge_delta",
+            )
+            return {
+                "ticker": ticker,
+                "side": side,
+                "action": "hold",
+                "reason": "position_flip_edge_delta_threshold_not_met",
+                "edge_delta": edge_delta,
+            }
+
+        family = str(position.get("family") or self._read_field(q, "family", "series_ticker", default="") or self.get_market_family({"ticker": ticker}) or "UNKNOWN")
+        flip_context = {
+            "ticker": ticker,
+            "family": family,
+            "current_side": side,
+            "opposite_side": opposite_side,
+            "opposite_entry_price": opposite_entry_price,
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "count": count,
+            "unrealized_pnl": unrealized_pnl,
+            "edge_delta": edge_delta,
+            "min_edge_delta": min_edge_delta,
+            "min_unrealized_loss": min_loss,
+            "edge_source": edge_context.get("edge_source"),
+            "allow_reenter": bool(AION_POSITION_FLIP_ALLOW_REENTER),
+            "side_selection_reason": (side_selection or {}).get("reason"),
+        }
+        self._emit_position_flip_log(
+            "AION-POSITION-FLIP-CHECK",
+            {**flip_context, "action": "exit", "reason": "position_flip_opposite_edge"},
+            cooldown_key=f"flip-check:{ticker}:trigger",
+            cooldown_seconds=5.0,
+        )
+        decision = dict(base_decision)
+        decision.update(
+            {
+                "ticker": ticker,
+                "family": family,
+                "side": side,
+                "action": "exit",
+                "reason": "position_flip_opposite_edge",
+                "count": count,
+                "entry_price": entry_price,
+                "current_price": exit_price,
+                "exit_price": exit_price,
+                "cashout_value": round(float(exit_price) * float(count), 4) if count else None,
+                "unrealized_pnl": unrealized_pnl,
+                "position_flip": flip_context,
+            }
+        )
+        return decision
+
     def _build_live_exit_order_payload(self, position, decision):
         return kalshi_exits_module.build_live_exit_order_payload(
             self,
@@ -43160,6 +43465,175 @@ class KalshiSniperBot:
             return result
         finally:
             self.live_exit_pending_tickers.discard(ticker)
+
+    def _position_flip_live_exposure_cleared(self, ticker):
+        ticker = str(ticker or "").strip()
+        if not ticker:
+            return {"cleared": False, "reason": "missing_ticker"}
+        try:
+            result = self.reconcile_live_positions()
+        except Exception as exc:
+            return {"cleared": False, "reason": exc.__class__.__name__, "reconcile_ok": False}
+        if not (isinstance(result, dict) and result.get("ok")):
+            return {
+                "cleared": False,
+                "reason": (result or {}).get("reason") if isinstance(result, dict) else "reconcile_failed",
+                "reconcile_ok": False,
+            }
+        remaining = []
+        for row in getattr(self, "live_positions", []) or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("ticker") or "").strip() != ticker:
+                continue
+            status = str(row.get("status") or "open").strip().lower()
+            count = self.to_float(
+                row.get("count")
+                if row.get("count") not in (None, "")
+                else row.get("position")
+                if row.get("position") not in (None, "")
+                else row.get("position_fp")
+                if row.get("position_fp") not in (None, "")
+                else row.get("yes_count")
+                if row.get("yes_count") not in (None, "")
+                else row.get("yes_count_fp")
+                if row.get("yes_count_fp") not in (None, "")
+                else row.get("no_count")
+                if row.get("no_count") not in (None, "")
+                else row.get("no_count_fp"),
+                0.0,
+            ) or 0.0
+            if status == "open" and abs(float(count)) > 0.0:
+                remaining.append({"ticker": ticker, "side": row.get("side"), "count": count, "status": status})
+        return {
+            "cleared": len(remaining) == 0,
+            "reason": "cleared" if len(remaining) == 0 else "remaining_live_exposure",
+            "reconcile_ok": True,
+            "remaining": remaining,
+        }
+
+    def _build_position_flip_reentry_payload(self, position, decision):
+        position = position if isinstance(position, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        flip_context = decision.get("position_flip") if isinstance(decision.get("position_flip"), dict) else {}
+        ticker = str(decision.get("ticker") or position.get("ticker") or flip_context.get("ticker") or "").strip()
+        side = self._normalize_live_side(flip_context.get("opposite_side"))
+        price = self._position_flip_price_value(flip_context.get("opposite_entry_price") or flip_context.get("selected_price"))
+        count = self.to_float(flip_context.get("count") or decision.get("count") or position.get("count"), 0.0) or 0.0
+        if count < 0:
+            count = abs(count)
+        count = int(max(1, min(int(MAX_LIVE_ORDER_SIZE or 1), int(count))))
+        if not ticker or side not in {"yes", "no"} or price is None or not (0.0 < float(price) < 1.0):
+            return None
+        family = str(flip_context.get("family") or decision.get("family") or position.get("family") or self.get_market_family({"ticker": ticker}) or "UNKNOWN")
+        price_cents = max(1, min(99, int(round(float(price) * 100.0))))
+        payload = {
+            "ticker": ticker,
+            "family": family,
+            "side": side,
+            "selected_side": side,
+            "action": "buy",
+            "count": count,
+            "price": price,
+            "selected_price": price,
+            "_aion_position_flip_reentry": True,
+            "entry_context": {
+                "source": "position_flip_reentry",
+                "previous_side": flip_context.get("current_side"),
+                "previous_unrealized_pnl": flip_context.get("unrealized_pnl"),
+                "edge_delta": flip_context.get("edge_delta"),
+                "edge_source": flip_context.get("edge_source"),
+            },
+        }
+        if side == "yes":
+            payload["yes_price"] = price_cents
+        else:
+            payload["no_price"] = price_cents
+        return payload
+
+    def _maybe_reenter_position_flip(self, position, decision, exit_result):
+        position = position if isinstance(position, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        flip_context = decision.get("position_flip") if isinstance(decision.get("position_flip"), dict) else {}
+        ticker = str(decision.get("ticker") or position.get("ticker") or flip_context.get("ticker") or "").strip()
+        if not flip_context:
+            return {"submitted": False, "reason": "not_position_flip"}
+        if not bool(exit_result.get("submitted")):
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {
+                    "ticker": ticker,
+                    "reason": "exit_not_submitted_no_reenter",
+                    "exit_reason": exit_result.get("reason"),
+                },
+                cooldown_key=f"flip-reenter:{ticker}:exit_failed",
+                cooldown_seconds=5.0,
+            )
+            return {"submitted": False, "reason": "exit_not_submitted"}
+        if not bool(AION_POSITION_FLIP_ALLOW_REENTER):
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "reason": "reenter_disabled"},
+                cooldown_key=f"flip-reenter:{ticker}:disabled",
+            )
+            return {"submitted": False, "reason": "reenter_disabled"}
+        exposure = self._position_flip_live_exposure_cleared(ticker)
+        if not exposure.get("cleared"):
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {
+                    "ticker": ticker,
+                    "reason": "exit_not_cleared_no_reenter",
+                    "exposure_reason": exposure.get("reason"),
+                    "remaining": exposure.get("remaining"),
+                },
+                cooldown_key=f"flip-reenter:{ticker}:not_cleared",
+                cooldown_seconds=5.0,
+            )
+            return {"submitted": False, "reason": "exit_not_cleared", "exposure": exposure}
+        payload = self._build_position_flip_reentry_payload(position, decision)
+        if not payload:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "reason": "invalid_reentry_payload"},
+                cooldown_key=f"flip-reenter:{ticker}:invalid_payload",
+            )
+            return {"submitted": False, "reason": "invalid_reentry_payload"}
+        q = SimpleNamespace(
+            ticker=payload.get("ticker"),
+            family=payload.get("family"),
+            selected_side=payload.get("side"),
+            selected_price=payload.get("selected_price"),
+            side=payload.get("side"),
+            price=payload.get("price"),
+        )
+        self._emit_position_flip_log(
+            "AION-POSITION-FLIP-REENTER",
+            {
+                "ticker": payload.get("ticker"),
+                "side": payload.get("side"),
+                "price": payload.get("selected_price"),
+                "count": payload.get("count"),
+                "reason": "exit_cleared_reenter_opposite_side",
+            },
+            cooldown_key=f"flip-reenter:{ticker}:submit",
+            cooldown_seconds=5.0,
+        )
+        try:
+            return self.submit_live_order(
+                q,
+                size=payload.get("count"),
+                lane="SPORTS" if self._is_sports_market_or_family(payload.get("family")) else None,
+                payload_override=payload,
+            )
+        except Exception as exc:
+            self._emit_position_flip_log(
+                "AION-POSITION-FLIP-SKIP",
+                {"ticker": ticker, "reason": "reentry_exception", "exception": exc.__class__.__name__},
+                cooldown_key=f"flip-reenter:{ticker}:exception",
+                cooldown_seconds=5.0,
+            )
+            return {"submitted": False, "reason": exc.__class__.__name__}
 
     def maybe_exit_positions(self, quotes_by_ticker=None):
         return None
@@ -43443,14 +43917,47 @@ class KalshiSniperBot:
         open_positions = list(self._get_open_live_positions())
         decisions = []
         submitted = 0
+        flip_reentries_submitted = 0
         for position in open_positions:
             decision = self._evaluate_dynamic_live_exit(position, quotes_by_ticker=quotes_by_ticker)
+            position_flip_decision = self._evaluate_position_flip(
+                position,
+                base_decision=decision,
+                quotes_by_ticker=quotes_by_ticker,
+            )
+            if position_flip_decision.get("action") == "exit":
+                decision = position_flip_decision
             result = {"submitted": False, "reason": "hold"}
+            reentry_result = {"submitted": False, "reason": "not_attempted"}
             if decision.get("action") == "exit":
                 if allow_real_exits:
                     result = self.submit_live_exit_order(position, decision)
+                    if decision.get("position_flip"):
+                        cooldowns = getattr(self, "position_flip_cooldowns", None)
+                        if not isinstance(cooldowns, dict):
+                            self.position_flip_cooldowns = {}
+                            cooldowns = self.position_flip_cooldowns
+                        cooldowns[decision.get("ticker")] = time.time() + float(AION_POSITION_FLIP_COOLDOWN_SECONDS or 120)
+                        self._emit_position_flip_log(
+                            "AION-POSITION-FLIP-EXIT",
+                            {
+                                "ticker": decision.get("ticker"),
+                                "side": decision.get("side"),
+                                "opposite_side": (decision.get("position_flip") or {}).get("opposite_side"),
+                                "submitted": bool(result.get("submitted")),
+                                "exit_reason": result.get("reason"),
+                                "unrealized_pnl": decision.get("unrealized_pnl"),
+                                "edge_delta": (decision.get("position_flip") or {}).get("edge_delta"),
+                            },
+                            cooldown_key=f"flip-exit:{decision.get('ticker')}",
+                            cooldown_seconds=5.0,
+                        )
                     if result.get("submitted"):
                         submitted += 1
+                        if decision.get("position_flip"):
+                            reentry_result = self._maybe_reenter_position_flip(position, decision, result)
+                            if reentry_result.get("submitted"):
+                                flip_reentries_submitted += 1
                 else:
                     result = {"submitted": False, "reason": "monitor_only", "payload": None}
                     print(
@@ -43473,6 +43980,9 @@ class KalshiSniperBot:
                     "reason": decision.get("reason"),
                     "submitted": bool(result.get("submitted")),
                     "submit_reason": result.get("reason"),
+                    "position_flip": bool(decision.get("position_flip")),
+                    "reentry_submitted": bool(reentry_result.get("submitted")),
+                    "reentry_reason": reentry_result.get("reason"),
                 }
             )
         post_exit_reconcile = None
@@ -43499,6 +44009,7 @@ class KalshiSniperBot:
             "open_positions": len(open_positions),
             "allow_real_exits": bool(allow_real_exits),
             "exit_orders_submitted": submitted,
+            "flip_reentries_submitted": flip_reentries_submitted,
             "post_exit_reconcile": post_exit_reconcile,
             "decisions": decisions,
         }
