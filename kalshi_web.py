@@ -42545,6 +42545,10 @@ class KalshiSniperBot:
             if position.get("count") is not None
             else position.get("position")
             if position.get("position") is not None
+            else position.get("position_fp")
+            if position.get("position_fp") is not None
+            else position.get("count_fp")
+            if position.get("count_fp") is not None
             else position.get("yes_count")
             if position.get("yes_count") is not None
             else position.get("no_count")
@@ -42552,7 +42556,7 @@ class KalshiSniperBot:
         count = self.to_float(raw_count, 0.0) or 0.0
         side = str(position.get("side") or position.get("outcome_side") or "").strip().lower()
         if side not in {"yes", "no"}:
-            side = "no" if position.get("no_count") not in (None, "", 0, 0.0) else "yes"
+            side = "no" if position.get("no_count") not in (None, "", 0, 0.0) or count < 0 else "yes"
         avg_price = (
             position.get("avg_price")
             if position.get("avg_price") is not None
@@ -42560,12 +42564,21 @@ class KalshiSniperBot:
             if position.get("average_price") is not None
             else position.get("entry_price")
         )
+        normalized_avg_price = self.normalize_contract_price(avg_price, ticker=ticker, source="extract_position_summary")
+        if normalized_avg_price is None:
+            market_exposure = self.to_float(position.get("market_exposure_dollars"), None)
+            if market_exposure is None:
+                market_exposure = self.to_float(position.get("market_exposure"), None)
+                if market_exposure is not None and market_exposure > 1.0:
+                    market_exposure = market_exposure / 100.0
+            if market_exposure is not None and abs(count) > 0:
+                normalized_avg_price = round(float(market_exposure) / abs(float(count)), 6)
         status = "open" if abs(count) > 0 else "closed"
         return {
             "ticker": ticker,
             "side": side,
-            "count": count,
-            "avg_price": self.normalize_contract_price(avg_price, ticker=ticker, source="extract_position_summary"),
+            "count": abs(count),
+            "avg_price": normalized_avg_price,
             "status": status,
             "updated_ts": time.time(),
             "raw": position,

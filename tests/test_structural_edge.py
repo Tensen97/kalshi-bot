@@ -75,6 +75,46 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return bot._record_sports_memory_trade_event(event)
 
+    def test_extract_position_summary_uses_kalshi_position_fp(self):
+        bot = self._make_bot()
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = bot.extract_position_summary(
+                {
+                    "ticker": "KXMLBSPREAD-26MAY311920CHCSTL-STL5",
+                    "position_fp": "5.00",
+                    "market_exposure_dollars": "1.570000",
+                    "realized_pnl_dollars": "0.000000",
+                }
+            )
+        self.assertEqual(summary["ticker"], "KXMLBSPREAD-26MAY311920CHCSTL-STL5")
+        self.assertEqual(summary["side"], "yes")
+        self.assertEqual(summary["count"], 5.0)
+        self.assertEqual(summary["status"], "open")
+        self.assertAlmostEqual(summary["avg_price"], 0.314)
+
+    def test_reduce_only_live_order_uses_ioc_time_in_force(self):
+        bot = self._make_bot()
+        normalized = bot._normalize_legacy_order_payload(
+            {
+                "ticker": "KXNCAABBGAME-26MAY312100TAMUSC-USC",
+                "client_order_id": "unit-reduce-only",
+                "side": "yes",
+                "action": "sell",
+                "yes_price": 58,
+                "count": 2,
+                "post_only": True,
+                "reduce_only": True,
+            }
+        )
+        self.assertEqual(normalized["time_in_force"], "immediate_or_cancel")
+        self.assertFalse(normalized["post_only"])
+        self.assertTrue(normalized["reduce_only"])
+        invalid = dict(normalized, time_in_force="fill_or_kill")
+        self.assertEqual(
+            kw.kalshi_execution_module.validate_canonical_order_payload(invalid)["reason"],
+            "reduce_only_requires_ioc",
+        )
+
     def test_execution_log_mode_keeps_execution_and_suppresses_advisory(self):
         old_mode = kw.AION_LOG_MODE
         old_debug = kw.AION_DEBUG_TELEMETRY

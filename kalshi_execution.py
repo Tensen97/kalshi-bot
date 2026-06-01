@@ -89,6 +89,10 @@ def _cash_value_to_dollars(value, *, cents=False):
     return round(float(numeric), 4)
 
 
+def _live_order_time_in_force(*, reduce_only=False):
+    return "immediate_or_cancel" if bool(reduce_only) else "fill_or_kill"
+
+
 def _find_mapping_field(mapping, field_names):
     mapping = mapping if isinstance(mapping, dict) else {}
     for field_name in field_names:
@@ -393,6 +397,13 @@ def validate_canonical_order_payload(payload, endpoint_kind=CANONICAL_ORDER_ENDP
         }
     if isinstance(count, bool) or not isinstance(count, int) or int(count) < 1:
         return {"ok": False, "reason": "invalid_integer_count", "count": count, "payload_keys": sorted(payload.keys())}
+    if bool(payload.get("reduce_only")) and payload.get("time_in_force") != "immediate_or_cancel":
+        return {
+            "ok": False,
+            "reason": "reduce_only_requires_ioc",
+            "time_in_force": payload.get("time_in_force"),
+            "payload_keys": sorted(payload.keys()),
+        }
     return {
         "ok": True,
         "reason": "schema_valid",
@@ -460,14 +471,15 @@ def normalize_legacy_order_payload(
     )
     if not order_fields:
         return None
+    reduce_only = bool(payload.get("reduce_only", False))
     order = {
         "ticker": ticker,
         "client_order_id": payload["client_order_id"],
         "count": count,
         "type": "limit",
-        "time_in_force": "fill_or_kill",
-        "post_only": bool(payload.get("post_only", False)),
-        "reduce_only": bool(payload.get("reduce_only", False)),
+        "time_in_force": _live_order_time_in_force(reduce_only=reduce_only),
+        "post_only": False if reduce_only else bool(payload.get("post_only", False)),
+        "reduce_only": reduce_only,
         "self_trade_prevention_type": "taker_at_cross",
     }
     order.update(order_fields)
@@ -499,17 +511,18 @@ def normalize_event_order_payload(
         event_side = "ask" if action == "buy" else "bid"
         yes_side_price = round(1.0 - selected_price, 4)
     yes_side_price = max(0.01, min(0.99, yes_side_price))
+    reduce_only = bool(legacy_payload.get("reduce_only", False))
     return {
         "ticker": legacy_payload.get("ticker"),
         "client_order_id": legacy_payload.get("client_order_id"),
         "side": event_side,
         "count": f"{bot.to_float(legacy_payload.get('count'), 1.0) or 1.0:.2f}",
         "price": f"{yes_side_price:.4f}",
-        "time_in_force": "fill_or_kill",
+        "time_in_force": _live_order_time_in_force(reduce_only=reduce_only),
         "self_trade_prevention_type": "taker_at_cross",
-        "post_only": bool(legacy_payload.get("post_only", False)),
+        "post_only": False if reduce_only else bool(legacy_payload.get("post_only", False)),
         "cancel_order_on_pause": True,
-        "reduce_only": bool(legacy_payload.get("reduce_only", False)),
+        "reduce_only": reduce_only,
         "subaccount": 0,
         "exchange_index": 0,
     }
@@ -659,6 +672,9 @@ def place_live_order(bot, payload):
                 "action": legacy_payload.get("action"),
                 "selected_price_cents": selected_price,
                 "count": legacy_payload.get("count"),
+                "time_in_force": request_payload.get("time_in_force"),
+                "reduce_only": request_payload.get("reduce_only"),
+                "post_only": request_payload.get("post_only"),
                 "payload_keys": sorted(request_payload.keys()),
             },
             sort_keys=True,
@@ -714,6 +730,9 @@ def place_live_order(bot, payload):
                 "selected_side": request_payload.get("side"),
                 "selected_price_cents": selected_price,
                 "count": request_payload.get("count"),
+                "time_in_force": request_payload.get("time_in_force"),
+                "reduce_only": request_payload.get("reduce_only"),
+                "post_only": request_payload.get("post_only"),
                 "buy_max_cost": request_payload.get("buy_max_cost"),
                 "outbound_payload_keys": sorted(request_payload.keys()),
             },
