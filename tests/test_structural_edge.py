@@ -5582,6 +5582,71 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(payload["no_price"], 42)
         self.assertNotIn("yes_price", payload)
 
+    def test_live_candidate_terminal_accounting_balances_every_sports_candidate(self):
+        bot = self._make_bot()
+        future_start = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        markets = [
+            {"ticker": "KXNBA-FUTURE", "series_ticker": "KXNBA", "occurrence_datetime": future_start},
+            {"ticker": "KXNBA-NOQUOTE", "series_ticker": "KXNBA", "in_play": True},
+            {"ticker": "KXNBA-NOSIDE", "series_ticker": "KXNBA", "in_play": True},
+            {"ticker": "KXNBA-NOPRICE", "series_ticker": "KXNBA", "in_play": True},
+            {"ticker": "KXNBA-LOWEDGE", "series_ticker": "KXNBA", "in_play": True},
+            {"ticker": "KXNBA-SUBMIT", "series_ticker": "KXNBA", "in_play": True},
+        ]
+        quotes_by_ticker = {
+            "KXNBA-FUTURE": SimpleNamespace(ticker="KXNBA-FUTURE", selected_side="yes", selected_price=0.45, yes_ask=0.45),
+            "KXNBA-NOSIDE": SimpleNamespace(ticker="KXNBA-NOSIDE", selected_price=0.45, yes_ask=0.45),
+            "KXNBA-NOPRICE": SimpleNamespace(ticker="KXNBA-NOPRICE", selected_side="yes"),
+            "KXNBA-LOWEDGE": SimpleNamespace(ticker="KXNBA-LOWEDGE", selected_side="yes", selected_price=0.45, yes_ask=0.45),
+            "KXNBA-SUBMIT": SimpleNamespace(ticker="KXNBA-SUBMIT", selected_side="yes", selected_price=0.45, yes_ask=0.45),
+        }
+        readiness_records = [
+            {
+                "ticker": "KXNBA-LOWEDGE",
+                "decision_reason": "edge_below_cost",
+                "sports_edge_after_cost": -0.01,
+                "liquidity": 120,
+                "spread_bucket": "tight",
+            }
+        ]
+
+        accounting = bot._build_aion_live_candidate_terminal_accounting(
+            markets=markets,
+            quotes_by_ticker=quotes_by_ticker,
+            quote_hydration_summary={"attempted": 6, "success": 5, "failure": 1},
+            trade_readiness_records=readiness_records,
+            selected_ticker="KXNBA-SUBMIT",
+            submit_attempted=True,
+            stage="unit_test",
+        )
+
+        outcomes = accounting["terminal_outcomes"]
+        self.assertTrue(accounting["terminal_balance_ok"])
+        self.assertEqual(accounting["terminal_total"], len(markets))
+        self.assertEqual(sum(outcomes.values()), len(markets))
+        self.assertEqual(outcomes["future_start_time_block"], 1)
+        self.assertEqual(outcomes["no_quote"], 1)
+        self.assertEqual(outcomes["no_side"], 1)
+        self.assertEqual(outcomes["no_price"], 1)
+        self.assertEqual(outcomes["low_edge"], 1)
+        self.assertEqual(outcomes["submit_attempt"], 1)
+
+    def test_live_candidate_terminal_accounting_fail_log_emits_on_mismatch(self):
+        bot = self._make_bot()
+        bad_accounting = {
+            "stage": "unit_test",
+            "sports_candidates": 3,
+            "terminal_total": 2,
+            "terminal_balance_ok": False,
+            "terminal_outcomes": {"future_start_time_block": 2},
+        }
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            bot._emit_aion_live_candidate_terminal_accounting(bad_accounting)
+        output = stream.getvalue()
+        self.assertIn("[AION-FUNNEL-ACCOUNTING]", output)
+        self.assertIn("[AION-FUNNEL-ACCOUNTING-FAIL]", output)
+
 
 if __name__ == "__main__":
     unittest.main()

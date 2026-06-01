@@ -3736,6 +3736,287 @@ class KalshiSniperBot:
             "start_time_raw": start_raw,
         }
 
+    def _aion_funnel_terminal_buckets(self):
+        return (
+            "future_start_time_block",
+            "no_quote",
+            "no_side",
+            "no_price",
+            "low_edge",
+            "low_ev",
+            "low_confidence",
+            "liquidity_block",
+            "spread_block",
+            "duplicate_guard",
+            "exposure_cap",
+            "risk_governor",
+            "sizing_zero",
+            "submit_attempt",
+            "submit_success",
+            "other",
+        )
+
+    def _aion_funnel_terminal_reason(self, reason):
+        reason_text = str(reason or "").strip().lower()
+        if not reason_text:
+            return "other"
+        if any(token in reason_text for token in ("future_start_time", "pregame", "pre_game", "not_started", "not started", "scheduled", "upcoming", "lifecycle_not_allowed")):
+            return "future_start_time_block"
+        if any(token in reason_text for token in ("missing_quote", "no_quote", "quote_missing", "no_quote_ready", "missing_prices_and_sizes")):
+            return "no_quote"
+        if any(token in reason_text for token in ("missing_side", "no_side", "selected_side_missing", "side_missing")):
+            return "no_side"
+        if any(token in reason_text for token in ("missing_price", "no_price", "invalid_selected_price", "selected_price_missing", "selected_price_below", "selected_price_above", "missing_selected_side_price")):
+            return "no_price"
+        if any(token in reason_text for token in ("edge_below", "edge_too_low", "low_edge", "weak_edge", "negative_edge")):
+            return "low_edge"
+        if any(token in reason_text for token in ("low_ev", "negative_ev", "ev_below", "expectancy_below", "weak_expectancy", "no_positive_expectancy")):
+            return "low_ev"
+        if "confidence" in reason_text and any(token in reason_text for token in ("low", "weak", "below", "insufficient")):
+            return "low_confidence"
+        if any(token in reason_text for token in ("liquidity", "thin_market", "no_depth", "zero_yes_size", "zero_no_size", "no_liquidity")):
+            return "liquidity_block"
+        if any(token in reason_text for token in ("spread", "unsafe_price", "wide", "stale_orderbook")):
+            return "spread_block"
+        if any(token in reason_text for token in ("duplicate", "already_holding", "opposite_side")):
+            return "duplicate_guard"
+        if any(token in reason_text for token in ("exposure", "position_limit", "same_thesis", "account_pct_cap", "family_cap")):
+            return "exposure_cap"
+        if any(token in reason_text for token in ("daily_loss", "risk", "live_mode_disabled", "live_not_armed", "live_env", "dry_run", "auth_", "can_open_new_position")):
+            return "risk_governor"
+        if any(token in reason_text for token in ("sizing_zero", "size_zero", "count_zero", "zero_contract", "resolved_size_zero")):
+            return "sizing_zero"
+        return "other"
+
+    def _aion_funnel_candidate_price(self, market=None, q=None, side=None):
+        side = self._aion_normalize_live_side(side or self._read_field(q, "selected_side", "side", default=None) or self._read_field(market, "selected_side", "side", default=None))
+        raw_price = self._read_field(q, "selected_price", "selected_price_dollars", default=None)
+        if raw_price is None:
+            raw_price = self._read_field(market, "selected_price", "selected_price_dollars", default=None)
+        if raw_price is None and side == "yes":
+            raw_price = self._read_field(q, "yes_ask", "yes_price", default=None)
+            if raw_price is None:
+                raw_price = self._read_field(market, "yes_ask", "yes_price", default=None)
+        if raw_price is None and side == "no":
+            raw_price = self._read_field(q, "no_ask", "no_price", default=None)
+            if raw_price is None:
+                raw_price = self._read_field(market, "no_ask", "no_price", default=None)
+        price = self.to_float(raw_price, None)
+        if price is None:
+            cents = self._read_field(q, "selected_price_cents", default=None)
+            if cents is None:
+                cents = self._read_field(market, "selected_price_cents", default=None)
+            price = self.to_float(cents, None)
+        if price is None:
+            return None
+        if price > 1.0:
+            price = price / 100.0
+        if KALSHI_CONTRACT_MIN_PRICE <= price <= KALSHI_CONTRACT_MAX_PRICE:
+            return price
+        return None
+
+    def _aion_funnel_future_or_pregame_reason(self, market=None, q=None):
+        metadata = [source for source in (market, q) if source is not None]
+        now_ts = time.time()
+        start_ts, start_key, start_raw = self._sports_live_state_timestamp(metadata)
+        if start_ts is not None and start_ts > now_ts + 30.0:
+            return {
+                "reason": "future_start_time",
+                "start_key": start_key,
+                "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                "seconds_to_start": round(float(start_ts - now_ts), 3),
+                "start_time_raw": start_raw,
+            }
+        status_value, status_key = self._sports_live_state_field(
+            metadata,
+            "status",
+            "market_status",
+            "event_status",
+            "game_status",
+            "match_status",
+            "live_state",
+            "game_state",
+        )
+        status_text = str(status_value or "").strip().lower()
+        if status_text in {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}:
+            explicit_live_value, explicit_live_key = self._sports_live_state_field(metadata, "in_play", "inplay", "is_in_play", "is_live", "live", "currently_live", "is_currently_live")
+            scoreboard_live, scoreboard_key, scoreboard_value = self._sports_live_state_has_scoreboard(metadata)
+            if not self._sports_live_state_bool(explicit_live_value) and not scoreboard_live:
+                return {
+                    "reason": "pregame_status",
+                    "status_key": status_key,
+                    "status": status_value,
+                    "explicit_live_key": explicit_live_key,
+                    "explicit_live_value": explicit_live_value,
+                    "scoreboard_key": scoreboard_key,
+                    "scoreboard_value": scoreboard_value,
+                }
+        return None
+
+    def _build_aion_live_candidate_terminal_accounting(
+        self,
+        *,
+        markets=None,
+        quotes_by_ticker=None,
+        quote_hydration_summary=None,
+        trade_readiness_records=None,
+        live_select_summary=None,
+        execution_funnel=None,
+        selected_ticker=None,
+        submit_attempted=False,
+        submit_success=False,
+        stage="post_quote_hydration",
+    ):
+        markets = list(markets or [])
+        quotes_by_ticker = quotes_by_ticker if isinstance(quotes_by_ticker, dict) else {}
+        quote_hydration_summary = quote_hydration_summary if isinstance(quote_hydration_summary, dict) else {}
+        live_select_summary = live_select_summary if isinstance(live_select_summary, dict) else {}
+        execution_funnel = execution_funnel if isinstance(execution_funnel, dict) else {}
+        selected_ticker = str(selected_ticker or "").strip()
+        record_by_ticker = {}
+        for record in list(trade_readiness_records or []):
+            if not isinstance(record, dict):
+                continue
+            ticker_key = str(record.get("ticker") or "").strip()
+            if ticker_key and ticker_key not in record_by_ticker:
+                record_by_ticker[ticker_key] = record
+
+        buckets = self._aion_funnel_terminal_buckets()
+        counts = Counter({bucket: 0 for bucket in buckets})
+        examples = {bucket: [] for bucket in buckets}
+        raw_reasons = Counter()
+
+        for market in markets:
+            market = market if isinstance(market, dict) else {}
+            ticker = str(market.get("ticker") or "").strip()
+            family = str(self.get_market_family(market or {"ticker": ticker}) or market.get("family") or market.get("category") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            q = quotes_by_ticker.get(ticker) if ticker else None
+            record = record_by_ticker.get(ticker) if ticker else None
+            outcome = "other"
+            reason = "unclassified"
+
+            if ticker and selected_ticker and ticker == selected_ticker and bool(submit_success or execution_funnel.get("execution_submitted") or execution_funnel.get("submitted")):
+                outcome = "submit_success"
+                reason = "submit_success"
+            elif ticker and selected_ticker and ticker == selected_ticker and bool(submit_attempted or execution_funnel.get("execution_attempted")):
+                outcome = "submit_attempt"
+                reason = "submit_attempt"
+            else:
+                future_detail = self._aion_funnel_future_or_pregame_reason(market=market, q=q)
+                if future_detail:
+                    outcome = "future_start_time_block"
+                    reason = future_detail.get("reason") or "future_start_time"
+                elif q is None:
+                    outcome = "no_quote"
+                    reason = "missing_quote_object"
+                else:
+                    side = self._aion_normalize_live_side(
+                        self._read_field(q, "selected_side", "side", default=None)
+                        or self._read_field(market, "selected_side", "side", default=None)
+                    )
+                    if not side:
+                        outcome = "no_side"
+                        reason = "missing_side"
+                    else:
+                        selected_price = self._aion_funnel_candidate_price(market=market, q=q, side=side)
+                        if selected_price is None:
+                            outcome = "no_price"
+                            reason = "missing_selected_price"
+                        elif isinstance(record, dict):
+                            reason = (
+                                record.get("decision_reason")
+                                or record.get("reject_reason")
+                                or record.get("entry_ready_reason")
+                                or record.get("phase55_status")
+                                or "record_present_unclassified"
+                            )
+                            outcome = self._aion_funnel_terminal_reason(reason)
+                            if outcome == "other":
+                                edge = self.to_float(
+                                    record.get("final_edge"),
+                                    self.to_float(record.get("edge_after_cost"), self.to_float(record.get("sports_edge_after_cost"), None)),
+                                )
+                                confidence = self.to_float(record.get("probability_confidence"), None)
+                                liquidity = self.to_float(record.get("liquidity"), None)
+                                spread_bucket = str(record.get("spread_bucket") or "").strip().lower()
+                                if edge is not None and edge <= 0.0:
+                                    outcome = "low_edge"
+                                    reason = "edge_too_low"
+                                elif confidence is not None and confidence <= 0.0:
+                                    outcome = "low_confidence"
+                                    reason = "low_confidence"
+                                elif liquidity is not None and liquidity <= 0.0:
+                                    outcome = "liquidity_block"
+                                    reason = "no_liquidity"
+                                elif spread_bucket in {"unsafe", "too_wide", "wide_unsafe"}:
+                                    outcome = "spread_block"
+                                    reason = "unsafe_spread"
+                        else:
+                            dominant_reason = (
+                                live_select_summary.get("final_no_candidate_reason")
+                                or live_select_summary.get("top_reject_reason")
+                                or live_select_summary.get("execution_block_reason")
+                                or live_select_summary.get("block_reason")
+                                or (live_select_summary.get("top_missing_reason") if isinstance(live_select_summary.get("top_missing_reason"), str) else None)
+                            )
+                            mapped = self._aion_funnel_terminal_reason(dominant_reason)
+                            if dominant_reason and mapped != "other":
+                                outcome = mapped
+                                reason = dominant_reason
+                            else:
+                                outcome = "other"
+                                reason = dominant_reason or "quote_side_price_valid_no_terminal_record"
+
+            counts[outcome] += 1
+            raw_reasons[str(reason or outcome)] += 1
+            if len(examples[outcome]) < 5:
+                examples[outcome].append({"ticker": ticker or None, "family": family, "reason": reason})
+
+        terminal_total = int(sum(counts.values()))
+        sports_candidates = int(len(markets))
+        balanced = terminal_total == sports_candidates
+        percentages = {
+            bucket: round((float(counts.get(bucket, 0)) / max(sports_candidates, 1)) * 100.0, 2)
+            for bucket in buckets
+        }
+        dominant = counts.most_common(1)[0][0] if terminal_total else "none"
+        return {
+            "stage": stage,
+            "sports_candidates": sports_candidates,
+            "terminal_total": terminal_total,
+            "terminal_balance_ok": bool(balanced),
+            "terminal_outcomes": {bucket: int(counts.get(bucket, 0)) for bucket in buckets},
+            "terminal_percentages": percentages,
+            "dominant_terminal_outcome": dominant,
+            "top_raw_reasons": [{"reason": reason, "count": int(count)} for reason, count in raw_reasons.most_common(20)],
+            "examples": {bucket: values for bucket, values in examples.items() if values},
+            "quote_hydration_attempted": int(quote_hydration_summary.get("attempted", 0) or 0),
+            "quote_hydration_success": int(quote_hydration_summary.get("success", 0) or 0),
+            "quote_hydration_failure": int(quote_hydration_summary.get("failure", 0) or 0),
+        }
+
+    def _emit_aion_live_candidate_terminal_accounting(self, accounting):
+        accounting = accounting if isinstance(accounting, dict) else {}
+        try:
+            builtins.print("[AION-FUNNEL-ACCOUNTING] " + json.dumps(accounting, sort_keys=True, default=str))
+            if not bool(accounting.get("terminal_balance_ok")):
+                builtins.print(
+                    "[AION-FUNNEL-ACCOUNTING-FAIL] "
+                    + json.dumps(
+                        {
+                            "stage": accounting.get("stage"),
+                            "sports_candidates": accounting.get("sports_candidates"),
+                            "terminal_total": accounting.get("terminal_total"),
+                            "terminal_outcomes": accounting.get("terminal_outcomes"),
+                            "reason": "sports_candidates_did_not_equal_terminal_outcomes",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        except Exception:
+            pass
+
     def compute_no_vig_probability(self, *args, **kwargs):
         if sports_calibration is None or not hasattr(sports_calibration, "compute_no_vig_probability"):
             raise RuntimeError("sports.calibration.compute_no_vig_probability unavailable")
@@ -45924,6 +46205,14 @@ class KalshiSniperBot:
                 or self.to_float(getattr(q, "yes_ask", None), None) not in (None, 0.0)
                 or self.to_float(getattr(q, "no_ask", None), None) not in (None, 0.0)
             )
+            terminal_accounting = self._build_aion_live_candidate_terminal_accounting(
+                markets=markets,
+                quotes_by_ticker=quotes_by_ticker,
+                quote_hydration_summary=quote_hydration_summary,
+                live_select_summary=self.last_live_select_summary or {},
+                execution_funnel=execution_funnel,
+                stage="post_quote_hydration",
+            )
             print(
                 "[AION-LIVE-CANDIDATE-FUNNEL] "
                 + json.dumps(
@@ -45938,11 +46227,18 @@ class KalshiSniperBot:
                         "candidate_count": int(len(candidates) if isinstance(candidates, list) else 0),
                         "submitted": int(execution_funnel.get("submitted", 0) or execution_funnel.get("execution_submitted", 0) or 0),
                         "dominant_blocker": market_filter_summary.get("final_no_trade_reason"),
+                        "terminal_total": terminal_accounting.get("terminal_total"),
+                        "terminal_balance_ok": terminal_accounting.get("terminal_balance_ok"),
+                        "terminal_outcomes": terminal_accounting.get("terminal_outcomes"),
+                        "terminal_percentages": terminal_accounting.get("terminal_percentages"),
+                        "dominant_terminal_outcome": terminal_accounting.get("dominant_terminal_outcome"),
+                        "top_raw_reasons": terminal_accounting.get("top_raw_reasons"),
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
+            self._emit_aion_live_candidate_terminal_accounting(terminal_accounting)
         except Exception:
             pass
         if (AION_FAIR_VALUE_SHADOW or AION_LIVE_ARB_ENABLED) and markets:
@@ -46719,6 +47015,51 @@ class KalshiSniperBot:
                 self.live_canary_authorized_ticker = auto_live_ticker
         expectancy_summary_by_ticker = dict(getattr(self, "last_auto_live_expectancy_summary_by_ticker", {}) or {})
         trade_readiness_records = list(getattr(self, "last_auto_live_trade_readiness_records", []) or [])
+        try:
+            post_selector_accounting = self._build_aion_live_candidate_terminal_accounting(
+                markets=markets,
+                quotes_by_ticker=quotes_by_ticker,
+                quote_hydration_summary=quote_hydration_summary,
+                trade_readiness_records=trade_readiness_records,
+                live_select_summary=self.last_live_select_summary or {},
+                execution_funnel=execution_funnel,
+                selected_ticker=auto_live_ticker,
+                submit_attempted=False,
+                submit_success=False,
+                stage="post_selector",
+            )
+            print(
+                "[AION-LIVE-CANDIDATE-FUNNEL] "
+                + json.dumps(
+                    {
+                        "stage": "post_selector",
+                        "raw_discovered": int(raw_discovered_count),
+                        "sports_candidates": int(len(markets)),
+                        "quote_hydration_attempted": int(quote_hydration_summary.get("attempted", 0) or 0),
+                        "quote_hydration_success": int(quote_hydration_summary.get("success", 0) or 0),
+                        "quote_hydration_failure": int(quote_hydration_summary.get("failure", 0) or 0),
+                        "selected_ticker": auto_live_ticker,
+                        "selected_reason": auto_live_reason,
+                        "readiness_records": int(len(trade_readiness_records)),
+                        "submitted": int(execution_funnel.get("submitted", 0) or execution_funnel.get("execution_submitted", 0) or 0),
+                        "dominant_blocker": (self.last_live_select_summary or {}).get("final_no_candidate_reason")
+                        or (self.last_live_select_summary or {}).get("execution_block_reason")
+                        or (self.last_live_select_summary or {}).get("block_reason")
+                        or market_filter_summary.get("final_no_trade_reason"),
+                        "terminal_total": post_selector_accounting.get("terminal_total"),
+                        "terminal_balance_ok": post_selector_accounting.get("terminal_balance_ok"),
+                        "terminal_outcomes": post_selector_accounting.get("terminal_outcomes"),
+                        "terminal_percentages": post_selector_accounting.get("terminal_percentages"),
+                        "dominant_terminal_outcome": post_selector_accounting.get("dominant_terminal_outcome"),
+                        "top_raw_reasons": post_selector_accounting.get("top_raw_reasons"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            self._emit_aion_live_candidate_terminal_accounting(post_selector_accounting)
+        except Exception:
+            pass
 
         selected_context_quote = None
         if auto_live_ticker:
