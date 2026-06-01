@@ -1820,6 +1820,10 @@ AION_POSITION_FLIP_MIN_EDGE_DELTA = _env_float("AION_POSITION_FLIP_MIN_EDGE_DELT
 AION_POSITION_FLIP_MIN_UNREALIZED_LOSS = _env_float("AION_POSITION_FLIP_MIN_UNREALIZED_LOSS", 0.05)
 AION_POSITION_FLIP_COOLDOWN_SECONDS = int(_env_float("AION_POSITION_FLIP_COOLDOWN_SECONDS", 120))
 AION_POSITION_FLIP_ALLOW_REENTER = (os.environ.get("AION_POSITION_FLIP_ALLOW_REENTER", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+AION_LIVE_DISCOVERY_SCAN_PAGES = get_env_int("AION_LIVE_DISCOVERY_SCAN_PAGES", 4)
+AION_LIVE_DISCOVERY_CANDIDATE_LIMIT = get_env_int("AION_LIVE_DISCOVERY_CANDIDATE_LIMIT", 96)
+AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS = int(_env_float("AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS", 12 * 60 * 60))
+AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT = get_env_int("AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT", 32)
 LIVE_SELECT_BATCH_SIZE = 60
 LIVE_SELECT_MAX_BATCHES = 5
 LIVE_SELECT_MAX_MARKETS = 240
@@ -1853,10 +1857,15 @@ TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS = [
     "KXCFB",
     "KXCBB",
     "KXATPCHALLENGERMATCH",
+    "KXATPMATCH",
     "KXTENNISMATCH",
+    "KXITFMATCH",
+    "KXITFWMATCH",
+    "KXWTAMATCH",
     "KXATP",
     "KXWTA",
     "KXITF",
+    "KXSQUASHMATCH",
     "KXGOLF",
     "KXEPL",
     "KXSOCCER",
@@ -1877,7 +1886,7 @@ AION_HIGH_LIQUIDITY_ALLOWED_FAMILIES = HIGH_LIQUIDITY_PRIORITY_FAMILIES
 LIQUIDITY_PRIORITY_TIER_1_PREFIXES = ("KXNBA1H", "KXNBASPREAD")
 LIQUIDITY_PRIORITY_TIER_2_PREFIXES = (
     "KXNBA", "KXWNBA", "KXMLB", "KXNFL", "KXNHL", "KXNCAA", "KXCFB", "KXCBB",
-    "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXGOLF", "KXEPL", "KXSOCCER",
+    "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXSQUASH", "KXGOLF", "KXEPL", "KXSOCCER",
     "NBA", "MLB", "NFL", "NHL", "NCAA", "TENNIS", "GOLF", "SOCCER",
 )
 DISCOVERY_DEPRIORITIZED_FAMILIES = (
@@ -1909,10 +1918,15 @@ TARGETED_SERIES_PRIORITY_WINDOWS = {
     "KXCFB": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXCBB": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXATPCHALLENGERMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXATPMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXTENNISMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXITFMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXITFWMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXWTAMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXATP": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXWTA": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXITF": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXSQUASHMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXGOLF": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXEPL": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXSOCCER": {"hours_utc": (), "reason": "sports_expansion_window"},
@@ -1942,7 +1956,12 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
             "KXNCAAB",
             "KXNCAAF",
             "KXATPCHALLENGERMATCH",
+            "KXATPMATCH",
             "KXTENNISMATCH",
+            "KXITFMATCH",
+            "KXITFWMATCH",
+            "KXWTAMATCH",
+            "KXSQUASHMATCH",
             "KXGOLF",
             "KXEPL",
             "KXSOCCER",
@@ -1969,7 +1988,12 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
             "KXNCAAB",
             "KXNCAAF",
             "KXATPCHALLENGERMATCH",
+            "KXATPMATCH",
             "KXTENNISMATCH",
+            "KXITFMATCH",
+            "KXITFWMATCH",
+            "KXWTAMATCH",
+            "KXSQUASHMATCH",
             "KXGOLF",
             "KXEPL",
             "KXSOCCER",
@@ -3200,7 +3224,7 @@ class KalshiSniperBot:
         sports_prefixes = (
             "KXNBA", "KXWNBA", "KXMLB", "KXNFL", "KXNHL", "KXNCAA", "KXNCAAB", "KXNCAAF",
             "KXCFB", "KXCBB", "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXGOLF", "KXEPL",
-            "KXSOCCER", "KXUFC", "KXMMA", "KXBOX",
+            "KXSOCCER", "KXSQUASH", "KXUFC", "KXMMA", "KXBOX",
         )
         explicit_sports_families = {
             "KXNBA", "KXNBA1H", "KXNBA1HTOTAL", "KXNBA1HSPREAD", "KXNBASPREAD", "KXNBATOTAL",
@@ -3209,7 +3233,7 @@ class KalshiSniperBot:
             "KXNHL", "KXNHLGOAL",
             "KXNCAAB", "KXNCAAF",
             "KXCFB", "KXCBB", "KXATP", "KXWTA", "KXITF", "KXTENNISMATCH", "KXATPCHALLENGERMATCH",
-            "KXGOLF", "KXEPL", "KXSOCCER", "KXUFC", "KXMMA", "KXBOX",
+            "KXGOLF", "KXEPL", "KXSOCCER", "KXSQUASHMATCH", "KXUFC", "KXMMA", "KXBOX",
         }
         if family in explicit_sports_families or any(family.startswith(prefix) for prefix in sports_prefixes):
             return True
@@ -3239,7 +3263,7 @@ class KalshiSniperBot:
             return "mlb_core"
         if code.startswith(("KXATP", "KXTENNIS", "KXWTA", "KXITF")) or "ATP" in text or "TENNIS" in text:
             return "tennis_atp"
-        if code.startswith(("KXNBA", "KXNFL", "KXNHL", "KXNCAA", "KXCFB", "KXCBB")):
+        if code.startswith(("KXNBA", "KXNFL", "KXNHL", "KXNCAA", "KXCFB", "KXCBB", "KXSQUASH")):
             return "sports_core"
         return "sports_default"
 
@@ -3609,6 +3633,44 @@ class KalshiSniperBot:
         except Exception:
             pass
 
+    def _aion_ticker_embedded_start_timestamp(self, ticker):
+        ticker_text = str(ticker or "").strip().upper()
+        if not ticker_text:
+            return None, None, None
+        match = re.search(r"-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{4})?", ticker_text)
+        if not match:
+            return None, None, None
+        month_map = {
+            "JAN": 1,
+            "FEB": 2,
+            "MAR": 3,
+            "APR": 4,
+            "MAY": 5,
+            "JUN": 6,
+            "JUL": 7,
+            "AUG": 8,
+            "SEP": 9,
+            "OCT": 10,
+            "NOV": 11,
+            "DEC": 12,
+        }
+        year = 2000 + int(match.group(1))
+        month = month_map.get(match.group(2))
+        day = int(match.group(3))
+        hhmm = match.group(4)
+        hour = 0
+        minute = 0
+        source_key = "ticker_date"
+        if hhmm and len(hhmm) == 4:
+            hour = int(hhmm[:2])
+            minute = int(hhmm[2:])
+            source_key = "ticker_datetime"
+        try:
+            dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+        except Exception:
+            return None, None, None
+        return dt.timestamp(), source_key, match.group(0).lstrip("-")
+
     def evaluate_sports_live_state_pre_submit_guard(self, payload, q=None, *, source="pre_submit", refresh=True):
         payload = payload if isinstance(payload, dict) else {}
         ticker = str(payload.get("ticker") or self._read_field(q, "ticker", default="") or "").strip()
@@ -3653,7 +3715,10 @@ class KalshiSniperBot:
                 detail_reason = f"market_detail_{exc.__class__.__name__}"
 
         now_ts = time.time()
-        start_ts, start_key, start_raw = self._sports_live_state_timestamp(metadata)
+        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_timestamp(metadata)
+        start_ts, start_key, start_raw = metadata_start_ts, metadata_start_key, metadata_start_raw
+        if start_ts is None:
+            start_ts, start_key, start_raw = self._aion_ticker_embedded_start_timestamp(ticker)
         status_value, status_key = self._sports_live_state_field(metadata, "status", "market_status", "event_status", "game_status", "match_status", "live_state", "game_state")
         status_text = str(status_value or "").strip().lower()
         explicit_live_value, explicit_live_key = self._sports_live_state_field(metadata, "in_play", "inplay", "is_in_play", "is_live", "live", "currently_live", "is_currently_live")
@@ -3664,13 +3729,25 @@ class KalshiSniperBot:
         pregame_statuses = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}
         live_statuses = {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"}
 
+        seconds_to_start = float(start_ts - now_ts) if start_ts is not None else None
+        metadata_future_start = bool(metadata_start_ts is not None and metadata_start_ts > now_ts + 30.0)
+        exact_ticker_future_start = bool(start_key == "ticker_datetime" and start_ts is not None and start_ts > now_ts + 30.0)
+        ambiguous_ticker_date_future = bool(start_key == "ticker_date" and start_ts is not None and start_ts > now_ts + 30.0)
+        ambiguous_ticker_date_live_evidence = bool(
+            ambiguous_ticker_date_future
+            and executable_book
+            and seconds_to_start is not None
+            and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
+            and status_text not in pregame_statuses
+        )
+
         reason = "unknown_sports_live_state"
         ok = False
         live_state = "unknown"
         if status_text in closed_statuses:
             reason = "sports_market_closed"
             live_state = "closed"
-        elif start_ts is not None and start_ts > now_ts + 30.0:
+        elif metadata_future_start or exact_ticker_future_start or (ambiguous_ticker_date_future and not ambiguous_ticker_date_live_evidence):
             reason = "future_start_time"
             live_state = "future"
         elif status_text in pregame_statuses:
@@ -3688,13 +3765,13 @@ class KalshiSniperBot:
             ok = True
             reason = "scoreboard_live_state"
             live_state = "live"
-        elif start_ts is not None and start_ts <= now_ts + 30.0:
+        elif start_ts is not None and start_ts <= now_ts + 30.0 and start_key != "ticker_date":
             ok = True
             reason = "start_time_elapsed"
             live_state = "started"
         elif executable_book:
             ok = True
-            reason = "fresh_executable_orderbook_no_future_start"
+            reason = "fresh_executable_orderbook_ambiguous_ticker_date" if ambiguous_ticker_date_live_evidence else "fresh_executable_orderbook_no_future_start"
             live_state = "live_evidence"
 
         selected_price = payload.get("selected_price")
@@ -3734,6 +3811,512 @@ class KalshiSniperBot:
             "reason": "sports_live_state_ok" if ok else "pregame_sports_market",
             "block_reason": None if ok else reason,
             "start_time_raw": start_raw,
+        }
+
+    def _aion_live_discovery_state(self, market=None, q=None, side=None):
+        market = market if isinstance(market, dict) else {}
+        metadata = [source for source in (market, q) if source is not None]
+        now_ts = time.time()
+        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_timestamp(metadata)
+        start_ts, start_key, start_raw = metadata_start_ts, metadata_start_key, metadata_start_raw
+        ticker_value = str(market.get("ticker") or self._read_field(q, "ticker", default="") or "").strip()
+        ticker_start_ts, ticker_start_key, ticker_start_raw = self._aion_ticker_embedded_start_timestamp(ticker_value)
+        if start_ts is None:
+            start_ts, start_key, start_raw = ticker_start_ts, ticker_start_key, ticker_start_raw
+        status_value, status_key = self._sports_live_state_field(
+            metadata,
+            "status",
+            "market_status",
+            "event_status",
+            "game_status",
+            "match_status",
+            "live_state",
+            "game_state",
+        )
+        status_text = str(status_value or "").strip().lower()
+        explicit_live_value, explicit_live_key = self._sports_live_state_field(
+            metadata,
+            "in_play",
+            "inplay",
+            "is_in_play",
+            "is_live",
+            "live",
+            "currently_live",
+            "is_currently_live",
+        )
+        explicit_live = self._sports_live_state_bool(explicit_live_value)
+        scoreboard_live, scoreboard_key, scoreboard_value = self._sports_live_state_has_scoreboard(metadata)
+        executable_book, executable_book_key, executable_book_value = self._sports_live_state_has_executable_orderbook(metadata, side=side)
+        closed_statuses = {"closed", "settled", "finalized", "expired", "halted", "cancelled", "canceled", "resolved"}
+        pregame_statuses = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}
+        live_statuses = {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"}
+        seconds_to_start = float(start_ts - now_ts) if start_ts is not None else None
+        metadata_future_start = bool(metadata_start_ts is not None and metadata_start_ts > now_ts + 30.0)
+        exact_ticker_future_start = bool(start_key == "ticker_datetime" and start_ts is not None and start_ts > now_ts + 30.0)
+        ambiguous_ticker_date_future = bool(start_key == "ticker_date" and start_ts is not None and start_ts > now_ts + 30.0)
+        ambiguous_ticker_date_live_evidence = bool(
+            ambiguous_ticker_date_future
+            and executable_book
+            and seconds_to_start is not None
+            and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
+            and status_text not in pregame_statuses
+        )
+
+        reason = "unknown_sports_live_state"
+        live_state = "unknown"
+        admit = False
+        priority = 0
+        terminal_drop = False
+        if status_text in closed_statuses:
+            reason = "sports_market_closed"
+            live_state = "closed"
+            terminal_drop = True
+        elif metadata_future_start or exact_ticker_future_start:
+            reason = "future_start_time"
+            live_state = "future"
+            terminal_drop = True
+        elif (
+            ticker_start_ts is not None
+            and ticker_start_ts > now_ts + 30.0
+            and status_text not in live_statuses
+            and not explicit_live
+            and not scoreboard_live
+            and not ambiguous_ticker_date_live_evidence
+        ):
+            reason = "future_start_time"
+            live_state = "future"
+            terminal_drop = True
+        elif start_ts is not None and start_ts > now_ts + 30.0 and not ambiguous_ticker_date_live_evidence:
+            reason = "future_start_time"
+            live_state = "future"
+            terminal_drop = True
+        elif status_text in pregame_statuses and not explicit_live and not scoreboard_live:
+            reason = "pregame_status"
+            live_state = "pregame"
+            terminal_drop = True
+        elif explicit_live:
+            reason = "explicit_live_flag"
+            live_state = "live"
+            admit = True
+            priority = 90
+        elif status_text in live_statuses:
+            reason = "live_status"
+            live_state = "live"
+            admit = True
+            priority = 85
+        elif scoreboard_live:
+            reason = "scoreboard_live_state"
+            live_state = "live"
+            admit = True
+            priority = 80
+        elif start_ts is not None and start_ts <= now_ts + 30.0 and start_key != "ticker_date":
+            reason = "start_time_elapsed"
+            live_state = "started"
+            admit = True
+            priority = 70
+        elif executable_book:
+            reason = "fresh_executable_orderbook_ambiguous_ticker_date" if ambiguous_ticker_date_live_evidence else "fresh_executable_orderbook_no_future_start"
+            live_state = "live_evidence"
+            admit = True
+            priority = 60 if ambiguous_ticker_date_live_evidence else 55
+        else:
+            reason = "unknown_sports_live_state"
+            live_state = "unknown"
+            priority = 10
+
+        return {
+            "admit": bool(admit),
+            "terminal_drop": bool(terminal_drop),
+            "reason": reason,
+            "live_state": live_state,
+            "priority": int(priority),
+            "start_key": start_key,
+            "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if start_ts is not None else None,
+            "seconds_to_start": round(float(start_ts - now_ts), 3) if start_ts is not None else None,
+            "start_time_raw": start_raw,
+            "status_key": status_key,
+            "status": status_value,
+            "explicit_live_key": explicit_live_key,
+            "explicit_live_value": explicit_live_value,
+            "scoreboard_key": scoreboard_key,
+            "scoreboard_value": scoreboard_value,
+            "executable_book": bool(executable_book),
+            "executable_book_key": executable_book_key,
+            "executable_book_value": executable_book_value,
+        }
+
+    def _aion_sports_only_live_selector_admission(self, market=None, *, selection_merge_source=None):
+        source = str(selection_merge_source or "").strip()
+        if not self._sports_only_mode_enabled() or source not in {"provided_markets", "sports_only_live_discovery_selector"}:
+            return False, {"reason": "selector_live_admission_not_applicable"}
+        try:
+            state = self._aion_live_discovery_state(market=market)
+        except Exception as exc:
+            return False, {"reason": f"selector_live_admission_exception:{exc.__class__.__name__}"}
+        return bool(state.get("admit")), state
+
+    def _aion_market_liquidity_rank_value(self, market):
+        market = market if isinstance(market, dict) else {}
+        total = 0.0
+        for key in (
+            "volume",
+            "volume_24h",
+            "open_interest",
+            "open_interest_fp",
+            "liquidity",
+            "liquidity_depth",
+            "yes_top_size",
+            "no_top_size",
+            "yes_ask_size",
+            "no_ask_size",
+        ):
+            value = self.to_float(market.get(key), None)
+            if value is not None and value > 0.0:
+                total += float(value)
+        return total
+
+    def _dedupe_markets_by_ticker(self, markets):
+        deduped = []
+        seen = set()
+        for market in markets or []:
+            if not isinstance(market, dict):
+                continue
+            ticker = str(market.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            deduped.append(market)
+        return deduped
+
+    def _emit_aion_live_discovery_summary(self, tag, payload):
+        try:
+            print(f"[{tag}] " + json.dumps(payload if isinstance(payload, dict) else {}, sort_keys=True, default=str))
+        except Exception:
+            pass
+
+    def _filter_live_sports_discovery_markets(self, markets, *, source="live_discovery", limit=None):
+        markets = self._dedupe_markets_by_ticker(markets)
+        limit = int(limit or AION_LIVE_DISCOVERY_CANDIDATE_LIMIT or 96)
+        if not self._sports_only_mode_enabled():
+            return markets, {
+                "source": source,
+                "input_count": len(markets),
+                "admitted_count": len(markets),
+                "sports_only_mode": False,
+            }
+
+        admitted_entries = []
+        dropped_future = []
+        dropped_unknown = []
+        reason_counts = Counter()
+        family_counts = Counter()
+        admitted_family_counts = Counter()
+        ambiguous_hydration_attempts = 0
+        ambiguous_hydration_success = 0
+        ambiguous_hydration_failures = Counter()
+
+        def _should_hydrate_ambiguous_date_market(state):
+            if not isinstance(state, dict):
+                return False
+            if state.get("reason") != "future_start_time" or state.get("start_key") != "ticker_date":
+                return False
+            seconds_to_start = self.to_float(state.get("seconds_to_start"), None)
+            return bool(
+                seconds_to_start is not None
+                and seconds_to_start > 30.0
+                and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
+            )
+
+        def _hydrate_ambiguous_live_discovery_market(market, family):
+            hydrated_market = dict(market or {})
+            ticker = str(hydrated_market.get("ticker") or "").strip()
+            if not ticker:
+                return hydrated_market, "missing_ticker"
+            detail_reason = "not_attempted"
+            orderbook_reason = "not_attempted"
+            try:
+                detail = self.get_live_market_detail(ticker)
+                if isinstance(detail, dict) and detail:
+                    for key, value in detail.items():
+                        if value not in (None, "", [], {}):
+                            hydrated_market[key] = value
+                    detail_reason = "market_detail_merged"
+                else:
+                    detail_reason = "market_detail_empty"
+            except Exception as exc:
+                detail_reason = f"market_detail_{exc.__class__.__name__}"
+            try:
+                orderbook_payload = self.get_live_market_orderbook(ticker)
+                if isinstance(orderbook_payload, dict) and orderbook_payload:
+                    orderbook_source = self._aion_coerce_orderbook_endpoint_source(
+                        orderbook_payload,
+                        ticker=ticker,
+                        family=family,
+                    )
+                    if isinstance(orderbook_source, dict) and orderbook_source:
+                        for key, value in orderbook_source.items():
+                            if value not in (None, "", [], {}):
+                                hydrated_market[key] = value
+                        hydrated_market["orderbook_ready"] = bool(orderbook_source.get("normalized_orderbook_present") or orderbook_source.get("orderbook_exists"))
+                        orderbook_reason = "orderbook_endpoint_merged"
+                    else:
+                        orderbook_reason = "orderbook_endpoint_empty_source"
+                else:
+                    orderbook_reason = "orderbook_endpoint_empty"
+            except Exception as exc:
+                orderbook_reason = f"orderbook_endpoint_{exc.__class__.__name__}"
+            return hydrated_market, f"{detail_reason}+{orderbook_reason}"
+
+        for market in markets:
+            family = str(self.get_market_family(market) or "").strip().upper() or "UNKNOWN"
+            ticker = str(market.get("ticker") or "").strip()
+            family_counts[family] += 1
+            if not self.is_sports_family(family, ticker=ticker):
+                continue
+            state = self._aion_live_discovery_state(market=market)
+            if (
+                not state.get("admit")
+                and _should_hydrate_ambiguous_date_market(state)
+                and ambiguous_hydration_attempts < max(0, AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT)
+            ):
+                ambiguous_hydration_attempts += 1
+                hydrated_market, hydration_reason = _hydrate_ambiguous_live_discovery_market(market, family)
+                hydrated_state = self._aion_live_discovery_state(market=hydrated_market)
+                if hydrated_state.get("admit"):
+                    ambiguous_hydration_success += 1
+                    market = hydrated_market
+                    state = hydrated_state
+                    state["reason"] = state.get("reason") or "ambiguous_date_hydrated_live"
+                    state["hydration_reason"] = hydration_reason
+                    try:
+                        print(
+                            "[AION-LIVE-MARKET-ADMITTED] "
+                            + json.dumps(
+                                {
+                                    "source": source,
+                                    "ticker": ticker or None,
+                                    "family": family,
+                                    "reason": state.get("reason"),
+                                    "live_state": state.get("live_state"),
+                                    "hydration_reason": hydration_reason,
+                                    "start_key": state.get("start_key"),
+                                    "seconds_to_start": state.get("seconds_to_start"),
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                    except Exception:
+                        pass
+                else:
+                    ambiguous_hydration_failures[hydrated_state.get("reason") or hydration_reason or "unknown"] += 1
+            reason_counts[state.get("reason") or "unknown"] += 1
+            if state.get("admit"):
+                admitted_family_counts[family] += 1
+                admitted_entries.append((state, market))
+            elif state.get("terminal_drop"):
+                if len(dropped_future) < 12:
+                    dropped_future.append(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "reason": state.get("reason"),
+                            "live_state": state.get("live_state"),
+                            "start_time": state.get("start_time"),
+                            "seconds_to_start": state.get("seconds_to_start"),
+                        }
+                    )
+            else:
+                if len(dropped_unknown) < 12:
+                    dropped_unknown.append(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "reason": state.get("reason"),
+                            "live_state": state.get("live_state"),
+                        }
+                    )
+
+        admitted_entries = sorted(
+            admitted_entries,
+            key=lambda item: (
+                -int(item[0].get("priority") or 0),
+                -float(self._aion_market_liquidity_rank_value(item[1]) or 0.0),
+                abs(float(item[0].get("seconds_to_start") or 0.0)),
+                str(item[1].get("ticker") or ""),
+            ),
+        )
+        admitted = [market for _, market in admitted_entries[: max(0, limit)]]
+        payload = {
+            "source": source,
+            "input_count": int(len(markets)),
+            "admitted_count": int(len(admitted)),
+            "dropped_future_or_pregame": int(reason_counts.get("future_start_time", 0) + reason_counts.get("pregame_status", 0)),
+            "dropped_unknown": int(reason_counts.get("unknown_sports_live_state", 0)),
+            "reason_counts": dict(reason_counts),
+            "families_scanned": dict(family_counts.most_common(20)),
+            "admitted_families": dict(admitted_family_counts.most_common(20)),
+            "admitted_examples": [
+                {
+                    "ticker": str(market.get("ticker") or "").strip() or None,
+                    "family": str(self.get_market_family(market) or "").strip().upper() or "UNKNOWN",
+                    "reason": state.get("reason"),
+                    "live_state": state.get("live_state"),
+                    "start_time": state.get("start_time"),
+                    "seconds_to_start": state.get("seconds_to_start"),
+                }
+                for state, market in admitted_entries[:8]
+            ],
+            "future_examples": dropped_future,
+            "unknown_examples": dropped_unknown,
+            "candidate_limit": int(limit),
+            "ambiguous_hydration_attempts": int(ambiguous_hydration_attempts),
+            "ambiguous_hydration_success": int(ambiguous_hydration_success),
+            "ambiguous_hydration_failures": dict(ambiguous_hydration_failures.most_common(10)),
+        }
+        self._emit_aion_live_discovery_summary("AION-LIVE-DISCOVERY-SCAN", payload)
+        if dropped_future:
+            self._emit_aion_live_discovery_summary(
+                "AION-FUTURE-MARKET-DROPPED-EARLY",
+                {
+                    "source": source,
+                    "count": int(payload["dropped_future_or_pregame"]),
+                    "examples": dropped_future[:8],
+                },
+            )
+        if admitted:
+            self._emit_aion_live_discovery_summary(
+                "AION-LIVE-MARKET-ADMITTED",
+                {
+                    "source": source,
+                    "count": int(len(admitted)),
+                    "families": dict(admitted_family_counts.most_common(12)),
+                    "examples": payload["admitted_examples"],
+                },
+            )
+        return admitted, payload
+
+    def fetch_live_sports_discovery_markets(self, *, root_markets=None, scan_depth=1):
+        root_markets = list(root_markets or [])
+        scan_depth = max(1, int(scan_depth or 1))
+        max_pages = max(1, min(int(AION_LIVE_DISCOVERY_SCAN_PAGES or 8) + max(0, scan_depth - 1), 12))
+        discovered = []
+        seen = set()
+
+        def add_markets(markets):
+            added = 0
+            for market in markets or []:
+                if not isinstance(market, dict):
+                    continue
+                ticker = str(market.get("ticker") or "").strip()
+                if not ticker or ticker in seen:
+                    continue
+                seen.add(ticker)
+                discovered.append(market)
+                added += 1
+            return added
+
+        add_markets(root_markets)
+        focus_series = [
+            "KXATPCHALLENGERMATCH",
+            "KXATPMATCH",
+            "KXTENNISMATCH",
+            "KXITFMATCH",
+            "KXITFWMATCH",
+            "KXWTAMATCH",
+            "KXATP",
+            "KXWTA",
+            "KXITF",
+            "KXSQUASHMATCH",
+        ]
+        focus_fetched = {}
+        for series_ticker in focus_series:
+            try:
+                series_markets = self.get_markets(
+                    limit=min(60, LIVE_SELECT_BATCH_SIZE),
+                    status="open",
+                    extra_params={"series_ticker": series_ticker, "mve_filter": "exclude"},
+                )
+            except Exception as exc:
+                focus_fetched[series_ticker] = f"error:{exc.__class__.__name__}"
+                continue
+            focus_fetched[series_ticker] = int(len(series_markets))
+            add_markets(series_markets)
+
+        cursor = None
+        pages_fetched = 0
+        for _page in range(max_pages):
+            try:
+                batch, cursor = self.fetch_market_batch(cursor=cursor)
+            except Exception as exc:
+                self._emit_aion_live_discovery_summary(
+                    "AION-LIVE-DISCOVERY-MISS",
+                    {
+                        "source": "live_paginated_scan",
+                        "reason": f"fetch_market_batch_{exc.__class__.__name__}",
+                        "pages_fetched": int(pages_fetched),
+                        "discovered_count": int(len(discovered)),
+                        "focus_series_fetched": focus_fetched,
+                    },
+                )
+                break
+            pages_fetched += 1
+            add_markets(batch)
+            if not cursor:
+                break
+
+        sports_markets = self._filter_sports_only_markets(
+            discovered,
+            source="live_discovery_expanded_scan",
+            force_log=False,
+        )
+        admitted, summary = self._filter_live_sports_discovery_markets(
+            sports_markets,
+            source="live_discovery_expanded_scan",
+            limit=AION_LIVE_DISCOVERY_CANDIDATE_LIMIT,
+        )
+        root_live, root_summary = self._filter_live_sports_discovery_markets(
+            root_markets,
+            source="live_discovery_root_probe",
+            limit=AION_LIVE_DISCOVERY_CANDIDATE_LIMIT,
+        )
+        if not root_live and admitted:
+            self._emit_aion_live_discovery_summary(
+                "AION-LIVE-DISCOVERY-MISS",
+                {
+                    "source": "run_once_root_discovery",
+                    "reason": "root_page_missed_live_markets",
+                    "root_sports_candidates": int(len(root_markets)),
+                    "root_future_or_pregame": int(root_summary.get("dropped_future_or_pregame", 0) or 0),
+                    "expanded_live_admitted": int(len(admitted)),
+                    "expanded_admitted_families": summary.get("admitted_families"),
+                },
+            )
+        self._emit_aion_live_discovery_summary(
+            "AION-LIVE-DISCOVERY-SCAN",
+            {
+                "source": "live_discovery_fetch_summary",
+                "root_count": int(len(root_markets)),
+                "unique_discovered": int(len(discovered)),
+                "sports_discovered": int(len(sports_markets)),
+                "admitted_live": int(len(admitted)),
+                "pages_fetched": int(pages_fetched),
+                "max_pages": int(max_pages),
+                "focus_series_first": True,
+                "focus_series_fetched": focus_fetched,
+                "families_scanned": summary.get("families_scanned"),
+                "admitted_families": summary.get("admitted_families"),
+            },
+        )
+        return admitted, {
+            **summary,
+            "root_summary": root_summary,
+            "pages_fetched": pages_fetched,
+            "focus_series_fetched": focus_fetched,
+            "unique_discovered": len(discovered),
+            "sports_discovered": len(sports_markets),
         }
 
     def _aion_funnel_terminal_buckets(self):
@@ -3815,18 +4398,141 @@ class KalshiSniperBot:
             return price
         return None
 
+    def _propagate_quote_hydration_selection(self, quote=None, market=None, quote_diag=None, *, source="quote_hydration"):
+        if quote is None:
+            return {}
+        market = market if isinstance(market, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        canonical = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else {}
+        ticker = str(getattr(quote, "ticker", None) or market.get("ticker") or quote_diag.get("ticker") or canonical.get("ticker") or "").strip()
+        family = str(
+            getattr(quote, "family", None)
+            or market.get("family")
+            or market.get("series_ticker")
+            or quote_diag.get("family")
+            or canonical.get("family")
+            or self.get_market_family(market or {"ticker": ticker})
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+
+        def _price_value(*values):
+            for value in values:
+                if value in (None, "", [], {}):
+                    continue
+                parsed = self.to_float(value, None)
+                if parsed is None:
+                    continue
+                if parsed > 1.0:
+                    parsed = parsed / 100.0
+                if KALSHI_CONTRACT_MIN_PRICE <= parsed <= KALSHI_CONTRACT_MAX_PRICE:
+                    return round(float(parsed), 4)
+            return None
+
+        side = self._aion_normalize_live_side(
+            getattr(quote, "selected_side", None)
+            or getattr(quote, "side", None)
+            or quote_diag.get("selected_side")
+            or quote_diag.get("side")
+            or canonical.get("selected_side")
+            or canonical.get("side")
+            or canonical.get("executable_side")
+            or canonical.get("chosen_side")
+        )
+        price = _price_value(
+            getattr(quote, "selected_price", None),
+            getattr(quote, "selected_price_dollars", None),
+            quote_diag.get("selected_price_dollars"),
+            quote_diag.get("selected_price"),
+            quote_diag.get("selected_price_cents"),
+            canonical.get("selected_price_dollars"),
+            canonical.get("selected_price"),
+            canonical.get("selected_price_cents"),
+            canonical.get("chosen_price_dollars"),
+            canonical.get("chosen_price"),
+            canonical.get("chosen_price_cents"),
+        )
+        resolution = {}
+        if ticker and (side not in {"yes", "no"} or price is None):
+            try:
+                resolution = self.resolve_aion_orderbook_for_payload(
+                    ticker,
+                    candidate=quote,
+                    market=market,
+                    quote_diag=quote_diag,
+                    price_source="ask",
+                    selected_side=side,
+                    selection_stage=f"{source}_selection_propagation",
+                    allow_refresh=False,
+                ) or {}
+            except Exception:
+                resolution = {}
+        if side not in {"yes", "no"} and resolution:
+            side = self._aion_normalize_live_side(
+                resolution.get("chosen_side")
+                or resolution.get("selected_side")
+                or resolution.get("side")
+            )
+        if price is None and resolution:
+            price = _price_value(
+                resolution.get("chosen_price_dollars"),
+                resolution.get("chosen_price"),
+                resolution.get("chosen_price_cents"),
+                resolution.get("selected_price_dollars"),
+                resolution.get("selected_price"),
+                resolution.get("selected_price_cents"),
+            )
+        if side not in {"yes", "no"} or price is None:
+            return {
+                "ticker": ticker or None,
+                "family": family,
+                "selected_side": side or None,
+                "selected_price": price,
+                "applied": False,
+                "reason": "selection_unresolved",
+            }
+
+        price_cents = int(round(float(price) * 100.0))
+        for attr_name, attr_value in (
+            ("selected_side", side),
+            ("side", side),
+            ("selected_price", price),
+            ("selected_price_dollars", price),
+            ("selected_price_cents", price_cents),
+        ):
+            try:
+                setattr(quote, attr_name, attr_value)
+            except Exception:
+                pass
+        for key, value in (
+            ("selected_side", side),
+            ("side", side),
+            ("selected_price", price),
+            ("selected_price_dollars", price),
+            ("selected_price_cents", price_cents),
+        ):
+            quote_diag[key] = value
+            if isinstance(market, dict) and market.get(key) in (None, "", 0, 0.0):
+                market[key] = value
+        if isinstance(market, dict):
+            market.setdefault("family", family)
+        return {
+            "ticker": ticker or None,
+            "family": family,
+            "selected_side": side,
+            "selected_price": price,
+            "selected_price_cents": price_cents,
+            "applied": True,
+            "reason": "canonical_selection_propagated",
+        }
+
     def _aion_funnel_future_or_pregame_reason(self, market=None, q=None):
         metadata = [source for source in (market, q) if source is not None]
         now_ts = time.time()
-        start_ts, start_key, start_raw = self._sports_live_state_timestamp(metadata)
-        if start_ts is not None and start_ts > now_ts + 30.0:
-            return {
-                "reason": "future_start_time",
-                "start_key": start_key,
-                "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-                "seconds_to_start": round(float(start_ts - now_ts), 3),
-                "start_time_raw": start_raw,
-            }
+        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_timestamp(metadata)
+        start_ts, start_key, start_raw = metadata_start_ts, metadata_start_key, metadata_start_raw
+        if start_ts is None:
+            ticker_value = str(self._read_field(market, "ticker", default="") or self._read_field(q, "ticker", default="") or "").strip()
+            start_ts, start_key, start_raw = self._aion_ticker_embedded_start_timestamp(ticker_value)
         status_value, status_key = self._sports_live_state_field(
             metadata,
             "status",
@@ -3838,9 +4544,33 @@ class KalshiSniperBot:
             "game_state",
         )
         status_text = str(status_value or "").strip().lower()
+        explicit_live_value, explicit_live_key = self._sports_live_state_field(metadata, "in_play", "inplay", "is_in_play", "is_live", "live", "currently_live", "is_currently_live")
+        scoreboard_live, scoreboard_key, scoreboard_value = self._sports_live_state_has_scoreboard(metadata)
+        executable_book, executable_book_key, executable_book_value = self._sports_live_state_has_executable_orderbook(metadata)
+        pregame_statuses = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}
+        seconds_to_start = float(start_ts - now_ts) if start_ts is not None else None
+        metadata_future_start = bool(metadata_start_ts is not None and metadata_start_ts > now_ts + 30.0)
+        exact_ticker_future_start = bool(start_key == "ticker_datetime" and start_ts is not None and start_ts > now_ts + 30.0)
+        ambiguous_ticker_date_future = bool(start_key == "ticker_date" and start_ts is not None and start_ts > now_ts + 30.0)
+        ambiguous_ticker_date_live_evidence = bool(
+            ambiguous_ticker_date_future
+            and executable_book
+            and seconds_to_start is not None
+            and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
+            and status_text not in pregame_statuses
+        )
+        if (metadata_future_start or exact_ticker_future_start or (start_ts is not None and start_ts > now_ts + 30.0 and not ambiguous_ticker_date_live_evidence)):
+            return {
+                "reason": "future_start_time",
+                "start_key": start_key,
+                "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                "seconds_to_start": round(float(start_ts - now_ts), 3),
+                "start_time_raw": start_raw,
+                "executable_book": bool(executable_book),
+                "executable_book_key": executable_book_key,
+                "executable_book_value": executable_book_value,
+            }
         if status_text in {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}:
-            explicit_live_value, explicit_live_key = self._sports_live_state_field(metadata, "in_play", "inplay", "is_in_play", "is_live", "live", "currently_live", "is_currently_live")
-            scoreboard_live, scoreboard_key, scoreboard_value = self._sports_live_state_has_scoreboard(metadata)
             if not self._sports_live_state_bool(explicit_live_value) and not scoreboard_live:
                 return {
                     "reason": "pregame_status",
@@ -29092,7 +29822,7 @@ class KalshiSniperBot:
         if "sport" in explicit_category or family.startswith((
             "KXNBA", "KXWNBA", "KXNHL", "KXMLB", "KXNFL", "KXNCAA", "KXNCAAB", "KXNCAAF",
             "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXEPL", "KXSOCCER", "KXUFC",
-            "KXBOX", "KXMMA", "KXGOLF", "KXCFB", "KXCBB"
+            "KXBOX", "KXMMA", "KXSQUASH", "KXGOLF", "KXCFB", "KXCBB"
         )):
             return "sports"
         return "general"
@@ -38354,8 +39084,12 @@ class KalshiSniperBot:
         previous_candidates_found = None
         max_attempts = max(1, MAX_DISCOVERY_RETRIES + 1)
         retry_delay = DISCOVERY_RETRY_DELAY_SECONDS
+        authoritative_live_markets = list(markets or []) if markets is not None and self._sports_only_mode_enabled() else None
         for attempt in range(1, max_attempts + 1):
-            ticker, reason = self.find_best_live_ticker(markets=markets if attempt == 1 else None)
+            selector_markets = markets if attempt == 1 else None
+            if authoritative_live_markets is not None:
+                selector_markets = authoritative_live_markets
+            ticker, reason = self.find_best_live_ticker(markets=selector_markets)
             summary = self.last_live_select_summary or {}
             within_window = summary.get("within_window")
             families_in_window = summary.get("families_in_window") or []
@@ -38399,7 +39133,7 @@ class KalshiSniperBot:
                     MAX_DISCOVERY_RETRY_DELAY_SECONDS,
                     max(retry_delay, int(retry_delay * DISCOVERY_RETRY_BACKOFF_MULTIPLIER)),
                 )
-            markets = None
+            markets = authoritative_live_markets if authoritative_live_markets is not None else None
         return None, None
 
     def _emit_aion_final_blocker_trace(
@@ -45855,11 +46589,65 @@ class KalshiSniperBot:
         self.maybe_send_telegram_heartbeat()
         raw_markets = self.get_markets(limit=self.max_markets, status="open")
         raw_discovered_count = len(raw_markets) if isinstance(raw_markets, list) else 0
-        markets = self._filter_sports_only_markets(
+        root_sports_markets = self._filter_sports_only_markets(
             raw_markets,
             source="run_once_root_discovery",
             force_log=True,
         )
+        markets = root_sports_markets
+        live_discovery_summary = {}
+        if self._sports_only_mode_enabled():
+            try:
+                markets, live_discovery_summary = self.fetch_live_sports_discovery_markets(
+                    root_markets=root_sports_markets,
+                    scan_depth=self._get_aion_discovery_scan_depth(),
+                )
+                raw_discovered_count = max(
+                    int(raw_discovered_count),
+                    int(live_discovery_summary.get("unique_discovered", raw_discovered_count) or raw_discovered_count),
+                )
+                if not markets:
+                    self._emit_aion_live_discovery_summary(
+                        "AION-LIVE-DISCOVERY-MISS",
+                        {
+                            "source": "run_once_live_discovery",
+                            "reason": "no_live_sports_markets_admitted_after_expanded_scan",
+                            "root_sports_candidates": int(len(root_sports_markets)),
+                            "expanded_unique_discovered": int(live_discovery_summary.get("unique_discovered", 0) or 0),
+                            "sports_discovered": int(live_discovery_summary.get("sports_discovered", 0) or 0),
+                            "future_or_pregame": int(live_discovery_summary.get("dropped_future_or_pregame", 0) or 0),
+                            "unknown_sports_live_state": int(live_discovery_summary.get("dropped_unknown", 0) or 0),
+                        },
+                    )
+            except Exception as exc:
+                markets, live_discovery_summary = self._filter_live_sports_discovery_markets(
+                    root_sports_markets,
+                    source="run_once_live_discovery_fallback",
+                    limit=AION_LIVE_DISCOVERY_CANDIDATE_LIMIT,
+                )
+                self._emit_aion_live_discovery_summary(
+                    "AION-LIVE-DISCOVERY-MISS",
+                    {
+                        "source": "run_once_live_discovery",
+                        "reason": f"expanded_scan_exception:{exc.__class__.__name__}",
+                        "root_sports_candidates": int(len(root_sports_markets)),
+                        "fallback_live_admitted": int(len(markets)),
+                    },
+                )
+            self._emit_aion_live_discovery_summary(
+                "AION-LIVE-EXECUTION-READY",
+                {
+                    "source": "run_once",
+                    "live_candidates": int(len(markets)),
+                    "raw_discovered": int(raw_discovered_count),
+                    "root_sports_candidates": int(len(root_sports_markets)),
+                    "families": dict(Counter(str(self.get_market_family(market) or "").strip().upper() or "UNKNOWN" for market in markets if isinstance(market, dict)).most_common(20)),
+                    "future_dropped_early": int(live_discovery_summary.get("dropped_future_or_pregame", 0) or 0) if isinstance(live_discovery_summary, dict) else 0,
+                    "admitted_families": live_discovery_summary.get("admitted_families", {}) if isinstance(live_discovery_summary, dict) else {},
+                    "reason_counts": live_discovery_summary.get("reason_counts", {}) if isinstance(live_discovery_summary, dict) else {},
+                    "focus_series_fetched": live_discovery_summary.get("focus_series_fetched", {}) if isinstance(live_discovery_summary, dict) else {},
+                },
+            )
         self._refresh_aion_data_coverage_cache(source="live_cycle")
         self._maybe_emit_aion_distilled_memory_audit(source="live_cycle")
         self._start_execution_failure_audit_cycle(source="live_cycle")
@@ -46014,6 +46802,19 @@ class KalshiSniperBot:
                     quote_diag["source_of_quote_data"] = quote_diag.get("source_of_quote_data") or "hydrated_quote_object"
             quote_ready_reason = str(quote_diag.get("quote_ready_reason") or quote_failure_reason or "unknown").strip() or "unknown"
             canonical_tradeability = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else {}
+            selection_propagation = {}
+            if quote is not None:
+                try:
+                    selection_propagation = self._propagate_quote_hydration_selection(
+                        quote=quote,
+                        market=market,
+                        quote_diag=quote_diag,
+                        source="quote_hydration",
+                    ) or {}
+                    if selection_propagation.get("applied"):
+                        canonical_tradeability = quote_diag.get("canonical_tradeability") if isinstance(quote_diag.get("canonical_tradeability"), dict) else canonical_tradeability
+                except Exception as exc:
+                    selection_propagation = {"applied": False, "reason": exc.__class__.__name__}
             realm_vv_recoverable = bool(
                 quote is not None
                 and not quote_ready
@@ -46064,6 +46865,8 @@ class KalshiSniperBot:
                 "quote_source": quote_diag.get("source_of_quote_data") or "quote_hydration",
                 "selected_side": quote_diag.get("selected_side"),
                 "selected_price": quote_diag.get("selected_price"),
+                "selection_propagated": bool(selection_propagation.get("applied")),
+                "selection_propagation_reason": selection_propagation.get("reason"),
                 "orderbook_ready": bool(quote_diag.get("orderbook_ready")),
                 "orderbook_missing_reason": quote_diag.get("orderbook_missing_reason"),
                 "realm_vv_recoverable": bool(realm_vv_recoverable),

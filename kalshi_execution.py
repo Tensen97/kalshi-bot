@@ -90,7 +90,12 @@ def _cash_value_to_dollars(value, *, cents=False):
 
 
 def _live_order_time_in_force(*, reduce_only=False):
-    return "immediate_or_cancel" if bool(reduce_only) else "fill_or_kill"
+    if bool(reduce_only):
+        return "immediate_or_cancel"
+    requested = str(os.environ.get("AION_LIVE_BUY_TIME_IN_FORCE", "immediate_or_cancel") or "immediate_or_cancel").strip().lower()
+    if requested not in {"immediate_or_cancel", "fill_or_kill"}:
+        requested = "immediate_or_cancel"
+    return requested
 
 
 def _find_mapping_field(mapping, field_names):

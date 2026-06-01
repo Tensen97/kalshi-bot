@@ -13069,6 +13069,7 @@ def find_best_live_ticker(self, markets=None):
 
     spread_skip_count = 0
     selection_merge_source = "provided_markets" if markets is not None else "unresolved"
+    provided_markets_input = markets is not None
     current_hour_utc = time.gmtime().tm_hour
     targeted_in_window = []
     targeted_in_window_family_counts = {}
@@ -13193,6 +13194,49 @@ def find_best_live_ticker(self, markets=None):
         )
 
     discovery_scan_depth = self._get_aion_discovery_scan_depth() if markets is None else 1
+    if markets is None and self._sports_only_mode_enabled() and hasattr(self, "fetch_live_sports_discovery_markets"):
+        try:
+            selector_live_markets, selector_live_summary = self.fetch_live_sports_discovery_markets(
+                root_markets=[],
+                scan_depth=discovery_scan_depth,
+            )
+            if selector_live_markets:
+                markets = selector_live_markets
+                selection_merge_source = "sports_only_live_discovery_selector"
+                targeted_selection_count = len(markets)
+                merged_selection_count = len(markets)
+                print(
+                    "[AION-LIVE-GUARD-ALLOW] "
+                    + json.dumps(
+                        {
+                            "source": "find_best_live_ticker",
+                            "reason": "selector_live_discovery_authoritative",
+                            "live_candidates": len(markets),
+                            "future_dropped_early": int((selector_live_summary or {}).get("dropped_future_or_pregame", 0) or 0),
+                            "families": dict(
+                                Counter(
+                                    str(self.get_market_family(market) or "").strip().upper() or "UNKNOWN"
+                                    for market in markets
+                                    if isinstance(market, dict)
+                                ).most_common(12)
+                            ),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        except Exception as exc:
+            print(
+                "[AION-LIVE-DISCOVERY-MISS] "
+                + json.dumps(
+                    {
+                        "source": "find_best_live_ticker",
+                        "reason": f"selector_live_discovery_exception:{exc.__class__.__name__}",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
     if markets is None:
         if ENABLE_TARGETED_SERIES_MODE:
             targeted_markets = self.fetch_targeted_series_markets(scan_depth=discovery_scan_depth)
@@ -14040,11 +14084,50 @@ def find_best_live_ticker(self, markets=None):
         f"[LIVE-SELECT-DEBUG] broad_discovery_effective_max_minutes={broad_discovery_max_minutes_to_event}"
     )
     timing_sample_logged = False
+    sports_only_live_selector_mode = bool(
+        self._sports_only_mode_enabled()
+        and selection_merge_source in {"provided_markets", "sports_only_live_discovery_selector"}
+    )
     for market in markets:
         timestamp_details = self.get_market_event_timestamp_details(market)
         minutes_to_event = None
         if timestamp_details.get("timestamp") is not None:
             minutes_to_event = (timestamp_details["timestamp"] - time.time()) / 60.0
+        live_selector_state = {}
+        if sports_only_live_selector_mode:
+            try:
+                live_selector_admitted, live_selector_state = self._aion_sports_only_live_selector_admission(
+                    market=market,
+                    selection_merge_source=selection_merge_source,
+                )
+            except Exception:
+                live_selector_admitted = False
+                live_selector_state = {}
+            if bool(live_selector_admitted):
+                base_window_market_count += 1
+                time_window_markets.append(market)
+                if not timing_sample_logged:
+                    print(
+                        f"[LIVE-SELECT-DEBUG] timing_sample ticker={str(market.get('ticker', '') or '').strip()} "
+                        f"source={live_selector_state.get('reason') or timestamp_details.get('source_key')} "
+                        f"event_ts={timestamp_details.get('event_ts')} "
+                        f"minutes_to_event={round(minutes_to_event, 2) if minutes_to_event is not None else None} "
+                        f"window_max={broad_discovery_max_minutes_to_event} admitted=yes reason=live_selector_authoritative"
+                    )
+                    timing_sample_logged = True
+                continue
+            if bool(live_selector_state.get("terminal_drop")):
+                skipped_too_early_markets += 1
+                if not timing_sample_logged:
+                    print(
+                        f"[LIVE-SELECT-DEBUG] timing_sample ticker={str(market.get('ticker', '') or '').strip()} "
+                        f"source={live_selector_state.get('start_key') or timestamp_details.get('source_key')} "
+                        f"event_ts={timestamp_details.get('event_ts')} "
+                        f"minutes_to_event={round(minutes_to_event, 2) if minutes_to_event is not None else None} "
+                        f"window_max={broad_discovery_max_minutes_to_event} admitted=no reason={live_selector_state.get('reason') or 'live_state_terminal_drop'}"
+                    )
+                    timing_sample_logged = True
+                continue
         inclusion_reason = self.get_time_window_inclusion_reason(
             minutes_to_event,
             max_minutes_to_event=broad_discovery_max_minutes_to_event,

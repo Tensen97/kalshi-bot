@@ -1181,6 +1181,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(posted[0]["action"], "buy")
         self.assertEqual(posted[0]["count"], 2)
         self.assertEqual(posted[0]["yes_price"], 46)
+        self.assertEqual(posted[0]["time_in_force"], "immediate_or_cancel")
         self.assertNotIn("no_price", posted[0])
 
     def test_sports_live_state_guard_blocks_future_start_time(self):
@@ -1468,6 +1469,412 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["skipped"])
         self.assertEqual(result["reason"], "not_sports_buy")
+
+    def test_live_discovery_drops_future_sports_before_ranking(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        live_market = {
+            "ticker": "KXITFWMATCH-26JUN01LIVE-LIVE",
+            "series_ticker": "KXITFWMATCH",
+            "title": "ITF live match",
+            "status": "active",
+            "game_status": "in_progress",
+            "yes_ask": 0.48,
+            "yes_bid": 0.45,
+            "volume": 200,
+        }
+        future_market = {
+            "ticker": "KXATPCHALLENGERMATCH-26JUN02FUT-FUT",
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "title": "ATP Challenger tomorrow",
+            "status": "active",
+            "occurrence_datetime": future_start,
+            "yes_ask": 0.42,
+            "yes_bid": 0.39,
+            "volume": 500,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [future_market, live_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
+        self.assertEqual(summary["dropped_future_or_pregame"], 1)
+        self.assertEqual(summary["admitted_count"], 1)
+
+    def test_live_discovery_drops_future_ticker_date_without_metadata(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        token = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
+        future_market = {
+            "ticker": f"KXATPCHALLENGERMATCH-{token}UNIT-FUT",
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "title": "ATP Challenger future without occurrence metadata",
+            "status": "active",
+            "yes_ask": 0.42,
+            "yes_bid": 0.39,
+            "volume": 500,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [future_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(summary["dropped_future_or_pregame"], 1)
+        self.assertEqual(summary["reason_counts"]["future_start_time"], 1)
+
+    def test_live_discovery_admits_ambiguous_ticker_date_with_executable_book(self):
+        self._set_sports_only_mode(True)
+        old_window = kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS
+        kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS = 48 * 60 * 60
+        self.addCleanup(setattr, kw, "AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS", old_window)
+        bot = self._make_bot()
+        token = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%y%b%d").upper()
+        live_market = {
+            "ticker": f"KXITFMATCH-{token}UNIT-LIVE",
+            "series_ticker": "KXITFMATCH",
+            "title": "ITF ambiguous date live market",
+            "status": "active",
+            "yes_ask": 0.47,
+            "yes_bid": 0.45,
+            "no_ask": 0.55,
+            "no_bid": 0.53,
+            "yes_top_size": 12,
+            "no_top_size": 14,
+            "volume": 500,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [live_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
+        self.assertEqual(summary["admitted_count"], 1)
+        self.assertEqual(summary["reason_counts"]["fresh_executable_orderbook_ambiguous_ticker_date"], 1)
+
+    def test_live_discovery_hydrates_ambiguous_ticker_date_before_drop(self):
+        self._set_sports_only_mode(True)
+        old_window = kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS
+        old_limit = kw.AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT
+        kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS = 48 * 60 * 60
+        kw.AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT = 4
+        self.addCleanup(setattr, kw, "AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS", old_window)
+        self.addCleanup(setattr, kw, "AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT", old_limit)
+        bot = self._make_bot()
+        token = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%y%b%d").upper()
+        thin_live_market = {
+            "ticker": f"KXITFWMATCH-{token}UNIT-HYDRATE",
+            "series_ticker": "KXITFWMATCH",
+            "title": "ITF ambiguous date list payload",
+            "status": "active",
+            "volume": 500,
+        }
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXITFWMATCH",
+            "status": "active",
+        }
+        bot.get_live_market_orderbook = lambda ticker: {
+            "yes_bid": 0.45,
+            "yes_ask": 0.47,
+            "no_bid": 0.53,
+            "no_ask": 0.55,
+            "yes_top_size": 8,
+            "no_top_size": 9,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [thin_live_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual([market["ticker"] for market in admitted], [thin_live_market["ticker"]])
+        self.assertEqual(summary["ambiguous_hydration_attempts"], 1)
+        self.assertEqual(summary["ambiguous_hydration_success"], 1)
+
+    def test_live_discovery_hydration_preserves_exact_future_metadata_block(self):
+        self._set_sports_only_mode(True)
+        old_window = kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS
+        old_limit = kw.AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT
+        kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS = 48 * 60 * 60
+        kw.AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT = 4
+        self.addCleanup(setattr, kw, "AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS", old_window)
+        self.addCleanup(setattr, kw, "AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT", old_limit)
+        bot = self._make_bot()
+        token = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%y%b%d").upper()
+        exact_future = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        thin_future_market = {
+            "ticker": f"KXITFWMATCH-{token}UNIT-FUTURE",
+            "series_ticker": "KXITFWMATCH",
+            "title": "ITF exact future list payload",
+            "status": "active",
+            "volume": 500,
+        }
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXITFWMATCH",
+            "status": "active",
+            "occurrence_datetime": exact_future,
+        }
+        bot.get_live_market_orderbook = lambda ticker: {
+            "yes_bid": 0.45,
+            "yes_ask": 0.47,
+            "no_bid": 0.53,
+            "no_ask": 0.55,
+            "yes_top_size": 8,
+            "no_top_size": 9,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [thin_future_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(summary["ambiguous_hydration_attempts"], 1)
+        self.assertEqual(summary["ambiguous_hydration_success"], 0)
+        self.assertEqual(summary["dropped_future_or_pregame"], 1)
+
+    def test_live_discovery_drops_future_ticker_even_with_ambiguous_elapsed_timestamp(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_token = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
+        past_start = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        future_market = {
+            "ticker": f"KXATPCHALLENGERMATCH-{future_token}UNIT-FUT",
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "title": "ATP Challenger future with ambiguous timestamp",
+            "status": "active",
+            "start_time": past_start,
+            "yes_ask": 0.42,
+            "yes_bid": 0.39,
+            "volume": 500,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [future_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual(admitted, [])
+        self.assertEqual(summary["dropped_future_or_pregame"], 1)
+        self.assertEqual(summary["reason_counts"]["future_start_time"], 1)
+
+    def test_live_discovery_admits_itf_atp_wta_match_series(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        exact_series = ("KXITFMATCH", "KXITFWMATCH", "KXATPMATCH", "KXWTAMATCH", "KXSQUASHMATCH")
+        for family in exact_series:
+            self.assertIn(family, kw.TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS)
+            self.assertTrue(bot.is_sports_family(family, ticker=f"{family}-26JUN01LIVE-TEST"))
+
+    def test_quote_hydration_propagates_canonical_side_and_price(self):
+        bot = self._make_bot()
+        quote = SimpleNamespace(
+            ticker="KXATPMATCH-26JUN01TIAARN-TIA",
+            family="KXATPMATCH",
+            yes_bid=0.38,
+            yes_ask=0.39,
+            no_bid=0.6,
+            no_ask=0.62,
+            yes_top_size=100,
+            no_top_size=80,
+            selected_side=None,
+            selected_price=None,
+        )
+        market = {
+            "ticker": quote.ticker,
+            "series_ticker": "KXATPMATCH",
+            "status": "active",
+            "yes_bid": 0.38,
+            "yes_ask": 0.39,
+            "no_bid": 0.6,
+            "no_ask": 0.62,
+            "yes_top_size": 100,
+            "no_top_size": 80,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._propagate_quote_hydration_selection(
+                quote=quote,
+                market=market,
+                quote_diag={},
+                source="unit_test",
+            )
+
+        self.assertTrue(result["applied"])
+        self.assertIn(quote.selected_side, {"yes", "no"})
+        self.assertIsNotNone(quote.selected_price)
+        self.assertGreaterEqual(quote.selected_price_cents, 1)
+        self.assertEqual(market["selected_side"], quote.selected_side)
+
+    def test_live_discovery_missing_start_with_scoreboard_is_admitted(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXATPCHALLENGERMATCH-26JUN01BIRM-LIVE",
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "title": "ATP Challenger Birmingham live",
+            "status": "active",
+            "scoreboard": {"set": 2, "clock": "live"},
+            "yes_ask": 0.57,
+            "yes_bid": 0.53,
+            "volume": 125,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(admitted[0]["ticker"], market["ticker"])
+        self.assertEqual(summary["admitted_count"], 1)
+        self.assertIn("scoreboard_live_state", summary["reason_counts"])
+
+    def test_live_discovery_expanded_scan_recovers_live_market_after_future_root(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        future_market = {
+            "ticker": "KXATPCHALLENGERMATCH-26JUN02ROOT-FUT",
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "status": "active",
+            "occurrence_datetime": future_start,
+            "yes_ask": 0.44,
+            "yes_bid": 0.41,
+        }
+        live_market = {
+            "ticker": "KXITFMATCH-26JUN01LIVE-RECOVERED",
+            "series_ticker": "KXITFMATCH",
+            "status": "active",
+            "event_status": "in_play",
+            "yes_ask": 0.52,
+            "yes_bid": 0.49,
+            "volume": 100,
+        }
+
+        batches = iter([([future_market, live_market], None)])
+        bot.fetch_market_batch = lambda cursor=None: next(batches)
+        bot.get_markets = lambda *args, **kwargs: []
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot.fetch_live_sports_discovery_markets(
+                root_markets=[future_market],
+                scan_depth=1,
+            )
+
+        self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
+        self.assertEqual(summary["root_summary"]["dropped_future_or_pregame"], 1)
+        self.assertGreaterEqual(summary["unique_discovered"], 2)
+
+    def test_sports_only_live_selector_admits_started_live_market(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXATPMATCH-26JUN01LIVE-ONE",
+            "series_ticker": "KXATPMATCH",
+            "status": "active",
+            "event_status": "in_play",
+            "yes_bid": 0.24,
+            "yes_ask": 0.25,
+            "no_bid": 0.74,
+            "no_ask": 0.75,
+        }
+
+        admitted, state = bot._aion_sports_only_live_selector_admission(
+            market=market,
+            selection_merge_source="provided_markets",
+        )
+
+        self.assertTrue(admitted)
+        self.assertIn(state["reason"], {"live_status", "scoreboard_live_state", "explicit_live_flag"})
+
+    def test_sports_only_live_selector_rejects_future_market(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        market = {
+            "ticker": "KXATPMATCH-26JUN02FUT-ONE",
+            "series_ticker": "KXATPMATCH",
+            "status": "active",
+            "start_time": future_start,
+            "yes_bid": 0.24,
+            "yes_ask": 0.25,
+            "no_bid": 0.74,
+            "no_ask": 0.75,
+        }
+
+        admitted, state = bot._aion_sports_only_live_selector_admission(
+            market=market,
+            selection_merge_source="provided_markets",
+        )
+
+        self.assertFalse(admitted)
+        self.assertEqual(state["reason"], "future_start_time")
+
+    def test_sports_only_live_selector_retries_keep_authoritative_live_markets(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        live_markets = [
+            {
+                "ticker": "KXATPMATCH-26JUN01LIVE-ONE",
+                "series_ticker": "KXATPMATCH",
+                "status": "active",
+                "event_status": "in_play",
+                "yes_bid": 0.24,
+                "yes_ask": 0.25,
+                "no_bid": 0.74,
+                "no_ask": 0.75,
+            }
+        ]
+        old_retries = kw.MAX_DISCOVERY_RETRIES
+        old_delay = kw.DISCOVERY_RETRY_DELAY_SECONDS
+        kw.MAX_DISCOVERY_RETRIES = 1
+        kw.DISCOVERY_RETRY_DELAY_SECONDS = 0
+        self.addCleanup(setattr, kw, "MAX_DISCOVERY_RETRIES", old_retries)
+        self.addCleanup(setattr, kw, "DISCOVERY_RETRY_DELAY_SECONDS", old_delay)
+        calls = []
+
+        def fake_find_best(markets=None):
+            calls.append(markets)
+            bot.last_live_select_summary = {
+                "within_window": len(markets or []),
+                "families_in_window": ["KXATPMATCH"] if markets else [],
+                "candidates_found": 0,
+            }
+            return None, None
+
+        bot.find_best_live_ticker = fake_find_best
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ticker, reason = bot.find_best_live_ticker_with_retries(markets=live_markets)
+
+        self.assertIsNone(ticker)
+        self.assertIsNone(reason)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], live_markets)
+        self.assertEqual(calls[1], live_markets)
+        self.assertIsNotNone(calls[1])
 
     def test_game_thesis_boosts_aligned_sports_candidates(self):
         self._set_sports_only_mode(True)
