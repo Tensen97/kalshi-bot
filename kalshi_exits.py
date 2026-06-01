@@ -273,6 +273,105 @@ def _resolve_minutes_left(*containers):
     return None
 
 
+def _sports_pregame_exit_context(bot, *, market, position, metadata, q=None, now_ts):
+    sources = []
+    for source in (market, metadata.get("metadata") if isinstance(metadata, dict) else None, position, q):
+        if source is None:
+            continue
+        if isinstance(source, dict):
+            if isinstance(source.get("market"), dict):
+                sources.append(source.get("market"))
+            sources.append(source)
+        else:
+            sources.append(source)
+    start_ts = None
+    start_key = None
+    status_value = None
+    status_key = None
+    explicit_live_value = None
+    explicit_live_key = None
+    scoreboard_live = False
+    scoreboard_key = None
+    try:
+        if hasattr(bot, "_sports_live_state_timestamp"):
+            start_ts, start_key, _raw = bot._sports_live_state_timestamp(sources)
+        else:
+            for source in sources:
+                for key in ("event_start_time", "occurrence_datetime", "start_time", "scheduled_start_time", "game_start_time", "match_start_time"):
+                    try:
+                        raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
+                    except Exception:
+                        raw = None
+                    ts = _coerce_timestamp(raw)
+                    if ts is not None:
+                        start_ts = ts
+                        start_key = key
+                        raise StopIteration
+    except StopIteration:
+        pass
+    except Exception:
+        start_ts = None
+        start_key = None
+    try:
+        if hasattr(bot, "_sports_live_state_field"):
+            status_value, status_key = bot._sports_live_state_field(
+                sources,
+                "status",
+                "market_status",
+                "event_status",
+                "game_status",
+                "match_status",
+                "live_state",
+                "game_state",
+            )
+            explicit_live_value, explicit_live_key = bot._sports_live_state_field(
+                sources,
+                "in_play",
+                "inplay",
+                "is_in_play",
+                "is_live",
+                "live",
+                "currently_live",
+                "is_currently_live",
+            )
+    except Exception:
+        status_value = None
+        status_key = None
+        explicit_live_value = None
+        explicit_live_key = None
+    try:
+        if hasattr(bot, "_sports_live_state_has_scoreboard"):
+            scoreboard_live, scoreboard_key, _value = bot._sports_live_state_has_scoreboard(sources)
+    except Exception:
+        scoreboard_live = False
+        scoreboard_key = None
+
+    status_text = str(status_value or "").strip().lower()
+    try:
+        explicit_live = bool(bot._sports_live_state_bool(explicit_live_value)) if hasattr(bot, "_sports_live_state_bool") else False
+    except Exception:
+        explicit_live = False
+    live_statuses = {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"}
+    pregame_statuses = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}
+    future_start = bool(start_ts is not None and start_ts > float(now_ts) + 30.0)
+    pregame_status = bool(status_text in pregame_statuses)
+    live_evidence = bool(explicit_live or scoreboard_live or status_text in live_statuses or (start_ts is not None and start_ts <= float(now_ts) + 30.0))
+    return {
+        "is_pregame_or_future": bool((future_start or pregame_status) and not live_evidence),
+        "future_start": future_start,
+        "pregame_status": pregame_status,
+        "live_evidence": live_evidence,
+        "start_key": start_key,
+        "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if start_ts is not None else None,
+        "seconds_to_start": round(float(start_ts - now_ts), 3) if start_ts is not None else None,
+        "status_key": status_key,
+        "status": status_value,
+        "explicit_live_key": explicit_live_key,
+        "explicit_live_value": explicit_live_value,
+        "scoreboard_key": scoreboard_key,
+    }
+
+
 def log_crypto_exit_decision(bot, decision, *, log_cooldown_seconds):
     decision = decision if isinstance(decision, dict) else {}
     if not decision.get("is_crypto_short_cycle"):
@@ -562,6 +661,13 @@ def evaluate_dynamic_live_exit(
         is_sports_position = bool(bot.is_sports_family(family, ticker=ticker))
     except Exception:
         is_sports_position = False
+    if is_sports_position and ticker and not market:
+        try:
+            refreshed_market = bot.get_live_market_detail(ticker)
+            if isinstance(refreshed_market, dict) and refreshed_market:
+                market = refreshed_market
+        except Exception:
+            pass
     is_crypto_ladder_position = False
     crypto_asset = None
     crypto_timeframe = None
@@ -582,6 +688,11 @@ def evaluate_dynamic_live_exit(
             sports_lifecycle_state = str(bot._get_sports_market_lifecycle_state(market=market, family=family) or "unknown").strip().lower()
         except Exception:
             sports_lifecycle_state = "unknown"
+    sports_pregame_exit_context = (
+        _sports_pregame_exit_context(bot, market=market, position=position, metadata=metadata, q=q, now_ts=now_ts)
+        if is_sports_position
+        else {}
+    )
     probability_collapse = bool(
         recent_delta <= -max(0.015, momentum_eps * 4.0)
         or last_step_delta <= -max(0.012, momentum_eps * 3.0)
@@ -941,6 +1052,16 @@ def evaluate_dynamic_live_exit(
         action = "exit"
         reason = "protect_profit"
 
+    pregame_loss_exit_blocked = bool(
+        action == "exit"
+        and is_sports_position
+        and pnl_per_contract < 0.0
+        and (sports_pregame_exit_context or {}).get("is_pregame_or_future")
+    )
+    if pregame_loss_exit_blocked:
+        action = "hold"
+        reason = "pregame_loss_exit_blocked"
+
     if action == "exit" and pnl_per_contract < 0.0:
         loss_counts = getattr(bot, "live_loss_exit_confirmation_counts", {})
         if not isinstance(loss_counts, dict):
@@ -1022,6 +1143,8 @@ def evaluate_dynamic_live_exit(
         "crypto_momentum_strength": round(abs(recent_delta) + abs(last_step_delta) + max(0.0, abs(side_support)), 4),
         "minutes_left": minutes_left,
         "sports_lifecycle_state": sports_lifecycle_state,
+        "sports_pregame_exit_context": sports_pregame_exit_context,
+        "pregame_loss_exit_blocked": bool(pregame_loss_exit_blocked),
         "probability_collapse": bool(probability_collapse),
         "near_lock_harvest": bool(near_lock_harvest),
         "fast_green_harvest": bool(fast_green_harvest),

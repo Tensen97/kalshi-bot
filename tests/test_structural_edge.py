@@ -38,6 +38,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.last_dual_lane_execution_summary = {}
         bot.live_trade_count_today = 0
         bot.live_positions = []
+        bot.get_live_market_detail = lambda ticker: {"ticker": ticker, "in_play": True, "status": "in_play"}
         return bot
 
     def _set_sports_only_mode(self, enabled):
@@ -1181,6 +1182,165 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(posted[0]["count"], 2)
         self.assertEqual(posted[0]["yes_price"], 46)
         self.assertNotIn("no_price", posted[0])
+
+    def test_sports_live_state_guard_blocks_future_start_time(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        posted = []
+        future_start = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "status": "active",
+            "occurrence_datetime": future_start,
+        }
+        bot.live_positions = []
+        bot.load_live_position_state = lambda: {}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": []}
+
+        def fake_live_request(method, path, json_payload=None, timeout=15):
+            if method == "GET" and "balance" in str(path):
+                return {"ok": True, "status_code": 200, "body": {"balance": 10000}}
+            posted.append(dict(json_payload or {}))
+            return {
+                "ok": True,
+                "status_code": 201,
+                "body": {"order": {"order_id": "should-not-post"}},
+            }
+
+        bot._live_request_json = fake_live_request
+
+        result = bot.place_live_order(
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 2,
+                "yes_price": 46,
+                "selected_price": 0.46,
+                "_risk_governor_checked": True,
+            }
+        )
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "pregame_sports_market")
+        self.assertEqual(result["sports_live_state_guard"]["block_reason"], "future_start_time")
+        self.assertEqual(posted, [])
+
+    def test_sports_live_state_guard_blocks_missing_live_metadata(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        bot.get_live_market_detail = lambda ticker: {}
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 44,
+                "selected_price": 0.44,
+            },
+            source="unit_test",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "pregame_sports_market")
+        self.assertEqual(result["block_reason"], "unknown_sports_live_state")
+
+    def test_sports_live_state_guard_allows_live_scoreboard(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        posted = []
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXNBAGAME",
+            "status": "open",
+            "scoreboard": {"game_status": "in_progress", "quarter": 2, "clock": "07:41"},
+        }
+        bot.live_positions = []
+        bot.load_live_position_state = lambda: {}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": []}
+
+        def fake_live_request(method, path, json_payload=None, timeout=15):
+            if method == "GET" and "balance" in str(path):
+                return {"ok": True, "status_code": 200, "body": {"balance": 10000}}
+            posted.append(dict(json_payload or {}))
+            return {
+                "ok": True,
+                "status_code": 201,
+                "body": {"order": {"order_id": "unit-live-scoreboard"}},
+            }
+
+        bot._live_request_json = fake_live_request
+
+        result = bot.place_live_order(
+            {
+                "ticker": "KXNBAGAME-26JUN01-BOSNYK-BOS",
+                "family": "KXNBAGAME",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 44,
+                "selected_price": 0.44,
+                "_risk_governor_checked": True,
+            }
+        )
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(posted[0]["ticker"], "KXNBAGAME-26JUN01-BOSNYK-BOS")
+        self.assertEqual(posted[0]["side"], "yes")
+        self.assertEqual(posted[0]["yes_price"], 44)
+        self.assertNotIn("no_price", posted[0])
+
+    def test_sports_live_state_guard_allows_in_play_flag(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXNBAGAME",
+            "in_play": True,
+            "status": "open",
+        }
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXNBAGAME-26JUN01-BOSNYK-BOS",
+                "family": "KXNBAGAME",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 44,
+                "selected_price": 0.44,
+            },
+            source="unit_test",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_state_ok")
+
+    def test_sports_live_state_guard_skips_non_sports(self):
+        bot = self._make_bot()
+        bot.get_live_market_detail = lambda ticker: {}
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXHIGHAUS-26JUN01",
+                "family": "KXHIGHAUS",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 44,
+                "selected_price": 0.44,
+            },
+            source="unit_test",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "not_sports_buy")
 
     def test_game_thesis_boosts_aligned_sports_candidates(self):
         self._set_sports_only_mode(True)
@@ -3100,6 +3260,83 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(decision["reason"], "fast_profit_dollar_lock")
         self.assertTrue(decision["profit_lock_exit"])
         self.assertTrue(decision["is_sports_position"])
+
+    def test_pregame_sports_position_negative_exit_is_held(self):
+        bot = self._make_bot()
+        ticker = "KXMLBKS-26JUN011845MIAWSH-WSHCCAVALLI24-7"
+        future_start = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.29,
+            "side": "yes",
+            "count": 2,
+            "entry_ts": time.time() - 300,
+        }
+        bot.get_live_market_detail = lambda _ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXMLBKS",
+            "status": "active",
+            "occurrence_datetime": future_start,
+            "yes_bid_dollars": "0.2600",
+            "yes_ask_dollars": "0.2900",
+            "no_bid_dollars": "0.7100",
+            "no_ask_dollars": "0.7400",
+        }
+        bot.get_market_family = lambda _market: "KXMLBKS"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": -0.50}
+        q = SimpleNamespace(ticker=ticker, yes_bid=0.26, yes_ask=0.29, no_bid=0.71, no_ask=0.74)
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.29, "count": 2, "entry_ts": time.time() - 300},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "hold")
+        self.assertEqual(decision["reason"], "pregame_loss_exit_blocked")
+        self.assertTrue(decision["pregame_loss_exit_blocked"])
+        self.assertTrue(decision["sports_pregame_exit_context"]["future_start"])
+
+    def test_pregame_sports_position_profitable_exit_still_allowed(self):
+        bot = self._make_bot()
+        ticker = "KXMLBKS-26JUN011845MIAWSH-WSHCCAVALLI24-7"
+        future_start = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.get_live_entry_metadata = lambda _ticker: {
+            "entry_price": 0.20,
+            "side": "yes",
+            "count": 5,
+            "entry_ts": time.time() - 300,
+        }
+        bot.get_live_market_detail = lambda _ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXMLBKS",
+            "status": "active",
+            "occurrence_datetime": future_start,
+            "yes_bid_dollars": "0.2900",
+            "yes_ask_dollars": "0.3100",
+            "no_bid_dollars": "0.6900",
+            "no_ask_dollars": "0.7100",
+        }
+        bot.get_market_family = lambda _market: "KXMLBKS"
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.20}
+        q = SimpleNamespace(ticker=ticker, yes_bid=0.29, yes_ask=0.31, no_bid=0.69, no_ask=0.71)
+
+        decision = bot._evaluate_dynamic_live_exit(
+            {"ticker": ticker, "side": "yes", "entry_price": 0.20, "count": 5, "entry_ts": time.time() - 300},
+            quotes_by_ticker={ticker: q},
+        )
+
+        self.assertEqual(decision["action"], "exit")
+        self.assertFalse(decision["pregame_loss_exit_blocked"])
+        self.assertGreater(decision["unrealized_pnl"], 0.0)
 
     def test_profit_lock_tracks_peak_value_and_trailing_giveback(self):
         bot = self._make_bot()

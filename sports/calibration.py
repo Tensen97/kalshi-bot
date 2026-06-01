@@ -182,7 +182,7 @@ def get_sports_market_lifecycle_state(bot=None, market=None, q=None, family=None
     live_flag = bool(
         market.get("is_live")
         or market.get("live")
-        or str(market.get("status") or market.get("market_status") or "").strip().lower() in {"live", "in_play", "open"}
+        or str(market.get("status") or market.get("market_status") or "").strip().lower() in {"live", "in_play", "inplay", "in-progress", "in_progress"}
     )
     if minutes_to_event is None:
         if urgency in {"immediate", "near", "near_term", "urgent"}:

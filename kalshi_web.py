@@ -439,6 +439,9 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-LIVE-EXECUTION-BLOCKED",
     "AION-EXECUTION-BLOCKER",
     "AION-FINAL-BLOCKER",
+    "AION-SPORTS-LIVE-STATE-CHECK",
+    "AION-PREGAME-SPORTS-BLOCK",
+    "AION-LIVE-SPORTS-ALLOW",
     "AION-NEAR-SAFE-RELIEF",
     "AION-NEAR-SAFE-REJECT",
     "REAL-SUBMIT-ATTEMPT",
@@ -3417,6 +3420,236 @@ class KalshiSniperBot:
         if sports_calibration is None or not hasattr(sports_calibration, "get_sports_market_lifecycle_state"):
             raise RuntimeError("sports.calibration.get_sports_market_lifecycle_state unavailable")
         return sports_calibration.get_sports_market_lifecycle_state(bot=self, *args, **kwargs)
+
+    def _sports_live_state_field(self, sources, *names):
+        for source in sources:
+            if source is None:
+                continue
+            for name in names:
+                try:
+                    value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+                except Exception:
+                    value = None
+                if value not in (None, ""):
+                    return value, name
+        return None, None
+
+    def _sports_live_state_bool(self, value):
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "live", "in_play", "inplay", "in-play"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "scheduled", "pregame", "not_started", "upcoming"}:
+            return False
+        return False
+
+    def _sports_live_state_timestamp(self, sources):
+        keys = (
+            "event_start_time",
+            "event_start_time_ts",
+            "occurrence_datetime",
+            "occurrence_datetime_ts",
+            "start_time",
+            "start_time_ts",
+            "scheduled_start_time",
+            "scheduled_start_time_ts",
+            "game_start_time",
+            "game_start_time_ts",
+            "match_start_time",
+            "match_start_time_ts",
+        )
+        for source in sources:
+            if source is None:
+                continue
+            for key in keys:
+                try:
+                    raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
+                except Exception:
+                    raw = None
+                ts = self._parse_market_timestamp(raw)
+                if ts is not None:
+                    return ts, key, raw
+        return None, None, None
+
+    def _sports_live_state_has_scoreboard(self, sources):
+        live_values = {"live", "in_play", "inplay", "in-play", "started", "in_progress", "running", "midgame", "halftime", "intermission", "between_periods", "top", "bottom"}
+        non_live_values = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview", "created"}
+        scoreboard_keys = (
+            "scoreboard",
+            "box_score",
+            "game",
+            "match",
+            "live_context",
+            "sports_live_context",
+        )
+        state_keys = (
+            "live_state",
+            "game_state",
+            "game_status",
+            "event_status",
+            "match_status",
+            "period",
+            "current_period",
+            "quarter",
+            "inning",
+            "current_inning",
+            "half",
+            "set",
+            "current_set",
+            "clock",
+            "game_clock",
+            "time_remaining",
+        )
+        for source in sources:
+            if source is None:
+                continue
+            containers = [source]
+            if isinstance(source, dict):
+                for key in scoreboard_keys:
+                    value = source.get(key)
+                    if isinstance(value, dict):
+                        containers.append(value)
+            for container in containers:
+                for key in state_keys:
+                    try:
+                        value = container.get(key) if isinstance(container, dict) else getattr(container, key, None)
+                    except Exception:
+                        value = None
+                    if value in (None, ""):
+                        continue
+                    text = str(value).strip().lower()
+                    if text in non_live_values:
+                        continue
+                    if key in {"clock", "game_clock", "time_remaining"} and text in {"0", "00:00", "0:00"}:
+                        continue
+                    if text in live_values or key not in {"event_status", "game_status", "match_status", "live_state", "game_state"}:
+                        return True, key, value
+        return False, None, None
+
+    def _emit_sports_live_state_guard_log(self, tag, payload):
+        try:
+            print(f"[{tag}] " + json.dumps(payload if isinstance(payload, dict) else {}, sort_keys=True, default=str))
+        except Exception:
+            pass
+
+    def evaluate_sports_live_state_pre_submit_guard(self, payload, q=None, *, source="pre_submit", refresh=True):
+        payload = payload if isinstance(payload, dict) else {}
+        ticker = str(payload.get("ticker") or self._read_field(q, "ticker", default="") or "").strip()
+        family = str(payload.get("family") or self._read_field(q, "family", "series_ticker", default="") or "").strip().upper()
+        if not family and ticker:
+            family = str(self.get_market_family({"ticker": ticker}) or "").strip().upper()
+        side = self._normalize_live_side(payload.get("side") or payload.get("selected_side") or self._read_field(q, "selected_side", "side", default=None))
+        action = str(payload.get("action") or "buy").strip().lower()
+        reduce_only = bool(payload.get("reduce_only"))
+        is_buy = action in {"", "buy"} and not reduce_only
+        is_sports = bool(self.is_sports_family(family, ticker=ticker))
+        if not is_sports or not is_buy:
+            return {
+                "ok": True,
+                "reason": "not_sports_buy",
+                "skipped": True,
+                "ticker": ticker,
+                "family": family,
+                "side": side,
+                "source": source,
+            }
+
+        metadata = []
+        for candidate in (
+            payload,
+            payload.get("market") if isinstance(payload.get("market"), dict) else None,
+            payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else None,
+            q,
+        ):
+            if candidate is not None:
+                metadata.append(candidate)
+        detail = {}
+        detail_reason = None
+        if refresh and ticker:
+            try:
+                detail = self.get_live_market_detail(ticker)
+                if isinstance(detail, dict) and detail:
+                    metadata.insert(0, detail)
+                else:
+                    detail_reason = "market_detail_empty"
+            except Exception as exc:
+                detail_reason = f"market_detail_{exc.__class__.__name__}"
+
+        now_ts = time.time()
+        start_ts, start_key, start_raw = self._sports_live_state_timestamp(metadata)
+        status_value, status_key = self._sports_live_state_field(metadata, "status", "market_status", "event_status", "game_status", "match_status", "live_state", "game_state")
+        status_text = str(status_value or "").strip().lower()
+        explicit_live_value, explicit_live_key = self._sports_live_state_field(metadata, "in_play", "inplay", "is_in_play", "is_live", "live", "currently_live", "is_currently_live")
+        explicit_live = self._sports_live_state_bool(explicit_live_value)
+        scoreboard_live, scoreboard_key, scoreboard_value = self._sports_live_state_has_scoreboard(metadata)
+        closed_statuses = {"closed", "settled", "finalized", "expired", "halted", "cancelled", "canceled", "resolved"}
+        pregame_statuses = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}
+        live_statuses = {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"}
+
+        reason = "unknown_sports_live_state"
+        ok = False
+        live_state = "unknown"
+        if status_text in closed_statuses:
+            reason = "sports_market_closed"
+            live_state = "closed"
+        elif start_ts is not None and start_ts > now_ts + 30.0:
+            reason = "future_start_time"
+            live_state = "future"
+        elif status_text in pregame_statuses:
+            reason = "pregame_status"
+            live_state = "pregame"
+        elif explicit_live:
+            ok = True
+            reason = "explicit_live_flag"
+            live_state = "live"
+        elif status_text in live_statuses:
+            ok = True
+            reason = "live_status"
+            live_state = "live"
+        elif scoreboard_live:
+            ok = True
+            reason = "scoreboard_live_state"
+            live_state = "live"
+        elif start_ts is not None and start_ts <= now_ts + 30.0:
+            ok = True
+            reason = "start_time_elapsed"
+            live_state = "started"
+
+        selected_price = payload.get("selected_price")
+        if selected_price is None:
+            price_key = "yes_price" if side == "yes" else "no_price" if side == "no" else None
+            selected_price = payload.get(price_key) if price_key else None
+        payload_log = {
+            "ticker": ticker or None,
+            "family": family or None,
+            "side": side,
+            "selected_price": selected_price,
+            "ok": bool(ok),
+            "reason": reason,
+            "source": source,
+            "live_state": live_state,
+            "start_key": start_key,
+            "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if start_ts is not None else None,
+            "seconds_to_start": round(float(start_ts - now_ts), 3) if start_ts is not None else None,
+            "status_key": status_key,
+            "status": status_value,
+            "explicit_live_key": explicit_live_key,
+            "explicit_live_value": explicit_live_value,
+            "scoreboard_key": scoreboard_key,
+            "scoreboard_value": scoreboard_value,
+            "detail_reason": detail_reason,
+            "metadata_sources": len(metadata),
+        }
+        self._emit_sports_live_state_guard_log("AION-SPORTS-LIVE-STATE-CHECK", payload_log)
+        self._emit_sports_live_state_guard_log("AION-LIVE-SPORTS-ALLOW" if ok else "AION-PREGAME-SPORTS-BLOCK", payload_log)
+        return {
+            **payload_log,
+            "ok": bool(ok),
+            "reason": "sports_live_state_ok" if ok else "pregame_sports_market",
+            "block_reason": None if ok else reason,
+            "start_time_raw": start_raw,
+        }
 
     def compute_no_vig_probability(self, *args, **kwargs):
         if sports_calibration is None or not hasattr(sports_calibration, "compute_no_vig_probability"):
