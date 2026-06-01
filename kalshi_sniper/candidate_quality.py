@@ -2106,11 +2106,14 @@ def compute_candidate_quality(self, market=None, q=None, expectancy_summary=None
         return None
 
     def _to_cents(value):
-        value = to_float(value, None)
-        if value is None:
+        numeric = to_float(value, None)
+        if numeric is None:
             return None
         try:
-            return int(round(float(value) * 100.0))
+            numeric = float(numeric)
+            if 1.0 < numeric <= 100.0:
+                return int(round(numeric))
+            return int(round(numeric * 100.0))
         except (TypeError, ValueError):
             return None
 

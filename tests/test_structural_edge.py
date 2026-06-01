@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import kalshi_web as kw
 from sports import live_intelligence as sli
+from kalshi_ranking import get_momentum_rank_adjustment
 from kalshi_sniper.candidate_quality import compute_candidate_ev
 
 
@@ -293,6 +294,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 kw.print('[AION-SPORTS-SUBMIT-ATTEMPT] {"ticker":"KXNCAABSPREAD-PURMICH","reason":"unit_test"}')
                 kw.print('[POSITION-OPEN] {"ticker":"KXNCAABSPREAD-PURMICH"}')
                 kw.print('[AION-FINAL-SUBMIT-BLOCKED] {"ticker":"KXNCAABTOTAL-PURMICH","reason":"duplicate_guard"}')
+                kw.print('[AION-FINAL-GATE-BLOCKER] {"ticker":"KXNCAABSPREAD-PURMICH","reason":"all_guards_passed"}')
                 kw.print("[AION-FINAL-BLOCKER-TRACE] ticker=KXNCAABTOTAL-PURMICH final_block_reason=unsafe_price")
                 kw.print('[LIVE-REACTIVATION-WATCHLIST] {"ticker":"KXNCAABSPREAD-PURMICH","state":"unchanged"}')
                 kw.print('[AION-RUNONCE-START] {"cycle_count":102,"timestamp":1779694360.0}')
@@ -304,6 +306,7 @@ class StructuralEdgeTests(unittest.TestCase):
             self.assertIn('"positions_opened": 1', rendered)
             self.assertIn('"duplicate_guard": 1', rendered)
             self.assertIn('"unsafe_price": 1', rendered)
+            self.assertNotIn('"all_guards_passed":', rendered)
             self.assertIn('"advisory_logs_suppressed": 1', rendered)
             self.assertNotIn("[AION-FINAL-BLOCKER-TRACE]", rendered)
             self.assertNotIn("[LIVE-REACTIVATION-WATCHLIST]", rendered)
@@ -354,6 +357,109 @@ class StructuralEdgeTests(unittest.TestCase):
         )
         self.assertEqual(decision["selected_side"], "no")
         self.assertEqual(decision["selected_price"], 0.37)
+
+    def test_lane_selected_price_derives_missing_side_from_bidirectional_selector(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXNCAABSPREAD-SIDELESS",
+            title="College basketball spread",
+            yes_bid=0.40,
+            yes_ask=0.42,
+            no_bid=0.56,
+            no_ask=0.58,
+            yes_top_size=20,
+            no_top_size=20,
+            liquidity=40,
+        )
+
+        selected_side, selected_price = bot._extract_lane_selected_price(
+            q,
+            {"yes_edge_after_cost": 0.04, "no_edge_after_cost": -0.01},
+            {},
+            market={"ticker": q.ticker, "series_ticker": "KXNCAABSPREAD", "title": q.title},
+            family="KXNCAABSPREAD",
+        )
+
+        self.assertEqual(selected_side, "yes")
+        self.assertEqual(selected_price, 0.42)
+        self.assertEqual(q.selected_side, "yes")
+        self.assertEqual(q.selected_price, 0.42)
+        self.assertEqual(q.selected_price_cents, 42)
+
+    def test_candidate_quality_preserves_cent_price_units(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-UNIT",
+            family="KXATPCHALLENGERMATCH",
+            selected_side="yes",
+            selected_price=0.80,
+            selected_price_dollars=0.80,
+            selected_price_cents=80,
+            yes_bid=0.74,
+            yes_ask=0.80,
+            no_bid=0.18,
+            no_ask=0.24,
+            liquidity=100,
+        )
+
+        quality = bot._evaluate_aion_candidate_quality(
+            market={"ticker": q.ticker, "series_ticker": q.family},
+            q=q,
+            expectancy_summary={"quote_ready": True, "payload_ready": True},
+            tradeability={"orderbook_ready": True},
+        )
+
+        self.assertEqual(quality["selected_price"], 0.80)
+        self.assertEqual(quality["selected_price_cents"], 80)
+        self.assertTrue(quality["selected_price_in_bounds"])
+        self.assertTrue(quality["selected_side_executable"])
+        self.assertNotEqual(quality["preferred_reason"], "selected_price_out_of_range")
+
+    def test_lane_selected_price_accepts_cents_field(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-CENTS",
+            selected_side="yes",
+            selected_price_cents=46,
+        )
+
+        selected_side, selected_price = bot._extract_lane_selected_price(
+            q,
+            {},
+            {},
+            market={"ticker": q.ticker, "series_ticker": "KXATPCHALLENGERMATCH"},
+            family="KXATPCHALLENGERMATCH",
+        )
+
+        self.assertEqual(selected_side, "yes")
+        self.assertEqual(selected_price, 0.46)
+
+    def test_momentum_engine_derives_side_from_selected_price(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-MOMENTUM",
+            selected_price_cents=80,
+            yes_bid=0.74,
+            yes_ask=0.80,
+            no_bid=0.18,
+            no_ask=0.24,
+            price_history=[0.76, 0.80],
+        )
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = get_momentum_rank_adjustment(
+                bot,
+                {"q": q, "selected_price_cents": 80, "price_history": [0.76, 0.80]},
+                market={"ticker": q.ticker},
+                family="KXATPCHALLENGERMATCH",
+                imbalance_context={"imbalance": 0.15},
+                log=True,
+            )
+
+        self.assertEqual(result["side"], "yes")
+        self.assertNotIn("unknown_side_neutral", result["reason"])
+        self.assertIn("side=yes", out.getvalue())
 
     def test_sports_side_selection_allows_one_sided_thin_executable_book(self):
         bot = self._make_bot()

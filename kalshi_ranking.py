@@ -463,7 +463,16 @@ def _current_yes_probability(bot, item, market, q):
     selected_side = str(_candidate_get(bot, item, market, q, "selected_side", "side") or "").strip().lower()
     selected_price = _coerce_probability(
         bot,
-        _candidate_get(bot, item, market, q, "selected_price", "selected_price_dollars", "ev_selected_price"),
+        _candidate_get(
+            bot,
+            item,
+            market,
+            q,
+            "selected_price",
+            "selected_price_dollars",
+            "selected_price_cents",
+            "ev_selected_price",
+        ),
     )
     if selected_price is not None and selected_side in {"yes", "no"}:
         return (selected_price if selected_side == "yes" else round(1.0 - selected_price, 6)), "selected_price"
@@ -523,6 +532,32 @@ def _selected_side(bot, item, market, q, ev_context=None):
         return "no"
     if side in {"yes", "no"}:
         return side
+    selected_price = _coerce_probability(
+        bot,
+        _candidate_get(
+            bot,
+            item,
+            market,
+            q,
+            "selected_price",
+            "selected_price_dollars",
+            "selected_price_cents",
+            "ev_selected_price",
+        ),
+    )
+    yes_ask = _coerce_probability(bot, _candidate_get(bot, item, market, q, "yes_ask", "yes_ask_dollars"))
+    no_ask = _coerce_probability(bot, _candidate_get(bot, item, market, q, "no_ask", "no_ask_dollars"))
+    if selected_price is not None:
+        if yes_ask is not None and abs(selected_price - yes_ask) <= 0.000001:
+            return "yes"
+        if no_ask is not None and abs(selected_price - no_ask) <= 0.000001:
+            return "no"
+    yes_edge = bot.to_float(_candidate_get(bot, item, market, q, "yes_edge_after_cost", "yes_final_edge", "yes_edge"), None)
+    no_edge = bot.to_float(_candidate_get(bot, item, market, q, "no_edge_after_cost", "no_final_edge", "no_edge"), None)
+    if yes_edge is not None or no_edge is not None:
+        if (yes_edge or 0.0) >= (no_edge or 0.0):
+            return "yes"
+        return "no"
     return "unknown"
 
 

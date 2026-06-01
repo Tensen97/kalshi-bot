@@ -9151,9 +9151,26 @@ def _build_aion_scan_rebalancer_profile(self, *, family=None, market=None, q=Non
     }
 
 
-def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_snapshot=None):
+def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_snapshot=None, market=None, family=None):
     expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
     quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+    market = market if isinstance(market, dict) else {}
+    ticker = str(
+        expectancy_summary.get("ticker")
+        or quality_snapshot.get("ticker")
+        or market.get("ticker")
+        or getattr(q, "ticker", "")
+        or ""
+    ).strip()
+    family = str(
+        family
+        or expectancy_summary.get("family")
+        or quality_snapshot.get("family")
+        or market.get("series_ticker")
+        or market.get("event_ticker")
+        or (self.get_market_family(market or {"ticker": ticker}) if ticker or market else "")
+        or ""
+    ).strip().upper()
     selected_side = self._aion_normalize_live_side(
         expectancy_summary.get("selected_side")
         or quality_snapshot.get("selected_side")
@@ -9163,14 +9180,55 @@ def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_
     selected_price = (
         expectancy_summary.get("selected_price")
         or expectancy_summary.get("selected_price_dollars")
+        or expectancy_summary.get("selected_price_cents")
         or quality_snapshot.get("selected_price")
         or quality_snapshot.get("selected_price_dollars")
+        or quality_snapshot.get("selected_price_cents")
         or getattr(q, "selected_price", None)
         or getattr(q, "selected_price_dollars", None)
+        or getattr(q, "selected_price_cents", None)
     )
     if selected_price is None and q is not None:
         selected_price = getattr(q, "yes_ask", None) if selected_side == "yes" else getattr(q, "no_ask", None) if selected_side == "no" else None
-    return selected_side, self.to_float(selected_price, None)
+    selected_price = self.to_float(selected_price, None)
+    if selected_price is not None and 1.0 < float(selected_price) <= 100.0:
+        selected_price = round(float(selected_price) / 100.0, 4)
+
+    needs_derivation = bool(selected_side not in {"yes", "no"} or selected_price is None or not (0.0 < float(selected_price) < 1.0))
+    if needs_derivation and q is not None:
+        try:
+            quote_diag = {}
+            quote_diag.update(expectancy_summary)
+            quote_diag.update(quality_snapshot)
+            decision = self._aion_select_bidirectional_side(
+                ticker=ticker,
+                family=family,
+                lane="SPORTS" if self._is_sports_market_or_family(family) else None,
+                market=market or {"ticker": ticker, "series_ticker": family},
+                q=q,
+                quote_diag=quote_diag,
+                preferred_side=selected_side,
+                source="lane_selected_price",
+                emit_log=False,
+            )
+            derived_side = self._aion_normalize_live_side((decision or {}).get("selected_side"))
+            derived_price = self.to_float((decision or {}).get("selected_price"), None)
+            if derived_price is not None and 1.0 < float(derived_price) <= 100.0:
+                derived_price = round(float(derived_price) / 100.0, 4)
+            if derived_side in {"yes", "no"} and derived_price is not None and 0.0 < float(derived_price) < 1.0:
+                selected_side = derived_side
+                selected_price = round(float(derived_price), 4)
+                try:
+                    setattr(q, "selected_side", selected_side)
+                    setattr(q, "side", selected_side)
+                    setattr(q, "selected_price", selected_price)
+                    setattr(q, "selected_price_dollars", selected_price)
+                    setattr(q, "selected_price_cents", int(round(selected_price * 100.0)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return selected_side, selected_price
 
 
 def _quality_market_text(self, *, family=None, ticker=None, market=None, q=None):
@@ -9218,7 +9276,13 @@ def _build_sports_lane_quality(self, item=None, *, market=None):
     quality_snapshot = item.get("quality_snapshot") if isinstance(item.get("quality_snapshot"), dict) else {}
     sports_context = item.get("sports_edge_context") if isinstance(item.get("sports_edge_context"), dict) else {}
     ev_context = item.get("ev_context") if isinstance(item.get("ev_context"), dict) else {}
-    selected_side, selected_price = self._extract_lane_selected_price(q, expectancy_summary, quality_snapshot)
+    selected_side, selected_price = self._extract_lane_selected_price(
+        q,
+        expectancy_summary,
+        quality_snapshot,
+        market=market,
+        family=family,
+    )
     spread = self.to_float(item.get("spread"), None)
     if spread is None:
         spread = self.to_float(quality_snapshot.get("spread"), self.to_float(expectancy_summary.get("spread"), None))
@@ -9594,7 +9658,13 @@ def _build_lane_allocation_context(self, item=None, *, market=None):
     else:
         expectancy_summary = item.get("expectancy_summary") if isinstance(item.get("expectancy_summary"), dict) else {}
         quality_snapshot = item.get("quality_snapshot") if isinstance(item.get("quality_snapshot"), dict) else {}
-        selected_side, selected_price = self._extract_lane_selected_price(q, expectancy_summary, quality_snapshot)
+        selected_side, selected_price = self._extract_lane_selected_price(
+            q,
+            expectancy_summary,
+            quality_snapshot,
+            market=market,
+            family=family,
+        )
         context = {
             "lane": "OTHER",
             "ticker": ticker,

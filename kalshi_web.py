@@ -904,6 +904,26 @@ def _aion_reset_cycle_execution_summary(cycle_id, started_at=None):
     )
 
 
+_AION_NON_BLOCKING_REASONS = {
+    "none",
+    "ok",
+    "approved",
+    "pass",
+    "passed",
+    "ready",
+    "allowed",
+    "all_gates_passed",
+    "all_guards_passed",
+    "canonical_lane_passed",
+    "canonical_ready",
+    "entry_ready",
+    "final_ready",
+    "payload_ready",
+    "quote_ready",
+    "tradeable",
+}
+
+
 def _aion_record_hard_blocker(tag, payload, message=None):
     reason = _aion_payload_value(
         payload,
@@ -915,8 +935,9 @@ def _aion_record_hard_blocker(tag, payload, message=None):
         "rejection_reason",
     ) if isinstance(payload, dict) else None
     reason = reason or _aion_blocker_reason_from_message(message)
-    if reason:
-        _AION_EXECUTION_CYCLE_STATE["hard_blockers"][str(reason).strip()] += 1
+    reason_text = str(reason or "").strip().lower()
+    if reason_text and reason_text not in _AION_NON_BLOCKING_REASONS:
+        _AION_EXECUTION_CYCLE_STATE["hard_blockers"][reason_text] += 1
 
 
 def _aion_track_execution_cycle(*args):
@@ -54029,7 +54050,27 @@ class KalshiSniperBot:
                 elif str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
                     payload_missing_reason = "invalid_action"
                 else:
-                    payload_missing_reason = "payload_builder_rejected"
+                    last_kelly = getattr(self, "last_fractional_kelly_result", None)
+                    last_kelly = last_kelly if isinstance(last_kelly, dict) else {}
+                    kelly_final_size = self.to_float(last_kelly.get("final_contract_size"), None)
+                    kelly_contracts = self.to_float(last_kelly.get("contracts"), None)
+                    kelly_multiplier = self.to_float(last_kelly.get("sizing_multiplier"), None)
+                    kelly_reason = str(
+                        last_kelly.get("cap_reason")
+                        or last_kelly.get("reason")
+                        or last_kelly.get("action")
+                        or ""
+                    ).strip().lower()
+                    if (
+                        kelly_final_size == 0
+                        or kelly_contracts == 0
+                        or kelly_multiplier == 0
+                        or "zero" in kelly_reason
+                        or "deprioritize_micro" in kelly_reason
+                    ):
+                        payload_missing_reason = f"kelly_size_zero:{kelly_reason or 'zero_contracts'}"
+                    else:
+                        payload_missing_reason = "payload_builder_rejected"
             if payload_rejection_reason is None:
                 payload_rejection_reason = payload_missing_reason
         if payload_rejection_reason is None and not payload_ready:
