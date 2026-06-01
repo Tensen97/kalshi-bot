@@ -10639,15 +10639,34 @@ def _aion_sizing_account_value(self, context=None, payload=None):
 
     def _from_mapping(mapping):
         mapping = mapping if isinstance(mapping, dict) else {}
+        kalshi_raw_hint = any(
+            field in mapping
+            for field in (
+                "exchange_index",
+                "balance_breakdown",
+                "portfolio_value",
+                "available_balance_cents",
+                "balance_cents",
+                "cash_balance_cents",
+                "buying_power_cents",
+            )
+        )
+        raw_balance = self.to_float(mapping.get("balance"), None)
+        raw_portfolio_value = self.to_float(mapping.get("portfolio_value"), None)
+        if raw_balance is not None and raw_balance > 0.0 and raw_portfolio_value is not None and raw_portfolio_value >= 0.0:
+            if kalshi_raw_hint or raw_balance >= 100.0 or raw_portfolio_value >= 100.0:
+                return round((float(raw_balance) + float(raw_portfolio_value)) / 100.0, 4)
+            return round(float(raw_balance) + float(raw_portfolio_value), 4)
         for field in (
-            "portfolio_value",
+            "portfolio_value_dollars",
             "account_value",
             "account_balance",
             "available_balance_dollars",
+            "available_cash_dollars",
+            "buying_power_dollars",
+            "cash_balance_dollars",
             "balance_dollars",
-            "available_balance",
             "available_cash",
-            "cash_balance",
             "bankroll",
             "kelly_bankroll",
             "available_bankroll",
@@ -10655,10 +10674,23 @@ def _aion_sizing_account_value(self, context=None, payload=None):
             value = _normal(mapping.get(field), cents=False)
             if value is not None:
                 return value
-        for field in ("balance_cents", "available_balance_cents", "cash_balance_cents"):
+        for field in (
+            "balance_cents",
+            "available_balance_cents",
+            "available_cash_cents",
+            "buying_power_cents",
+            "cash_balance_cents",
+        ):
             value = _normal(mapping.get(field), cents=True)
             if value is not None:
                 return value
+        for field in ("balance", "available_balance", "buying_power", "cash_balance", "portfolio_value"):
+            raw_value = self.to_float(mapping.get(field), None)
+            if raw_value is None or raw_value <= 0.0:
+                continue
+            if kalshi_raw_hint or raw_value >= 100.0:
+                return round(float(raw_value) / 100.0, 4)
+            return round(float(raw_value), 4)
         return None
 
     snapshots = [context, payload, entry_context]
@@ -10918,6 +10950,175 @@ def _aion_position_sizing_evidence(self, q=None, *, context=None, payload=None, 
     }
 
 
+def _aion_refresh_live_positions_for_sizing(self, *, ticker=None, min_interval_sec=2.0):
+    reconcile = getattr(self, "reconcile_live_positions", None)
+    if not callable(reconcile):
+        return {"ok": True, "refreshed": False, "reason": "reconcile_unavailable"}
+    now = time.time()
+    try:
+        last = float(getattr(self, "_last_aion_sizing_reconcile_ts", 0.0) or 0.0)
+    except Exception:
+        last = 0.0
+    if last > 0.0 and now - last < float(min_interval_sec or 0.0):
+        return {
+            "ok": bool(getattr(self, "_last_aion_sizing_reconcile_ok", True)),
+            "refreshed": False,
+            "reason": "recent_live_api_snapshot",
+        }
+    try:
+        before_count = len(self._get_open_live_positions() or [])
+    except Exception:
+        before_count = 0
+    try:
+        result = reconcile()
+    except Exception as exc:
+        result = {"ok": False, "reason": type(exc).__name__}
+    ok = bool(isinstance(result, dict) and result.get("ok"))
+    setattr(self, "_last_aion_sizing_reconcile_ts", now)
+    setattr(self, "_last_aion_sizing_reconcile_ok", ok)
+    try:
+        after_count = len(self._get_open_live_positions() or [])
+    except Exception:
+        after_count = 0
+    if not ok or before_count != after_count:
+        try:
+            print(
+                "[AION-LIVE-STATE-OVERRIDE] "
+                + json.dumps(
+                    {
+                        "ok": ok,
+                        "reason": "position_sizing_pre_submit",
+                        "ticker": ticker,
+                        "before_open_positions": before_count,
+                        "after_open_positions": after_count,
+                        "api_reason": result.get("reason") if isinstance(result, dict) else None,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    return {
+        "ok": ok,
+        "refreshed": True,
+        "reason": "live_api_reconciled" if ok else (result.get("reason") if isinstance(result, dict) else "live_api_reconcile_failed"),
+    }
+
+
+def _aion_position_exposure_dollars(self, position, *, fallback_price=None):
+    position = position if isinstance(position, dict) else {}
+    direct = self.to_float(
+        position.get("market_exposure_dollars")
+        or position.get("exposure_dollars")
+        or position.get("cost_dollars")
+        or position.get("notional_dollars"),
+        None,
+    )
+    if direct is not None and direct > 0.0:
+        return round(float(direct), 6)
+    direct_cents = self.to_float(
+        position.get("market_exposure_cents")
+        or position.get("exposure_cents")
+        or position.get("cost_cents")
+        or position.get("notional_cents"),
+        None,
+    )
+    if direct_cents is not None and direct_cents > 0.0:
+        return round(float(direct_cents) / 100.0, 6)
+    count = self.to_float(
+        position.get("count")
+        or position.get("contracts")
+        or position.get("contract_count")
+        or position.get("quantity")
+        or position.get("qty")
+        or position.get("position_fp")
+        or position.get("count_fp"),
+        0.0,
+    ) or 0.0
+    raw_price = (
+        position.get("entry_price")
+        or position.get("avg_price")
+        or position.get("average_price")
+        or position.get("price")
+        or position.get("selected_price")
+        or position.get("selected_price_dollars")
+        or fallback_price
+    )
+    price = self.to_float(raw_price, None)
+    if price is None:
+        return 0.0
+    if 1.0 < price <= 100.0:
+        price = price / 100.0
+    if count <= 0.0 or price <= 0.0:
+        return 0.0
+    return round(abs(float(count)) * float(price), 6)
+
+
+def _aion_existing_sizing_exposure(self, evidence=None, *, payload=None, selected_price=None):
+    evidence = evidence if isinstance(evidence, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+    ticker = str(evidence.get("ticker") or payload.get("ticker") or "").strip()
+    family = str(evidence.get("family") or payload.get("family") or "").strip().upper()
+    target_game_key = None
+    if ticker and callable(getattr(self, "_extract_sports_game_key", None)):
+        try:
+            target_game_key = self._extract_sports_game_key(ticker)
+        except Exception:
+            target_game_key = None
+    target_ladder_plan = str(
+        entry_context.get("sports_ladder_plan_id")
+        or payload.get("sports_ladder_plan_id")
+        or ""
+    ).strip()
+    exposure = 0.0
+    matches = []
+    try:
+        open_positions = self._get_open_live_positions() or []
+    except Exception:
+        open_positions = []
+    for position in open_positions:
+        if not isinstance(position, dict):
+            continue
+        pos_ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
+        if not pos_ticker:
+            continue
+        pos_entry_context = position.get("entry_context") if isinstance(position.get("entry_context"), dict) else {}
+        pos_family = str(position.get("family") or "").strip().upper()
+        if not pos_family and callable(getattr(self, "get_market_family", None)):
+            try:
+                pos_family = str(self.get_market_family({"ticker": pos_ticker}) or "").strip().upper()
+            except Exception:
+                pos_family = ""
+        reason = None
+        if ticker and pos_ticker == ticker:
+            reason = "same_ticker"
+        elif target_ladder_plan and str(pos_entry_context.get("sports_ladder_plan_id") or "").strip() == target_ladder_plan:
+            reason = "same_ladder_plan"
+        elif target_game_key and callable(getattr(self, "_extract_sports_game_key", None)):
+            try:
+                if self._extract_sports_game_key(pos_ticker) == target_game_key:
+                    reason = "same_game_ladder"
+            except Exception:
+                reason = None
+        if not reason:
+            continue
+        dollars = _aion_position_exposure_dollars(self, position, fallback_price=selected_price)
+        if dollars <= 0.0:
+            continue
+        exposure += float(dollars)
+        matches.append(
+            {
+                "ticker": pos_ticker,
+                "family": pos_family or family,
+                "reason": reason,
+                "exposure_dollars": round(float(dollars), 4),
+            }
+        )
+    return round(float(exposure), 6), matches[:12]
+
+
 def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, selected_price=None, payload=None, ev_context=None, quality_context=None, hard_max=None, source=None):
     if not _aion_sizing_env_bool("AION_POSITION_SIZING_INTELLIGENCE_ENABLED", AION_POSITION_SIZING_INTELLIGENCE_ENABLED):
         return planned_size, None
@@ -10937,6 +11138,13 @@ def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, sele
     if not (0.0 < price < 1.0):
         return planned, None
 
+    _aion_refresh_live_positions_for_sizing(self, ticker=evidence.get("ticker"), min_interval_sec=2.0)
+    existing_exposure, exposure_matches = _aion_existing_sizing_exposure(
+        self,
+        evidence,
+        payload=payload,
+        selected_price=price,
+    )
     account_value = _aion_sizing_account_value(self, context=context, payload=payload)
     if account_value is None or account_value <= 0.0:
         details = {
@@ -10963,22 +11171,48 @@ def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, sele
     longshot_dollars = max(float(price), float(account_value) * longshot_pct)
     max_contract_bound = max(1, int(hard_max or MAX_LIVE_ORDER_SIZE or planned))
 
-    def _contracts_for(dollars):
-        return max(1, min(max_contract_bound, int(float(dollars) / float(price))))
+    def _contracts_for(dollars, *, allow_zero=False):
+        contracts = min(max_contract_bound, int(float(max(0.0, dollars)) / float(price)))
+        if allow_zero:
+            return max(0, contracts)
+        return max(1, contracts)
+
+    def _remaining_cap(total_dollars):
+        if existing_exposure > 0.0:
+            return max(0.0, float(total_dollars) - float(existing_exposure))
+        return float(total_dollars)
 
     if evidence.get("elite"):
         max_dollars = elite_dollars
-        max_allowed = _contracts_for(max_dollars)
-        reason = "elite_account_pct_cap" if planned > max_allowed else "elite_within_account_pct_cap"
+        remaining_dollars = _remaining_cap(max_dollars)
+        max_allowed = _contracts_for(remaining_dollars, allow_zero=existing_exposure > 0.0)
+        if existing_exposure > 0.0 and max_allowed <= 0:
+            reason = "elite_same_thesis_account_pct_cap_exhausted"
+        elif existing_exposure > 0.0 and planned > max_allowed:
+            reason = "elite_same_thesis_account_pct_cap"
+        else:
+            reason = "elite_account_pct_cap" if planned > max_allowed else "elite_within_account_pct_cap"
     elif evidence.get("longshot"):
         max_dollars = longshot_dollars
-        max_allowed = _contracts_for(max_dollars)
-        reason = "longshot_account_pct_cap" if planned > max_allowed else "longshot_within_account_pct_cap"
+        remaining_dollars = _remaining_cap(max_dollars)
+        max_allowed = _contracts_for(remaining_dollars, allow_zero=existing_exposure > 0.0)
+        if existing_exposure > 0.0 and max_allowed <= 0:
+            reason = "longshot_same_thesis_account_pct_cap_exhausted"
+        elif existing_exposure > 0.0 and planned > max_allowed:
+            reason = "longshot_same_thesis_account_pct_cap"
+        else:
+            reason = "longshot_account_pct_cap" if planned > max_allowed else "longshot_within_account_pct_cap"
     else:
         max_dollars = standard_dollars
-        max_allowed = _contracts_for(max_dollars)
-        reason = "standard_account_pct_cap_requires_elite" if planned > max_allowed else "within_account_pct_cap"
-    adjusted = max(1, min(planned, int(max_allowed), max_contract_bound))
+        remaining_dollars = _remaining_cap(max_dollars)
+        max_allowed = _contracts_for(remaining_dollars, allow_zero=existing_exposure > 0.0)
+        if existing_exposure > 0.0 and max_allowed <= 0:
+            reason = "standard_same_thesis_account_pct_cap_exhausted"
+        elif existing_exposure > 0.0 and planned > max_allowed:
+            reason = "standard_same_thesis_account_pct_cap_requires_elite"
+        else:
+            reason = "standard_account_pct_cap_requires_elite" if planned > max_allowed else "within_account_pct_cap"
+    adjusted = max(0, min(planned, int(max_allowed), max_contract_bound))
     planned_notional = float(planned) * float(price)
     adjusted_notional = float(adjusted) * float(price)
     details = {
@@ -10989,10 +11223,14 @@ def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, sele
         "account_value": round(float(account_value), 4),
         "max_allowed": int(max_allowed),
         "max_allowed_dollars": round(float(max_dollars), 4),
+        "remaining_cap_dollars": round(float(remaining_dollars), 4),
+        "existing_exposure_dollars": round(float(existing_exposure), 4),
+        "exposure_matches": exposure_matches,
         "selected_price": round(float(price), 6),
         "planned_notional": round(planned_notional, 4),
         "adjusted_notional": round(adjusted_notional, 4),
         "account_pct": round(adjusted_notional / max(float(account_value), 0.000001), 6),
+        "aggregate_account_pct": round((adjusted_notional + float(existing_exposure)) / max(float(account_value), 0.000001), 6),
         "score": evidence.get("score"),
         "reason": reason,
         "elite": bool(evidence.get("elite")),
@@ -11007,7 +11245,29 @@ def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, sele
             setattr(q, "position_sizing_reason", reason)
     except Exception:
         pass
-    should_log = bool(adjusted < planned or evidence.get("elite") or planned_notional >= standard_dollars * 0.80)
+    if existing_exposure > 0.0:
+        try:
+            print(
+                "[AION-EXPOSURE-RECONCILE] "
+                + json.dumps(
+                    {
+                        "ticker": details["ticker"],
+                        "family": details["family"],
+                        "existing_exposure_dollars": details["existing_exposure_dollars"],
+                        "planned_notional": details["planned_notional"],
+                        "adjusted_notional": details["adjusted_notional"],
+                        "max_allowed_dollars": details["max_allowed_dollars"],
+                        "remaining_cap_dollars": details["remaining_cap_dollars"],
+                        "reason": reason,
+                        "matches": exposure_matches[:5],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    should_log = bool(adjusted < planned or evidence.get("elite") or existing_exposure > 0.0 or planned_notional >= standard_dollars * 0.80)
     if should_log:
         try:
             print(
@@ -11020,6 +11280,8 @@ def _apply_position_sizing_intelligence(self, q=None, *, planned_size=None, sele
                         "adjusted_size": details["adjusted_size"],
                         "account_value": details["account_value"],
                         "max_allowed": details["max_allowed"],
+                        "existing_exposure_dollars": details["existing_exposure_dollars"],
+                        "remaining_cap_dollars": details["remaining_cap_dollars"],
                         "score": details["score"],
                         "reason": details["reason"],
                     },

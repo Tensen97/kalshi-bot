@@ -1,6 +1,7 @@
 """Hard live-trading risk guards for kalshi_web."""
 
 from collections import Counter
+import json
 import os
 import time
 
@@ -90,6 +91,88 @@ def already_holding(bot, ticker):
     )
 
 
+def _open_positions(bot):
+    try:
+        return bot._get_open_live_positions() or []
+    except Exception:
+        return [
+            position for position in (getattr(bot, "live_positions", None) or [])
+            if isinstance(position, dict)
+            and str(position.get("status", "open") or "open").strip().lower() == "open"
+        ]
+
+
+def _same_ticker_open(bot, ticker):
+    ticker = str(ticker or "").strip()
+    if not ticker:
+        return False
+    return any(
+        str(position.get("ticker") or position.get("market_ticker") or "").strip() == ticker
+        for position in _open_positions(bot)
+        if isinstance(position, dict)
+    )
+
+
+def _refresh_live_positions_for_guard(bot, *, ticker=None, reason="live_guard", min_interval_sec=5.0):
+    reconcile = getattr(bot, "reconcile_live_positions", None)
+    if not callable(reconcile):
+        return {"ok": True, "refreshed": False, "reason": "reconcile_unavailable"}
+    now = time.time()
+    last = 0.0
+    try:
+        last = float(getattr(bot, "_last_live_api_guard_reconcile_ts", 0.0) or 0.0)
+    except Exception:
+        last = 0.0
+    if min_interval_sec and last > 0.0 and now - last < float(min_interval_sec):
+        return {
+            "ok": bool(getattr(bot, "_last_live_api_guard_reconcile_ok", True)),
+            "refreshed": False,
+            "reason": str(getattr(bot, "_last_live_api_guard_reconcile_reason", "") or "recent_live_api_snapshot"),
+        }
+
+    before_count = len(_open_positions(bot))
+    before_same = _same_ticker_open(bot, ticker)
+    try:
+        result = reconcile()
+    except Exception as exc:
+        result = {"ok": False, "reason": type(exc).__name__}
+    ok = bool(isinstance(result, dict) and result.get("ok"))
+    result_reason = "live_api_reconciled" if ok else (result.get("reason") if isinstance(result, dict) else "live_api_reconcile_failed")
+    setattr(bot, "_last_live_api_guard_reconcile_ts", now)
+    setattr(bot, "_last_live_api_guard_reconcile_ok", ok)
+    setattr(bot, "_last_live_api_guard_reconcile_reason", result_reason)
+    after_count = len(_open_positions(bot))
+    after_same = _same_ticker_open(bot, ticker)
+    should_log = bool(ok and (before_count != after_count or before_same != after_same))
+    should_log = bool(should_log or not ok)
+    if should_log:
+        try:
+            print(
+                "[AION-LIVE-STATE-OVERRIDE] "
+                + json.dumps(
+                    {
+                        "ok": ok,
+                        "reason": reason,
+                        "ticker": ticker,
+                        "before_open_positions": before_count,
+                        "after_open_positions": after_count,
+                        "before_same_ticker_open": before_same,
+                        "after_same_ticker_open": after_same,
+                        "api_reason": result.get("reason") if isinstance(result, dict) else None,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+    return {
+        "ok": ok,
+        "refreshed": True,
+        "reason": result_reason,
+    }
+
+
 def is_on_cooldown(bot, ticker):
     ticker = str(ticker or "").strip()
     if not ticker:
@@ -119,6 +202,12 @@ def can_open_new_position(bot, q, *, max_simultaneous_live_positions, max_live_t
         live_realized_pnl_today = bot.to_float(getattr(bot, "live_realized_pnl_today", 0.0), 0.0) or 0.0
         if realized_pnl <= -max_daily_loss or live_realized_pnl_today <= -max_daily_loss:
             return False, "daily_loss_guard"
+    _refresh_live_positions_for_guard(
+        bot,
+        ticker=ticker,
+        reason="can_open_duplicate_guard",
+        min_interval_sec=15.0,
+    )
     if bot.already_holding(ticker):
         return False, "already_holding"
     return True, None
@@ -130,7 +219,13 @@ def should_enter_yes(bot, q, *, default_live_order_side):
 
 
 def get_live_exposure_snapshot(bot, candidate_ticker=None, candidate_family=None):
-    open_positions = bot._get_open_live_positions()
+    _refresh_live_positions_for_guard(
+        bot,
+        ticker=candidate_ticker,
+        reason="exposure_snapshot",
+        min_interval_sec=10.0,
+    )
+    open_positions = _open_positions(bot)
     by_family = Counter(
         bot.get_market_family({"ticker": position.get("ticker")})
         for position in open_positions
@@ -154,6 +249,12 @@ def check_live_duplicate_position_api(
 ):
     ticker = str(ticker or "").strip()
     family = ticker.split("-")[0].upper() if ticker else "UNKNOWN"
+    live_state = _refresh_live_positions_for_guard(
+        bot,
+        ticker=ticker,
+        reason="duplicate_live_api_guard",
+        min_interval_sec=5.0,
+    )
     recent_order = bot.recent_submitted_order_for_ticker(ticker)
     pending_family_orders = bot.recent_submitted_order_count_for_family(family)
     max_pending_family_orders = int(
@@ -166,7 +267,7 @@ def check_live_duplicate_position_api(
     same_ticker_open = bool(ticker and bot.already_holding(ticker))
     blocked = bool(ticker and (same_ticker_open or recent_order))
     matching = [
-        position for position in bot._get_open_live_positions()
+        position for position in _open_positions(bot)
         if isinstance(position, dict) and str(position.get("ticker") or "").strip() == ticker
     ]
     reason = "clear"
@@ -174,6 +275,23 @@ def check_live_duplicate_position_api(
         reason = "recent_order_pending_confirmation"
     elif same_ticker_open:
         reason = "duplicate_position_guard"
+    if same_ticker_open:
+        try:
+            print(
+                "[AION-DUPLICATE-LIVE-API-GUARD] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "reason": reason,
+                        "open_live_matches": len(matching),
+                        "live_state_reason": live_state.get("reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
     return {
         "blocked": blocked,
         "reason": reason,
@@ -214,7 +332,7 @@ def _position_family_exposure(bot, family, fallback_price=None):
     if not family_key:
         return 0.0
     exposure = 0.0
-    for position in bot._get_open_live_positions() or []:
+    for position in _open_positions(bot) or []:
         if not isinstance(position, dict):
             continue
         pos_ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
@@ -225,6 +343,26 @@ def _position_family_exposure(bot, family, fallback_price=None):
             except Exception:
                 pos_family = ""
         if pos_family != family_key:
+            continue
+        direct_exposure = bot.to_float(
+            position.get("market_exposure_dollars")
+            or position.get("exposure_dollars")
+            or position.get("cost_dollars")
+            or position.get("notional_dollars"),
+            None,
+        )
+        if direct_exposure is not None and direct_exposure > 0.0:
+            exposure += float(direct_exposure)
+            continue
+        direct_exposure_cents = bot.to_float(
+            position.get("market_exposure_cents")
+            or position.get("exposure_cents")
+            or position.get("cost_cents")
+            or position.get("notional_cents"),
+            None,
+        )
+        if direct_exposure_cents is not None and direct_exposure_cents > 0.0:
+            exposure += float(direct_exposure_cents) / 100.0
             continue
         count = bot.to_float(
             position.get("count")
@@ -237,6 +375,8 @@ def _position_family_exposure(bot, family, fallback_price=None):
         price = _contract_price(
             bot,
             position.get("entry_price")
+            or position.get("avg_price")
+            or position.get("average_price")
             or position.get("price")
             or position.get("selected_price")
             or position.get("selected_price_dollars")
@@ -329,7 +469,35 @@ def evaluate_live_order_risk_governor(
         live_realized_pnl_today = bot.to_float(getattr(bot, "live_realized_pnl_today", 0.0), 0.0) or 0.0
         if realized_pnl <= -daily_loss or live_realized_pnl_today <= -daily_loss:
             return _block("daily_loss_guard")
+    live_state = _refresh_live_positions_for_guard(
+        bot,
+        ticker=ticker,
+        reason="risk_governor_pre_submit",
+        min_interval_sec=2.0,
+    )
+    if (
+        not live_state.get("ok", True)
+        and str(live_state.get("reason") or "").strip().lower()
+        not in {"missing_auth_config", "auth_not_ready", "live_auth_unavailable"}
+    ):
+        return _block("live_position_reconcile_unavailable")
     if bot.already_holding(ticker):
+        try:
+            print(
+                "[AION-DUPLICATE-LIVE-API-GUARD] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "reason": "duplicate_position_guard",
+                        "live_state_reason": live_state.get("reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
         return _block("duplicate_position_guard")
     recent_order = bot.recent_submitted_order_for_ticker(ticker)
     if recent_order:
@@ -349,6 +517,24 @@ def evaluate_live_order_risk_governor(
             cap_reasons.append("max_dollars_per_trade")
     max_family = float(max_family_exposure_dollars or 0.0)
     current_family_exposure = _position_family_exposure(bot, family, selected_price)
+    if current_family_exposure > 0.0:
+        try:
+            print(
+                "[AION-EXPOSURE-RECONCILE] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "current_family_exposure_dollars": round(current_family_exposure, 4),
+                        "candidate_notional_dollars": round(float(count) * float(selected_price), 4),
+                        "max_family_exposure_dollars": round(max_family, 4),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
     if max_family > 0.0:
         remaining_family = max(0.0, max_family - current_family_exposure)
         family_cap = int(remaining_family / selected_price)

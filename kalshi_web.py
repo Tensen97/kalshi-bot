@@ -42521,20 +42521,87 @@ class KalshiSniperBot:
             if root.get("yes_price") is not None
             else root.get("no_price")
         )
-        count = (
+        filled_count = (
             root.get("filled_count")
             if root.get("filled_count") is not None
+            else root.get("fill_count")
+            if root.get("fill_count") is not None
+            else root.get("filled_count_fp")
+            if root.get("filled_count_fp") is not None
+            else root.get("fill_count_fp")
+            if root.get("fill_count_fp") is not None
+            else root.get("filled_quantity")
+        )
+        initial_count = (
+            root.get("initial_count")
+            if root.get("initial_count") is not None
+            else root.get("initial_count_fp")
+            if root.get("initial_count_fp") is not None
             else root.get("count")
             if root.get("count") is not None
             else root.get("count_fp")
         )
+        remaining_count = (
+            root.get("remaining_count")
+            if root.get("remaining_count") is not None
+            else root.get("remaining_count_fp")
+        )
+        status = str(root.get("status") or root.get("state") or "").strip().lower()
+        count = filled_count
+        if count is None and status in {"executed", "filled", "closed", "settled"}:
+            count = initial_count
+        if count is None and not status:
+            count = initial_count
+        if filled_count is None and remaining_count is not None and initial_count is not None:
+            try:
+                count = max(0.0, float(initial_count) - float(remaining_count))
+            except (TypeError, ValueError):
+                pass
+        action = str(root.get("action") or root.get("type") or "").strip().lower() or None
+        if not side and root.get("yes_price") is not None:
+            side = "yes"
+        if not side and root.get("no_price") is not None:
+            side = "no"
+        if side in {"buy_yes", "yes_buy"}:
+            side = "yes"
+        elif side in {"buy_no", "no_buy"}:
+            side = "no"
+        normalized_price = self.normalize_contract_price(price, ticker=ticker, source="extract_order_execution_summary")
+        filled_count_value = self.to_float(count, None)
+        initial_count_value = self.to_float(initial_count, None)
+        remaining_count_value = self.to_float(remaining_count, None)
+        raw_keys = sorted(str(key) for key in root.keys())
+        if any(key in root for key in ("fill_count_fp", "initial_count_fp", "remaining_count_fp", "position_fp")):
+            try:
+                print(
+                    "[AION-API-SCHEMA-AUDIT] "
+                    + json.dumps(
+                        {
+                            "parser": "order",
+                            "ticker": ticker,
+                            "keys": raw_keys[:40],
+                            "status": status or None,
+                            "filled_count": filled_count_value,
+                            "initial_count": initial_count_value,
+                            "remaining_count": remaining_count_value,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         return {
             "order_id": root.get("order_id") or root.get("id"),
             "ticker": ticker,
             "side": side,
-            "price": self.normalize_contract_price(price, ticker=ticker, source="extract_order_execution_summary"),
-            "filled_count": self.to_float(count, None),
-            "status": root.get("status"),
+            "action": action,
+            "price": normalized_price,
+            "filled_count": filled_count_value,
+            "initial_count": initial_count_value,
+            "remaining_count": remaining_count_value,
+            "status": status or root.get("status"),
+            "raw": root,
         }
 
     def extract_position_summary(self, position=None):
@@ -42565,20 +42632,48 @@ class KalshiSniperBot:
             else position.get("entry_price")
         )
         normalized_avg_price = self.normalize_contract_price(avg_price, ticker=ticker, source="extract_position_summary")
+        market_exposure = self.to_float(position.get("market_exposure_dollars"), None)
+        if market_exposure is None:
+            market_exposure_cents = self.to_float(position.get("market_exposure_cents"), None)
+            if market_exposure_cents is not None:
+                market_exposure = market_exposure_cents / 100.0
+        if market_exposure is None:
+            market_exposure = self.to_float(position.get("market_exposure"), None)
+            if market_exposure is not None and market_exposure > 1.0:
+                market_exposure = market_exposure / 100.0
         if normalized_avg_price is None:
-            market_exposure = self.to_float(position.get("market_exposure_dollars"), None)
-            if market_exposure is None:
-                market_exposure = self.to_float(position.get("market_exposure"), None)
-                if market_exposure is not None and market_exposure > 1.0:
-                    market_exposure = market_exposure / 100.0
             if market_exposure is not None and abs(count) > 0:
                 normalized_avg_price = round(float(market_exposure) / abs(float(count)), 6)
+        realized_pnl = self.to_float(
+            position.get("realized_pnl_dollars")
+            if position.get("realized_pnl_dollars") is not None
+            else position.get("pnl_dollars")
+            if position.get("pnl_dollars") is not None
+            else position.get("realized_pnl"),
+            None,
+        )
+        fees_paid = self.to_float(
+            position.get("fees_paid_dollars")
+            if position.get("fees_paid_dollars") is not None
+            else position.get("fees_dollars"),
+            None,
+        )
+        total_traded = self.to_float(
+            position.get("total_traded_dollars")
+            if position.get("total_traded_dollars") is not None
+            else position.get("volume_dollars"),
+            None,
+        )
         status = "open" if abs(count) > 0 else "closed"
         return {
             "ticker": ticker,
             "side": side,
             "count": abs(count),
             "avg_price": normalized_avg_price,
+            "market_exposure_dollars": None if market_exposure is None else round(float(market_exposure), 6),
+            "realized_pnl": None if realized_pnl is None else round(float(realized_pnl), 6),
+            "fees_paid_dollars": None if fees_paid is None else round(float(fees_paid), 6),
+            "total_traded_dollars": None if total_traded is None else round(float(total_traded), 6),
             "status": status,
             "updated_ts": time.time(),
             "raw": position,
@@ -42630,6 +42725,34 @@ class KalshiSniperBot:
             for row in (raw_positions or [])
             if isinstance(row, dict)
         ]
+        try:
+            raw_position_keys = sorted(
+                {
+                    str(key)
+                    for row in (raw_positions or [])
+                    if isinstance(row, dict)
+                    for key in row.keys()
+                }
+            )
+            schema_signature = "|".join(raw_position_keys)
+            if schema_signature and getattr(self, "_last_live_position_schema_signature", None) != schema_signature:
+                self._last_live_position_schema_signature = schema_signature
+                print(
+                    "[AION-API-SCHEMA-AUDIT] "
+                    + json.dumps(
+                        {
+                            "endpoint": "/trade-api/v2/portfolio/positions",
+                            "body_keys": sorted(str(key) for key in body.keys())[:40],
+                            "position_keys": raw_position_keys[:60],
+                            "raw_position_count": len(raw_positions or []),
+                            "normalized_count": len(normalized),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        except Exception:
+            pass
         previous_state = self.load_live_position_state()
         normalized_by_ticker = {
             str(row.get("ticker") or "").strip(): row
@@ -42655,14 +42778,41 @@ class KalshiSniperBot:
                 or closed_summary.get("exit_price")
             )
             count = self.to_float(entry.get("count") or closed_summary.get("count"), None)
+            api_realized_pnl = self.to_float(closed_summary.get("realized_pnl"), None)
             realized_pnl = self.to_float(
-                entry.get("realized_pnl")
+                api_realized_pnl
+                if api_realized_pnl is not None
+                else entry.get("realized_pnl")
                 or entry.get("pnl_dollars")
                 or entry.get("unrealized_pnl_at_exit"),
                 None,
             )
             if realized_pnl is None and entry_price is not None and exit_price is not None and count is not None:
                 realized_pnl = round((exit_price - entry_price) * abs(float(count)), 6)
+            original_cost = None
+            settled_payout = None
+            if entry_price is not None and count is not None:
+                original_cost = round(float(entry_price) * abs(float(count)), 6)
+                if realized_pnl is not None:
+                    settled_payout = round(float(original_cost) + float(realized_pnl), 6)
+            if api_realized_pnl is not None:
+                try:
+                    print(
+                        "[AION-SETTLEMENT-PNL-RECONCILE] "
+                        + json.dumps(
+                            {
+                                "ticker": ticker,
+                                "realized_pnl": realized_pnl,
+                                "original_cost_dollars": original_cost,
+                                "settled_payout_dollars": settled_payout,
+                                "source": "kalshi_position_realized_pnl",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                except Exception:
+                    pass
             hold_seconds = self.to_float(entry.get("hold_seconds"), None)
             if hold_seconds is None and self.to_float(entry.get("entry_ts"), None) is not None:
                 hold_seconds = round(max(0.0, time.time() - float(entry.get("entry_ts"))), 3)
@@ -42680,6 +42830,10 @@ class KalshiSniperBot:
                     "count": count,
                     "pnl_dollars": realized_pnl,
                     "realized_pnl": realized_pnl,
+                    "original_cost_dollars": original_cost,
+                    "settled_payout_dollars": settled_payout,
+                    "fees_paid_dollars": closed_summary.get("fees_paid_dollars"),
+                    "total_traded_dollars": closed_summary.get("total_traded_dollars"),
                     "hold_seconds": hold_seconds,
                     "sports_memory_context": entry_context.get("sports_memory_context") if isinstance(entry_context, dict) else {},
                     "sports_memory_dimensions": entry_context.get("sports_memory_dimensions") if isinstance(entry_context, dict) else {},

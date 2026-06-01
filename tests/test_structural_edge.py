@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import kalshi_web as kw
+from sports import live_intelligence as sli
 from kalshi_sniper.candidate_quality import compute_candidate_ev
 
 
@@ -91,6 +92,75 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(summary["count"], 5.0)
         self.assertEqual(summary["status"], "open")
         self.assertAlmostEqual(summary["avg_price"], 0.314)
+        self.assertEqual(summary["realized_pnl"], 0.0)
+        self.assertAlmostEqual(summary["market_exposure_dollars"], 1.57)
+
+    def test_extract_order_execution_summary_uses_kalshi_count_fp_fields(self):
+        bot = self._make_bot()
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = bot.extract_order_execution_summary(
+                {
+                    "order": {
+                        "id": "order-1",
+                        "market_ticker": "KXMLBHRRBI-26JUN01ARISEA-PERDOMO3",
+                        "side": "yes",
+                        "action": "buy",
+                        "yes_price": 47,
+                        "initial_count_fp": "4.00",
+                        "fill_count_fp": "2.00",
+                        "remaining_count_fp": "2.00",
+                        "status": "partially_filled",
+                    }
+                }
+            )
+        self.assertEqual(summary["ticker"], "KXMLBHRRBI-26JUN01ARISEA-PERDOMO3")
+        self.assertEqual(summary["side"], "yes")
+        self.assertEqual(summary["action"], "buy")
+        self.assertAlmostEqual(summary["price"], 0.47)
+        self.assertEqual(summary["filled_count"], 2.0)
+        self.assertEqual(summary["initial_count"], 4.0)
+        self.assertEqual(summary["remaining_count"], 2.0)
+
+    def test_sizing_account_value_treats_kalshi_balance_as_cents(self):
+        bot = self._make_bot()
+        bot.live_balance = {"balance": 7174, "portfolio_value": 47, "exchange_index": 0}
+        account_value = sli._aion_sizing_account_value(bot)
+        self.assertAlmostEqual(account_value, 72.21)
+
+    def test_position_sizing_cap_includes_existing_same_game_exposure(self):
+        bot = self._make_bot()
+        bot.live_positions = [
+            {
+                "ticker": "KXMLBHRRBI-26JUN01ARISEA-PERDOMO3",
+                "family": "KXMLBHRRBI",
+                "status": "open",
+                "count": 1,
+                "avg_price": 0.47,
+            }
+        ]
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": bot.live_positions}
+        q = SimpleNamespace(
+            ticker="KXMLBHRRBI-26JUN01ARISEA-RODRIGUEZ2",
+            family="KXMLBHRRBI",
+            selected_side="yes",
+            selected_price=0.47,
+            unified_opportunity_score=70,
+            edge_after_cost=0.03,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            adjusted, details = sli._apply_position_sizing_intelligence(
+                bot,
+                q,
+                planned_size=2,
+                selected_price=0.47,
+                payload={"ticker": q.ticker, "family": q.family, "side": "yes"},
+                ev_context={"account_value": 10.0, "ticker": q.ticker, "family": q.family},
+                hard_max=5,
+                source="unit_test",
+            )
+        self.assertEqual(adjusted, 0)
+        self.assertEqual(details["existing_exposure_dollars"], 0.47)
+        self.assertEqual(details["reason"], "standard_same_thesis_account_pct_cap_exhausted")
 
     def test_reduce_only_live_order_uses_ioc_time_in_force(self):
         bot = self._make_bot()

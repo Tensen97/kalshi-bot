@@ -8,6 +8,9 @@ import kalshi_risk
 class RiskBotStub:
     def __init__(self):
         self.live_positions = []
+        self.reconcile_positions = None
+        self.reconcile_ok = True
+        self.reconcile_calls = 0
         self.recent_orders = {}
         self.trading_halted = False
         self.realized_pnl = 0.0
@@ -34,6 +37,12 @@ class RiskBotStub:
             for position in self.live_positions
             if str(position.get("status", "open") or "open").lower() == "open"
         ]
+
+    def reconcile_live_positions(self):
+        self.reconcile_calls += 1
+        if self.reconcile_positions is not None:
+            self.live_positions = list(self.reconcile_positions)
+        return {"ok": self.reconcile_ok, "positions": self.live_positions}
 
     def already_holding(self, ticker):
         ticker = str(ticker or "").strip()
@@ -113,6 +122,23 @@ class RiskGovernorTests(unittest.TestCase):
         result = self._evaluate(bot=bot)
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "duplicate_position_guard")
+
+    def test_duplicate_guard_refreshes_live_api_truth_before_submit(self):
+        bot = RiskBotStub()
+        bot.reconcile_positions = [{"ticker": "KXNCAABSPREAD-PURMICH", "count": 1, "avg_price": 0.40}]
+        result = self._evaluate(bot=bot)
+        self.assertEqual(bot.reconcile_calls, 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "duplicate_position_guard")
+
+    def test_family_exposure_counts_api_reconciled_avg_price(self):
+        bot = RiskBotStub()
+        bot.reconcile_positions = [
+            {"ticker": "KXNCAABSPREAD-OTHER", "family": "KXNCAABSPREAD", "count": 10, "avg_price": 0.50}
+        ]
+        result = self._evaluate(bot=bot)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "max_family_exposure")
 
     def test_daily_loss_blocks(self):
         bot = RiskBotStub()
