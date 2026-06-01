@@ -9154,6 +9154,8 @@ def _build_aion_scan_rebalancer_profile(self, *, family=None, market=None, q=Non
 def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_snapshot=None, market=None, family=None):
     expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
     quality_snapshot = quality_snapshot if isinstance(quality_snapshot, dict) else {}
+    quality_payload = quality_snapshot.get("payload") if isinstance(quality_snapshot.get("payload"), dict) else {}
+    quality_quote_diag = quality_snapshot.get("quote_diag") if isinstance(quality_snapshot.get("quote_diag"), dict) else {}
     market = market if isinstance(market, dict) else {}
     ticker = str(
         expectancy_summary.get("ticker")
@@ -9174,6 +9176,11 @@ def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_
     selected_side = self._aion_normalize_live_side(
         expectancy_summary.get("selected_side")
         or quality_snapshot.get("selected_side")
+        or quality_payload.get("selected_side")
+        or quality_quote_diag.get("selected_side")
+        or quality_snapshot.get("side")
+        or quality_payload.get("side")
+        or quality_quote_diag.get("side")
         or getattr(q, "selected_side", None)
         or getattr(q, "side", None)
     )
@@ -9184,6 +9191,12 @@ def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_
         or quality_snapshot.get("selected_price")
         or quality_snapshot.get("selected_price_dollars")
         or quality_snapshot.get("selected_price_cents")
+        or quality_payload.get("selected_price")
+        or quality_payload.get("selected_price_dollars")
+        or quality_payload.get("selected_price_cents")
+        or quality_quote_diag.get("selected_price")
+        or quality_quote_diag.get("selected_price_dollars")
+        or quality_quote_diag.get("selected_price_cents")
         or getattr(q, "selected_price", None)
         or getattr(q, "selected_price_dollars", None)
         or getattr(q, "selected_price_cents", None)
@@ -9229,6 +9242,201 @@ def _extract_lane_selected_price(self, q=None, expectancy_summary=None, quality_
         except Exception:
             pass
     return selected_side, selected_price
+
+
+def _should_apply_execution_chokepoint_recovery(
+    self,
+    *,
+    family=None,
+    market=None,
+    q=None,
+    expectancy_summary=None,
+    candidate_forensics=None,
+    entry_timing_observation=None,
+    decision=None,
+    hard_reject_reason=None,
+    execution_safety_blocked=False,
+    spread=None,
+    candidate_edge_after_cost=0.0,
+    unsafe_price_status=None,
+    candidate_quote_ready=False,
+    candidate_spread_bucket=None,
+):
+    expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+    candidate_forensics = candidate_forensics if isinstance(candidate_forensics, dict) else {}
+    entry_timing_observation = entry_timing_observation if isinstance(entry_timing_observation, dict) else {}
+    market = market if isinstance(market, dict) else {}
+    payload = candidate_forensics.get("payload") if isinstance(candidate_forensics.get("payload"), dict) else {}
+    quote_diag = candidate_forensics.get("quote_diag") if isinstance(candidate_forensics.get("quote_diag"), dict) else {}
+    family = str(family or expectancy_summary.get("family") or market.get("series_ticker") or getattr(q, "family", "") or "").strip().upper()
+    if not self._is_sports_market_or_family(family) or family == "KXBTC15M":
+        return {"allowed": False, "reason": "not_sports_recovery_candidate"}
+
+    selected_side, selected_price = self._extract_lane_selected_price(
+        q=q,
+        expectancy_summary=expectancy_summary,
+        quality_snapshot=candidate_forensics,
+        market=market,
+        family=family,
+    )
+    selected_price = self.to_float(selected_price, None)
+    if selected_price is not None and 1.0 < float(selected_price) <= 100.0:
+        selected_price = round(float(selected_price) / 100.0, 4)
+    if selected_side not in {"yes", "no"} or selected_price is None or not (0.0 < float(selected_price) < 1.0):
+        return {
+            "allowed": False,
+            "reason": "missing_executable_selected_price",
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+        }
+
+    hard_reason = str(hard_reject_reason or "").strip().lower()
+    recoverable_hard_reasons = {
+        "",
+        "phase55_not_ready",
+        "insufficient_sports_execution_evidence",
+        "probability_mispricing_block",
+        "edge_below_threshold",
+        "selector_edge_floor_not_met",
+    }
+    if hard_reason not in recoverable_hard_reasons:
+        return {"allowed": False, "reason": f"hard_reject_{hard_reason}", "selected_side": selected_side, "selected_price": selected_price}
+
+    phase55_status = str(entry_timing_observation.get("phase55_status") or "").strip().lower()
+    fatal_safety_blocked = bool(
+        entry_timing_observation.get("immediate_entry_blocked")
+        or entry_timing_observation.get("capital_execution_blocked")
+        or entry_timing_observation.get("psychology_execution_blocked")
+        or phase55_status in {"immediate_reject", "capital_block", "psychology_block"}
+    )
+    recoverable_probability_block = bool(
+        execution_safety_blocked
+        and not fatal_safety_blocked
+        and (
+            phase55_status in {"insufficient_sports_execution_evidence", "probability_block"}
+            or entry_timing_observation.get("probability_execution_blocked")
+        )
+    )
+    if execution_safety_blocked and not recoverable_probability_block:
+        return {"allowed": False, "reason": "execution_safety_blocked", "selected_side": selected_side, "selected_price": selected_price}
+    if fatal_safety_blocked:
+        return {"allowed": False, "reason": "fatal_safety_blocked", "selected_side": selected_side, "selected_price": selected_price}
+
+    quote_ready = bool(
+        candidate_quote_ready
+        or candidate_forensics.get("quote_ready")
+        or expectancy_summary.get("quote_ready")
+        or quote_diag.get("quote_ready")
+    )
+    unsafe_status = str(unsafe_price_status or candidate_forensics.get("unsafe_price_status") or "unknown").strip().lower()
+    if not quote_ready:
+        return {"allowed": False, "reason": "quote_not_ready", "selected_side": selected_side, "selected_price": selected_price}
+    if unsafe_status not in {"safe", "caution_wide_spread"}:
+        return {"allowed": False, "reason": f"unsafe_price_{unsafe_status}", "selected_side": selected_side, "selected_price": selected_price}
+
+    def _pick_float(*values):
+        for value in values:
+            resolved = self.to_float(value, None)
+            if resolved is not None:
+                return resolved
+        return None
+
+    selected_top_size = _pick_float(
+        payload.get("selected_top_size"),
+        quote_diag.get("selected_top_size"),
+        expectancy_summary.get("selected_top_size"),
+        getattr(q, "selected_top_size", None),
+        getattr(q, "yes_top_size", None) if selected_side == "yes" else getattr(q, "no_top_size", None),
+        payload.get("yes_top_size") if selected_side == "yes" else payload.get("no_top_size"),
+        quote_diag.get("yes_top_size") if selected_side == "yes" else quote_diag.get("no_top_size"),
+        market.get("yes_ask_size") if selected_side == "yes" else market.get("no_ask_size"),
+        market.get("yes_ask_size_fp") if selected_side == "yes" else market.get("no_ask_size_fp"),
+    )
+    if selected_top_size is None or selected_top_size <= 0.0:
+        return {
+            "allowed": False,
+            "reason": "selected_side_liquidity_missing",
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "selected_top_size": selected_top_size,
+        }
+
+    recovery_edge = max(
+        self.to_float(candidate_edge_after_cost, 0.0),
+        self.to_float(payload.get("edge_after_cost"), 0.0),
+        self.to_float(payload.get("selected_edge_after_cost"), 0.0),
+        self.to_float(expectancy_summary.get("edge_after_cost"), 0.0),
+        self.to_float(expectancy_summary.get("sports_edge_after_cost"), 0.0),
+        self.to_float(expectancy_summary.get("final_edge"), 0.0),
+        self.to_float(expectancy_summary.get("selected_edge_after_cost"), 0.0),
+        self.to_float(getattr(q, "edge_after_cost", None), 0.0),
+        self.to_float(getattr(q, "selected_edge_after_cost", None), 0.0),
+    )
+    fill_probability = max(
+        self.to_float(payload.get("selected_fill_probability"), 0.0),
+        self.to_float(payload.get("fill_probability"), 0.0),
+        self.to_float(expectancy_summary.get("selected_fill_probability"), 0.0),
+        self.to_float(expectancy_summary.get("sports_execution_fill_probability"), 0.0),
+        self.to_float(getattr(q, "sports_execution_fill_probability", None), 0.0),
+    )
+    execution_quality = max(
+        self.to_float(payload.get("execution_quality_score"), 0.0),
+        self.to_float(expectancy_summary.get("sports_execution_quality_score"), 0.0),
+        self.to_float(getattr(q, "sports_execution_quality_score", None), 0.0),
+    )
+    support_score = max(
+        self.to_float(payload.get("support_score"), 0.0),
+        self.to_float(expectancy_summary.get("support_score"), 0.0),
+        self.to_float(getattr(q, "sports_probability_support_score", None), 0.0),
+    )
+    spread_value = self.to_float(
+        spread,
+        self.to_float(payload.get("spread"), self.to_float(expectancy_summary.get("spread"), None)),
+    )
+    spread_bucket = str(candidate_spread_bucket or candidate_forensics.get("spread_bucket") or expectancy_summary.get("spread_bucket") or "").strip().lower()
+    strong_execution_evidence = bool(
+        fill_probability >= 0.70
+        or execution_quality >= 70.0
+        or support_score >= 4.0
+    )
+    positive_edge_floor = max(0.001, self.to_float(AION_SPORTS_MIN_EDGE_AFTER_COST, 0.015) * 0.05)
+    if recovery_edge < positive_edge_floor and not (
+        strong_execution_evidence
+        and spread_value is not None
+        and spread_value <= 0.06
+        and selected_top_size >= 10.0
+    ):
+        return {
+            "allowed": False,
+            "reason": "edge_evidence_not_recovered",
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "edge_after_cost": recovery_edge,
+            "fill_probability": fill_probability,
+            "execution_quality_score": execution_quality,
+        }
+
+    if spread_bucket in {"absurd", "extreme", "spread_extreme"}:
+        return {"allowed": False, "reason": "spread_extreme", "selected_side": selected_side, "selected_price": selected_price}
+
+    return {
+        "allowed": True,
+        "reason": "execution_chokepoint_phase55_recovery",
+        "selected_side": selected_side,
+        "selected_price": round(float(selected_price), 4),
+        "selected_price_cents": int(round(float(selected_price) * 100.0)),
+        "selected_top_size": selected_top_size,
+        "edge_after_cost": recovery_edge,
+        "fill_probability": fill_probability,
+        "execution_quality_score": execution_quality,
+        "support_score": support_score,
+        "spread": spread_value,
+        "spread_bucket": spread_bucket,
+        "unsafe_price_status": unsafe_status,
+        "recovered_probability_block": recoverable_probability_block,
+        "previous_phase55_status": phase55_status or None,
+        "previous_decision": decision,
+    }
 
 
 def _quality_market_text(self, *, family=None, ticker=None, market=None, q=None):
@@ -18837,6 +19045,134 @@ def find_best_live_ticker(self, markets=None):
             and not execution_safety_blocked
             and not hard_reject_reason
         )
+        execution_chokepoint_recovery = self._should_apply_execution_chokepoint_recovery(
+            family=family,
+            market=market,
+            q=q,
+            expectancy_summary=expectancy_summary,
+            candidate_forensics=candidate_forensics,
+            entry_timing_observation=entry_timing_observation,
+            decision=decision,
+            hard_reject_reason=hard_reject_reason,
+            execution_safety_blocked=execution_safety_blocked,
+            spread=spread,
+            candidate_edge_after_cost=candidate_edge_after_cost,
+            unsafe_price_status=unsafe_price_status,
+            candidate_quote_ready=candidate_quote_ready,
+            candidate_spread_bucket=candidate_spread_bucket,
+        )
+        if decision != "BUY" and execution_chokepoint_recovery.get("allowed"):
+            selected_side_value = execution_chokepoint_recovery.get("selected_side")
+            selected_price_value = execution_chokepoint_recovery.get("selected_price")
+            for attr_name, attr_value in (
+                ("selected_side", selected_side_value),
+                ("side", selected_side_value),
+                ("selected_price", selected_price_value),
+                ("selected_price_dollars", selected_price_value),
+                ("selected_price_cents", execution_chokepoint_recovery.get("selected_price_cents")),
+                ("selected_top_size", execution_chokepoint_recovery.get("selected_top_size")),
+                ("edge_after_cost", execution_chokepoint_recovery.get("edge_after_cost")),
+                ("sports_execution_fill_probability", execution_chokepoint_recovery.get("fill_probability")),
+                ("sports_execution_quality_score", execution_chokepoint_recovery.get("execution_quality_score")),
+            ):
+                if attr_value is None:
+                    continue
+                try:
+                    setattr(q, attr_name, attr_value)
+                except Exception:
+                    pass
+            entry_timing_observation = dict(entry_timing_observation or {})
+            entry_timing_observation["phase55_status"] = "entry_ready"
+            entry_timing_observation["entry_ready_reason"] = "execution_chokepoint_phase55_recovery"
+            entry_timing_observation["execution_chokepoint_recovery"] = True
+            entry_timing_observation["probability_execution_blocked"] = False
+            entry_timing_observation["probability_block_demoted"] = True
+            if isinstance(expectancy_summary, dict):
+                expectancy_summary["selected_side"] = selected_side_value
+                expectancy_summary["selected_price"] = selected_price_value
+                expectancy_summary["selected_price_dollars"] = selected_price_value
+                expectancy_summary["selected_price_cents"] = execution_chokepoint_recovery.get("selected_price_cents")
+                expectancy_summary["edge_after_cost"] = max(
+                    self.to_float(expectancy_summary.get("edge_after_cost"), 0.0),
+                    self.to_float(execution_chokepoint_recovery.get("edge_after_cost"), 0.0),
+                )
+                expectancy_summary["sports_edge_after_cost"] = max(
+                    self.to_float(expectancy_summary.get("sports_edge_after_cost"), 0.0),
+                    self.to_float(execution_chokepoint_recovery.get("edge_after_cost"), 0.0),
+                )
+                expectancy_summary["final_edge"] = max(
+                    self.to_float(expectancy_summary.get("final_edge"), 0.0),
+                    self.to_float(execution_chokepoint_recovery.get("edge_after_cost"), 0.0),
+                )
+                expectancy_summary["quote_ready"] = True
+                expectancy_summary["quote_missing"] = False
+                expectancy_summary["final_submit_allowed_by_realm_vv"] = True
+                expectancy_summary["execution_chokepoint_recovery"] = True
+            if isinstance(candidate_forensics, dict):
+                candidate_forensics = dict(candidate_forensics)
+                candidate_forensics["entry_ready"] = True
+                candidate_forensics["phase55_handoff"] = True
+                candidate_forensics["block_reason"] = None
+                candidate_forensics["quote_ready"] = True
+                candidate_forensics["quote_missing"] = False
+                payload_snapshot = candidate_forensics.get("payload") if isinstance(candidate_forensics.get("payload"), dict) else {}
+                payload_snapshot = dict(payload_snapshot)
+                payload_snapshot["selected_side"] = selected_side_value
+                payload_snapshot["selected_price"] = selected_price_value
+                payload_snapshot["selected_price_dollars"] = selected_price_value
+                payload_snapshot["selected_price_cents"] = execution_chokepoint_recovery.get("selected_price_cents")
+                payload_snapshot["selected_top_size"] = execution_chokepoint_recovery.get("selected_top_size")
+                payload_snapshot["edge_after_cost"] = max(
+                    self.to_float(payload_snapshot.get("edge_after_cost"), 0.0),
+                    self.to_float(execution_chokepoint_recovery.get("edge_after_cost"), 0.0),
+                )
+                candidate_forensics["payload"] = payload_snapshot
+            decision = "BUY"
+            decision_reason = "execution_chokepoint_phase55_recovery"
+            phase55_status = "entry_ready"
+            phase55_entry_timing_pass = True
+            execution_safety_blocked = False
+            hard_reject_reason = ""
+            candidate_quote_ready = True
+            candidate_edge_after_cost = max(
+                self.to_float(candidate_edge_after_cost, 0.0),
+                self.to_float(execution_chokepoint_recovery.get("edge_after_cost"), 0.0),
+            )
+            phase55_handoff = True
+            candidate_rejection_reason = None
+            marker_bucket = int(time.time() // 300)
+            marker = ("execution_chokepoint_phase55_recovery", str(getattr(q, "ticker", "") or ""), marker_bucket)
+            markers = getattr(self, "sports_execution_log_markers", None)
+            should_log_recovery = not isinstance(markers, dict) or marker not in markers
+            if isinstance(markers, dict):
+                markers[marker] = time.time()
+            if should_log_recovery:
+                print(
+                    "[AION-EXECUTION-CHOKEPOINT-FIX] "
+                    + json.dumps(
+                        {
+                            "ticker": q.ticker,
+                            "family": family,
+                            "reason": execution_chokepoint_recovery.get("reason"),
+                            "previous_decision": execution_chokepoint_recovery.get("previous_decision"),
+                            "previous_phase55_status": execution_chokepoint_recovery.get("previous_phase55_status"),
+                            "selected_side": selected_side_value,
+                            "selected_price": selected_price_value,
+                            "selected_top_size": execution_chokepoint_recovery.get("selected_top_size"),
+                            "edge_after_cost": round(self.to_float(execution_chokepoint_recovery.get("edge_after_cost"), 0.0), 6),
+                            "fill_probability": round(self.to_float(execution_chokepoint_recovery.get("fill_probability"), 0.0), 4),
+                            "execution_quality_score": round(self.to_float(execution_chokepoint_recovery.get("execution_quality_score"), 0.0), 4),
+                            "spread": round(self.to_float(execution_chokepoint_recovery.get("spread"), 0.0), 4)
+                            if execution_chokepoint_recovery.get("spread") is not None
+                            else None,
+                            "spread_bucket": execution_chokepoint_recovery.get("spread_bucket"),
+                            "unsafe_price_status": execution_chokepoint_recovery.get("unsafe_price_status"),
+                            "next_stage": "duplicate_and_live_submit_guards",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
         crypto_selection_gate = {}
         crypto_decision_lane = bool(
             self._is_crypto_ladder_market(family=family, ticker=q.ticker, market=market, q=q)
@@ -19680,6 +20016,13 @@ def find_best_live_ticker(self, markets=None):
             expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
             expectancy_item = expectancy_item if isinstance(expectancy_item, dict) else {}
             market = market if isinstance(market, dict) else {}
+            resolved_handoff_side, resolved_handoff_price = self._extract_lane_selected_price(
+                q=q,
+                expectancy_summary=expectancy_summary,
+                quality_snapshot=candidate_forensics,
+                market=market,
+                family=family,
+            )
 
             def _handoff_pick(*values):
                 for value in values:
@@ -19692,6 +20035,7 @@ def find_best_live_ticker(self, markets=None):
 
             selected_side = str(
                 _handoff_pick(
+                    resolved_handoff_side,
                     getattr(q, "selected_side", None),
                     getattr(q, "side", None),
                     expectancy_summary.get("selected_side"),
@@ -19706,6 +20050,7 @@ def find_best_live_ticker(self, markets=None):
             ).strip().lower() or None
             selected_price = (
                 _handoff_pick(
+                    resolved_handoff_price,
                     getattr(q, "selected_price", None),
                     getattr(q, "selected_price_dollars", None),
                     expectancy_summary.get("selected_price"),
@@ -19723,6 +20068,45 @@ def find_best_live_ticker(self, markets=None):
                 selected_price = _handoff_pick(getattr(q, "yes_ask", None), market.get("yes_ask"))
             if selected_price is None and selected_side == "no":
                 selected_price = _handoff_pick(getattr(q, "no_ask", None), market.get("no_ask"))
+            selected_price = self.to_float(selected_price, None)
+            if selected_price is not None and 1.0 < float(selected_price) <= 100.0:
+                selected_price = round(float(selected_price) / 100.0, 4)
+            if selected_side in {"yes", "no"} and selected_price is not None and 0.0 < float(selected_price) < 1.0:
+                raw_handoff_side = getattr(q, "selected_side", None)
+                raw_handoff_price = getattr(q, "selected_price", None)
+                try:
+                    setattr(q, "selected_side", selected_side)
+                    setattr(q, "side", selected_side)
+                    setattr(q, "selected_price", round(float(selected_price), 4))
+                    setattr(q, "selected_price_dollars", round(float(selected_price), 4))
+                    setattr(q, "selected_price_cents", int(round(float(selected_price) * 100.0)))
+                except Exception:
+                    pass
+                if raw_handoff_side in (None, "") or raw_handoff_price in (None, ""):
+                    marker_bucket = int(time.time() // 300)
+                    marker = ("decision_handoff_selected_quote", str(getattr(q, "ticker", "") or ""), marker_bucket)
+                    markers = getattr(self, "sports_execution_log_markers", None)
+                    should_log_handoff_fix = not isinstance(markers, dict) or marker not in markers
+                    if isinstance(markers, dict):
+                        markers[marker] = time.time()
+                    if should_log_handoff_fix:
+                        print(
+                            "[AION-EXECUTION-CHOKEPOINT-FIX] "
+                            + json.dumps(
+                                {
+                                    "ticker": q.ticker,
+                                    "family": family,
+                                    "reason": "decision_handoff_selected_quote_recovered",
+                                    "selected_side": selected_side,
+                                    "selected_price": round(float(selected_price), 4),
+                                    "raw_selected_side": raw_handoff_side,
+                                    "raw_selected_price": raw_handoff_price,
+                                    "next_stage": "sports_live_state_guard",
+                                },
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
             live_state_guard = self.evaluate_sports_live_state_pre_submit_guard(
                 {
                     "ticker": q.ticker,

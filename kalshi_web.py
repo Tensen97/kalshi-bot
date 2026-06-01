@@ -25178,6 +25178,9 @@ class KalshiSniperBot:
     def _extract_lane_selected_price(self, *args, **kwargs):
         return _call_sports_live_intelligence("_extract_lane_selected_price", self, *args, **kwargs)
 
+    def _should_apply_execution_chokepoint_recovery(self, *args, **kwargs):
+        return _call_sports_live_intelligence("_should_apply_execution_chokepoint_recovery", self, *args, **kwargs)
+
     def _quality_market_text(self, *args, **kwargs):
         return _call_sports_live_intelligence("_quality_market_text", self, *args, **kwargs)
 

@@ -4419,6 +4419,123 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreaterEqual(resolved, 1)
         self.assertLess(resolved, 10)
 
+    def test_lane_selected_price_uses_phase55_forensics_payload(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-LIVE-EDGE",
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.20,
+            yes_ask=0.22,
+            no_bid=0.78,
+            no_ask=0.80,
+            yes_top_size=120,
+            no_top_size=90,
+        )
+
+        selected_side, selected_price = bot._extract_lane_selected_price(
+            q=q,
+            expectancy_summary={},
+            quality_snapshot={
+                "payload": {
+                    "selected_side": "yes",
+                    "selected_price": 0.22,
+                    "selected_price_cents": 22,
+                }
+            },
+            market={"ticker": q.ticker, "series_ticker": q.family},
+            family=q.family,
+        )
+
+        self.assertEqual(selected_side, "yes")
+        self.assertAlmostEqual(selected_price, 0.22)
+
+    def test_execution_chokepoint_recovery_promotes_quote_ready_phase55_veto(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-LIVE-EDGE",
+            family="KXATPCHALLENGERMATCH",
+            yes_bid=0.20,
+            yes_ask=0.22,
+            no_bid=0.78,
+            no_ask=0.80,
+            yes_top_size=120,
+            no_top_size=90,
+        )
+
+        result = bot._should_apply_execution_chokepoint_recovery(
+            family=q.family,
+            market={"ticker": q.ticker, "series_ticker": q.family, "status": "open"},
+            q=q,
+            expectancy_summary={
+                "quote_ready": True,
+                "spread_bucket": "wide_but_possible",
+                "sports_execution_fill_probability": 0.75,
+            },
+            candidate_forensics={
+                "quote_ready": True,
+                "unsafe_price_status": "safe",
+                "spread_bucket": "wide_but_possible",
+                "payload": {
+                    "selected_side": "yes",
+                    "selected_price": 0.22,
+                    "selected_top_size": 120,
+                    "edge_after_cost": 0.0155,
+                    "selected_fill_probability": 0.75,
+                    "spread": 0.19,
+                },
+            },
+            entry_timing_observation={"phase55_status": "trigger_wait"},
+            decision="SKIP",
+            hard_reject_reason="",
+            execution_safety_blocked=False,
+            spread=0.19,
+            candidate_edge_after_cost=0.0,
+            unsafe_price_status="safe",
+            candidate_quote_ready=True,
+            candidate_spread_bucket="wide_but_possible",
+        )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["reason"], "execution_chokepoint_phase55_recovery")
+        self.assertEqual(result["selected_side"], "yes")
+        self.assertAlmostEqual(result["selected_price"], 0.22)
+
+    def test_execution_chokepoint_recovery_preserves_capital_safety_block(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-LIVE-BLOCK",
+            family="KXATPCHALLENGERMATCH",
+            selected_side="yes",
+            selected_price=0.22,
+            yes_top_size=120,
+            yes_bid=0.20,
+            yes_ask=0.22,
+        )
+
+        result = bot._should_apply_execution_chokepoint_recovery(
+            family=q.family,
+            market={"ticker": q.ticker, "series_ticker": q.family, "status": "open"},
+            q=q,
+            expectancy_summary={"quote_ready": True, "edge_after_cost": 0.02},
+            candidate_forensics={
+                "quote_ready": True,
+                "unsafe_price_status": "safe",
+                "payload": {"selected_side": "yes", "selected_price": 0.22, "selected_top_size": 120, "edge_after_cost": 0.02},
+            },
+            entry_timing_observation={"phase55_status": "capital_block", "capital_execution_blocked": True},
+            decision="SKIP",
+            hard_reject_reason="",
+            execution_safety_blocked=True,
+            spread=0.02,
+            candidate_edge_after_cost=0.02,
+            unsafe_price_status="safe",
+            candidate_quote_ready=True,
+            candidate_spread_bucket="tight",
+        )
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "execution_safety_blocked")
+
     def test_realm_vv_edge_floor_probability_block_becomes_sports_probability_cost(self):
         bot = self._make_bot()
         market = {
