@@ -42938,6 +42938,16 @@ class KalshiSniperBot:
             max_family_exposure_dollars=globals().get("AION_KELLY_MAX_FAMILY_EXPOSURE_DOLLARS", globals().get("REALM_XVIII_MAX_FAMILY_EXPOSURE_DOLLARS", 10.0)),
         )
 
+    def evaluate_opposite_side_pre_submit_guard(self, payload, q=None, *, source="pre_submit", refresh=True, live_state=None):
+        return kalshi_risk_module.evaluate_opposite_side_pre_submit_guard(
+            self,
+            payload,
+            q=q,
+            source=source,
+            refresh=refresh,
+            live_state=live_state,
+        )
+
     def should_enter_yes(self, q):
         return kalshi_risk_module.should_enter_yes(
             self,

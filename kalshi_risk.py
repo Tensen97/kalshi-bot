@@ -3,6 +3,7 @@
 from collections import Counter
 import json
 import os
+import re
 import time
 
 
@@ -387,6 +388,317 @@ def _position_family_exposure(bot, family, fallback_price=None):
     return max(0.0, exposure)
 
 
+def _guard_key(value):
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def _read_from_sources(sources, *names):
+    for source in sources:
+        if not source:
+            continue
+        if isinstance(source, dict):
+            for name in names:
+                value = source.get(name)
+                if value not in (None, ""):
+                    return value
+        else:
+            for name in names:
+                value = getattr(source, name, None)
+                if value not in (None, ""):
+                    return value
+    return None
+
+
+def _position_side(bot, position):
+    position = position if isinstance(position, dict) else {}
+    side = str(position.get("side") or position.get("outcome_side") or "").strip().lower()
+    if side in {"yes", "no"}:
+        return side
+    yes_count = bot.to_float(position.get("yes_count"), None)
+    no_count = bot.to_float(position.get("no_count"), None)
+    if no_count is not None and abs(float(no_count)) > 0.0 and not (yes_count is not None and abs(float(yes_count)) > 0.0):
+        return "no"
+    if yes_count is not None and abs(float(yes_count)) > 0.0:
+        return "yes"
+    raw_position = bot.to_float(position.get("position") if position.get("position") is not None else position.get("position_fp"), None)
+    if raw_position is not None and raw_position < 0:
+        return "no"
+    return "yes"
+
+
+def _position_count(bot, position):
+    position = position if isinstance(position, dict) else {}
+    value = bot.to_float(
+        position.get("count")
+        or position.get("contracts")
+        or position.get("contract_count")
+        or position.get("quantity")
+        or position.get("qty")
+        or position.get("position_fp")
+        or position.get("position")
+        or position.get("yes_count")
+        or position.get("no_count"),
+        0.0,
+    )
+    return abs(float(value or 0.0))
+
+
+def _is_local_open_position(bot, entry):
+    entry = entry if isinstance(entry, dict) else {}
+    status = str(entry.get("status", "open") or "open").strip().lower()
+    if status in {"closed", "settled", "cancelled", "canceled"}:
+        return False
+    return _position_count(bot, entry) > 0.0
+
+
+def _local_position_state(bot):
+    loader = getattr(bot, "load_live_position_state", None)
+    if not callable(loader):
+        return {}
+    try:
+        state = loader()
+    except Exception:
+        state = {}
+    return state if isinstance(state, dict) else {}
+
+
+def _open_positions_for_opposite_guard(bot, *, live_state=None):
+    local_state = _local_position_state(bot)
+    local_by_ticker = {
+        str((entry or {}).get("ticker") or ticker or "").strip(): entry
+        for ticker, entry in local_state.items()
+        if isinstance(entry, dict)
+    }
+    api_ok = bool(isinstance(live_state, dict) and live_state.get("ok"))
+    rows = []
+    seen = set()
+    for position in _open_positions(bot) or []:
+        if not isinstance(position, dict):
+            continue
+        ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
+        if not ticker or _position_count(bot, position) <= 0.0:
+            continue
+        merged = dict(position)
+        local = local_by_ticker.get(ticker)
+        if isinstance(local, dict):
+            for key, value in local.items():
+                if key == "entry_context" and isinstance(value, dict) and not isinstance(merged.get("entry_context"), dict):
+                    merged[key] = value
+                elif merged.get(key) in (None, "") and value not in (None, ""):
+                    merged[key] = value
+        merged["_aion_position_source"] = "live_api" if api_ok else "local_or_runtime"
+        rows.append(merged)
+        seen.add(ticker)
+    if not api_ok:
+        for ticker, entry in local_by_ticker.items():
+            if not ticker or ticker in seen or not _is_local_open_position(bot, entry):
+                continue
+            row = dict(entry)
+            row["ticker"] = str(row.get("ticker") or ticker).strip()
+            row["_aion_position_source"] = "local_state"
+            rows.append(row)
+    return rows
+
+
+def _candidate_family(bot, ticker, sources):
+    family = str(_read_from_sources(sources, "family", "series_ticker") or "").strip().upper()
+    if not family and ticker:
+        try:
+            family = str(bot.get_market_family({"ticker": ticker}) or "").strip().upper()
+        except Exception:
+            family = ticker.split("-")[0].upper()
+    return family or "UNKNOWN"
+
+
+def _sports_event_key(bot, ticker, family, sources):
+    game_id = _read_from_sources(sources, "game_id", "sports_graph_game_id")
+    if game_id not in (None, ""):
+        return f"{family}:{_guard_key(game_id)}"
+    event_ticker = _read_from_sources(sources, "event_ticker")
+    if event_ticker not in (None, ""):
+        return f"{family}:{_guard_key(event_ticker)}"
+    extractor = getattr(bot, "_extract_sports_game_key", None)
+    if callable(extractor) and ticker:
+        try:
+            return f"{family}:{_guard_key(extractor(ticker))}"
+        except Exception:
+            pass
+    parts = str(ticker or "").strip().split("-")
+    if len(parts) >= 2:
+        return f"{family}:{_guard_key(parts[1])}"
+    return f"{family}:{_guard_key(ticker)}" if ticker else ""
+
+
+def _outcome_slot(ticker):
+    parts = str(ticker or "").strip().split("-")
+    if len(parts) >= 3:
+        return _guard_key(parts[-1])
+    return ""
+
+
+def _profile_for_opposite_guard(bot, *, ticker, side, payload=None, q=None, position=None):
+    payload = payload if isinstance(payload, dict) else {}
+    position = position if isinstance(position, dict) else {}
+    entry_context = payload.get("entry_context") if isinstance(payload.get("entry_context"), dict) else {}
+    pos_entry_context = position.get("entry_context") if isinstance(position.get("entry_context"), dict) else {}
+    raw = position.get("raw") if isinstance(position.get("raw"), dict) else {}
+    sources = [payload, entry_context, position, pos_entry_context, raw, q]
+    family = _candidate_family(bot, ticker, sources)
+    event_key = _sports_event_key(bot, ticker, family, sources)
+    ladder_plan = _guard_key(_read_from_sources(sources, "sports_ladder_plan_id", "plan_id"))
+    role = _guard_key(_read_from_sources(sources, "sports_ladder_role", "sports_graph_role", "market_type", "role"))
+    thesis = _guard_key(_read_from_sources(sources, "game_thesis_type", "thesis_type", "sports_ladder_leg_type"))
+    return {
+        "ticker": ticker,
+        "family": family,
+        "side": side,
+        "event_key": event_key,
+        "outcome_slot": _outcome_slot(ticker),
+        "ladder_plan": ladder_plan,
+        "role": role,
+        "thesis": thesis,
+    }
+
+
+def _exclusive_outcome_family(family):
+    text = str(family or "").upper()
+    return any(token in text for token in ("MONEYLINE", "MATCH", "WINNER", "SPREAD"))
+
+
+def _opposite_total_tokens(left, right):
+    pair = {_guard_key(left), _guard_key(right)}
+    return bool(
+        {"OVER", "UNDER"} <= pair
+        or {"O", "U"} <= pair
+        or {"HIGH", "LOW"} <= pair
+    )
+
+
+def _opposite_side_conflict_reason(candidate, position):
+    if not candidate.get("ticker") or not position.get("ticker"):
+        return None
+    same_ticker = candidate["ticker"] == position["ticker"]
+    same_event = bool(candidate.get("event_key") and candidate.get("event_key") == position.get("event_key"))
+    same_family = bool(candidate.get("family") and candidate.get("family") == position.get("family"))
+    candidate_side = candidate.get("side")
+    position_side = position.get("side")
+    if same_ticker:
+        if candidate_side in {"yes", "no"} and position_side in {"yes", "no"} and candidate_side != position_side:
+            return "exact_ticker_opposite_side"
+        return None
+    if not (same_event and same_family):
+        return None
+    if candidate.get("ladder_plan") and candidate.get("ladder_plan") == position.get("ladder_plan"):
+        if candidate_side != position_side or candidate.get("outcome_slot") != position.get("outcome_slot"):
+            return "same_ladder_opposite_exposure"
+    if candidate_side in {"yes", "no"} and position_side in {"yes", "no"}:
+        if candidate_side != position_side and candidate.get("outcome_slot") == position.get("outcome_slot"):
+            return "same_event_opposite_side"
+        if candidate_side == position_side and candidate.get("outcome_slot") and candidate.get("outcome_slot") != position.get("outcome_slot"):
+            if _exclusive_outcome_family(candidate.get("family")):
+                return "same_event_competing_outcome"
+            if "TOTAL" in str(candidate.get("family") or "").upper() and _opposite_total_tokens(candidate.get("outcome_slot"), position.get("outcome_slot")):
+                return "same_event_total_opposite_outcome"
+    if candidate.get("role") and candidate.get("role") == position.get("role") and candidate_side != position_side:
+        return "same_role_opposite_side"
+    if candidate.get("thesis") and candidate.get("thesis") == position.get("thesis") and candidate_side != position_side:
+        return "same_thesis_opposite_side"
+    return None
+
+
+def _emit_opposite_side_log(tag, payload):
+    try:
+        print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+    except Exception:
+        pass
+
+
+def evaluate_opposite_side_pre_submit_guard(bot, payload, q=None, *, source="pre_submit", refresh=True, live_state=None):
+    payload = dict(payload or {})
+    ticker = str(payload.get("ticker") or getattr(q, "ticker", "") or "").strip()
+    side = str(payload.get("selected_side") or payload.get("side") or getattr(q, "selected_side", None) or getattr(q, "side", None) or "").strip().lower()
+    action = str(payload.get("action") or "buy").strip().lower()
+    reduce_only = bool(payload.get("reduce_only"))
+    if side not in {"yes", "no"}:
+        return {"ok": False, "reason": "missing_selected_side", "ticker": ticker or None, "source": source}
+    if not ticker:
+        return {"ok": False, "reason": "missing_ticker", "source": source}
+    if action != "buy" or reduce_only:
+        result = {
+            "ok": True,
+            "reason": "reduce_only_or_non_buy_allowed",
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "reduce_only": reduce_only,
+            "source": source,
+        }
+        if reduce_only or action == "sell":
+            _emit_opposite_side_log("AION-OPPOSITE-SIDE-ALLOW-REDUCE-ONLY", result)
+        return result
+    if refresh:
+        live_state = _refresh_live_positions_for_guard(
+            bot,
+            ticker=ticker,
+            reason="opposite_side_pre_submit",
+            min_interval_sec=0.0,
+        )
+    candidate = _profile_for_opposite_guard(bot, ticker=ticker, side=side, payload=payload, q=q)
+    matches = []
+    for position in _open_positions_for_opposite_guard(bot, live_state=live_state):
+        position_ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
+        if not position_ticker:
+            continue
+        pos_side = _position_side(bot, position)
+        pos_profile = _profile_for_opposite_guard(
+            bot,
+            ticker=position_ticker,
+            side=pos_side,
+            position=position,
+        )
+        reason = _opposite_side_conflict_reason(candidate, pos_profile)
+        if not reason:
+            continue
+        matches.append(
+            {
+                "ticker": position_ticker,
+                "side": pos_side,
+                "reason": reason,
+                "event_key": pos_profile.get("event_key"),
+                "outcome_slot": pos_profile.get("outcome_slot"),
+                "source": position.get("_aion_position_source"),
+                "count": _position_count(bot, position),
+            }
+        )
+    if matches:
+        result = {
+            "ok": False,
+            "reason": "opposite_side_conflict",
+            "ticker": ticker,
+            "side": side,
+            "family": candidate.get("family"),
+            "event_key": candidate.get("event_key"),
+            "outcome_slot": candidate.get("outcome_slot"),
+            "conflict_count": len(matches),
+            "conflicts": matches[:6],
+            "live_state_reason": (live_state or {}).get("reason") if isinstance(live_state, dict) else None,
+            "source": source,
+        }
+        _emit_opposite_side_log("AION-OPPOSITE-SIDE-AUDIT", result)
+        _emit_opposite_side_log("AION-OPPOSITE-SIDE-BLOCK", result)
+        return result
+    return {
+        "ok": True,
+        "reason": "no_opposite_side_exposure",
+        "ticker": ticker,
+        "side": side,
+        "family": candidate.get("family"),
+        "event_key": candidate.get("event_key"),
+        "live_state_reason": (live_state or {}).get("reason") if isinstance(live_state, dict) else None,
+        "source": source,
+    }
+
+
 def evaluate_live_order_risk_governor(
     bot,
     payload,
@@ -481,6 +793,18 @@ def evaluate_live_order_risk_governor(
         not in {"missing_auth_config", "auth_not_ready", "live_auth_unavailable"}
     ):
         return _block("live_position_reconcile_unavailable")
+    opposite_guard = evaluate_opposite_side_pre_submit_guard(
+        bot,
+        payload,
+        q=q,
+        source="risk_governor_pre_submit",
+        refresh=False,
+        live_state=live_state,
+    )
+    if not opposite_guard.get("ok"):
+        blocked = _block(opposite_guard.get("reason") or "opposite_side_conflict")
+        blocked["opposite_side_guard"] = opposite_guard
+        return blocked
     if bot.already_holding(ticker):
         try:
             print(

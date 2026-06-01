@@ -1017,6 +1017,139 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(captured_payloads[0]["count"], 1)
         self.assertEqual(captured_payloads[0]["yes_price"], 54)
 
+    def test_canonical_place_order_blocks_opposite_side_before_post(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        posted = []
+        bot.live_positions = [
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-MIL",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "count": 2,
+                "entry_price": 0.60,
+            }
+        ]
+        bot.load_live_position_state = lambda: {}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": bot.live_positions}
+
+        def fake_live_request(method, path, json_payload=None, timeout=15):
+            if method == "GET" and "balance" in str(path):
+                return {"ok": True, "status_code": 200, "body": {"balance": 10000}}
+            posted.append(dict(json_payload or {}))
+            return {
+                "ok": True,
+                "status_code": 201,
+                "body": {"order": {"order_id": "should-not-post"}},
+            }
+
+        bot._live_request_json = fake_live_request
+
+        result = bot.place_live_order(
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 2,
+                "yes_price": 46,
+                "selected_price": 0.46,
+                "_risk_governor_checked": True,
+            }
+        )
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+        self.assertEqual(posted, [])
+
+    def test_canonical_place_order_allows_reduce_only_exit_with_conflict(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        posted = []
+        bot.live_positions = [
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-MIL",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "count": 2,
+                "entry_price": 0.60,
+            }
+        ]
+        bot.load_live_position_state = lambda: {}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": bot.live_positions}
+
+        def fake_live_request(method, path, json_payload=None, timeout=15):
+            if method == "GET" and "balance" in str(path):
+                return {"ok": True, "status_code": 200, "body": {"balance": 10000}}
+            posted.append(dict(json_payload or {}))
+            return {
+                "ok": True,
+                "status_code": 201,
+                "body": {"order": {"order_id": "unit-exit"}},
+            }
+
+        bot._live_request_json = fake_live_request
+
+        result = bot.place_live_order(
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "action": "sell",
+                "count": 2,
+                "yes_price": 40,
+                "selected_price": 0.40,
+                "reduce_only": True,
+                "_risk_governor_checked": True,
+            }
+        )
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(posted[0]["action"], "sell")
+        self.assertTrue(posted[0]["reduce_only"])
+        self.assertEqual(posted[0]["time_in_force"], "immediate_or_cancel")
+
+    def test_canonical_place_order_keeps_one_sided_payload_shape(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        posted = []
+        bot.live_positions = []
+        bot.load_live_position_state = lambda: {}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": []}
+
+        def fake_live_request(method, path, json_payload=None, timeout=15):
+            if method == "GET" and "balance" in str(path):
+                return {"ok": True, "status_code": 200, "body": {"balance": 10000}}
+            posted.append(dict(json_payload or {}))
+            return {
+                "ok": True,
+                "status_code": 201,
+                "body": {"order": {"order_id": "unit-one-sided"}},
+            }
+
+        bot._live_request_json = fake_live_request
+
+        result = bot.place_live_order(
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 2,
+                "yes_price": 46,
+                "selected_price": 0.46,
+                "_risk_governor_checked": True,
+            }
+        )
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(posted[0]["ticker"], "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN")
+        self.assertEqual(posted[0]["side"], "yes")
+        self.assertEqual(posted[0]["action"], "buy")
+        self.assertEqual(posted[0]["count"], 2)
+        self.assertEqual(posted[0]["yes_price"], 46)
+        self.assertNotIn("no_price", posted[0])
+
     def test_game_thesis_boosts_aligned_sports_candidates(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()

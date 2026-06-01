@@ -12,6 +12,7 @@ class RiskBotStub:
         self.reconcile_ok = True
         self.reconcile_calls = 0
         self.recent_orders = {}
+        self.local_state = {}
         self.trading_halted = False
         self.realized_pnl = 0.0
         self.live_realized_pnl_today = 0.0
@@ -37,6 +38,17 @@ class RiskBotStub:
             for position in self.live_positions
             if str(position.get("status", "open") or "open").lower() == "open"
         ]
+
+    def _extract_sports_game_key(self, ticker, market=None):
+        ticker = str(ticker or "").strip()
+        family = self.get_market_family({"ticker": ticker})
+        parts = ticker.split("-")
+        if len(parts) >= 2:
+            return f"{family}-{parts[1]}"
+        return ticker
+
+    def load_live_position_state(self):
+        return dict(self.local_state)
 
     def reconcile_live_positions(self):
         self.reconcile_calls += 1
@@ -130,6 +142,95 @@ class RiskGovernorTests(unittest.TestCase):
         self.assertEqual(bot.reconcile_calls, 1)
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "duplicate_position_guard")
+
+    def test_same_ticker_opposite_side_buy_is_blocked(self):
+        bot = RiskBotStub()
+        bot.live_positions.append({"ticker": "KXNCAABSPREAD-PURMICH", "side": "yes", "count": 1, "entry_price": 0.40})
+        result = self._evaluate(bot=bot, payload=self._payload(side="no"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+        self.assertEqual(result["opposite_side_guard"]["conflicts"][0]["reason"], "exact_ticker_opposite_side")
+
+    def test_negative_position_fp_no_side_blocks_same_ticker_yes_buy(self):
+        bot = RiskBotStub()
+        bot.reconcile_positions = [{"ticker": "KXNCAABSPREAD-PURMICH", "position_fp": "-2.00"}]
+        result = self._evaluate(bot=bot, payload=self._payload(side="yes"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+        self.assertEqual(result["opposite_side_guard"]["conflicts"][0]["side"], "no")
+
+    def test_same_match_competing_player_yes_buy_is_blocked(self):
+        bot = RiskBotStub()
+        bot.live_positions.append(
+            {"ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-MIL", "family": "KXATPCHALLENGERMATCH", "side": "yes", "count": 2, "entry_price": 0.60}
+        )
+        result = self._evaluate(
+            bot=bot,
+            payload=self._payload(
+                ticker="KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                family="KXATPCHALLENGERMATCH",
+                side="yes",
+                selected_price=0.46,
+            ),
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+        self.assertEqual(result["opposite_side_guard"]["conflicts"][0]["reason"], "same_event_competing_outcome")
+
+    def test_same_game_competing_team_yes_buy_is_blocked(self):
+        bot = RiskBotStub()
+        bot.live_positions.append(
+            {"ticker": "KXMLBMONEYLINE-26JUN01NYYBOS-NYY", "family": "KXMLBMONEYLINE", "side": "yes", "count": 1, "entry_price": 0.52}
+        )
+        result = self._evaluate(
+            bot=bot,
+            payload=self._payload(
+                ticker="KXMLBMONEYLINE-26JUN01NYYBOS-BOS",
+                family="KXMLBMONEYLINE",
+                side="yes",
+                selected_price=0.49,
+            ),
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+
+    def test_live_api_opposite_side_truth_overrides_empty_local_state(self):
+        bot = RiskBotStub()
+        bot.local_state = {}
+        bot.reconcile_positions = [
+            {"ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-MIL", "family": "KXATPCHALLENGERMATCH", "side": "yes", "count": 2, "avg_price": 0.60}
+        ]
+        result = self._evaluate(
+            bot=bot,
+            payload=self._payload(
+                ticker="KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                family="KXATPCHALLENGERMATCH",
+                side="yes",
+                selected_price=0.46,
+            ),
+        )
+        self.assertEqual(bot.reconcile_calls, 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+
+    def test_reduce_only_exit_allowed_despite_opposite_side_exposure(self):
+        bot = RiskBotStub()
+        bot.live_positions.append(
+            {"ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-MIL", "family": "KXATPCHALLENGERMATCH", "side": "yes", "count": 2, "entry_price": 0.60}
+        )
+        result = kalshi_risk.evaluate_opposite_side_pre_submit_guard(
+            bot,
+            self._payload(
+                ticker="KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
+                family="KXATPCHALLENGERMATCH",
+                side="yes",
+                action="sell",
+                reduce_only=True,
+            ),
+            source="unit_reduce_only",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "reduce_only_or_non_buy_allowed")
 
     def test_family_exposure_counts_api_reconciled_avg_price(self):
         bot = RiskBotStub()

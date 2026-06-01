@@ -659,6 +659,26 @@ def place_live_order(bot, payload):
         }
     selected_price_key = validation.get("price_key")
     selected_price = request_payload.get(selected_price_key)
+    opposite_guard = getattr(bot, "evaluate_opposite_side_pre_submit_guard", None)
+    if callable(opposite_guard):
+        guard_payload = dict(payload)
+        guard_payload.update(request_payload)
+        guard_result = opposite_guard(
+            guard_payload,
+            q=None,
+            source="canonical_place_live_order",
+            refresh=True,
+        )
+        if not guard_result.get("ok"):
+            return {
+                "submitted": False,
+                "reason": guard_result.get("reason") or "opposite_side_conflict",
+                "payload": legacy_payload,
+                "request_payload": request_payload,
+                "endpoint": path,
+                "endpoint_kind": endpoint_kind,
+                "opposite_side_guard": guard_result,
+            }
     print(
         "[ORDER-SUBMIT] "
         + json.dumps(
