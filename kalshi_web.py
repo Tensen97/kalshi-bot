@@ -43290,11 +43290,31 @@ class KalshiSniperBot:
                     "submit_reason": result.get("reason"),
                 }
             )
+        post_exit_reconcile = None
+        if allow_real_exits and submitted > 0:
+            try:
+                post_exit_reconcile = self.reconcile_live_positions()
+            except Exception as exc:
+                post_exit_reconcile = {"ok": False, "reason": exc.__class__.__name__}
+            print(
+                "[LIVE-EXIT-RECONCILE] "
+                + json.dumps(
+                    {
+                        "exit_orders_submitted": submitted,
+                        "ok": bool((post_exit_reconcile or {}).get("ok")),
+                        "open_positions": len(self._get_open_live_positions()),
+                        "reason": (post_exit_reconcile or {}).get("reason"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         return {
             "ok": True,
             "open_positions": len(open_positions),
             "allow_real_exits": bool(allow_real_exits),
             "exit_orders_submitted": submitted,
+            "post_exit_reconcile": post_exit_reconcile,
             "decisions": decisions,
         }
 

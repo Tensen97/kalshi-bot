@@ -115,6 +115,34 @@ class StructuralEdgeTests(unittest.TestCase):
             "reduce_only_requires_ioc",
         )
 
+    def test_live_monitor_reconciles_after_submitted_exit(self):
+        bot = self._make_bot()
+        bot.live_positions = [{"ticker": "KXATPCHALLENGERMATCH-26JUN01MATIMA-MAT", "status": "open", "count": 1}]
+        reconcile_calls = []
+
+        def evaluate_exit(position, quotes_by_ticker=None):
+            return {"ticker": position["ticker"], "action": "exit", "reason": "unit_exit"}
+
+        def submit_exit(position, decision):
+            return {"submitted": True, "reason": "submitted"}
+
+        def reconcile():
+            reconcile_calls.append(True)
+            bot.live_positions = []
+            return {"ok": True, "positions": []}
+
+        bot._evaluate_dynamic_live_exit = evaluate_exit
+        bot.submit_live_exit_order = submit_exit
+        bot.reconcile_live_positions = reconcile
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot.run_live_monitor_positions_pass(allow_real_exits=True)
+
+        self.assertEqual(result["exit_orders_submitted"], 1)
+        self.assertEqual(len(reconcile_calls), 1)
+        self.assertTrue(result["post_exit_reconcile"]["ok"])
+        self.assertEqual(bot._get_open_live_positions(), [])
+
     def test_execution_log_mode_keeps_execution_and_suppresses_advisory(self):
         old_mode = kw.AION_LOG_MODE
         old_debug = kw.AION_DEBUG_TELEMETRY
