@@ -1316,8 +1316,13 @@ def submit_live_order(
     payload = dict(payload_override) if isinstance(payload_override, dict) else bot.build_live_order_payload(q, size=size)
     if not payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
+    sizing_resolved = bool(payload.get("_aion_sizing_resolved"))
+    try:
+        sizing_resolved_count = int(bot.to_float(payload.get("count"), 0) or 0)
+    except Exception:
+        sizing_resolved_count = 0
     dynamic_size_resolver = getattr(bot, "_resolve_dynamic_live_entry_size", None)
-    if callable(dynamic_size_resolver):
+    if callable(dynamic_size_resolver) and not (sizing_resolved and sizing_resolved_count > 0):
         try:
             payload["count"] = dynamic_size_resolver(
                 q,

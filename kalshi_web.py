@@ -51292,7 +51292,13 @@ class KalshiSniperBot:
 
         price_hydration_refresh_attempted = False
         price_hydration_recovered = False
-        if selected_source_dict is None and allow_refresh and raw_ticker and resolved_side in {"yes", "no"}:
+        can_refresh_without_side = bool(
+            resolved_side not in {"yes", "no"}
+            and (self._is_sports_market_or_family(family) or is_crypto_ladder)
+        )
+        if selected_source_dict is None and allow_refresh and raw_ticker and (
+            resolved_side in {"yes", "no"} or can_refresh_without_side
+        ):
             orderbook_fetch_called = True
             price_hydration_refresh_attempted = True
             self._emit_aion_price_hydration_event(
@@ -51308,7 +51314,11 @@ class KalshiSniperBot:
                 no_bid=no_bid_dollars,
                 no_ask=no_ask_dollars,
                 refresh_attempted=True,
-                final_reason="selected_price_missing_before_refresh",
+                final_reason=(
+                    "selected_price_missing_before_refresh"
+                    if resolved_side in {"yes", "no"}
+                    else "selected_side_missing_before_refresh"
+                ),
             )
             try:
                 fresh_orderbook = self.get_live_market_orderbook(raw_ticker)
@@ -51341,6 +51351,69 @@ class KalshiSniperBot:
                     yes_ask = yes_ask_dollars
                     no_bid = no_bid_dollars
                     no_ask = no_ask_dollars
+                    if resolved_side not in {"yes", "no"}:
+                        refresh_side_selection = self._aion_select_bidirectional_side(
+                            ticker=raw_ticker,
+                            family=family,
+                            lane="CRYPTO_LADDER" if is_crypto_ladder else "SPORTS" if self._is_sports_market_or_family(family) else None,
+                            market=fresh_source,
+                            q=candidate,
+                            quote_diag=quote_diag,
+                            yes_bid=yes_bid_dollars,
+                            yes_ask=yes_ask_dollars,
+                            no_bid=no_bid_dollars,
+                            no_ask=no_ask_dollars,
+                            yes_top_size=fresh_source.get("yes_top_size"),
+                            no_top_size=fresh_source.get("no_top_size"),
+                            preferred_side=None,
+                            source=f"resolve_aion_orderbook_for_payload:{selection_stage or 'payload'}:fresh_side_derivation",
+                            emit_log=False,
+                        )
+                        refresh_selected_side = self._aion_normalize_live_side(
+                            refresh_side_selection.get("selected_side")
+                        )
+                        if refresh_selected_side:
+                            resolved_side = refresh_selected_side
+                            selected_price = self.to_float(refresh_side_selection.get("selected_price"), None)
+                            selected_price_source = refresh_side_selection.get("selected_price_source") or effective_price_source
+                            selected_price_raw, selected_price_dollars, selected_price_cents, selected_price_block_reason = _normalize_selected_price_snapshot(selected_price)
+                            selected_price_in_bounds = bool(
+                                selected_price_cents is not None
+                                and 1 <= int(selected_price_cents) <= 99
+                            )
+                            if selected_price_in_bounds:
+                                selected_price = selected_price_dollars
+                                selected_source_label = "fresh_orderbook_endpoint"
+                                selected_source_dict = dict(fresh_source)
+                                selected_source_dict.update(
+                                    {
+                                        "selected_side": resolved_side,
+                                        "selected_price": selected_price,
+                                        "selected_price_dollars": selected_price_dollars,
+                                        "selected_price_cents": selected_price_cents,
+                                        "selected_price_source_used": selected_price_source,
+                                    }
+                                )
+                                orderbook_keys = sorted(list(fresh_source.keys()))[:64]
+                                price_hydration_recovered = True
+                                fetch_error = None
+                                self._emit_aion_price_hydration_event(
+                                    "AION-PRICE-HYDRATION-RECOVERED",
+                                    ticker=raw_ticker or None,
+                                    family=family,
+                                    selection_stage=selection_stage,
+                                    selected_side=resolved_side,
+                                    selected_price_cents=selected_price_cents,
+                                    selected_price_dollars=selected_price,
+                                    selected_price_source=selected_price_source,
+                                    source_field=refresh_side_selection.get("selected_price_source"),
+                                    yes_bid=yes_bid_dollars,
+                                    yes_ask=yes_ask_dollars,
+                                    no_bid=no_bid_dollars,
+                                    no_ask=no_ask_dollars,
+                                    refresh_attempted=True,
+                                    final_reason="live_orderbook_side_and_price_recovered",
+                                )
                     executable_price = self._aion_selected_executable_price_from_book(
                         selected_side=resolved_side,
                         yes_bid=yes_bid_dollars,
@@ -51976,7 +52049,16 @@ class KalshiSniperBot:
         )
         if not orderbook_ready:
             if not resolved_side:
-                orderbook_missing_reason = "missing_side"
+                side_selection_reason = str(
+                    side_selection.get("reason")
+                    if isinstance(side_selection, dict)
+                    else ""
+                ).strip().lower()
+                orderbook_missing_reason = (
+                    side_selection_reason
+                    if side_selection_reason in {"missing_two_sided_quote", "no_executable_side", "both_sides_unexecutable"}
+                    else "missing_side"
+                )
             elif selected_source_dict is None:
                 if orderbook_fetch_called:
                     if fetch_error:
@@ -52518,6 +52600,8 @@ class KalshiSniperBot:
             "action": DEFAULT_LIVE_ORDER_ACTION,
             "count": count,
             "type": "limit",
+            "_aion_sizing_resolved": True,
+            "_aion_sizing_source": selection_stage or "build_live_order_payload",
             "is_dry_run": compute_effective_live_dry_run(),
             "entry_context": self._build_entry_context(
                 q=q,

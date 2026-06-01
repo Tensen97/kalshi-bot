@@ -433,6 +433,53 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(payload["no_price"], 37)
         self.assertNotIn("yes_price", payload)
 
+    def test_missing_side_refresh_uses_bidirectional_selector_for_sports_payload(self):
+        bot = self._make_bot()
+        ticker = "KXNBASPREAD-SIDELESS"
+        q = SimpleNamespace(ticker=ticker, title="NBA spread")
+        market = {"ticker": ticker, "series_ticker": "KXNBASPREAD", "title": "NBA spread"}
+        bot.get_live_market_orderbook = lambda requested_ticker: {
+            "ticker": requested_ticker,
+            "yes_bid": 0.40,
+            "yes_ask": 0.42,
+            "no_bid": 0.56,
+            "no_ask": 0.58,
+            "yes_top_size": 12,
+            "no_top_size": 9,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            resolution = bot.resolve_aion_orderbook_for_payload(
+                ticker,
+                candidate=q,
+                market=market,
+                quote_diag={"yes_edge_after_cost": 0.04, "no_edge_after_cost": -0.01},
+                price_source="ask",
+                selection_stage="quote_hydration",
+                allow_refresh=True,
+            )
+
+        self.assertTrue(resolution["orderbook_fetch_called"])
+        self.assertTrue(resolution["orderbook_ready"])
+        self.assertEqual(resolution["selected_side"], "yes")
+        self.assertEqual(resolution["selected_price"], 0.42)
+        self.assertEqual(resolution["selected_price_cents"], 42)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            payload = bot.build_live_order_payload(
+                q,
+                size=1,
+                market=market,
+                quote_diag={"yes_edge_after_cost": 0.04, "no_edge_after_cost": -0.01},
+                orderbook_resolution=resolution,
+                allow_orderbook_refresh=False,
+            )
+
+        self.assertEqual(payload["side"], "yes")
+        self.assertEqual(payload["selected_side"], "yes")
+        self.assertEqual(payload["yes_price"], 42)
+        self.assertNotIn("no_price", payload)
+
     def test_ladder_dislocation_gets_structural_score_and_boost(self):
         bot = self._make_bot()
         q = SimpleNamespace(
@@ -805,6 +852,64 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual([payload["side"] for payload in captured_payloads], ["yes", "no"])
         self.assertEqual(captured_payloads[0]["entry_context"]["sports_memory_regime"], "hot")
         self.assertEqual(captured_payloads[0]["entry_context"]["sports_memory_size_multiplier"], 1.08)
+
+    def test_submit_preserves_canonical_payload_resolved_size(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        captured_payloads = []
+        bot.recent_submitted_order_for_ticker = lambda ticker: None
+        bot.recent_submitted_order_count_for_family = lambda family: 0
+        bot.recent_submitted_order_count_total = lambda: 0
+        bot.get_live_submit_authorization = lambda payload: {"ok": True}
+        bot.can_build_live_auth = lambda: True
+        bot._reset_live_trade_counter_if_needed = lambda: None
+        bot._active_live_order_timestamps = lambda: []
+        bot._live_order_timestamps = []
+        bot.already_holding = lambda ticker: False
+        bot.extract_order_execution_summary = lambda response: {"order_id": response.get("order_id")}
+        bot.persist_live_entry_metadata = lambda **kwargs: None
+        bot.append_live_audit_log = lambda *args, **kwargs: None
+        bot.append_aion_learning_archive_event = lambda *args, **kwargs: None
+        bot._resolve_dynamic_live_entry_size = lambda *args, **kwargs: 0
+
+        def fake_place_live_order(payload):
+            captured_payloads.append(dict(payload))
+            return {
+                "submitted": True,
+                "reason": "submitted",
+                "endpoint": "/trade-api/v2/portfolio/orders",
+                "payload": dict(payload),
+                "response": {"order_id": "unit-sized"},
+                "status_code": 201,
+            }
+
+        bot.place_live_order = fake_place_live_order
+        q = SimpleNamespace(
+            ticker="KXNCAABTOTAL-PURMICH-YES",
+            family="KXNCAABTOTAL",
+            selected_side="yes",
+            selected_price=0.54,
+        )
+
+        result = bot.submit_live_order(
+            q,
+            size=1,
+            lane="SPORTS",
+            payload_override={
+                "ticker": q.ticker,
+                "family": q.family,
+                "side": "yes",
+                "selected_side": "yes",
+                "selected_price": 0.54,
+                "price": 0.54,
+                "count": 1,
+                "_aion_sizing_resolved": True,
+            },
+        )
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(captured_payloads[0]["count"], 1)
+        self.assertEqual(captured_payloads[0]["yes_price"], 54)
 
     def test_game_thesis_boosts_aligned_sports_candidates(self):
         self._set_sports_only_mode(True)
