@@ -659,6 +659,7 @@ def place_live_order(bot, payload):
         }
     selected_price_key = validation.get("price_key")
     selected_price = request_payload.get(selected_price_key)
+    sports_live_guard_result = None
     sports_live_guard = getattr(bot, "evaluate_sports_live_state_pre_submit_guard", None)
     if callable(sports_live_guard):
         guard_payload = dict(payload)
@@ -669,6 +670,7 @@ def place_live_order(bot, payload):
             source="canonical_place_live_order",
             refresh=True,
         )
+        sports_live_guard_result = guard_result if isinstance(guard_result, dict) else None
         if not guard_result.get("ok"):
             return {
                 "submitted": False,
@@ -699,6 +701,28 @@ def place_live_order(bot, payload):
                 "endpoint_kind": endpoint_kind,
                 "opposite_side_guard": guard_result,
             }
+    print(
+        "[AION-EXECUTION-RECOVERY-SUBMIT] "
+        + json.dumps(
+            {
+                "method": "POST",
+                "endpoint": path,
+                "endpoint_kind": endpoint_kind,
+                "ticker": legacy_payload.get("ticker"),
+                "selected_side": legacy_payload.get("side"),
+                "action": legacy_payload.get("action"),
+                "selected_price_cents": selected_price,
+                "count": legacy_payload.get("count"),
+                "sports_live_guard_ok": None if sports_live_guard_result is None else bool(sports_live_guard_result.get("ok")),
+                "sports_live_guard_reason": None if sports_live_guard_result is None else sports_live_guard_result.get("reason"),
+                "sports_live_guard_block_reason": None if sports_live_guard_result is None else sports_live_guard_result.get("block_reason"),
+                "orderbook_ready": payload.get("orderbook_ready"),
+                "subsystem": "kalshi_execution.place_live_order",
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
     print(
         "[ORDER-SUBMIT] "
         + json.dumps(

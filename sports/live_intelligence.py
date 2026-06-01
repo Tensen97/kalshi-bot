@@ -19676,6 +19676,94 @@ def find_best_live_ticker(self, markets=None):
             decision_skip_family_counts[family] = decision_skip_family_counts.get(family, 0) + 1
             decision_skip_reasons["sports_only_crypto_execution_disabled"] = decision_skip_reasons.get("sports_only_crypto_execution_disabled", 0) + 1
             continue
+        if buy_lane == "SPORTS" and callable(getattr(self, "evaluate_sports_live_state_pre_submit_guard", None)):
+            expectancy_summary = expectancy_summary if isinstance(expectancy_summary, dict) else {}
+            expectancy_item = expectancy_item if isinstance(expectancy_item, dict) else {}
+            market = market if isinstance(market, dict) else {}
+
+            def _handoff_pick(*values):
+                for value in values:
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and not value.strip():
+                        continue
+                    return value
+                return None
+
+            selected_side = str(
+                _handoff_pick(
+                    getattr(q, "selected_side", None),
+                    getattr(q, "side", None),
+                    expectancy_summary.get("selected_side"),
+                    expectancy_summary.get("side"),
+                    expectancy_item.get("selected_side"),
+                    expectancy_item.get("side"),
+                    market.get("selected_side"),
+                    market.get("side"),
+                    market.get("preferred_side"),
+                )
+                or ""
+            ).strip().lower() or None
+            selected_price = (
+                _handoff_pick(
+                    getattr(q, "selected_price", None),
+                    getattr(q, "selected_price_dollars", None),
+                    expectancy_summary.get("selected_price"),
+                    expectancy_summary.get("selected_price_dollars"),
+                    expectancy_summary.get("price"),
+                    expectancy_item.get("selected_price"),
+                    expectancy_item.get("selected_price_dollars"),
+                    expectancy_item.get("price"),
+                    market.get("selected_price"),
+                    market.get("selected_price_dollars"),
+                    market.get("price"),
+                )
+            )
+            if selected_price is None and selected_side == "yes":
+                selected_price = _handoff_pick(getattr(q, "yes_ask", None), market.get("yes_ask"))
+            if selected_price is None and selected_side == "no":
+                selected_price = _handoff_pick(getattr(q, "no_ask", None), market.get("no_ask"))
+            live_state_guard = self.evaluate_sports_live_state_pre_submit_guard(
+                {
+                    "ticker": q.ticker,
+                    "family": family,
+                    "side": selected_side,
+                    "selected_side": selected_side,
+                    "selected_price": selected_price,
+                    "yes_ask": getattr(q, "yes_ask", None),
+                    "yes_bid": getattr(q, "yes_bid", None),
+                    "no_ask": getattr(q, "no_ask", None),
+                    "no_bid": getattr(q, "no_bid", None),
+                    "orderbook_ready": True,
+                    "selected_side_has_liquidity": True,
+                    "market": market,
+                },
+                q=q,
+                source="sports_decision_handoff",
+                refresh=False,
+            )
+            if not bool((live_state_guard or {}).get("ok")):
+                decision_skip_count += 1
+                decision_skip_family_counts[family] = decision_skip_family_counts.get(family, 0) + 1
+                live_state_reason = str((live_state_guard or {}).get("block_reason") or (live_state_guard or {}).get("reason") or "pregame_sports_market").strip() or "pregame_sports_market"
+                decision_skip_reasons[live_state_reason] = decision_skip_reasons.get(live_state_reason, 0) + 1
+                print(
+                    "[AION-LIVE-GUARD-BLOCK] "
+                    + json.dumps(
+                        {
+                            "ticker": q.ticker,
+                            "family": family,
+                            "source": "sports_decision_handoff",
+                            "reason": live_state_reason,
+                            "selected_side": selected_side,
+                            "selected_price": selected_price,
+                            "decision": "SKIP",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                continue
         lane_buy_candidates.append({
             "ticker": q.ticker,
             "family": family,

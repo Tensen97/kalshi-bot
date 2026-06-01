@@ -1250,6 +1250,133 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["reason"], "pregame_sports_market")
         self.assertEqual(result["block_reason"], "unknown_sports_live_state")
 
+    def test_sports_live_state_guard_allows_missing_start_with_executable_book(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        posted = []
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXMLBSPREAD",
+            "status": "open",
+        }
+        bot.live_positions = []
+        bot.load_live_position_state = lambda: {}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": []}
+
+        def fake_live_request(method, path, json_payload=None, timeout=15):
+            if method == "GET" and "balance" in str(path):
+                return {"ok": True, "status_code": 200, "body": {"balance": 10000}}
+            posted.append(dict(json_payload or {}))
+            return {
+                "ok": True,
+                "status_code": 201,
+                "body": {"order": {"order_id": "unit-live-book"}},
+            }
+
+        bot._live_request_json = fake_live_request
+
+        result = bot.place_live_order(
+            {
+                "ticker": "KXMLBSPREAD-26JUN011840DETTB-DET2",
+                "family": "KXMLBSPREAD",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 49,
+                "selected_price": 0.49,
+                "selected_side": "yes",
+                "orderbook_ready": True,
+                "selected_side_has_liquidity": True,
+                "_risk_governor_checked": True,
+            }
+        )
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(posted[0]["ticker"], "KXMLBSPREAD-26JUN011840DETTB-DET2")
+        self.assertEqual(posted[0]["side"], "yes")
+        self.assertEqual(posted[0]["yes_price"], 49)
+        self.assertNotIn("no_price", posted[0])
+
+    def test_sports_live_state_guard_blocks_future_even_with_executable_book(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        posted = []
+        future_start = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXMLBSPREAD",
+            "status": "open",
+            "occurrence_datetime": future_start,
+        }
+        bot.live_positions = []
+        bot.load_live_position_state = lambda: {}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": []}
+
+        def fake_live_request(method, path, json_payload=None, timeout=15):
+            if method == "GET" and "balance" in str(path):
+                return {"ok": True, "status_code": 200, "body": {"balance": 10000}}
+            posted.append(dict(json_payload or {}))
+            return {
+                "ok": True,
+                "status_code": 201,
+                "body": {"order": {"order_id": "should-not-post"}},
+            }
+
+        bot._live_request_json = fake_live_request
+
+        result = bot.place_live_order(
+            {
+                "ticker": "KXMLBSPREAD-26JUN020100FUTURE-HOME2",
+                "family": "KXMLBSPREAD",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 49,
+                "selected_price": 0.49,
+                "selected_side": "yes",
+                "orderbook_ready": True,
+                "selected_side_has_liquidity": True,
+                "_risk_governor_checked": True,
+            }
+        )
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "pregame_sports_market")
+        self.assertEqual(result["sports_live_state_guard"]["block_reason"], "future_start_time")
+        self.assertEqual(posted, [])
+
+    def test_sports_live_state_guard_allows_elapsed_start_with_executable_book(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        past_start = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat().replace("+00:00", "Z")
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXMLBTOTAL",
+            "status": "open",
+            "occurrence_datetime": past_start,
+        }
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXMLBTOTAL-26JUN011840DETTB-8",
+                "family": "KXMLBTOTAL",
+                "side": "no",
+                "action": "buy",
+                "count": 1,
+                "no_price": 52,
+                "selected_price": 0.52,
+                "selected_side": "no",
+                "orderbook_ready": True,
+                "selected_side_has_liquidity": True,
+            },
+            source="unit_test",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_state_ok")
+        self.assertEqual(result["side"], "no")
+        self.assertEqual(result["selected_price"], 0.52)
+
     def test_sports_live_state_guard_allows_live_scoreboard(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
