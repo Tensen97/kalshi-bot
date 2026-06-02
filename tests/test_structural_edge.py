@@ -4230,6 +4230,131 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(context["final_quality_action"], "allow_exceptional_trash_pattern")
         self.assertIn("home_run_prop", context["trash_prop_patterns"])
 
+    def test_quality_calibration_demotes_ultra_low_tennis_longshot_despite_large_edge(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXITFWMATCH-26JUN02ZHISHU-ZHI",
+            selected_side="yes",
+            selected_price=0.09,
+            yes_bid=0.07,
+            yes_ask=0.09,
+            no_bid=0.91,
+            no_ask=0.93,
+            liquidity=140,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            context = bot._build_lane_allocation_context(
+                {
+                    "raw_score": 90.0,
+                    "adjusted_score": 90.0,
+                    "q": q,
+                    "spread": 0.02,
+                    "family": "KXITFWMATCH",
+                    "expectancy_summary": {
+                        "final_edge": 0.42,
+                        "sports_edge_after_cost": 0.42,
+                        "selected_side": "yes",
+                        "selected_price": 0.09,
+                        "expectancy_score": 0.92,
+                    },
+                    "quality_snapshot": {"selected_price": 0.09, "liquidity_depth": 140, "spread": 0.02},
+                    "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK"]},
+                    "ev_context": {"ev_edge": 0.42},
+                },
+                market={
+                    "ticker": q.ticker,
+                    "series_ticker": "KXITFWMATCH",
+                    "title": "ITF tennis match player winner",
+                },
+            )
+
+        self.assertEqual(context["decision"], "DEMOTE_WEAK_SPORT")
+        self.assertEqual(context["final_quality_action"], "demote")
+        self.assertFalse(context["exceptional_trash_quality"])
+        self.assertTrue(context["fragile_trash_pattern"])
+        self.assertIn("ultra_low_probability_longshot", context["trash_prop_patterns"])
+        self.assertLess(context["allocation_score"], context["pre_lane_score"])
+
+    def test_structured_profitable_sports_outranks_fragile_tennis_longshot(self):
+        bot = self._make_bot()
+        bot._get_family_profit_memory_stats = lambda *args, **kwargs: {}
+        tennis_q = SimpleNamespace(
+            ticker="KXITFWMATCH-26JUN02SAUBRO-SAU",
+            selected_side="yes",
+            selected_price=0.08,
+            yes_bid=0.06,
+            yes_ask=0.08,
+            no_bid=0.92,
+            no_ask=0.94,
+            liquidity=120,
+        )
+        mlb_q = SimpleNamespace(
+            ticker="KXMLBSPREAD-26JUN02NYYBOS-NYY15",
+            selected_side="yes",
+            selected_price=0.48,
+            yes_bid=0.46,
+            yes_ask=0.48,
+            no_bid=0.52,
+            no_ask=0.54,
+            liquidity=120,
+        )
+        tennis_item = {
+            "raw_score": 92.0,
+            "adjusted_score": 92.0,
+            "q": tennis_q,
+            "spread": 0.02,
+            "family": "KXITFWMATCH",
+            "expectancy_summary": {
+                "final_edge": 0.40,
+                "sports_edge_after_cost": 0.40,
+                "selected_side": "yes",
+                "selected_price": 0.08,
+                "expectancy_score": 0.92,
+            },
+            "quality_snapshot": {"selected_price": 0.08, "liquidity_depth": 120, "spread": 0.02},
+            "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK"]},
+            "ev_context": {"ev_edge": 0.40},
+        }
+        mlb_item = {
+            "raw_score": 78.0,
+            "adjusted_score": 78.0,
+            "q": mlb_q,
+            "spread": 0.02,
+            "family": "KXMLBSPREAD",
+            "expectancy_summary": {
+                "final_edge": 0.026,
+                "sports_edge_after_cost": 0.026,
+                "selected_side": "yes",
+                "selected_price": 0.48,
+                "expectancy_score": 0.76,
+            },
+            "quality_snapshot": {"selected_price": 0.48, "liquidity_depth": 120, "spread": 0.02},
+            "sports_edge_context": {"boost": 5.0, "tags": ["SPORTS_GOOD_BOOK", "STRUCTURED_LADDER"]},
+            "ev_context": {"ev_edge": 0.026},
+        }
+        tennis_market = {"ticker": tennis_q.ticker, "series_ticker": "KXITFWMATCH", "title": "ITF tennis match player winner"}
+        mlb_market = {
+            "ticker": mlb_q.ticker,
+            "series_ticker": "KXMLBSPREAD",
+            "title": "MLB spread ladder Yankees +1.5",
+            "price_ranges": [{"floor": -1.5, "cap": 1.5}],
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            tennis_allocation = bot._build_lane_allocation_context(tennis_item, market=tennis_market)
+            tennis_context = bot._build_unified_opportunity_context(tennis_item, market=tennis_market, allocation=tennis_allocation)
+            mlb_allocation = bot._build_lane_allocation_context(mlb_item, market=mlb_market)
+            mlb_context = bot._build_unified_opportunity_context(mlb_item, market=mlb_market, allocation=mlb_allocation)
+
+        self.assertEqual(tennis_allocation["decision"], "DEMOTE_WEAK_SPORT")
+        self.assertGreater(tennis_context["unified_score"], 0.0)
+        self.assertGreater(tennis_context["sports_lottery_quality_penalty"], 0.0)
+        self.assertIn("sports_lottery_quality_penalty", tennis_context["reason"])
+        self.assertLessEqual(tennis_context["size_multiplier"], 0.65)
+        self.assertEqual(mlb_allocation["final_quality_action"], "allow_structured_sports_ladder")
+        self.assertGreater(mlb_context["unified_score"], tennis_context["unified_score"])
+        self.assertGreater(mlb_context["size_multiplier"], tennis_context["size_multiplier"])
+
     def test_dual_lane_secondary_executes_different_strong_lane_through_submit_guard(self):
         bot = self._make_bot()
         submitted = []

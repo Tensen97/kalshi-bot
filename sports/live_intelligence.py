@@ -8599,6 +8599,11 @@ def _calibrate_final_execution_quality(self, context=None, *, item=None, market=
     spread = self.to_float(context.get("spread"), None)
     liquidity = self.to_float(context.get("liquidity"), 0.0) or 0.0
     sports_boost = self.to_float(context.get("sports_boost"), 0.0) or 0.0
+    selected_price = self._opportunity_price_dollars(
+        context.get("selected_price")
+        or getattr(q, "selected_price_dollars", None)
+        or getattr(q, "selected_price", None)
+    )
     good_book = bool(context.get("good_book")) or bool(spread is not None and spread <= 0.08 and liquidity >= 10.0)
     structured, structured_reasons = self._is_structured_quality_ladder(
         lane=lane,
@@ -8610,6 +8615,7 @@ def _calibrate_final_execution_quality(self, context=None, *, item=None, market=
     )
     trash_patterns = []
     exceptional_trash_quality = False
+    fragile_trash_pattern = False
     if lane == "SPORTS" and not structured:
         trash_patterns = self._detect_trash_sports_prop_patterns(
             family=family,
@@ -8618,8 +8624,21 @@ def _calibrate_final_execution_quality(self, context=None, *, item=None, market=
             q=q,
             context=context,
         )
+        fragile_trash_pattern = bool(
+            "multi_home_run_moonshot" in trash_patterns
+            or "ultra_low_probability_longshot" in trash_patterns
+            or (
+                "weak_tennis_player_pick" in trash_patterns
+                and (selected_price is None or selected_price <= 0.35 or liquidity < AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY)
+            )
+            or (
+                "low_probability_longshot" in trash_patterns
+                and (selected_price is None or selected_price <= 0.14 or liquidity < AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY)
+            )
+        )
         exceptional_trash_quality = bool(
             trash_patterns
+            and not fragile_trash_pattern
             and edge >= AION_SPORTS_TRASH_EXCEPTION_EDGE
             and (
                 confidence >= AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE
@@ -8681,6 +8700,7 @@ def _calibrate_final_execution_quality(self, context=None, *, item=None, market=
             "trash_prop_patterns": trash_patterns,
             "trash_prop_penalty": round(trash_penalty, 4),
             "exceptional_trash_quality": bool(exceptional_trash_quality),
+            "fragile_trash_pattern": bool(fragile_trash_pattern),
             "final_quality_action": final_action,
             "final_quality_reason": final_reason,
             "allocation_adjustment": round(allocation_adjustment, 4),
@@ -22626,6 +22646,8 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     sports_graph_lag_detected = bool(allocation.get("sports_graph_lag_detected") or sports_graph_context.get("lag_detected"))
     sports_graph_conflict_count = int(self.to_float(allocation.get("sports_graph_conflict_count"), self.to_float(sports_graph_context.get("conflict_count"), 0.0)) or 0)
     sports_graph_alignment_count = int(self.to_float(allocation.get("sports_graph_alignment_count"), self.to_float(sports_graph_context.get("alignment_count"), 0.0)) or 0)
+    trash_patterns = allocation.get("trash_prop_patterns") if isinstance(allocation.get("trash_prop_patterns"), list) else []
+    final_quality_action = str(allocation.get("final_quality_action") or "").strip().lower()
     distance_class = str(
         allocation.get("crypto_distance_class")
         or ev_context.get("crypto_distance_class")
@@ -22647,6 +22669,34 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     if selected_price is not None:
         payout_multiple = max(0.0, (1.0 - selected_price) / max(selected_price, 0.01))
         payout_component = min(8.0, math.log1p(payout_multiple) * 1.8)
+    sports_lottery_quality_penalty = 0.0
+    if lane == "SPORTS":
+        if allocation.get("decision") == "DEMOTE_WEAK_SPORT" or final_quality_action == "demote":
+            sports_lottery_quality_penalty += 10.0
+        elif final_quality_action == "allow_exceptional_trash_pattern":
+            sports_lottery_quality_penalty += 5.0
+        if "ultra_low_probability_longshot" in trash_patterns:
+            sports_lottery_quality_penalty += 14.0
+        elif "low_probability_longshot" in trash_patterns:
+            sports_lottery_quality_penalty += 8.0
+        if "weak_tennis_player_pick" in trash_patterns:
+            sports_lottery_quality_penalty += 12.0
+        if "multi_home_run_moonshot" in trash_patterns:
+            sports_lottery_quality_penalty += 16.0
+        if "weak_family_performance" in trash_patterns:
+            sports_lottery_quality_penalty += 8.0
+        if "thin_player_prop" in trash_patterns or "low_liquidity_market" in trash_patterns:
+            sports_lottery_quality_penalty += 6.0
+        if selected_price is not None and trash_patterns:
+            if selected_price <= 0.10:
+                sports_lottery_quality_penalty += 10.0
+            elif selected_price <= 0.14:
+                sports_lottery_quality_penalty += 6.0
+            elif selected_price <= 0.20:
+                sports_lottery_quality_penalty += 3.0
+        sports_lottery_quality_penalty = min(34.0, max(0.0, sports_lottery_quality_penalty))
+        if sports_lottery_quality_penalty > 0.0 and payout_component > 0.0:
+            payout_component *= 0.25 if sports_lottery_quality_penalty >= 20.0 else 0.55
     allocation_component = min(16.0, max(0.0, allocation_score) / 6.0)
     edge_component = min(24.0, max(0.0, edge) / 0.04 * 24.0)
     if edge < 0.0:
@@ -22683,6 +22733,7 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
             historical_boost * 1.3
             + family_adjustment * 2.0
             + max(0.0, family_pnl) * 0.30
+            - max(0.0, -family_pnl) * 0.45
             - max(0.0, loss_streak - 1.0) * 1.5
             + sports_live_memory_component,
         ),
@@ -22708,9 +22759,11 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     duration = self._build_capital_duration_context(lane=lane, allocation=allocation, item=item, market=market)
     capital_lock_penalty = self.to_float(duration.get("capital_lock_penalty"), 0.0) or 0.0
     turnover_boost = self.to_float(duration.get("capital_turnover_boost"), 0.0) or 0.0
-    unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + sports_execution_component + sports_ml_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty
+    unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + sports_execution_component + sports_ml_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty - sports_lottery_quality_penalty
     if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
         unified_score -= 30.0
+    elif allocation.get("decision") == "DEMOTE_WEAK_SPORT" or allocation.get("final_quality_action") == "demote":
+        unified_score -= 10.0
     unified_score = round(max(0.0, min(100.0, unified_score)), 4)
     size_multiplier = 1.0
     if unified_score >= 85.0 and capital_lock_penalty <= 5.0:
@@ -22727,6 +22780,12 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
         size_multiplier = min(size_multiplier, 0.55)
     elif capital_lock_penalty >= 10.0:
         size_multiplier = min(size_multiplier, 0.75)
+    if sports_lottery_quality_penalty >= 24.0:
+        size_multiplier = min(size_multiplier, 0.50)
+    elif sports_lottery_quality_penalty >= 14.0:
+        size_multiplier = min(size_multiplier, 0.65)
+    elif sports_lottery_quality_penalty > 0.0:
+        size_multiplier = min(size_multiplier, 0.85)
     if lane == "SPORTS" and sports_memory_size_multiplier > 0.0:
         pre_memory_size_multiplier = size_multiplier
         size_multiplier = max(0.35, min(1.65, size_multiplier * sports_memory_size_multiplier))
@@ -22893,6 +22952,8 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
         reasons.append(duration.get("duration_reason") or "capital_lock_penalty")
     if cheap_unsupported_penalty > 0.0:
         reasons.append("unsupported_cheap_tail_penalty")
+    if sports_lottery_quality_penalty > 0.0:
+        reasons.append("sports_lottery_quality_penalty")
     if not reasons:
         reasons.append("balanced_opportunity_score")
     context = {
@@ -22947,6 +23008,9 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
         "sports_graph_conflict_count": sports_graph_conflict_count if lane == "SPORTS" else 0,
         "sports_graph_alignment_count": sports_graph_alignment_count if lane == "SPORTS" else 0,
         "sports_graph_context": sports_graph_context if lane == "SPORTS" else {},
+        "trash_prop_patterns": trash_patterns if lane == "SPORTS" else [],
+        "final_quality_action": final_quality_action if lane == "SPORTS" else None,
+        "sports_lottery_quality_penalty": round(sports_lottery_quality_penalty, 4) if lane == "SPORTS" else 0.0,
         "confidence": round(confidence, 4),
         "payout_multiple": self._safe_round(payout_multiple, 4, None),
         "target_reachability": distance_class or None,
