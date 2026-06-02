@@ -335,6 +335,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-SIDE-SELECT",
     "AION-YES-EDGE",
     "AION-NO-EDGE",
+    "AION-NO-SIDE-AUDIT",
+    "AION-NO-SIDE-ALLOW",
+    "AION-NO-SIDE-BLOCK",
+    "AION-BIDIRECTIONAL-RANKING",
     "AION-CONFIDENCE-AUDIT",
     "AION-CONFIDENCE-BLOCK",
     "AION-CONFIDENCE-ALLOW",
@@ -7521,7 +7525,7 @@ class KalshiSniperBot:
             liquidity_score = min(8.0, math.log10(side_liquidity + 1.0) * 2.0) if side_liquidity > 0.0 else 0.0
             edge_score = float(side_edge) * 100.0
             momentum_score = momentum_alignment * 12.0
-            preference_score = 0.25 if preferred_side == side else 0.0
+            preference_score = 0.0
             total_top = max(0.0, yes_top_size) + max(0.0, no_top_size)
             side_pressure = (side_liquidity + 1.0) / max(total_top + 2.0, 2.0)
             depth_score = self._clamp(math.log1p(side_liquidity) / math.log1p(30.0), 0.0, 1.0)
@@ -7592,11 +7596,6 @@ class KalshiSniperBot:
                 reason = f"only_{selected['side']}_executable"
             else:
                 selected = max(executable, key=lambda item: item["final_score"])
-                if selected["edge_after_cost"] <= 0.0 and preferred_side in {"yes", "no"}:
-                    preferred_snapshot = yes_snapshot if preferred_side == "yes" else no_snapshot
-                    if preferred_snapshot["executable"] and preferred_snapshot["edge_after_cost"] >= selected["edge_after_cost"]:
-                        selected = preferred_snapshot
-                        reason = "kept_preferred_side_no_positive_edge_delta"
                 if reason == "selected_by_two_sided_score" and selected["side"] != preferred_side:
                     reason = f"switched_to_{selected['side']}_better_score"
         payload = {
@@ -7641,7 +7640,32 @@ class KalshiSniperBot:
             "two_sided_quote_ready": bool(two_sided_quote_ready),
             "reason": reason,
             "source": source,
+            "preferred_side_bonus_removed": True,
         }
+        if is_sports:
+            no_positive_edge = bool(no_snapshot["edge_after_cost"] > 0.0)
+            no_eligible = bool(no_snapshot["executable"] and no_positive_edge)
+            if not no_snapshot["executable"]:
+                no_reason = no_snapshot["block_reason"] or "no_not_executable"
+            elif not no_positive_edge:
+                no_reason = "negative_or_zero_no_edge"
+            elif selected and selected["side"] == "no":
+                no_reason = "no_positive_executable_selected"
+            else:
+                no_reason = "no_positive_executable_outranked"
+            no_payload = {
+                **payload,
+                "no_positive_edge": no_positive_edge,
+                "no_eligible": no_eligible,
+                "no_reason": no_reason,
+                "no_selected": bool(selected and selected["side"] == "no"),
+            }
+            try:
+                print("[AION-BIDIRECTIONAL-RANKING] " + json.dumps(payload, sort_keys=True, default=str))
+                print("[AION-NO-SIDE-AUDIT] " + json.dumps(no_payload, sort_keys=True, default=str))
+                print(("[AION-NO-SIDE-ALLOW] " if no_eligible else "[AION-NO-SIDE-BLOCK] ") + json.dumps(no_payload, sort_keys=True, default=str))
+            except Exception:
+                pass
         if emit_log:
             try:
                 print("[AION-SIDE-COMPARE] " + json.dumps(payload, sort_keys=True, default=str))

@@ -454,9 +454,9 @@ def normalize_legacy_order_payload(
 ):
     payload = bot._ensure_live_client_order_id(payload)
     ticker = str(payload.get("ticker") or "").strip()
-    side = str(payload.get("selected_side") or payload.get("side") or default_live_order_side).strip().lower()
+    side = str(payload.get("selected_side") or payload.get("side") or "").strip().lower()
     if side not in {"yes", "no"}:
-        side = default_live_order_side
+        return None
     action = str(payload.get("action") or default_live_order_action).strip().lower()
     count = int(max(1, min(int(bot.to_float(payload.get("count"), 1) or 1), int(max_live_order_size or 1))))
     price_cents = payload.get("yes_price") if side == "yes" else payload.get("no_price")
@@ -499,7 +499,9 @@ def normalize_event_order_payload(
     default_live_order_action,
 ):
     legacy_payload = dict(legacy_payload or {})
-    side = str(legacy_payload.get("side") or default_live_order_side).strip().lower()
+    side = str(legacy_payload.get("side") or legacy_payload.get("selected_side") or "").strip().lower()
+    if side not in {"yes", "no"}:
+        return None
     action = str(legacy_payload.get("action") or default_live_order_action).strip().lower()
     raw_price = legacy_payload.get("yes_price") if side == "yes" else legacy_payload.get("no_price")
     selected_price = bot.normalize_contract_price(
@@ -1036,7 +1038,6 @@ def maybe_auto_reprice_recent_order(
         or current_payload.get("side")
         or getattr(q, "selected_side", None)
         or getattr(q, "side", None)
-        or default_live_order_side
         or ""
     ).strip().lower()
     side = old_side if old_side in {"yes", "no"} else current_side
@@ -1486,7 +1487,11 @@ def submit_live_order(
     active_timestamps = bot._active_live_order_timestamps()
     if len(active_timestamps) >= int(live_order_rate_limit or 1):
         return {"submitted": False, "reason": "rate_limited", "payload": payload}
-    side = str(payload.get("selected_side") or payload.get("side") or default_live_order_side).strip().lower()
+    side = str(payload.get("selected_side") or payload.get("side") or "").strip().lower()
+    if side not in {"yes", "no"}:
+        return {"submitted": False, "reason": "missing_selected_side", "payload": payload}
+    payload["selected_side"] = side
+    payload["side"] = side
     if bot.already_holding(payload.get("ticker")):
         return {"submitted": False, "reason": "duplicate_position_guard", "payload": payload}
     legacy_payload = bot._normalize_legacy_order_payload(payload)

@@ -391,6 +391,71 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(decision["selected_side"], "no")
         self.assertEqual(decision["selected_price"], 0.37)
 
+    def test_sports_side_selection_no_outranks_preferred_yes_on_better_edge(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXMLBTOTAL-NYYBOS-85",
+            family="KXMLBTOTAL",
+            lane="SPORTS",
+            market={"ticker": "KXMLBTOTAL-NYYBOS-85", "title": "Yankees Red Sox total"},
+            yes_bid=0.47,
+            yes_ask=0.49,
+            no_bid=0.49,
+            no_ask=0.51,
+            yes_top_size=40,
+            no_top_size=40,
+            preferred_side="yes",
+            quote_diag={"yes_edge_after_cost": 0.030, "no_edge_after_cost": 0.032},
+            source="unit_test_no_beats_preferred_yes",
+        )
+
+        self.assertEqual(decision["selected_side"], "no")
+        self.assertEqual(decision["selected_price"], 0.51)
+        self.assertTrue(decision["preferred_side_bonus_removed"])
+
+    def test_sports_side_selection_yes_outranks_preferred_no_on_better_edge(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXMLBTOTAL-NYYBOS-85",
+            family="KXMLBTOTAL",
+            lane="SPORTS",
+            market={"ticker": "KXMLBTOTAL-NYYBOS-85", "title": "Yankees Red Sox total"},
+            yes_bid=0.47,
+            yes_ask=0.49,
+            no_bid=0.49,
+            no_ask=0.51,
+            yes_top_size=40,
+            no_top_size=40,
+            preferred_side="no",
+            quote_diag={"yes_edge_after_cost": 0.032, "no_edge_after_cost": 0.030},
+            source="unit_test_yes_beats_preferred_no",
+        )
+
+        self.assertEqual(decision["selected_side"], "yes")
+        self.assertEqual(decision["selected_price"], 0.49)
+        self.assertTrue(decision["preferred_side_bonus_removed"])
+
+    def test_sports_side_selection_fake_missing_no_quote_blocks_no(self):
+        bot = self._make_bot()
+        decision = bot._aion_select_bidirectional_side(
+            ticker="KXMLBTOTAL-NOQUOTE",
+            family="KXMLBTOTAL",
+            lane="SPORTS",
+            market={"ticker": "KXMLBTOTAL-NOQUOTE", "title": "MLB total"},
+            yes_bid=None,
+            yes_ask=0.49,
+            no_bid=0.49,
+            no_ask=None,
+            yes_top_size=40,
+            no_top_size=0,
+            preferred_side="no",
+            quote_diag={"yes_edge_after_cost": 0.010, "no_edge_after_cost": 0.050},
+            source="unit_test_missing_no_quote",
+        )
+
+        self.assertFalse(decision["no_executable"])
+        self.assertNotEqual(decision["selected_side"], "no")
+
     def test_lane_selected_price_derives_missing_side_from_bidirectional_selector(self):
         bot = self._make_bot()
         q = SimpleNamespace(
@@ -418,6 +483,17 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(q.selected_side, "yes")
         self.assertEqual(q.selected_price, 0.42)
         self.assertEqual(q.selected_price_cents, 42)
+
+    def test_legacy_payload_missing_side_does_not_default_to_yes(self):
+        bot = self._make_bot()
+        payload = {
+            "ticker": "KXMLBTOTAL-NYYBOS-85",
+            "action": "buy",
+            "count": 1,
+            "yes_price": 49,
+        }
+
+        self.assertIsNone(bot._normalize_legacy_order_payload(payload))
 
     def test_candidate_quality_preserves_cent_price_units(self):
         bot = self._make_bot()
