@@ -28148,6 +28148,11 @@ class KalshiSniperBot:
         pending_same_ticker = any(str(entry.get("ticker") or "").strip() == ticker for entry in submitted_entries)
         same_family_count = int(snapshot["family_counts"].get(family, 0))
         same_game_count = int(snapshot["game_counts"].get(game_key, 0)) if game_key else 0
+        capacity_pressure = 1.0
+        if same_family_count >= settings["max_same_family_positions"]:
+            capacity_pressure = min(capacity_pressure, 0.65)
+        if game_key and same_game_count >= settings["max_same_game_positions"]:
+            capacity_pressure = min(capacity_pressure, 0.65)
         block_reason = None
         tennis_cap = {"allowed": True, "reason": "not_checked"}
         if not ticker:
@@ -28169,10 +28174,6 @@ class KalshiSniperBot:
             block_reason = "max_new_positions_per_10min"
         elif snapshot["open_count"] >= settings["max_open_positions"]:
             block_reason = "max_open_positions"
-        elif same_family_count >= settings["max_same_family_positions"]:
-            block_reason = "max_same_family_positions"
-        elif game_key and same_game_count >= settings["max_same_game_positions"]:
-            block_reason = "max_same_game_positions"
         elif bool(getattr(self, "trading_halted", False)):
             block_reason = "trading_halted"
         elif self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS:
@@ -28222,6 +28223,7 @@ class KalshiSniperBot:
             "recent_new_positions_10min": recent_10min,
             "active_order_timestamps": len(active_timestamps),
             "settings": settings,
+            "capacity_pressure": round(capacity_pressure, 4),
             "tennis_cap": tennis_cap.get("audit") if isinstance(tennis_cap, dict) else None,
             "duplicate_guard": duplicate,
             "decision": "ALLOW" if block_reason is None else "BLOCK",
@@ -28386,6 +28388,25 @@ class KalshiSniperBot:
                     "subsystem": "multi_sports_submit",
                 })
                 continue
+            capacity_pressure = self.to_float((concurrency.get("audit") or {}).get("capacity_pressure"), 1.0)
+            capacity_pressure = 1.0 if capacity_pressure is None else capacity_pressure
+            if capacity_pressure < 1.0:
+                requested_count = self.to_float(payload.get("count"), None)
+                if requested_count is not None and requested_count > 0:
+                    scaled_count = int(max(1, round(requested_count * capacity_pressure)))
+                    if scaled_count < requested_count:
+                        payload["count"] = scaled_count
+                        self._emit_aion_concurrency_log("AION-CONCURRENCY-ALLOW", {
+                            "source": source,
+                            "ticker": ticker,
+                            "family": family,
+                            "decision": "ALLOW",
+                            "reason": "capacity_pressure_scale",
+                            "requested_count": requested_count,
+                            "scaled_count": scaled_count,
+                            "capacity_pressure": capacity_pressure,
+                            "subsystem": "multi_sports_submit",
+                        })
             pre_submit_check = self._sports_momentum_pre_submit_check(
                 q=q,
                 market=meta.get("market") if isinstance(meta.get("market"), dict) else {},
