@@ -479,6 +479,8 @@ _AION_EXECUTION_CRITICAL_PREFIXES = (
     "AION-TENNIS-CAP",
     "AION-TENNIS-ELITE-ALLOW",
     "AION-SLOT-ALLOCATION",
+    "AION-WINNER-SCALE-",
+    "AION-DEAD-POSITION-",
     "AION-EXECUTION-BLOCKER",
     "AION-LIVE-EXECUTION",
     "LIVE-EXECUTION",
@@ -2262,6 +2264,17 @@ AION_MAX_NEW_POSITIONS_PER_10MIN = max(1, get_env_int("AION_MAX_NEW_POSITIONS_PE
 AION_MIN_SECONDS_BETWEEN_SUBMITS = max(0.0, get_env_float("AION_MIN_SECONDS_BETWEEN_SUBMITS", 5.0))
 AION_MAX_SAME_FAMILY_POSITIONS = max(1, get_env_int("AION_MAX_SAME_FAMILY_POSITIONS", 3))
 AION_MAX_SAME_GAME_POSITIONS = max(1, get_env_int("AION_MAX_SAME_GAME_POSITIONS", 2))
+AION_WINNER_SCALE_ENABLED = get_env_bool("AION_WINNER_SCALE_ENABLED", 1)
+AION_WINNER_SCALE_MAX_TICKER_EXPOSURE = max(1.0, get_env_float("AION_WINNER_SCALE_MAX_TICKER_EXPOSURE", 20.0))
+AION_WINNER_SCALE_MIN_HOLD_SECONDS = max(0.0, get_env_float("AION_WINNER_SCALE_MIN_HOLD_SECONDS", 20.0))
+AION_WINNER_SCALE_MAX_SPREAD = max(0.01, get_env_float("AION_WINNER_SCALE_MAX_SPREAD", 0.12))
+AION_WINNER_SCALE_ABSURD_SPREAD = max(AION_WINNER_SCALE_MAX_SPREAD, get_env_float("AION_WINNER_SCALE_ABSURD_SPREAD", 0.66))
+AION_WINNER_SCALE_MIN_EDGE = get_env_float("AION_WINNER_SCALE_MIN_EDGE", 0.0)
+AION_DEAD_POSITION_EXIT_ENABLED = get_env_bool("AION_DEAD_POSITION_EXIT_ENABLED", 1)
+AION_DEAD_POSITION_MIN_HOLD_SECONDS = max(60.0, get_env_float("AION_DEAD_POSITION_MIN_HOLD_SECONDS", 300.0))
+AION_DEAD_POSITION_FLAT_PNL_PER_CONTRACT = max(0.0, get_env_float("AION_DEAD_POSITION_FLAT_PNL_PER_CONTRACT", 0.005))
+AION_DEAD_POSITION_FLAT_DELTA = max(0.0, get_env_float("AION_DEAD_POSITION_FLAT_DELTA", 0.004))
+AION_DEAD_POSITION_MAX_SPREAD = max(0.01, get_env_float("AION_DEAD_POSITION_MAX_SPREAD", 0.18))
 LIVE_ORDER_RATE_LIMIT = max(1, get_env_int("LIVE_ORDER_RATE_LIMIT", get_env_int("AION_LIVE_ORDER_RATE_LIMIT", 5)))
 LIVE_ORDER_RATE_WINDOW_SEC = max(1, get_env_int("LIVE_ORDER_RATE_WINDOW_SEC", 60))
 LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
@@ -46474,6 +46487,527 @@ class KalshiSniperBot:
         except Exception:
             pass
 
+    def _emit_position_management_log(self, tag, payload=None):
+        payload = payload if isinstance(payload, dict) else {}
+        try:
+            print(f"[{tag}] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+
+    def _position_monitor_market_quality(self, q, price_context=None):
+        price_context = price_context if isinstance(price_context, dict) else {}
+        quality = 0.0
+        for value in (
+            getattr(q, "sports_execution_quality_score", None),
+            getattr(q, "market_quality", None),
+            getattr(q, "conviction_score", None),
+            getattr(q, "confidence", None),
+        ):
+            quality = max(quality, self._opportunity_score_value(value, 0.0))
+        spread = self.to_float(price_context.get("spread"), None)
+        if spread is not None:
+            if spread <= 0.03:
+                quality = max(quality, 86.0)
+            elif spread <= 0.06:
+                quality = max(quality, 74.0)
+            elif spread <= 0.10:
+                quality = max(quality, 58.0)
+        return round(quality, 4)
+
+    def _position_explicit_edge_after_cost(self, q, side=None):
+        side = self._normalize_live_side(side)
+        keys = []
+        if side in {"yes", "no"}:
+            keys.extend((f"{side}_edge_after_cost", f"{side}_final_edge", f"{side}_ev_edge", f"{side}_edge"))
+        keys.extend(("selected_edge_after_cost", "edge_after_cost", "EV", "edge"))
+        for key in keys:
+            value = self.to_float(self._read_field(q, key, default=None), None)
+            if value is not None:
+                return value
+        return None
+
+    def _build_position_monitor_context(self, position, decision=None, quotes_by_ticker=None):
+        position = position if isinstance(position, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        metadata = self._get_live_exit_position_metadata(position)
+        ticker = str(decision.get("ticker") or metadata.get("ticker") or position.get("ticker") or "").strip()
+        side = self._normalize_live_side(decision.get("side") or metadata.get("side") or position.get("side"))
+        family = str(
+            decision.get("family")
+            or metadata.get("family")
+            or position.get("family")
+            or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")
+            or "UNKNOWN"
+        ).strip().upper()
+        q, market, quote_source, quote_reason = self._resolve_live_exit_quote_context(position, quotes_by_ticker=quotes_by_ticker)
+        price_context = self._get_live_exit_price_context(q, side) if q is not None else {}
+        entry_price = self._position_flip_price_value(decision.get("entry_price") or metadata.get("entry_price") or position.get("entry_price") or position.get("avg_price"))
+        current_price = self._position_flip_price_value(decision.get("current_price") or price_context.get("current_price"))
+        exit_price = self._position_flip_price_value(decision.get("exit_price") or price_context.get("exit_price"))
+        selected_ask = None
+        if side == "yes":
+            selected_ask = self._position_flip_price_value(price_context.get("yes_ask"))
+        elif side == "no":
+            selected_ask = self._position_flip_price_value(price_context.get("no_ask"))
+        count = self.to_float(decision.get("count") or metadata.get("count") or position.get("count") or position.get("position") or 0.0, 0.0) or 0.0
+        if count < 0:
+            count = abs(count)
+        entry_ts = self.to_float(metadata.get("entry_ts"), self.to_float(position.get("entry_ts"), None))
+        hold_seconds = self.to_float(decision.get("hold_seconds"), None)
+        if hold_seconds is None:
+            hold_seconds = max(0.0, time.time() - float(entry_ts)) if entry_ts is not None else 0.0
+        pnl_per_contract = self.to_float(decision.get("pnl_per_contract"), None)
+        if pnl_per_contract is None and current_price is not None and entry_price is not None:
+            pnl_per_contract = round(float(current_price) - float(entry_price), 4)
+        unrealized_pnl = self.to_float(decision.get("unrealized_pnl"), None)
+        if unrealized_pnl is None and pnl_per_contract is not None:
+            unrealized_pnl = round(float(pnl_per_contract) * float(count), 4)
+        gain_pct = None
+        if entry_price is not None and entry_price > 0.0 and pnl_per_contract is not None:
+            gain_pct = float(pnl_per_contract) / float(entry_price)
+        spread = self.to_float(decision.get("spread"), self.to_float(price_context.get("spread"), None))
+        recent_delta = self.to_float(decision.get("recent_delta"), 0.0) or 0.0
+        last_step_delta = self.to_float(decision.get("last_step_delta"), 0.0) or 0.0
+        side_support = self.to_float(decision.get("side_support"), 0.0) or 0.0
+        market_quality = self._position_monitor_market_quality(q, price_context)
+        flat_delta = float(AION_DEAD_POSITION_FLAT_DELTA or 0.0)
+        if pnl_per_contract is not None and pnl_per_contract < 0.0:
+            thesis_status = "weakening"
+        elif gain_pct is not None and gain_pct >= 0.05 and recent_delta >= -flat_delta and side_support >= -KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND:
+            thesis_status = "improving"
+        elif abs(recent_delta) <= flat_delta and abs(last_step_delta) <= flat_delta:
+            thesis_status = "flat"
+        else:
+            thesis_status = "weakening" if recent_delta < -flat_delta or side_support < -KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND else "flat"
+        entry_cost = round(float(entry_price or 0.0) * float(count), 4)
+        current_value = round(float(current_price or 0.0) * float(count), 4) if current_price is not None else None
+        cashout_value = round(float(exit_price) * float(count), 4) if exit_price is not None else None
+        return {
+            "ticker": ticker,
+            "family": family,
+            "side": side,
+            "entry_price": entry_price,
+            "current_mark": current_price,
+            "current_price": current_price,
+            "current_cashout_price": exit_price,
+            "exit_price": exit_price,
+            "selected_ask": selected_ask,
+            "count": count,
+            "entry_ts": entry_ts,
+            "hold_seconds": hold_seconds,
+            "pnl_per_contract": pnl_per_contract,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_gain_pct": round(gain_pct, 6) if gain_pct is not None else None,
+            "entry_cost": entry_cost,
+            "current_value": current_value,
+            "cashout_value": cashout_value,
+            "spread": spread,
+            "yes_bid": price_context.get("yes_bid"),
+            "yes_ask": price_context.get("yes_ask"),
+            "no_bid": price_context.get("no_bid"),
+            "no_ask": price_context.get("no_ask"),
+            "recent_delta": recent_delta,
+            "last_step_delta": last_step_delta,
+            "side_support": side_support,
+            "market_quality": market_quality,
+            "quote_source": quote_source,
+            "quote_reason": quote_reason,
+            "thesis_status": thesis_status,
+            "explicit_edge_after_cost": self._position_explicit_edge_after_cost(q, side),
+            "q": q,
+            "market": market,
+        }
+
+    def _winner_scale_tier(self, gain_pct):
+        gain_pct = self.to_float(gain_pct, None)
+        if gain_pct is None:
+            return None
+        if gain_pct >= 0.35:
+            return {"tier": "aggressive", "threshold": 0.35, "base_add_count": 4}
+        if gain_pct >= 0.20:
+            return {"tier": "strong", "threshold": 0.20, "base_add_count": 3}
+        if gain_pct >= 0.10:
+            return {"tier": "medium", "threshold": 0.10, "base_add_count": 2}
+        if gain_pct >= 0.05:
+            return {"tier": "small", "threshold": 0.05, "base_add_count": 1}
+        return None
+
+    def _winner_scale_state_for(self, ticker):
+        state = getattr(self, "winner_scale_state", None)
+        if not isinstance(state, dict):
+            self.winner_scale_state = {}
+            state = self.winner_scale_state
+        ticker = str(ticker or "").strip()
+        entry = state.get(ticker) if isinstance(state.get(ticker), dict) else {}
+        if ticker and not entry:
+            try:
+                persisted = self.load_live_position_state()
+                persisted_entry = persisted.get(ticker) if isinstance(persisted, dict) and isinstance(persisted.get(ticker), dict) else {}
+                if persisted_entry:
+                    entry = {
+                        "tiers": list(persisted_entry.get("winner_scale_tiers") or []),
+                        "last_ts": self.to_float(persisted_entry.get("winner_scale_last_ts"), 0.0) or 0.0,
+                    }
+            except Exception:
+                entry = {}
+        entry.setdefault("tiers", [])
+        entry.setdefault("last_ts", 0.0)
+        if ticker:
+            state[ticker] = entry
+        return entry
+
+    def _mark_winner_scale_added(self, position, context, payload, result, tier):
+        ticker = str(context.get("ticker") or "").strip()
+        if not ticker:
+            return
+        add_count = self.to_float(payload.get("count"), 0.0) or 0.0
+        add_price = self._position_flip_price_value(payload.get("price") or payload.get("selected_price")) or 0.0
+        old_count = self.to_float(context.get("count"), 0.0) or 0.0
+        old_entry = self._position_flip_price_value(context.get("entry_price")) or 0.0
+        new_count = old_count + add_count
+        new_entry = round(((old_count * old_entry) + (add_count * add_price)) / new_count, 4) if new_count > 0.0 else old_entry
+        scale_state = self._winner_scale_state_for(ticker)
+        tiers = list(scale_state.get("tiers") or [])
+        if tier and tier not in tiers:
+            tiers.append(tier)
+        scale_state.update({"tiers": tiers, "last_ts": time.time()})
+        for row in getattr(self, "live_positions", []) or []:
+            if isinstance(row, dict) and str(row.get("ticker") or "").strip() == ticker:
+                row["count"] = new_count
+                row["entry_price"] = new_entry
+                row["winner_scale_tiers"] = list(tiers)
+                row["winner_scale_last_ts"] = scale_state["last_ts"]
+        try:
+            state = self.load_live_position_state()
+            entry = state.get(ticker) if isinstance(state.get(ticker), dict) else {}
+            if isinstance(entry, dict):
+                entry["count"] = new_count
+                entry["entry_price"] = new_entry
+                entry["winner_scale_tiers"] = list(tiers)
+                entry["winner_scale_last_ts"] = scale_state["last_ts"]
+                entry["winner_scale_last_order_id"] = ((result.get("response") or {}) if isinstance(result.get("response"), dict) else {}).get("order_id")
+                state[ticker] = entry
+                self.save_live_position_state(state)
+        except Exception:
+            pass
+
+    def _winner_scale_preflight(self, context):
+        ticker = context.get("ticker")
+        family = str(context.get("family") or "").strip().upper()
+        side = self._normalize_live_side(context.get("side"))
+        tier = self._winner_scale_tier(context.get("unrealized_gain_pct"))
+        if not AION_WINNER_SCALE_ENABLED:
+            return {"allowed": False, "reason": "winner_scaling_disabled"}
+        if bool(getattr(self, "trading_halted", False)):
+            return {"allowed": False, "reason": "trading_halted"}
+        if self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS:
+            return {"allowed": False, "reason": "daily_loss_guard"}
+        if not ticker or side not in {"yes", "no"}:
+            return {"allowed": False, "reason": "missing_ticker_or_side"}
+        if tier is None:
+            return {"allowed": False, "reason": "winner_threshold_not_met"}
+        if (self.to_float(context.get("hold_seconds"), 0.0) or 0.0) < float(AION_WINNER_SCALE_MIN_HOLD_SECONDS or 0.0):
+            return {"allowed": False, "reason": "winner_scale_min_hold_not_met", "tier": tier}
+        if (self.to_float(context.get("pnl_per_contract"), 0.0) or 0.0) <= 0.0:
+            return {"allowed": False, "reason": "position_not_winning", "tier": tier}
+        if str(context.get("thesis_status") or "").strip().lower() not in {"improving", "flat"}:
+            return {"allowed": False, "reason": "thesis_weakening", "tier": tier}
+        spread = self.to_float(context.get("spread"), None)
+        if spread is not None and spread > float(AION_WINNER_SCALE_ABSURD_SPREAD):
+            return {"allowed": False, "reason": "absurd_spread", "tier": tier}
+        if spread is not None and spread > float(AION_WINNER_SCALE_MAX_SPREAD):
+            return {"allowed": False, "reason": "scale_spread_too_wide", "tier": tier}
+        edge = self.to_float(context.get("explicit_edge_after_cost"), None)
+        if edge is not None and edge < float(AION_WINNER_SCALE_MIN_EDGE):
+            return {"allowed": False, "reason": "negative_ev_scale_rejected", "tier": tier}
+        selected_ask = self._position_flip_price_value(context.get("selected_ask"))
+        if selected_ask is None or not (0.0 < float(selected_ask) < 1.0):
+            return {"allowed": False, "reason": "missing_scale_entry_ask", "tier": tier}
+        scale_state = self._winner_scale_state_for(ticker)
+        completed_tiers = set(str(item) for item in (scale_state.get("tiers") or []))
+        if tier.get("tier") in completed_tiers:
+            return {"allowed": False, "reason": "scale_tier_already_completed", "tier": tier, "completed_tiers": sorted(completed_tiers)}
+        for row in self._get_open_live_positions() or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("ticker") or "").strip() != ticker:
+                continue
+            row_side = self._normalize_live_side(row.get("side"))
+            if row_side in {"yes", "no"} and row_side != side:
+                return {"allowed": False, "reason": "opposite_side_conflict", "tier": tier}
+        base_add = int(tier.get("base_add_count") or 1)
+        if self._is_family_profitability_preferred(family):
+            base_add += 1
+        if self._is_family_profitability_weak_tennis(family):
+            base_add = max(1, base_add - 1)
+        base_add = max(1, min(int(MAX_LIVE_ORDER_SIZE or 1), base_add))
+        current_exposure = self.to_float(context.get("entry_cost"), 0.0) or 0.0
+        remaining_exposure = float(AION_WINNER_SCALE_MAX_TICKER_EXPOSURE) - float(current_exposure)
+        if remaining_exposure <= 0.0:
+            return {"allowed": False, "reason": "ticker_exposure_cap", "tier": tier, "current_exposure": round(current_exposure, 4), "max_exposure": AION_WINNER_SCALE_MAX_TICKER_EXPOSURE}
+        cap_add_count = int(math.floor(remaining_exposure / float(selected_ask)))
+        if cap_add_count <= 0:
+            return {"allowed": False, "reason": "ticker_exposure_cap", "tier": tier, "current_exposure": round(current_exposure, 4), "max_exposure": AION_WINNER_SCALE_MAX_TICKER_EXPOSURE}
+        add_count = max(1, min(base_add, cap_add_count))
+        recent_order = None
+        try:
+            recent_order = self.recent_submitted_order_for_ticker(ticker, window_seconds=LIVE_RECENT_ORDER_DUPLICATE_BLOCK_SECONDS)
+        except Exception:
+            recent_order = None
+        if recent_order:
+            return {"allowed": False, "reason": "recent_order_pending_confirmation", "tier": tier, "recent_order": recent_order}
+        return {
+            "allowed": True,
+            "reason": "winner_scale_allowed",
+            "tier": tier,
+            "add_count": add_count,
+            "scale_price": selected_ask,
+            "current_exposure": round(current_exposure, 4),
+            "post_scale_exposure": round(current_exposure + add_count * float(selected_ask), 4),
+            "max_exposure": float(AION_WINNER_SCALE_MAX_TICKER_EXPOSURE),
+        }
+
+    def _build_winner_scale_payload(self, context, preflight):
+        ticker = str(context.get("ticker") or "").strip()
+        family = str(context.get("family") or self.get_market_family({"ticker": ticker}) or "UNKNOWN").strip().upper()
+        side = self._normalize_live_side(context.get("side"))
+        price = self._position_flip_price_value(preflight.get("scale_price"))
+        count = int(preflight.get("add_count") or 0)
+        if not ticker or side not in {"yes", "no"} or price is None or count <= 0:
+            return None
+        price_cents = max(1, min(99, int(round(float(price) * 100.0))))
+        payload = {
+            "ticker": ticker,
+            "family": family,
+            "side": side,
+            "selected_side": side,
+            "action": "buy",
+            "count": count,
+            "type": "limit",
+            "time_in_force": "fill_or_kill",
+            "post_only": False,
+            "rest_remainder": True,
+            "price": round(price_cents / 100.0, 4),
+            "selected_price": round(price_cents / 100.0, 4),
+            "selected_price_dollars": round(price_cents / 100.0, 4),
+            "selected_price_cents": price_cents,
+            "_aion_winner_scale_in": True,
+            "entry_context": {
+                "source": "winner_scale",
+                "scale_tier": (preflight.get("tier") or {}).get("tier"),
+                "unrealized_gain_pct": context.get("unrealized_gain_pct"),
+                "unrealized_pnl": context.get("unrealized_pnl"),
+                "thesis_status": context.get("thesis_status"),
+                "current_exposure": preflight.get("current_exposure"),
+                "post_scale_exposure": preflight.get("post_scale_exposure"),
+            },
+        }
+        if side == "yes":
+            payload["yes_price"] = price_cents
+        else:
+            payload["no_price"] = price_cents
+        return self._ensure_live_client_order_id(payload)
+
+    def _maybe_scale_winning_position(self, position, decision, *, quotes_by_ticker=None, allow_real_submit=False):
+        context = self._build_position_monitor_context(position, decision=decision, quotes_by_ticker=quotes_by_ticker)
+        preflight = self._winner_scale_preflight(context)
+        payload = self._build_winner_scale_payload(context, preflight) if preflight.get("allowed") else None
+        check_payload = {
+            **{key: value for key, value in context.items() if key not in {"q", "market"}},
+            "decision": "ALLOW" if preflight.get("allowed") else "BLOCK",
+            "reason": preflight.get("reason"),
+            "scale_tier": (preflight.get("tier") or {}).get("tier") if isinstance(preflight.get("tier"), dict) else None,
+            "add_count": preflight.get("add_count"),
+            "post_scale_exposure": preflight.get("post_scale_exposure"),
+            "max_ticker_exposure": AION_WINNER_SCALE_MAX_TICKER_EXPOSURE,
+        }
+        self._emit_position_management_log("AION-WINNER-SCALE-CHECK", check_payload)
+        if not preflight.get("allowed"):
+            self._emit_position_management_log("AION-WINNER-SCALE-BLOCK", check_payload)
+            return {"submitted": False, "reason": preflight.get("reason"), "context": context, "preflight": preflight, "payload": payload}
+        if not payload:
+            self._emit_position_management_log("AION-WINNER-SCALE-BLOCK", {**check_payload, "reason": "invalid_scale_payload"})
+            return {"submitted": False, "reason": "invalid_scale_payload", "context": context, "preflight": preflight}
+        risk_result = self.evaluate_live_order_risk_governor(payload, q=context.get("q"))
+        if not risk_result.get("ok"):
+            self._emit_position_management_log(
+                "AION-WINNER-SCALE-BLOCK",
+                {**check_payload, "reason": risk_result.get("reason") or "risk_governor_block", "risk": risk_result},
+            )
+            return {"submitted": False, "reason": risk_result.get("reason") or "risk_governor_block", "context": context, "preflight": preflight, "payload": payload, "risk": risk_result}
+        payload = risk_result.get("payload") if isinstance(risk_result.get("payload"), dict) else payload
+        payload["_risk_governor_checked"] = True
+        if not allow_real_submit:
+            self._emit_position_management_log("AION-WINNER-SCALE-BLOCK", {**check_payload, "reason": "monitor_only", "payload": payload})
+            return {"submitted": False, "reason": "monitor_only", "would_submit": True, "context": context, "preflight": preflight, "payload": payload}
+        result = self.place_live_order(payload)
+        result = result if isinstance(result, dict) else {"submitted": False, "reason": "submit_error"}
+        if result.get("submitted"):
+            try:
+                self._live_order_timestamps.append(time.time())
+            except Exception:
+                pass
+            self._mark_winner_scale_added(position, context, payload, result, (preflight.get("tier") or {}).get("tier"))
+            self.append_live_audit_log(
+                "winner_scale_submitted",
+                ticker=context.get("ticker"),
+                side=payload.get("side"),
+                action="buy",
+                count=payload.get("count"),
+                price=payload.get("price"),
+                reason="winner_scale",
+                status_code=result.get("status_code"),
+            )
+            self._emit_position_management_log("AION-WINNER-SCALE-ADD", {**check_payload, "submitted": True, "payload": payload, "result_reason": result.get("reason")})
+            result["payload"] = payload
+            return result
+        self._emit_position_management_log("AION-WINNER-SCALE-BLOCK", {**check_payload, "reason": result.get("reason") or "submit_blocked", "payload": payload})
+        result["payload"] = payload
+        return result
+
+    def _evaluate_dead_position_exit(self, position, decision, *, quotes_by_ticker=None):
+        context = self._build_position_monitor_context(position, decision=decision, quotes_by_ticker=quotes_by_ticker)
+        pnl_per_contract = self.to_float(context.get("pnl_per_contract"), None)
+        hold_seconds = self.to_float(context.get("hold_seconds"), 0.0) or 0.0
+        spread = self.to_float(context.get("spread"), None)
+        recent_delta = self.to_float(context.get("recent_delta"), 0.0) or 0.0
+        last_step_delta = self.to_float(context.get("last_step_delta"), 0.0) or 0.0
+        current_price = self.to_float(context.get("current_price"), None)
+        entry_price = self.to_float(context.get("entry_price"), None)
+        side_support = self.to_float(context.get("side_support"), 0.0) or 0.0
+        flat_pnl = float(AION_DEAD_POSITION_FLAT_PNL_PER_CONTRACT or 0.0)
+        flat_delta = float(AION_DEAD_POSITION_FLAT_DELTA or 0.0)
+        flat_or_negative = bool(pnl_per_contract is not None and pnl_per_contract <= flat_pnl)
+        mark_not_improving = bool(recent_delta <= flat_delta and last_step_delta <= flat_delta)
+        no_price_move_in_favor = bool(current_price is not None and entry_price is not None and current_price <= entry_price + flat_pnl)
+        thesis_not_strengthening = bool(str(context.get("thesis_status") or "").lower() in {"flat", "weakening"} and side_support <= KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND)
+        spread_not_improving = bool(spread is None or spread >= 0.03 or side_support <= KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND)
+        executable_exit = bool(
+            context.get("exit_price") is not None
+            and 0.0 < float(context.get("exit_price")) < 1.0
+            and (spread is None or spread <= float(AION_DEAD_POSITION_MAX_SPREAD))
+        )
+        payload = {
+            **{key: value for key, value in context.items() if key not in {"q", "market"}},
+            "min_hold_seconds": AION_DEAD_POSITION_MIN_HOLD_SECONDS,
+            "flat_pnl_per_contract": flat_pnl,
+            "flat_delta": flat_delta,
+            "flat_or_negative": flat_or_negative,
+            "mark_not_improving": mark_not_improving,
+            "spread_not_improving": spread_not_improving,
+            "thesis_not_strengthening": thesis_not_strengthening,
+            "no_price_move_in_favor": no_price_move_in_favor,
+            "exit_executable": executable_exit,
+        }
+        self._emit_position_management_log("AION-DEAD-POSITION-CHECK", payload)
+        if not AION_DEAD_POSITION_EXIT_ENABLED:
+            self._emit_position_management_log("AION-DEAD-POSITION-HOLD", {**payload, "reason": "dead_position_exit_disabled"})
+            return {"action": "hold", "reason": "dead_position_exit_disabled", "context": context}
+        if str(decision.get("action") or "").lower() == "exit":
+            self._emit_position_management_log("AION-DEAD-POSITION-HOLD", {**payload, "reason": "existing_exit_decision"})
+            return {"action": "hold", "reason": "existing_exit_decision", "context": context}
+        if hold_seconds < float(AION_DEAD_POSITION_MIN_HOLD_SECONDS):
+            self._emit_position_management_log("AION-DEAD-POSITION-HOLD", {**payload, "reason": "min_hold_not_met"})
+            return {"action": "hold", "reason": "min_hold_not_met", "context": context}
+        is_dead = bool(flat_or_negative and mark_not_improving and no_price_move_in_favor and thesis_not_strengthening and spread_not_improving)
+        if not is_dead:
+            self._emit_position_management_log("AION-DEAD-POSITION-HOLD", {**payload, "reason": "position_not_dead"})
+            return {"action": "hold", "reason": "position_not_dead", "context": context}
+        if not executable_exit:
+            self._emit_position_management_log("AION-DEAD-POSITION-HOLD", {**payload, "reason": "exit_not_executable_retry"})
+            return {"action": "hold", "reason": "exit_not_executable_retry", "context": context}
+        exit_decision = dict(decision)
+        exit_decision.update({
+            "ticker": context.get("ticker"),
+            "family": context.get("family"),
+            "side": context.get("side"),
+            "action": "exit",
+            "reason": "dead_position_no_improvement",
+            "entry_price": context.get("entry_price"),
+            "current_price": context.get("current_price"),
+            "exit_price": context.get("exit_price"),
+            "spread": context.get("spread"),
+            "count": context.get("count"),
+            "hold_seconds": context.get("hold_seconds"),
+            "pnl_per_contract": context.get("pnl_per_contract"),
+            "unrealized_pnl": context.get("unrealized_pnl"),
+            "cashout_value": context.get("cashout_value"),
+            "dead_position_exit": True,
+        })
+        self._emit_position_management_log("AION-DEAD-POSITION-EXIT", {**payload, "reason": "dead_position_no_improvement"})
+        return exit_decision
+
+    def _is_protective_position_exit_decision(self, decision):
+        decision = decision if isinstance(decision, dict) else {}
+        if str(decision.get("action") or "").strip().lower() != "exit":
+            return False
+        reason = str(decision.get("reason") or "").strip().lower()
+        protective_reasons = {
+            "position_flip_opposite_edge",
+            "trailing_profit_giveback",
+            "green_to_red_peak_giveback",
+            "green_momentum_flip",
+            "defensive_exit",
+            "late_game_decay_exit",
+            "stale_sports_exit",
+            "severe_stop_loss",
+            "adverse_fast_cut",
+            "stop_loss",
+            "dead_prop_exit",
+            "max_payout_profit_lock",
+            "near_expiry_profit_lock",
+            "dead_position_no_improvement",
+        }
+        if reason in protective_reasons:
+            return True
+        protective_flags = (
+            "position_flip",
+            "trailing_profit_exit",
+            "green_to_red_exit",
+            "green_momentum_exit",
+            "defensive_exit",
+            "late_game_decay_exit",
+            "stale_sports_exit",
+            "severe_stop_loss_exit",
+            "adverse_fast_cut_exit",
+            "stop_loss_exit",
+            "dead_prop_exit",
+            "dead_position_exit",
+        )
+        return any(bool(decision.get(flag)) for flag in protective_flags)
+
+    def _defer_harvest_exit_after_winner_scale(self, decision, scale_result):
+        decision = decision if isinstance(decision, dict) else {}
+        scale_result = scale_result if isinstance(scale_result, dict) else {}
+        if not bool(scale_result.get("submitted")):
+            return decision
+        if self._is_protective_position_exit_decision(decision):
+            return decision
+        if str(decision.get("action") or "").strip().lower() != "exit":
+            return decision
+        deferred = dict(decision)
+        deferred.update(
+            {
+                "action": "hold",
+                "reason": "winner_scaled_harvest_deferred",
+                "deferred_exit_reason": decision.get("reason"),
+                "winner_scale_submitted": True,
+                "winner_scale_reason": scale_result.get("reason"),
+                "winner_scale_payload": scale_result.get("payload"),
+            }
+        )
+        self._emit_position_management_log(
+            "AION-WINNER-SCALE-ADD",
+            {
+                "ticker": deferred.get("ticker"),
+                "side": deferred.get("side"),
+                "reason": "harvest_exit_deferred_after_scale",
+                "deferred_exit_reason": decision.get("reason"),
+                "scale_reason": scale_result.get("reason"),
+            },
+        )
+        return deferred
+
     def _position_flip_side_selection(self, position, q, price_context, side):
         position = position if isinstance(position, dict) else {}
         price_context = price_context if isinstance(price_context, dict) else {}
@@ -47393,6 +47927,9 @@ class KalshiSniperBot:
         decisions = []
         submitted = 0
         flip_reentries_submitted = 0
+        winner_scale_attempts = 0
+        winner_scale_submitted = 0
+        dead_position_exit_orders = 0
         for position in open_positions:
             decision = self._evaluate_dynamic_live_exit(position, quotes_by_ticker=quotes_by_ticker)
             position_flip_decision = self._evaluate_position_flip(
@@ -47402,6 +47939,26 @@ class KalshiSniperBot:
             )
             if position_flip_decision.get("action") == "exit":
                 decision = position_flip_decision
+            scale_result = {"submitted": False, "reason": "not_attempted"}
+            if not self._is_protective_position_exit_decision(decision):
+                winner_scale_attempts += 1
+                scale_result = self._maybe_scale_winning_position(
+                    position,
+                    decision,
+                    quotes_by_ticker=quotes_by_ticker,
+                    allow_real_submit=allow_real_exits,
+                )
+                if scale_result.get("submitted"):
+                    winner_scale_submitted += 1
+                    decision = self._defer_harvest_exit_after_winner_scale(decision, scale_result)
+            if not scale_result.get("submitted") and decision.get("action") != "exit":
+                dead_decision = self._evaluate_dead_position_exit(
+                    position,
+                    decision,
+                    quotes_by_ticker=quotes_by_ticker,
+                )
+                if dead_decision.get("action") == "exit":
+                    decision = dead_decision
             result = {"submitted": False, "reason": "hold"}
             reentry_result = {"submitted": False, "reason": "not_attempted"}
             if decision.get("action") == "exit":
@@ -47429,6 +47986,8 @@ class KalshiSniperBot:
                         )
                     if result.get("submitted"):
                         submitted += 1
+                        if decision.get("dead_position_exit"):
+                            dead_position_exit_orders += 1
                         if decision.get("position_flip"):
                             reentry_result = self._maybe_reenter_position_flip(position, decision, result)
                             if reentry_result.get("submitted"):
@@ -47458,6 +48017,9 @@ class KalshiSniperBot:
                     "position_flip": bool(decision.get("position_flip")),
                     "reentry_submitted": bool(reentry_result.get("submitted")),
                     "reentry_reason": reentry_result.get("reason"),
+                    "winner_scale_submitted": bool(scale_result.get("submitted")),
+                    "winner_scale_reason": scale_result.get("reason"),
+                    "dead_position_exit": bool(decision.get("dead_position_exit")),
                 }
             )
         post_exit_reconcile = None
@@ -47485,6 +48047,9 @@ class KalshiSniperBot:
             "allow_real_exits": bool(allow_real_exits),
             "exit_orders_submitted": submitted,
             "flip_reentries_submitted": flip_reentries_submitted,
+            "winner_scale_attempts": winner_scale_attempts,
+            "winner_scale_submitted": winner_scale_submitted,
+            "dead_position_exit_orders": dead_position_exit_orders,
             "post_exit_reconcile": post_exit_reconcile,
             "decisions": decisions,
         }

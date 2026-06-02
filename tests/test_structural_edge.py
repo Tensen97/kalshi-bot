@@ -78,6 +78,62 @@ class StructuralEdgeTests(unittest.TestCase):
         bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.0}
         return bot
 
+    def _set_position_management_config(
+        self,
+        *,
+        winner_enabled=True,
+        winner_cap=20.0,
+        winner_min_hold=0.0,
+        dead_enabled=True,
+        dead_min_hold=300.0,
+    ):
+        old_values = {
+            "AION_WINNER_SCALE_ENABLED": kw.AION_WINNER_SCALE_ENABLED,
+            "AION_WINNER_SCALE_MAX_TICKER_EXPOSURE": kw.AION_WINNER_SCALE_MAX_TICKER_EXPOSURE,
+            "AION_WINNER_SCALE_MIN_HOLD_SECONDS": kw.AION_WINNER_SCALE_MIN_HOLD_SECONDS,
+            "AION_DEAD_POSITION_EXIT_ENABLED": kw.AION_DEAD_POSITION_EXIT_ENABLED,
+            "AION_DEAD_POSITION_MIN_HOLD_SECONDS": kw.AION_DEAD_POSITION_MIN_HOLD_SECONDS,
+        }
+        kw.AION_WINNER_SCALE_ENABLED = bool(winner_enabled)
+        kw.AION_WINNER_SCALE_MAX_TICKER_EXPOSURE = float(winner_cap)
+        kw.AION_WINNER_SCALE_MIN_HOLD_SECONDS = float(winner_min_hold)
+        kw.AION_DEAD_POSITION_EXIT_ENABLED = bool(dead_enabled)
+        kw.AION_DEAD_POSITION_MIN_HOLD_SECONDS = float(dead_min_hold)
+        for name, value in old_values.items():
+            self.addCleanup(setattr, kw, name, value)
+
+    def _configure_position_management_bot(self, bot, family="KXMLBSPREAD"):
+        bot.live_exit_price_history = {}
+        bot.dynamic_exit_log_markers = {}
+        bot.profit_lock_log_markers = {}
+        bot.sports_harvest_log_markers = {}
+        bot.live_loss_exit_confirmation_counts = {}
+        bot.position_flip_cooldowns = {}
+        bot.position_flip_log_markers = {}
+        bot.live_exit_cooldowns = {}
+        bot.live_exit_pending_tickers = set()
+        bot.winner_scale_state = {}
+        bot._live_order_timestamps = []
+        bot.live_trade_count_today = 0
+        bot.realized_pnl = 0.0
+        bot.live_realized_pnl_today = 0.0
+        bot.trading_halted = False
+        bot.get_live_entry_metadata = lambda _ticker: {}
+        bot.get_live_market_detail = lambda _ticker: {}
+        bot.get_market_family = lambda _market: family
+        bot._extract_orderbook_imbalance_context = lambda *args, **kwargs: {"imbalance": 0.0}
+        bot.recent_submitted_order_for_ticker = lambda *args, **kwargs: None
+        bot.evaluate_live_order_risk_governor = lambda payload, q=None: {"ok": True, "payload": dict(payload)}
+        bot.append_live_audit_log = lambda *args, **kwargs: None
+        state = {}
+        bot.load_live_position_state = lambda: state
+        bot.save_live_position_state = lambda new_state: state.clear() or state.update(dict(new_state or {}))
+        bot._ensure_live_client_order_id = lambda payload: dict(payload, client_order_id=payload.get("client_order_id") or f"unit-{payload.get('ticker')}")
+        logs = []
+        bot.position_management_test_logs = logs
+        bot._emit_position_management_log = lambda tag, payload=None: logs.append((tag, dict(payload or {})))
+        return bot
+
     def _set_temp_sports_memory(self, bot, tmpdir):
         bot.aion_sports_memory_file = str(Path(tmpdir) / "aion_adaptive_sports_memory.json")
         bot.aion_sports_memory_state = None
@@ -5101,6 +5157,284 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertEqual(decision["action"], "hold")
         self.assertEqual(decision["reason"], "position_flip_loss_threshold_not_met")
+
+    def test_winning_position_scales_in(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-WINNER-SCALE"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 4, "entry_ts": time.time() - 120}
+        bot.live_positions = [position]
+        submitted_payloads = []
+        bot.place_live_order = lambda payload: submitted_payloads.append(dict(payload)) or {"submitted": True, "reason": "submitted", "response": {"order": {"id": "scale-1"}}}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXMLBSPREAD",
+            yes_bid=0.56,
+            yes_ask=0.57,
+            no_bid=0.43,
+            no_ask=0.44,
+            yes_edge_after_cost=0.05,
+            sports_execution_quality_score=92,
+        )
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.56,
+            "exit_price": 0.56,
+            "count": 4,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.06,
+            "unrealized_pnl": 0.24,
+            "spread": 0.01,
+            "recent_delta": 0.006,
+            "last_step_delta": 0.004,
+            "side_support": 0.12,
+        }
+
+        result = bot._maybe_scale_winning_position(position, decision, quotes_by_ticker={ticker: q}, allow_real_submit=True)
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(submitted_payloads[0]["action"], "buy")
+        self.assertEqual(submitted_payloads[0]["side"], "yes")
+        self.assertEqual(submitted_payloads[0]["yes_price"], 57)
+        self.assertEqual(submitted_payloads[0]["count"], 3)
+        self.assertAlmostEqual(bot.live_positions[0]["count"], 7.0)
+        self.assertIn("medium", bot.live_positions[0]["winner_scale_tiers"])
+        self.assertTrue(any(tag == "AION-WINNER-SCALE-ADD" for tag, _payload in bot.position_management_test_logs))
+
+    def test_winner_scaling_respects_twenty_dollar_ticker_cap(self):
+        self._set_position_management_config(winner_min_hold=0.0, winner_cap=20.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-CAP"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 40, "entry_ts": time.time() - 120}
+        bot.live_positions = [position]
+        submitted_payloads = []
+        bot.place_live_order = lambda payload: submitted_payloads.append(dict(payload)) or {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.56, yes_ask=0.57, no_bid=0.43, no_ask=0.44, yes_edge_after_cost=0.04)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.56,
+            "exit_price": 0.56,
+            "count": 40,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.06,
+            "unrealized_pnl": 2.40,
+            "spread": 0.01,
+            "recent_delta": 0.006,
+            "last_step_delta": 0.004,
+            "side_support": 0.12,
+        }
+
+        result = bot._maybe_scale_winning_position(position, decision, quotes_by_ticker={ticker: q}, allow_real_submit=True)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "ticker_exposure_cap")
+        self.assertEqual(submitted_payloads, [])
+        self.assertTrue(any(tag == "AION-WINNER-SCALE-BLOCK" and payload.get("reason") == "ticker_exposure_cap" for tag, payload in bot.position_management_test_logs))
+
+    def test_winner_scaling_respects_risk_governor_caps(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-RISK-CAP"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 4, "entry_ts": time.time() - 120}
+        bot.live_positions = [position]
+        bot.evaluate_live_order_risk_governor = lambda payload, q=None: {"ok": False, "reason": "max_family_exposure", "payload": dict(payload)}
+        submitted_payloads = []
+        bot.place_live_order = lambda payload: submitted_payloads.append(dict(payload)) or {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.56, yes_ask=0.57, no_bid=0.43, no_ask=0.44, yes_edge_after_cost=0.04)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.56,
+            "exit_price": 0.56,
+            "count": 4,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.06,
+            "unrealized_pnl": 0.24,
+            "spread": 0.01,
+            "recent_delta": 0.006,
+            "last_step_delta": 0.004,
+            "side_support": 0.12,
+        }
+
+        result = bot._maybe_scale_winning_position(position, decision, quotes_by_ticker={ticker: q}, allow_real_submit=True)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "max_family_exposure")
+        self.assertEqual(submitted_payloads, [])
+
+    def test_flat_or_losing_position_does_not_scale(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-FLAT-NOSCALE"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 4, "entry_ts": time.time() - 120}
+        bot.live_positions = [position]
+        bot.place_live_order = lambda payload: {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.50, yes_ask=0.51, no_bid=0.49, no_ask=0.50, yes_edge_after_cost=0.03)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.50,
+            "exit_price": 0.50,
+            "count": 4,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.0,
+            "unrealized_pnl": 0.0,
+            "spread": 0.01,
+            "recent_delta": 0.0,
+            "last_step_delta": 0.0,
+            "side_support": 0.0,
+        }
+
+        result = bot._maybe_scale_winning_position(position, decision, quotes_by_ticker={ticker: q}, allow_real_submit=True)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "winner_threshold_not_met")
+
+    def test_dead_five_minute_position_exits_if_executable(self):
+        self._set_position_management_config(winner_min_hold=0.0, dead_min_hold=300.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-DEAD-EXIT"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 360}
+        bot.live_positions = [position]
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.50, yes_ask=0.52, no_bid=0.48, no_ask=0.50, yes_edge_after_cost=0.02)
+        bot._evaluate_dynamic_live_exit = lambda _position, quotes_by_ticker=None: {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "reason": "unit_hold",
+            "entry_price": 0.50,
+            "current_price": 0.50,
+            "exit_price": 0.50,
+            "count": 2,
+            "hold_seconds": 360,
+            "pnl_per_contract": 0.0,
+            "unrealized_pnl": 0.0,
+            "spread": 0.02,
+            "recent_delta": 0.0,
+            "last_step_delta": 0.0,
+            "side_support": 0.0,
+        }
+        bot._evaluate_position_flip = lambda _position, base_decision=None, quotes_by_ticker=None: {"ticker": ticker, "action": "hold", "reason": "no_flip"}
+        submitted_exits = []
+        bot.submit_live_exit_order = lambda _position, decision: submitted_exits.append(dict(decision)) or {"submitted": True, "reason": "submitted"}
+        bot.reconcile_live_positions = lambda: {"ok": True, "positions": bot.live_positions}
+
+        result = bot.run_live_monitor_positions_pass(allow_real_exits=True, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["exit_orders_submitted"], 1)
+        self.assertEqual(result["dead_position_exit_orders"], 1)
+        self.assertEqual(submitted_exits[0]["reason"], "dead_position_no_improvement")
+        self.assertTrue(submitted_exits[0]["dead_position_exit"])
+        self.assertTrue(any(tag == "AION-DEAD-POSITION-EXIT" for tag, _payload in bot.position_management_test_logs))
+
+    def test_dead_position_non_executable_exit_logs_and_retries(self):
+        self._set_position_management_config(dead_min_hold=300.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-DEAD-HOLD"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 360}
+        bot.live_positions = [position]
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.49, yes_ask=0.75, no_bid=0.25, no_ask=0.51, yes_edge_after_cost=0.02)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.49,
+            "exit_price": 0.49,
+            "count": 2,
+            "hold_seconds": 360,
+            "pnl_per_contract": -0.01,
+            "unrealized_pnl": -0.02,
+            "spread": 0.26,
+            "recent_delta": 0.0,
+            "last_step_delta": 0.0,
+            "side_support": 0.0,
+        }
+
+        result = bot._evaluate_dead_position_exit(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(result["reason"], "exit_not_executable_retry")
+        self.assertTrue(any(tag == "AION-DEAD-POSITION-HOLD" and payload.get("reason") == "exit_not_executable_retry" for tag, payload in bot.position_management_test_logs))
+
+    def test_winner_scaling_opposite_side_guard_remains_active(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-OPPOSITE-GUARD"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 4, "entry_ts": time.time() - 120}
+        bot.live_positions = [position, {"ticker": ticker, "family": "KXMLBSPREAD", "side": "no", "entry_price": 0.40, "count": 1, "entry_ts": time.time() - 60}]
+        bot.place_live_order = lambda payload: {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.56, yes_ask=0.57, no_bid=0.43, no_ask=0.44, yes_edge_after_cost=0.04)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.56,
+            "exit_price": 0.56,
+            "count": 4,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.06,
+            "unrealized_pnl": 0.24,
+            "spread": 0.01,
+            "recent_delta": 0.006,
+            "last_step_delta": 0.004,
+            "side_support": 0.12,
+        }
+
+        result = bot._maybe_scale_winning_position(position, decision, quotes_by_ticker={ticker: q}, allow_real_submit=True)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+
+    def test_winner_scaling_daily_loss_cap_remains_active(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        bot.live_realized_pnl_today = -kw.MAX_DAILY_LOSS
+        ticker = "KXMLBSPREAD-DAILY-LOSS"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 4, "entry_ts": time.time() - 120}
+        bot.live_positions = [position]
+        bot.place_live_order = lambda payload: {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.56, yes_ask=0.57, no_bid=0.43, no_ask=0.44, yes_edge_after_cost=0.04)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.56,
+            "exit_price": 0.56,
+            "count": 4,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.06,
+            "unrealized_pnl": 0.24,
+            "spread": 0.01,
+            "recent_delta": 0.006,
+            "last_step_delta": 0.004,
+            "side_support": 0.12,
+        }
+
+        result = bot._maybe_scale_winning_position(position, decision, quotes_by_ticker={ticker: q}, allow_real_submit=True)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "daily_loss_guard")
 
     def test_strong_sports_conviction_sizes_and_ranks_higher(self):
         bot = self._make_bot()
