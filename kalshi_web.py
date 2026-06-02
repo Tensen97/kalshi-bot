@@ -1869,6 +1869,9 @@ TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS = [
     "KXNHLGOAL",
     "KXNHLSPREAD",
     "KXNHLTOTAL",
+    "KXNCAASB",
+    "KXNCAASBSPREAD",
+    "KXNCAASBTOTAL",
     "KXNCAAB",
     "KXNCAAF",
     "KXCFB",
@@ -1930,6 +1933,9 @@ TARGETED_SERIES_PRIORITY_WINDOWS = {
     "KXNHLGOAL": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXNHLSPREAD": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXNHLTOTAL": {"hours_utc": (), "reason": "sports_expansion_window"},
+    "KXNCAASB": {"hours_utc": (), "reason": "profitable_family_expansion_window"},
+    "KXNCAASBSPREAD": {"hours_utc": (), "reason": "profitable_family_expansion_window"},
+    "KXNCAASBTOTAL": {"hours_utc": (), "reason": "profitable_family_expansion_window"},
     "KXNCAAB": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXNCAAF": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXCFB": {"hours_utc": (), "reason": "sports_expansion_window"},
@@ -2054,6 +2060,53 @@ AION_SPORTS_MEMORY_MAX_RANK_BOOST = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_B
 AION_SPORTS_MEMORY_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_PENALTY", 0.30)
 AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER", 0.95)
 AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER", 1.22)
+AION_FAMILY_PROFITABILITY_ENABLED = get_env_bool("AION_FAMILY_PROFITABILITY_ENABLED", 1)
+AION_FAMILY_PROFITABILITY_MIN_TRADES = get_env_int("AION_FAMILY_PROFITABILITY_MIN_TRADES", 2)
+AION_FAMILY_PROFITABILITY_MAX_RANK_BOOST = get_env_float("AION_FAMILY_PROFITABILITY_MAX_RANK_BOOST", 24.0)
+AION_FAMILY_PROFITABILITY_MAX_RANK_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_MAX_RANK_PENALTY", 55.0)
+AION_FAMILY_PROFITABILITY_MAX_UNIFIED_BOOST = get_env_float("AION_FAMILY_PROFITABILITY_MAX_UNIFIED_BOOST", 14.0)
+AION_FAMILY_PROFITABILITY_MAX_UNIFIED_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_MAX_UNIFIED_PENALTY", 28.0)
+AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER = get_env_float("AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER", 0.30)
+AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER = get_env_float("AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER", 1.85)
+AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY", 12.0)
+AION_FAMILY_PROFITABILITY_PRIORS = {
+    "MLB": {"family_pnl": 0.75, "wins": 7, "losses": 1, "trade_count": 8},
+    "KXMLB": {"family_pnl": 0.75, "wins": 7, "losses": 1, "trade_count": 8},
+    "KXMLBSPREAD": {"family_pnl": 0.77, "wins": 6, "losses": 0, "trade_count": 6},
+    "KXMLBTOTAL": {"family_pnl": 0.75, "wins": 7, "losses": 1, "trade_count": 8},
+    "KXMLBMONEYLINE": {"family_pnl": 0.75, "wins": 7, "losses": 1, "trade_count": 8},
+    "NCAASB": {"family_pnl": 0.30, "wins": 4, "losses": 0, "trade_count": 4},
+    "KXNCAASB": {"family_pnl": 0.30, "wins": 4, "losses": 0, "trade_count": 4},
+    "NCAAB": {"family_pnl": 0.96, "wins": 2, "losses": 1, "trade_count": 3},
+    "KXNCAAB": {"family_pnl": 0.96, "wins": 2, "losses": 1, "trade_count": 3},
+    "KXCBB": {"family_pnl": 0.96, "wins": 2, "losses": 1, "trade_count": 3},
+    "TENNIS": {"family_pnl": -1.52, "wins": 2, "losses": 26, "trade_count": 28},
+    "KXATPCHALLENGERMATCH": {"family_pnl": -1.61, "wins": 0, "losses": 26, "trade_count": 26},
+}
+AION_PROFITABLE_FAMILY_PREFIXES = (
+    "KXMLB",
+    "MLB",
+    "KXNCAASB",
+    "NCAASB",
+    "KXNCAAB",
+    "KXCBB",
+    "NCAAB",
+)
+AION_WEAK_TENNIS_FAMILY_PREFIXES = (
+    "KXATPCHALLENGERMATCH",
+    "KXITFMATCH",
+    "KXITFWMATCH",
+    "KXWTAMATCH",
+    "KXATPMATCH",
+    "KXTENNISMATCH",
+    "KXATP",
+    "KXWTA",
+    "KXITF",
+    "TENNIS",
+    "ATP",
+    "WTA",
+    "ITF",
+)
 AION_LIVE_SPORTS_REGIME_ENABLED = get_env_bool("AION_LIVE_SPORTS_REGIME_ENABLED", 1)
 AION_SPORTS_REGIME_MAX_RANK_BOOST = get_env_float("AION_SPORTS_REGIME_MAX_RANK_BOOST", 6.0)
 AION_SPORTS_REGIME_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_REGIME_MAX_RANK_PENALTY", 5.0)
@@ -25422,8 +25475,265 @@ class KalshiSniperBot:
             lookback=KALSHI_FAMILY_PROFIT_MEMORY_LOOKBACK,
         )
 
+    def _family_profitability_clamp(self, value, low, high):
+        numeric = self.to_float(value, 0.0) or 0.0
+        return max(float(low), min(float(high), float(numeric)))
+
+    def _family_profitability_prior_for(self, family):
+        family = self._normalize_family_for_profit_memory(family)
+        priors = AION_FAMILY_PROFITABILITY_PRIORS
+        if family in priors:
+            return family, dict(priors.get(family) or {})
+        for key in sorted(priors.keys(), key=len, reverse=True):
+            if key and family.startswith(key):
+                return key, dict(priors.get(key) or {})
+        if any(family.startswith(prefix) for prefix in AION_WEAK_TENNIS_FAMILY_PREFIXES):
+            return "TENNIS", dict(priors.get("TENNIS") or {})
+        return None, {}
+
+    def _is_family_profitability_weak_tennis(self, family):
+        family = self._normalize_family_for_profit_memory(family)
+        return any(family.startswith(prefix) for prefix in AION_WEAK_TENNIS_FAMILY_PREFIXES)
+
+    def _is_family_profitability_preferred(self, family):
+        family = self._normalize_family_for_profit_memory(family)
+        return any(family.startswith(prefix) for prefix in AION_PROFITABLE_FAMILY_PREFIXES)
+
+    def _family_profitability_selected_price(self, *sources):
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in ("selected_price", "selected_price_dollars", "price", "yes_ask", "no_ask"):
+                price = self._opportunity_price_dollars(source.get(key))
+                if price is not None:
+                    return price
+        return None
+
+    def _get_family_profitability_profile(self, family, *, selected_price=None, log=False, source="ranking"):
+        family = self._normalize_family_for_profit_memory(family)
+        if not AION_FAMILY_PROFITABILITY_ENABLED:
+            return {
+                "family": family,
+                "enabled": False,
+                "rank_adjustment": 0.0,
+                "unified_score_adjustment": 0.0,
+                "size_multiplier": 1.0,
+                "capital_preference": "neutral",
+            }
+        stats = self._get_family_profit_memory_stats(family)
+        prior_family, prior = self._family_profitability_prior_for(family)
+        history_trades = int(self.to_float(stats.get("trade_count"), 0.0) or 0)
+        prior_trades = int(self.to_float(prior.get("trade_count"), 0.0) or 0)
+        trade_count = max(0, history_trades + prior_trades)
+        wins = int(self.to_float(stats.get("wins"), 0.0) or 0) + int(self.to_float(prior.get("wins"), 0.0) or 0)
+        losses = int(self.to_float(stats.get("losses"), 0.0) or 0) + int(self.to_float(prior.get("losses"), 0.0) or 0)
+        family_pnl = (self.to_float(stats.get("family_pnl"), 0.0) or 0.0) + (self.to_float(prior.get("family_pnl"), 0.0) or 0.0)
+        recent_pnl = (self.to_float(stats.get("recent_pnl"), 0.0) or 0.0)
+        if prior_trades > 0:
+            recent_pnl += self.to_float(prior.get("recent_pnl"), prior.get("family_pnl")) or 0.0
+        win_rate = (wins / trade_count) if trade_count > 0 else None
+        realized_roi = (family_pnl / trade_count) if trade_count > 0 else 0.0
+        min_trades = max(1, int(AION_FAMILY_PROFITABILITY_MIN_TRADES or 1))
+        sample_factor = 0.0 if trade_count < min_trades else min(1.0, max(0.0, (trade_count - min_trades + 1) / 6.0))
+        pnl_signal = self._family_profitability_clamp(family_pnl / max(0.45, trade_count * 0.12), -1.0, 1.0) if trade_count > 0 else 0.0
+        roi_signal = self._family_profitability_clamp(realized_roi * 10.0, -1.0, 1.0)
+        win_signal = 0.0 if win_rate is None else self._family_profitability_clamp((win_rate - 0.50) * 2.0, -1.0, 1.0)
+        recent_signal = self._family_profitability_clamp(recent_pnl * 4.0, -1.0, 1.0)
+        raw_signal = (
+            roi_signal * 0.34
+            + win_signal * 0.32
+            + recent_signal * 0.24
+            + pnl_signal * 0.10
+        ) * sample_factor
+        preferred_family = self._is_family_profitability_preferred(family)
+        weak_tennis = self._is_family_profitability_weak_tennis(family)
+        if preferred_family and family_pnl > 0.0 and (win_rate is None or win_rate >= 0.50):
+            raw_signal = max(raw_signal, 0.35 * max(sample_factor, 0.70))
+        if weak_tennis and (family_pnl < 0.0 or (win_rate is not None and win_rate < 0.35)):
+            raw_signal = min(raw_signal, -0.65 * max(sample_factor, 0.80))
+        raw_signal = self._family_profitability_clamp(raw_signal, -1.0, 1.0)
+        longshot_penalty = 0.0
+        selected_price = self._opportunity_price_dollars(selected_price)
+        if weak_tennis and selected_price is not None and selected_price <= 0.18:
+            if selected_price <= 0.10:
+                longshot_penalty = float(AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY)
+            elif selected_price <= 0.14:
+                longshot_penalty = float(AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY) * 0.75
+            else:
+                longshot_penalty = float(AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY) * 0.45
+        if raw_signal >= 0.0:
+            rank_adjustment = raw_signal * float(AION_FAMILY_PROFITABILITY_MAX_RANK_BOOST)
+            unified_adjustment = raw_signal * float(AION_FAMILY_PROFITABILITY_MAX_UNIFIED_BOOST)
+            size_multiplier = 1.0 + raw_signal * (float(AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER) - 1.0)
+        else:
+            rank_adjustment = raw_signal * float(AION_FAMILY_PROFITABILITY_MAX_RANK_PENALTY)
+            unified_adjustment = raw_signal * float(AION_FAMILY_PROFITABILITY_MAX_UNIFIED_PENALTY)
+            size_multiplier = 1.0 + raw_signal * (1.0 - float(AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER))
+        rank_adjustment -= longshot_penalty
+        unified_adjustment -= longshot_penalty * 0.75
+        if preferred_family and family_pnl > 0.0:
+            size_multiplier = max(size_multiplier, 1.25)
+        if weak_tennis and (family_pnl < 0.0 or longshot_penalty > 0.0):
+            size_multiplier = max(0.85, min(size_multiplier, 0.95))
+        size_multiplier = self._family_profitability_clamp(
+            size_multiplier,
+            AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER,
+            AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER,
+        )
+        capital_preference = "increase" if raw_signal > 0.20 else "reduce" if raw_signal < -0.20 else "neutral"
+        profile = {
+            "family": family,
+            "enabled": True,
+            "prior_family": prior_family,
+            "history_trades": history_trades,
+            "prior_trades": prior_trades,
+            "trade_count": trade_count,
+            "wins": wins,
+            "losses": losses,
+            "family_pnl": round(family_pnl, 4),
+            "win_rate": self._safe_round(win_rate, 4, None),
+            "realized_roi": round(realized_roi, 6),
+            "recent_pnl": round(recent_pnl, 4),
+            "profitability_signal": round(raw_signal, 4),
+            "rank_adjustment": round(rank_adjustment, 4),
+            "unified_score_adjustment": round(unified_adjustment, 4),
+            "size_multiplier": round(size_multiplier, 4),
+            "capital_preference": capital_preference,
+            "profitable_family": bool(family_pnl > 0.0 and (win_rate is None or win_rate >= 0.50)),
+            "persistent_loser": bool(family_pnl < 0.0 and trade_count >= min_trades),
+            "weak_tennis": bool(weak_tennis),
+            "longshot_penalty": round(longshot_penalty, 4),
+            "selected_price": self._safe_round(selected_price, 4, None),
+            "source": source,
+        }
+        if log:
+            self._emit_aion_memory_log(
+                "[AION-FAMILY-PROFITABILITY]",
+                profile,
+                marker=("family_profitability", source, family, int(time.time() // 180)),
+            )
+        return profile
+
+    def _apply_family_profitability_to_allocation(self, context, *, item=None, market=None, source="lane_allocation"):
+        if not isinstance(context, dict):
+            return context
+        item = item if isinstance(item, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        q = item.get("q")
+        ticker = str(context.get("ticker") or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(context.get("family") or item.get("family"), ticker=ticker, market=market, q=q)
+        selected_price = self._family_profitability_selected_price(context, item, market)
+        profile = self._get_family_profitability_profile(family, selected_price=selected_price, log=True, source=source)
+        rank_adjustment = self.to_float(profile.get("rank_adjustment"), 0.0) or 0.0
+        allocation_score = self.to_float(context.get("allocation_score"), None)
+        if allocation_score is None:
+            pre_lane_score = self.to_float(context.get("pre_lane_score"), self.to_float(item.get("adjusted_score"), item.get("raw_score"))) or 0.0
+            allocation_adjustment = self.to_float(context.get("allocation_adjustment"), 0.0) or 0.0
+            allocation_score = pre_lane_score + allocation_adjustment
+        context["allocation_score_before_family_profitability"] = round(allocation_score, 4)
+        context["allocation_score"] = round(allocation_score + rank_adjustment, 4)
+        context["allocation_adjustment"] = round((self.to_float(context.get("allocation_adjustment"), 0.0) or 0.0) + rank_adjustment, 4)
+        context["family_profitability_profile"] = profile
+        context["family_profitability_rank_adjustment"] = profile.get("rank_adjustment")
+        context["family_profitability_size_multiplier"] = profile.get("size_multiplier")
+        context["family_profitability_capital_preference"] = profile.get("capital_preference")
+        context["family_profitability_signal"] = profile.get("profitability_signal")
+        context["family_realized_roi"] = profile.get("realized_roi")
+        context["family_realized_win_rate"] = profile.get("win_rate")
+        context["family_recent_pnl"] = profile.get("recent_pnl")
+        context["family_trade_count"] = profile.get("trade_count")
+        context["family_pnl"] = profile.get("family_pnl")
+        if q is not None:
+            for attr_name in (
+                "family_profitability_rank_adjustment",
+                "family_profitability_size_multiplier",
+                "family_profitability_capital_preference",
+                "family_profitability_signal",
+                "family_realized_roi",
+                "family_realized_win_rate",
+                "family_recent_pnl",
+                "family_trade_count",
+                "family_pnl",
+            ):
+                try:
+                    setattr(q, attr_name, context.get(attr_name))
+                except Exception:
+                    pass
+        return context
+
+    def _apply_family_profitability_to_unified_context(self, context, *, allocation=None, item=None, market=None, source="ranking"):
+        if not isinstance(context, dict):
+            return context
+        allocation = allocation if isinstance(allocation, dict) else {}
+        item = item if isinstance(item, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        q = item.get("q")
+        ticker = str(context.get("ticker") or allocation.get("ticker") or getattr(q, "ticker", "") or market.get("ticker", "") or "").strip()
+        family = self._normalize_family_for_profit_memory(context.get("family") or allocation.get("family") or item.get("family"), ticker=ticker, market=market, q=q)
+        selected_price = self._family_profitability_selected_price(context, allocation, item, market)
+        profile = allocation.get("family_profitability_profile") if isinstance(allocation.get("family_profitability_profile"), dict) else None
+        if profile is None:
+            profile = self._get_family_profitability_profile(family, selected_price=selected_price, log=True, source=source)
+        score_adjustment = self.to_float(profile.get("unified_score_adjustment"), 0.0) or 0.0
+        base_score = self.to_float(context.get("unified_score"), 0.0) or 0.0
+        context["unified_score_before_family_profitability"] = round(base_score, 4)
+        context["unified_score"] = round(max(0.0, min(100.0, base_score + score_adjustment)), 4)
+        base_size_multiplier = self.to_float(context.get("size_multiplier"), 1.0) or 1.0
+        family_size_multiplier = self.to_float(profile.get("size_multiplier"), 1.0) or 1.0
+        context["size_multiplier_before_family_profitability"] = round(base_size_multiplier, 4)
+        final_size_multiplier = max(
+            float(AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER),
+            min(float(AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER), base_size_multiplier * family_size_multiplier),
+        )
+        if profile.get("weak_tennis"):
+            final_size_multiplier = max(0.85, min(0.95, final_size_multiplier))
+        context["size_multiplier"] = round(final_size_multiplier, 4)
+        reason = str(context.get("reason") or "").strip()
+        profitability_reason = f"family_profitability_{profile.get('capital_preference', 'neutral')}"
+        context["reason"] = "+".join([part for part in (reason, profitability_reason) if part])
+        context["family_profitability_profile"] = profile
+        context["family_profitability_component"] = profile.get("unified_score_adjustment")
+        context["family_profitability_rank_adjustment"] = profile.get("rank_adjustment")
+        context["family_profitability_size_multiplier"] = profile.get("size_multiplier")
+        context["family_profitability_capital_preference"] = profile.get("capital_preference")
+        context["family_profitability_signal"] = profile.get("profitability_signal")
+        context["family_realized_roi"] = profile.get("realized_roi")
+        context["family_realized_win_rate"] = profile.get("win_rate")
+        context["family_recent_pnl"] = profile.get("recent_pnl")
+        context["family_trade_count"] = profile.get("trade_count")
+        context["family_pnl"] = profile.get("family_pnl")
+        context["ranking_contributions"] = {
+            "EV": context.get("edge_after_cost"),
+            "edge_after_cost": context.get("edge_after_cost"),
+            "confidence": context.get("confidence"),
+            "family_profitability": profile.get("unified_score_adjustment"),
+            "family_memory": context.get("family_memory"),
+            "market_quality": context.get("sports_execution_quality_score") or context.get("conviction_score"),
+            "spread": context.get("spread"),
+            "liquidity": context.get("liquidity"),
+        }
+        if q is not None:
+            for attr_name, attr_value in (
+                ("unified_opportunity_score", context.get("unified_score")),
+                ("unified_size_multiplier", context.get("size_multiplier")),
+                ("family_profitability_rank_adjustment", context.get("family_profitability_rank_adjustment")),
+                ("family_profitability_size_multiplier", context.get("family_profitability_size_multiplier")),
+                ("family_profitability_capital_preference", context.get("family_profitability_capital_preference")),
+                ("family_profitability_signal", context.get("family_profitability_signal")),
+                ("family_realized_roi", context.get("family_realized_roi")),
+                ("family_realized_win_rate", context.get("family_realized_win_rate")),
+                ("family_recent_pnl", context.get("family_recent_pnl")),
+                ("family_trade_count", context.get("family_trade_count")),
+                ("family_pnl", context.get("family_pnl")),
+            ):
+                try:
+                    setattr(q, attr_name, attr_value)
+                except Exception:
+                    pass
+        return context
+
     def _get_family_profit_memory_adjustment(self, family, *, log=True, source="ranking"):
-        return kalshi_memory_module.get_family_profit_memory_adjustment(
+        base_adjustment = kalshi_memory_module.get_family_profit_memory_adjustment(
             self,
             family,
             log=log,
@@ -25432,6 +25742,8 @@ class KalshiSniperBot:
             min_trades_for_penalty=KALSHI_FAMILY_MIN_TRADES_FOR_PENALTY,
             max_rank_adjustment=KALSHI_FAMILY_PROFIT_MEMORY_MAX_RANK_ADJUSTMENT,
         )
+        profile = self._get_family_profitability_profile(family, log=log, source=source)
+        return round((self.to_float(base_adjustment, 0.0) or 0.0) + (self.to_float(profile.get("rank_adjustment"), 0.0) or 0.0), 4)
 
     def _emit_aion_memory_log(self, tag, payload, marker=None):
         markers = getattr(self, "aion_distilled_memory_log_markers", None)
@@ -27030,7 +27342,14 @@ class KalshiSniperBot:
         return _call_sports_live_intelligence("_build_sports_lane_quality", self, *args, **kwargs)
 
     def _build_lane_allocation_context(self, *args, **kwargs):
-        return _call_sports_live_intelligence("_build_lane_allocation_context", self, *args, **kwargs)
+        context = _call_sports_live_intelligence("_build_lane_allocation_context", self, *args, **kwargs)
+        item = args[0] if args else kwargs.get("item")
+        return self._apply_family_profitability_to_allocation(
+            context,
+            item=item,
+            market=kwargs.get("market"),
+            source="lane_allocation",
+        )
 
     def _opportunity_price_dollars(self, value):
         numeric = self.to_float(value, None)
@@ -27092,7 +27411,15 @@ class KalshiSniperBot:
         return _call_sports_live_intelligence("_build_capital_duration_context", self, *args, **kwargs)
 
     def _build_unified_opportunity_context(self, *args, **kwargs):
-        return _call_sports_live_intelligence("_build_unified_opportunity_context", self, *args, **kwargs)
+        context = _call_sports_live_intelligence("_build_unified_opportunity_context", self, *args, **kwargs)
+        item = args[0] if args else kwargs.get("item")
+        return self._apply_family_profitability_to_unified_context(
+            context,
+            allocation=kwargs.get("allocation"),
+            item=item,
+            market=kwargs.get("market"),
+            source=kwargs.get("source", "ranking"),
+        )
 
     def _emit_unified_opportunity_logs(self, allocation=None, *, rank=None, source="ranking"):
         allocation = allocation if isinstance(allocation, dict) else {}
@@ -27107,16 +27434,32 @@ class KalshiSniperBot:
             "family": context.get("family"),
             "selected_side": context.get("selected_side"),
             "selected_price": context.get("selected_price"),
+            "EV": context.get("edge_after_cost"),
             "edge_after_cost": context.get("edge_after_cost"),
+            "confidence": context.get("confidence"),
             "liquidity": context.get("liquidity"),
             "spread": context.get("spread"),
+            "market_quality": context.get("sports_execution_quality_score") or context.get("conviction_score"),
             "momentum_score": context.get("momentum_score"),
             "conviction_score": context.get("conviction_score"),
+            "ranking_contributions": context.get("ranking_contributions"),
+            "family_profitability": context.get("family_profitability_component"),
+            "family_profitability_rank_adjustment": context.get("family_profitability_rank_adjustment"),
+            "family_profitability_size_multiplier": context.get("family_profitability_size_multiplier"),
+            "family_profitability_capital_preference": context.get("family_profitability_capital_preference"),
+            "family_profitability_signal": context.get("family_profitability_signal"),
+            "family_realized_roi": context.get("family_realized_roi"),
+            "family_realized_win_rate": context.get("family_realized_win_rate"),
+            "family_recent_pnl": context.get("family_recent_pnl"),
+            "family_trade_count": context.get("family_trade_count"),
+            "family_pnl": context.get("family_pnl"),
             "payout_multiple": context.get("payout_multiple"),
             "time_to_event_minutes": context.get("time_to_event_minutes"),
             "time_to_expiry_minutes": context.get("time_to_expiry_minutes"),
             "capital_lock_penalty": context.get("capital_lock_penalty"),
+            "unified_score_before_family_profitability": context.get("unified_score_before_family_profitability"),
             "unified_score": context.get("unified_score"),
+            "size_multiplier_before_family_profitability": context.get("size_multiplier_before_family_profitability"),
             "size_multiplier": context.get("size_multiplier"),
             "sports_memory_regime": context.get("sports_memory_regime"),
             "sports_memory_rank_adjustment": context.get("sports_memory_rank_adjustment"),
@@ -29346,6 +29689,75 @@ class KalshiSniperBot:
         )
 
     def _resolve_dynamic_live_entry_size(self, *args, **kwargs):
+        q = args[0] if args else kwargs.get("q")
+        payload = kwargs.get("payload")
+        ev_context = kwargs.get("ev_context")
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            kwargs["payload"] = payload
+        if isinstance(ev_context, dict):
+            ev_context = dict(ev_context)
+            kwargs["ev_context"] = ev_context
+        sources = [source for source in (ev_context, payload) if isinstance(source, dict)]
+        ticker = ""
+        family = ""
+        for source in sources:
+            ticker = ticker or str(source.get("ticker") or "").strip()
+            family = family or str(source.get("family") or "").strip().upper()
+        ticker = ticker or str(getattr(q, "ticker", "") or "").strip()
+        family = family or str(getattr(q, "family", "") or "").strip().upper()
+        if not family and ticker:
+            family = self._normalize_family_for_profit_memory(None, ticker=ticker, q=q)
+        if family:
+            selected_price = self._family_profitability_selected_price(*(sources or []))
+            profile = self._get_family_profitability_profile(
+                family,
+                selected_price=selected_price,
+                log=True,
+                source=kwargs.get("source") or "dynamic_live_entry_size",
+            )
+            size_multiplier = self.to_float(profile.get("size_multiplier"), 1.0) or 1.0
+            for target in sources:
+                if target.get("family_profitability_size_multiplier") is not None:
+                    continue
+                target["family_profitability_size_multiplier"] = round(size_multiplier, 4)
+                target["family_profitability_capital_preference"] = profile.get("capital_preference")
+                target["family_profitability_rank_adjustment"] = profile.get("rank_adjustment")
+                target["family_profitability_signal"] = profile.get("profitability_signal")
+                existing_multiplier = self.to_float(
+                    target.get("unified_size_multiplier"),
+                    self.to_float(target.get("capital_duration_size_multiplier"), None),
+                )
+                if existing_multiplier is not None and existing_multiplier > 0.0:
+                    target["unified_size_multiplier"] = round(
+                        max(
+                            float(AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER),
+                            min(float(AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER), existing_multiplier * size_multiplier),
+                        ),
+                        4,
+                    )
+                elif size_multiplier < 1.0:
+                    target["capital_duration_size_multiplier"] = round(size_multiplier, 4)
+            if q is not None:
+                for attr_name, attr_value in (
+                    ("family_profitability_size_multiplier", round(size_multiplier, 4)),
+                    ("family_profitability_capital_preference", profile.get("capital_preference")),
+                    ("family_profitability_rank_adjustment", profile.get("rank_adjustment")),
+                    ("family_profitability_signal", profile.get("profitability_signal")),
+                ):
+                    try:
+                        setattr(q, attr_name, attr_value)
+                    except Exception:
+                        pass
+                try:
+                    if (
+                        size_multiplier < 1.0
+                        and getattr(q, "unified_size_multiplier", None) is None
+                        and getattr(q, "capital_duration_size_multiplier", None) is None
+                    ):
+                        setattr(q, "capital_duration_size_multiplier", round(size_multiplier, 4))
+                except Exception:
+                    pass
         return _call_sports_live_intelligence("_resolve_dynamic_live_entry_size", self, *args, **kwargs)
 
     def _validate_elite_live_entry_size(self, *args, **kwargs):
