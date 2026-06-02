@@ -194,6 +194,24 @@ class RiskGovernorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "opposite_side_conflict")
 
+    def test_game_family_competing_team_yes_buy_is_blocked(self):
+        bot = RiskBotStub()
+        bot.live_positions.append(
+            {"ticker": "KXNCAASBGAME-26JUN012200ALATTUG2-TTU", "family": "KXNCAASBGAME", "side": "yes", "count": 2, "entry_price": 0.57}
+        )
+        result = self._evaluate(
+            bot=bot,
+            payload=self._payload(
+                ticker="KXNCAASBGAME-26JUN012200ALATTUG2-ALA",
+                family="KXNCAASBGAME",
+                side="yes",
+                selected_price=0.48,
+            ),
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "opposite_side_conflict")
+        self.assertEqual(result["opposite_side_guard"]["conflicts"][0]["reason"], "same_event_competing_outcome")
+
     def test_live_api_opposite_side_truth_overrides_empty_local_state(self):
         bot = RiskBotStub()
         bot.local_state = {}

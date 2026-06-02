@@ -562,7 +562,7 @@ def _profile_for_opposite_guard(bot, *, ticker, side, payload=None, q=None, posi
 
 def _exclusive_outcome_family(family):
     text = str(family or "").upper()
-    return any(token in text for token in ("MONEYLINE", "MATCH", "WINNER", "SPREAD"))
+    return any(token in text for token in ("MONEYLINE", "MATCH", "WINNER", "GAME", "SPREAD"))
 
 
 def _opposite_total_tokens(left, right):
