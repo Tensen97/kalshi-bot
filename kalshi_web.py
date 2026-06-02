@@ -335,6 +335,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-SIDE-SELECT",
     "AION-YES-EDGE",
     "AION-NO-EDGE",
+    "AION-CONFIDENCE-AUDIT",
+    "AION-CONFIDENCE-BLOCK",
+    "AION-CONFIDENCE-ALLOW",
+    "AION-LIVE-EXECUTION-RESTORE",
     "SPORTS-SIDE-COMPARE",
     "SPORTS-SIDE-SELECT",
     "AION-ORDER-SIDE-PAYLOAD",
@@ -458,6 +462,7 @@ _AION_EXECUTION_CRITICAL_PREFIXES = (
     "CASHOUT",
     "LIVE-CASHOUT",
     "LIVE-EXIT",
+    "AION-CONFIDENCE-",
     "AION-EXECUTION-BLOCKER",
     "AION-LIVE-EXECUTION",
     "LIVE-EXECUTION",
@@ -55147,7 +55152,7 @@ class KalshiSniperBot:
             canonical_tradeability_hint = canonical_payload.get("canonical_tradeability") if isinstance(canonical_payload.get("canonical_tradeability"), dict) else {}
         if not canonical_tradeability_hint:
             canonical_tradeability_hint = orderbook_context.get("canonical_tradeability") if isinstance(orderbook_context.get("canonical_tradeability"), dict) else {}
-        tradeability = canonical_tradeability_hint or self.resolve_canonical_tradeability(
+        tradeability = dict(canonical_tradeability_hint) if canonical_tradeability_hint else self.resolve_canonical_tradeability(
             market if isinstance(market, dict) else {"ticker": ticker},
             quote=quote_payload,
             context={
@@ -55237,6 +55242,31 @@ class KalshiSniperBot:
                     ),
                 ),
             )
+        ev_value = None
+        for ev_candidate in (
+            canonical_payload.get("ev_edge"),
+            canonical_payload.get("EV"),
+            canonical_payload.get("ev"),
+            canonical_payload.get("expected_value"),
+            canonical_payload.get("expected_roi"),
+            decision_context.get("ev_edge"),
+            decision_context.get("EV"),
+            decision_context.get("ev"),
+            decision_context.get("expected_value"),
+            decision_context.get("expected_roi"),
+            quote_diag.get("ev_edge"),
+            quote_diag.get("EV"),
+            quote_diag.get("ev"),
+            quote_diag.get("expected_value"),
+            quote_diag.get("expected_roi"),
+            tradeability.get("ev_edge") if isinstance(tradeability, dict) else None,
+            tradeability.get("expected_value") if isinstance(tradeability, dict) else None,
+            tradeability.get("expected_roi") if isinstance(tradeability, dict) else None,
+        ):
+            ev_candidate_value = self.to_float(ev_candidate, None)
+            if ev_candidate_value is not None:
+                ev_value = ev_candidate_value
+                break
         aggression_settings = _aion_aggression_profile_settings(profile, family=family, spread_bucket=tradeability.get("spread_bucket"), context="realm_vv_entry")
         edge_threshold = self.to_float(aggression_settings.get("effective_edge_threshold"), 0.003)
         confidence_floor = self.to_float(aggression_settings.get("confidence_floor"), 0.55)
@@ -55281,7 +55311,69 @@ class KalshiSniperBot:
         depth_available = bool(tradeability.get("depth_available") or selected_side_has_liquidity)
         blocker = str(tradeability.get("blocker_class") or tradeability.get("blocker") or tradeability.get("blocker_detail") or "").strip().lower() or None
         blocker_detail = str(tradeability.get("blocker_detail") or tradeability.get("unsafe_resolution_reason") or tradeability.get("unsafe_price_status") or blocker or "unknown").strip().lower() or "unknown"
-        if blocker in {"daily_trade_cap", "daily_cap", "max_live_positions", "max_total_live_positions", "position_limit", "pending_family_order_limit", "pending_global_order_limit"}:
+        spread_value = self.to_float(
+            tradeability.get("spread"),
+            self.to_float(tradeability.get("spread_dollars"), None),
+        )
+        if spread_value is None and tradeability.get("spread_cents") is not None:
+            spread_value = self.to_float(tradeability.get("spread_cents"), 0.0) / 100.0
+        spread_bucket = str(tradeability.get("spread_bucket") or "").strip().lower()
+        spread_classification = str(tradeability.get("spread_classification") or "").strip().upper()
+        unsafe_price_status = str(tradeability.get("unsafe_price_status") or "").strip().lower()
+        unsafe_resolution_reason = str(tradeability.get("unsafe_resolution_reason") or "").strip().lower()
+        capacity_blocker = blocker in {"daily_trade_cap", "daily_cap", "max_live_positions", "max_total_live_positions", "position_limit", "pending_family_order_limit", "pending_global_order_limit"}
+        liquidity_value = self.to_float(
+            tradeability.get("liquidity"),
+            self.to_float(tradeability.get("selected_top_size"), self.to_float(tradeability.get("yes_top_size"), self.to_float(tradeability.get("no_top_size"), None))),
+        )
+        positive_edge = bool(edge is not None and edge > 0.0)
+        positive_ev = bool(ev_value is not None and ev_value > 0.0)
+        explicit_negative_ev = bool(ev_value is not None and ev_value <= 0.0)
+        positive_value_signal = bool(positive_edge and not explicit_negative_ev)
+        live_market = bool(
+            decision_context.get("live_market")
+            or decision_context.get("market_live")
+            or decision_context.get("sports_live")
+            or decision_context.get("live_arm_ok")
+            or canonical_payload.get("live_market")
+            or canonical_payload.get("sports_live")
+            or market.get("in_play")
+            or str(market.get("status") or "").strip().lower() in {"in_play", "live", "open"}
+        )
+        truly_extreme_spread = bool(
+            blocker in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"}
+            or blocker_detail in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"}
+            or spread_bucket in {"extreme_wide", "spread_extreme", "spread_absurd", "absurd", "too_wide", "wide_unsafe"}
+            or spread_classification in {"UNSAFE", "CATASTROPHIC"}
+            or unsafe_price_status in {"unsafe_spread", "unsafe_price", "spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable"}
+            or unsafe_resolution_reason in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "catastrophic_spread"}
+        )
+        adaptive_confidence_floor = min(confidence_floor, max(0.35, confidence_floor - 0.20))
+        confidence_penalty_applied = False
+        confidence_rank_adjustment = 0.0
+        confidence_size_multiplier = 1.0
+        confidence_gate_action = None
+        confidence_gate_reason = None
+        adaptive_confidence_allow = bool(
+            self.is_sports_family(family, ticker=ticker)
+            and live_market
+            and quote_ready
+            and orderbook_ready
+            and price_bounds_pass
+            and selected_side in {"yes", "no"}
+            and selected_side_has_price
+            and (selected_side_has_liquidity or depth_available)
+            and positive_value_signal
+            and confidence >= adaptive_confidence_floor
+            and not truly_extreme_spread
+            and not duplicate_block
+            and not cooldown_block
+            and not capacity_blocker
+            and not max_positions_block
+            and not daily_cap_block
+            and live_arm_ok
+        )
+        if capacity_blocker:
             capacity_warnings.append(blocker)
             blocker = None
             blocker_detail = None
@@ -55332,6 +55424,11 @@ class KalshiSniperBot:
             blocker_detail = blocker
         elif blocker in {"both_sides_unexecutable", "unexecutable_price"}:
             decision = "SKIP"
+        elif blocker in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"} or truly_extreme_spread:
+            decision = "SKIP"
+            if blocker not in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold", "unsafe_spread", "unsafe_price"}:
+                blocker = "spread_extreme"
+            blocker_detail = blocker_detail if blocker_detail != "unknown" else blocker
         elif edge < edge_threshold:
             relaxed_near_miss_allowed = bool(
                 _relaxed_beast_mode_enabled(4)
@@ -55485,10 +55582,72 @@ class KalshiSniperBot:
                 elif probability_cost_context.get("hard_reject"):
                     blocker = probability_cost_context.get("reason") or "probability_true_hard_block"
                     blocker_detail = blocker
-        elif confidence < confidence_floor:
+        elif blocker in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"} or truly_extreme_spread:
             decision = "SKIP"
-            blocker = "confidence_below_threshold"
-            blocker_detail = f"confidence={confidence:.4f}<floor={confidence_floor:.4f}"
+            if blocker not in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold", "unsafe_spread", "unsafe_price"}:
+                blocker = "spread_extreme"
+            blocker_detail = blocker_detail if blocker_detail != "unknown" else blocker
+        elif confidence < confidence_floor:
+            if adaptive_confidence_allow:
+                confidence_gap = max(0.0, confidence_floor - confidence)
+                confidence_size_multiplier = max(0.45, min(1.0, 1.0 - min(0.45, confidence_gap * 1.8)))
+                confidence_rank_adjustment = round(-max(0.25, min(8.0, confidence_gap * 20.0)), 4)
+                confidence_penalty_applied = True
+                confidence_gate_action = "allow"
+                confidence_gate_reason = "positive_value_executable_live_sports_confidence_penalty"
+                decision = "BUY"
+                blocker = None
+                blocker_detail = None
+                tradeability["tradeable"] = True
+                tradeability["blocker"] = None
+                tradeability["blocker_class"] = None
+                tradeability["blocker_detail"] = None
+                tradeability["confidence_penalty_applied"] = True
+                tradeability["confidence_gate_action"] = confidence_gate_action
+                tradeability["confidence_gate_reason"] = confidence_gate_reason
+                tradeability["confidence_floor"] = confidence_floor
+                tradeability["adaptive_confidence_floor"] = adaptive_confidence_floor
+                tradeability["confidence_rank_adjustment"] = confidence_rank_adjustment
+                tradeability["confidence_size_multiplier"] = confidence_size_multiplier
+                existing_size_multiplier = self.to_float(tradeability.get("suggested_size_multiplier"), None)
+                if existing_size_multiplier is None:
+                    tradeability["suggested_size_multiplier"] = confidence_size_multiplier
+                else:
+                    tradeability["suggested_size_multiplier"] = max(0.10, existing_size_multiplier * confidence_size_multiplier)
+                for attr_name, attr_value in (
+                    ("confidence_penalty_applied", True),
+                    ("confidence_gate_action", confidence_gate_action),
+                    ("confidence_gate_reason", confidence_gate_reason),
+                    ("confidence_rank_adjustment", confidence_rank_adjustment),
+                    ("confidence_size_multiplier", confidence_size_multiplier),
+                    ("adaptive_confidence_floor", adaptive_confidence_floor),
+                ):
+                    if quote_payload is None:
+                        continue
+                    try:
+                        setattr(quote_payload, attr_name, attr_value)
+                    except Exception:
+                        pass
+            else:
+                decision = "SKIP"
+                blocker = "confidence_below_threshold"
+                blocker_detail = f"confidence={confidence:.4f}<floor={confidence_floor:.4f}"
+                confidence_gate_action = "block"
+                confidence_gate_reason = (
+                    "negative_ev"
+                    if explicit_negative_ev
+                    else "extreme_spread"
+                    if truly_extreme_spread
+                    else "missing_executable_quote"
+                    if not quote_ready or not orderbook_ready
+                    else "invalid_selected_price"
+                    if not price_bounds_pass
+                    else "missing_side_or_liquidity"
+                    if selected_side not in {"yes", "no"} or not selected_side_has_price or not (selected_side_has_liquidity or depth_available)
+                    else "risk_or_duplicate_guard"
+                    if duplicate_block or cooldown_block or capacity_blocker or max_positions_block or daily_cap_block or not live_arm_ok
+                    else "below_adaptive_confidence_floor"
+                )
         elif tradeability.get("unsafe_price_status") in {"unsafe_spread", "caution_wide_spread"} and profile in {"opportunistic", "beast"}:
             aggressive_wide_spread_ok = bool(
                 edge >= max(edge_threshold * 0.75, 0.00075)
@@ -55555,7 +55714,18 @@ class KalshiSniperBot:
             "selected_price_cents": selected_price_cents,
             "selected_price_dollars": selected_price,
             "edge": edge,
+            "edge_after_cost": edge,
+            "EV": ev_value,
+            "ev": ev_value,
             "confidence": confidence,
+            "confidence_floor": confidence_floor,
+            "adaptive_confidence_floor": adaptive_confidence_floor,
+            "adaptive_confidence_allow": bool(adaptive_confidence_allow),
+            "confidence_gate_action": confidence_gate_action,
+            "confidence_gate_reason": confidence_gate_reason,
+            "confidence_penalty_applied": bool(confidence_penalty_applied),
+            "confidence_rank_adjustment": confidence_rank_adjustment,
+            "confidence_size_multiplier": confidence_size_multiplier,
             "profile": profile,
             "side": selected_side,
             "timestamp": time.time(),
@@ -55589,12 +55759,67 @@ class KalshiSniperBot:
         try:
             result["normalized_ticker_key"] = self.normalize_phase55_ticker_key(selected_ticker) or "unknown_normalized_ticker"
             result["normalized_ticker"] = result["normalized_ticker_key"]
+            confidence_audit = {
+                "ticker": selected_ticker,
+                "family": family,
+                "side": selected_side,
+                "selected_side": selected_side,
+                "selected_price": selected_price,
+                "selected_price_cents": selected_price_cents,
+                "confidence": confidence,
+                "confidence_floor": confidence_floor,
+                "adaptive_confidence_floor": adaptive_confidence_floor,
+                "confidence_gate_action": confidence_gate_action,
+                "confidence_gate_reason": confidence_gate_reason,
+                "edge_after_cost": edge,
+                "EV": ev_value,
+                "positive_edge": bool(positive_edge),
+                "positive_ev": bool(positive_ev),
+                "spread": spread_value,
+                "spread_cents": tradeability.get("spread_cents"),
+                "spread_bucket": spread_bucket or None,
+                "spread_classification": spread_classification or None,
+                "liquidity": liquidity_value,
+                "quote_ready": bool(quote_ready),
+                "orderbook_ready": bool(orderbook_ready),
+                "price_bounds_pass": bool(price_bounds_pass),
+                "selected_side_has_price": bool(selected_side_has_price),
+                "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                "depth_available": bool(depth_available),
+                "duplicate_block": bool(duplicate_block),
+                "cooldown_block": bool(cooldown_block),
+                "exposure_cap": bool(max_positions_block),
+                "daily_cap_block": bool(daily_cap_block),
+                "risk_governor": bool(not live_arm_ok),
+                "live_market": bool(live_market),
+                "truly_extreme_spread": bool(truly_extreme_spread),
+                "decision": decision,
+                "final_disposition": phase55_status,
+                "blocker": blocker,
+                "blocker_detail": blocker_detail,
+                "subsystem": "realm_vv_entry",
+            }
+            print("[AION-CONFIDENCE-AUDIT] " + json.dumps(confidence_audit, sort_keys=True, default=str))
+            if confidence_gate_action == "allow":
+                print("[AION-CONFIDENCE-ALLOW] " + json.dumps(confidence_audit, sort_keys=True, default=str))
+                print("[AION-LIVE-EXECUTION-RESTORE] " + json.dumps({
+                    **confidence_audit,
+                    "confidence_rank_adjustment": confidence_rank_adjustment,
+                    "confidence_size_multiplier": confidence_size_multiplier,
+                    "restored_reason": "confidence_penalty_not_hard_block",
+                }, sort_keys=True, default=str))
+            elif confidence_gate_action == "block" or blocker == "confidence_below_threshold":
+                print("[AION-CONFIDENCE-BLOCK] " + json.dumps(confidence_audit, sort_keys=True, default=str))
             print("[AION-REALM-VV-ENTRY] " + json.dumps(result, sort_keys=True, default=str))
             print("[AION-REALM-VV-CONFIDENCE] " + json.dumps({
                 "ticker": selected_ticker,
                 "family": family,
                 "profile": profile,
                 "confidence_score": result.get("confidence"),
+                "confidence_floor": confidence_floor,
+                "adaptive_confidence_floor": adaptive_confidence_floor,
+                "confidence_gate_action": confidence_gate_action,
+                "confidence_gate_reason": confidence_gate_reason,
                 "confidence_tier": result.get("confidence_tier"),
                 "survivability_score": result.get("survivability_score"),
                 "suggested_size_multiplier": result.get("suggested_size_multiplier"),

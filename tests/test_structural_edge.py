@@ -5244,6 +5244,231 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertNotEqual(result["phase55_status"], "probability_block")
         self.assertIn("[SPORTS-PROBABILITY-BLOCK]", logs.getvalue())
 
+    def _realm_confidence_tradeability(self, **overrides):
+        tradeability = {
+            "selected_price_dollars": 0.42,
+            "selected_price": 0.42,
+            "selected_price_cents": 42,
+            "selected_side": "yes",
+            "quote_ready": True,
+            "orderbook_ready": True,
+            "selected_side_has_price": True,
+            "selected_side_has_liquidity": True,
+            "depth_available": True,
+            "tradeable": False,
+            "blocker_class": None,
+            "blocker": None,
+            "blocker_detail": None,
+            "unsafe_price_status": "safe",
+            "spread_classification": "SAFE",
+            "spread_bucket": "tight",
+            "spread_cents": 2,
+            "spread": 0.02,
+            "liquidity": 80,
+            "yes_bid_cents": 40,
+            "yes_ask_cents": 42,
+            "no_bid_cents": 58,
+            "no_ask_cents": 60,
+            "yes_top_size": 25,
+            "no_top_size": 25,
+            "selected_top_size": 25,
+            "edge_after_cost": 0.024,
+            "ev_edge": 0.024,
+            "expected_roi": 0.057,
+            "confidence_score": 0.54,
+            "suggested_size_multiplier": 1.0,
+        }
+        tradeability.update(overrides)
+        return tradeability
+
+    def _run_realm_confidence_case(self, bot, *, tradeability, edge=0.024, ev=0.024, confidence=0.54, duplicate_block=False, max_positions_block=False, live_arm_ok=True):
+        market = {
+            "ticker": "KXNBA-CONFIDENCE-LIVE",
+            "series_ticker": "KXNBA",
+            "status": "in_play",
+            "in_play": True,
+            "title": "NBA live confidence admission",
+        }
+        q = SimpleNamespace(
+            ticker=market["ticker"],
+            family="KXNBA",
+            selected_side=tradeability.get("selected_side"),
+            selected_price=tradeability.get("selected_price"),
+            yes_bid=0.40,
+            yes_ask=0.42,
+            no_bid=0.58,
+            no_ask=0.60,
+            yes_top_size=25,
+            no_top_size=25,
+            liquidity=tradeability.get("liquidity"),
+        )
+        canonical_payload = {
+            "ticker": q.ticker,
+            "edge_after_cost": edge,
+            "final_edge": edge,
+            "ev_edge": ev,
+            "confidence": confidence,
+            "canonical_tradeability": dict(tradeability),
+        }
+        expected_payload = {
+            "ticker": q.ticker,
+            "edge_after_cost": edge,
+            "final_edge": edge,
+            "ev_edge": ev,
+            "confidence": confidence,
+            "canonical_tradeability": dict(tradeability),
+        }
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot.resolve_realm_vv_entry_engine(
+                q,
+                canonical_payload=canonical_payload,
+                orderbook_context={"ticker": q.ticker, "selected_side": tradeability.get("selected_side")},
+                decision_context={
+                    "market": market,
+                    "ticker": q.ticker,
+                    "family": "KXNBA",
+                    "profile": "safe",
+                    "selected_side": tradeability.get("selected_side"),
+                    "edge_after_cost": edge,
+                    "ev_edge": ev,
+                    "confidence": confidence,
+                    "canonical_tradeability": dict(tradeability),
+                    "duplicate_block": duplicate_block,
+                    "max_positions_block": max_positions_block,
+                    "live_arm_ok": live_arm_ok,
+                    "live_market": True,
+                },
+            )
+        return result, logs.getvalue(), canonical_payload, expected_payload
+
+    def test_realm_vv_moderate_confidence_positive_ev_can_submit_with_penalty(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability()
+
+        result, logs, canonical_payload, expected_payload = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.024,
+            ev=0.024,
+            confidence=0.54,
+        )
+
+        self.assertTrue(result["tradeable"])
+        self.assertEqual(result["decision"], "BUY")
+        self.assertEqual(result["phase55_status"], "entry_ready")
+        self.assertEqual(result["confidence_gate_action"], "allow")
+        self.assertTrue(result["confidence_penalty_applied"])
+        self.assertLess(result["confidence_size_multiplier"], 1.0)
+        self.assertEqual(result["selected_side"], "yes")
+        self.assertAlmostEqual(result["selected_price"], 0.42)
+        self.assertEqual(canonical_payload, expected_payload)
+        self.assertIn("[AION-CONFIDENCE-AUDIT]", logs)
+        self.assertIn("[AION-CONFIDENCE-ALLOW]", logs)
+        self.assertIn("[AION-LIVE-EXECUTION-RESTORE]", logs)
+
+    def test_realm_vv_negative_ev_still_rejected_under_confidence_restore(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability(ev_edge=-0.01)
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.024,
+            ev=-0.01,
+            confidence=0.54,
+        )
+
+        self.assertFalse(result["tradeable"])
+        self.assertEqual(result["blocker"], "confidence_below_threshold")
+        self.assertEqual(result["confidence_gate_action"], "block")
+        self.assertEqual(result["confidence_gate_reason"], "negative_ev")
+        self.assertIn("[AION-CONFIDENCE-BLOCK]", logs)
+        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+
+    def test_realm_vv_spread_extreme_still_rejected_under_confidence_restore(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability(
+            blocker_class="spread_extreme",
+            blocker="spread_extreme",
+            blocker_detail="spread_extreme",
+            spread_bucket="extreme_wide",
+            spread_classification="UNSAFE",
+            unsafe_price_status="unsafe_spread",
+            spread_cents=65,
+            spread=0.65,
+        )
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.001,
+            ev=0.08,
+            confidence=0.54,
+        )
+
+        self.assertFalse(result["tradeable"])
+        self.assertEqual(result["blocker"], "spread_extreme")
+        self.assertNotEqual(result["confidence_gate_action"], "allow")
+        self.assertIn("[AION-CONFIDENCE-AUDIT]", logs)
+        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+        self.assertNotIn("[SPORTS-PROBABILITY-OVERRIDE]", logs)
+
+    def test_realm_vv_duplicate_guard_preserved_under_confidence_restore(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability()
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.024,
+            ev=0.024,
+            confidence=0.54,
+            duplicate_block=True,
+        )
+
+        self.assertFalse(result["tradeable"])
+        self.assertEqual(result["blocker"], "duplicate_position")
+        self.assertEqual(result["phase55_status"], "immediate_reject")
+        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+
+    def test_realm_vv_exposure_cap_preserved_under_confidence_restore(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability()
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.024,
+            ev=0.024,
+            confidence=0.54,
+            max_positions_block=True,
+        )
+
+        self.assertFalse(result["tradeable"])
+        self.assertFalse(result["adaptive_confidence_allow"])
+        self.assertEqual(result["confidence_gate_action"], "block")
+        self.assertEqual(result["confidence_gate_reason"], "risk_or_duplicate_guard")
+        self.assertIn("max_live_positions_warning", result["canonical_tradeability"].get("risk_capacity_warnings", []))
+        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+
+    def test_realm_vv_risk_governor_preserved_under_confidence_restore(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability()
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.024,
+            ev=0.024,
+            confidence=0.54,
+            live_arm_ok=False,
+        )
+
+        self.assertFalse(result["tradeable"])
+        self.assertEqual(result["blocker"], "live_arm")
+        self.assertEqual(result["phase55_status"], "immediate_reject")
+        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+
     def test_sports_smart_entry_still_blocks_broken_spread_book(self):
         bot = self._make_bot()
         market = {
