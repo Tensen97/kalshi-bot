@@ -1420,7 +1420,9 @@ class StructuralEdgeTests(unittest.TestCase):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         posted = []
-        future_start = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        future_dt = datetime.now(timezone.utc) + timedelta(hours=3)
+        future_start = future_dt.isoformat().replace("+00:00", "Z")
+        future_ticker = f"KXMLBSPREAD-{future_dt.strftime('%y%b%d%H%M').upper()}FUTURE-HOME2"
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
             "series_ticker": "KXMLBSPREAD",
@@ -1445,7 +1447,7 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.place_live_order(
             {
-                "ticker": "KXMLBSPREAD-26JUN020100FUTURE-HOME2",
+                "ticker": future_ticker,
                 "family": "KXMLBSPREAD",
                 "side": "yes",
                 "action": "buy",
@@ -3417,6 +3419,239 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertNotIn("crypto_submitted", result)
         self.assertNotIn("crypto_reason", result)
         self.assertEqual(submitted, [sports_q.ticker])
+
+    def _configure_multi_submit_bot(self, bot, submitted=None, *, submit_reason="submitted", captured_payloads=None, payload_extra=None):
+        submitted = submitted if isinstance(submitted, list) else []
+        bot._active_live_order_timestamps = lambda: []
+        bot.recent_submitted_order_count_total = lambda window_seconds=None: 0
+        bot.already_holding = lambda ticker: False
+        bot.check_live_duplicate_position_api = lambda ticker: {"blocked": False}
+        bot._sports_momentum_pre_submit_check = lambda **kwargs: {"allowed": True, "reason": "unit_test"}
+        def build_payload(q, **kwargs):
+            payload = {
+                "ticker": q.ticker,
+                "family": q.family,
+                "side": getattr(q, "selected_side", "yes"),
+                "selected_side": getattr(q, "selected_side", "yes"),
+                "selected_price": getattr(q, "selected_price", 0.45),
+                "price": getattr(q, "selected_price", 0.45),
+                "count": 1,
+                "orderbook_ready": True,
+                "entry_context": {},
+            }
+            if isinstance(payload_extra, dict):
+                payload.update(payload_extra)
+            return payload
+        bot.build_live_order_payload = build_payload
+        def submit(q, lane=None, payload_override=None, **kwargs):
+            if isinstance(captured_payloads, list):
+                captured_payloads.append(dict(payload_override or {}))
+            if submit_reason != "submitted":
+                return {"submitted": False, "reason": submit_reason, "payload": dict(payload_override or {})}
+            submitted.append(q.ticker)
+            return {"submitted": True, "reason": "submitted", "payload": dict(payload_override or {})}
+        bot.submit_live_order = submit
+        bot.record_live_position = lambda q, size=None, entry_price=None, side=None: None
+        return submitted
+
+    def _multi_sports_candidate(self, ticker, *, family="KXMLBTOTAL", score=80.0, game_id=None, side="yes", price=0.45):
+        q = SimpleNamespace(ticker=ticker, family=family, selected_side=side, selected_price=price)
+        event_key = game_id or (ticker.split("-")[1] if "-" in ticker else ticker)
+        return {
+            "ticker": ticker,
+            "family": family,
+            "lane": "SPORTS",
+            "q": q,
+            "market": {"ticker": ticker, "series_ticker": family, "event_ticker": event_key, "status": "in_play"},
+            "allocation": {
+                "lane": "SPORTS",
+                "ticker": ticker,
+                "family": family,
+                "allocation_score": score,
+                "unified_opportunity_score": score,
+                "edge": 0.03,
+                "confidence": 0.68,
+                "spread": 0.02,
+                "liquidity": 150,
+                "decision": "ALLOW_STRONG_SPORT",
+                "game_id": game_id or f"game:{ticker}",
+            },
+        }
+
+    def test_multi_submit_two_independent_candidates_can_both_submit(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBTOTAL-GAMEA-8", family="KXMLBTOTAL", score=88, game_id="mlb:game_a"),
+            self._multi_sports_candidate("KXNBATOTAL-GAMEB-210", family="KXNBATOTAL", score=84, game_id="nba:game_b"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_two")
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["submitted_count"], 2)
+        self.assertEqual(submitted, ["KXMLBTOTAL-GAMEA-8", "KXNBATOTAL-GAMEB-210"])
+        self.assertIn("[AION-CONCURRENCY-ALLOW]", logs.getvalue())
+        self.assertIn("[AION-MULTI-SUBMIT-CYCLE]", logs.getvalue())
+
+    def test_multi_submit_three_candidates_respect_max_submits_per_cycle(self):
+        self._set_sports_only_mode(True)
+        old_cap = kw.AION_MAX_SUBMITS_PER_CYCLE
+        kw.AION_MAX_SUBMITS_PER_CYCLE = 2
+        self.addCleanup(setattr, kw, "AION_MAX_SUBMITS_PER_CYCLE", old_cap)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBTOTAL-GAMEA-8", family="KXMLBTOTAL", score=90, game_id="mlb:game_a"),
+            self._multi_sports_candidate("KXNBATOTAL-GAMEB-210", family="KXNBATOTAL", score=88, game_id="nba:game_b"),
+            self._multi_sports_candidate("KXNHLTOTAL-GAMEC-5", family="KXNHLTOTAL", score=86, game_id="nhl:game_c"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_cap")
+
+        self.assertEqual(result["submitted_count"], 2)
+        self.assertEqual(submitted, ["KXMLBTOTAL-GAMEA-8", "KXNBATOTAL-GAMEB-210"])
+        self.assertIn({"ticker": "KXNHLTOTAL-GAMEC-5", "reason": "max_submits_per_cycle"}, result["skipped"])
+
+    def test_multi_submit_duplicate_ticker_still_blocked(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        duplicate = self._multi_sports_candidate("KXMLBTOTAL-GAMEA-8", family="KXMLBTOTAL", score=90, game_id="mlb:game_a")
+        duplicate_2 = self._multi_sports_candidate("KXMLBTOTAL-GAMEA-8", family="KXMLBTOTAL", score=88, game_id="mlb:game_a")
+        bot.last_dual_lane_buy_candidates = [duplicate, duplicate_2]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_duplicate")
+
+        self.assertEqual(submitted, ["KXMLBTOTAL-GAMEA-8"])
+        self.assertIn({"ticker": "KXMLBTOTAL-GAMEA-8", "reason": "duplicate_cycle_ticker"}, result["skipped"])
+
+    def test_multi_submit_same_game_cap_still_blocks(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        bot.live_positions = [
+            {"ticker": "KXMLBTOTAL-GAMEA-7", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_a"}},
+            {"ticker": "KXMLBSPREAD-GAMEA-MIL3", "family": "KXMLBSPREAD", "status": "open", "entry_context": {"game_id": "mlb:game_a"}},
+        ]
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBMONEYLINE-GAMEA-MIL", family="KXMLBMONEYLINE", score=90, game_id="mlb:game_a"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_same_game")
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(submitted, [])
+        self.assertIn({"ticker": "KXMLBMONEYLINE-GAMEA-MIL", "reason": "max_same_game_positions"}, result["skipped"])
+
+    def test_multi_submit_same_family_cap_still_blocks(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        bot.live_positions = [
+            {"ticker": "KXMLBTOTAL-GAMEA-7", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_a"}},
+            {"ticker": "KXMLBTOTAL-GAMEB-8", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_b"}},
+        ]
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBTOTAL-GAMEC-9", family="KXMLBTOTAL", score=90, game_id="mlb:game_c"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_same_family")
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(submitted, [])
+        self.assertIn({"ticker": "KXMLBTOTAL-GAMEC-9", "reason": "max_same_family_positions"}, result["skipped"])
+
+    def test_multi_submit_daily_loss_cap_and_risk_governor_blocks_preserved(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        bot.live_realized_pnl_today = -kw.MAX_DAILY_LOSS
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBTOTAL-GAMEA-8", family="KXMLBTOTAL", score=88, game_id="mlb:game_a"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_daily_loss")
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(submitted, [])
+        self.assertIn({"ticker": "KXMLBTOTAL-GAMEA-8", "reason": "daily_loss_guard"}, result["skipped"])
+
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [], submit_reason="risk_governor_block")
+        original_allocation = {
+            "lane": "SPORTS",
+            "ticker": "KXNBATOTAL-GAMEB-210",
+            "family": "KXNBATOTAL",
+            "allocation_score": 88,
+            "unified_opportunity_score": 88,
+            "edge": 0.03,
+            "confidence": 0.7,
+            "spread": 0.02,
+            "liquidity": 150,
+            "decision": "ALLOW_STRONG_SPORT",
+            "game_id": "nba:game_b",
+        }
+        candidate = self._multi_sports_candidate("KXNBATOTAL-GAMEB-210", family="KXNBATOTAL", score=88, game_id="nba:game_b")
+        candidate["allocation"] = dict(original_allocation)
+        bot.last_dual_lane_buy_candidates = [candidate]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_risk")
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(submitted, [])
+        self.assertIn({"ticker": "KXNBATOTAL-GAMEB-210", "reason": "risk_governor_block"}, result["skipped"])
+        self.assertEqual(candidate["allocation"], original_allocation)
+
+    def test_multi_submit_opposite_side_and_exposure_blocks_preserved(self):
+        self._set_sports_only_mode(True)
+        for reason in ("opposite_side_conflict", "max_family_exposure"):
+            bot = self._make_bot()
+            submitted = self._configure_multi_submit_bot(bot, [], submit_reason=reason)
+            bot.last_dual_lane_buy_candidates = [
+                self._multi_sports_candidate("KXMLBTOTAL-GAMEA-8", family="KXMLBTOTAL", score=88, game_id="mlb:game_a", side="no", price=0.42),
+            ]
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = bot._execute_multi_sports_submit_cycle(source=f"unit_multi_{reason}")
+
+            self.assertFalse(result["submitted"])
+            self.assertEqual(submitted, [])
+            self.assertIn({"ticker": "KXMLBTOTAL-GAMEA-8", "reason": reason}, result["skipped"])
+
+    def test_multi_submit_preserves_selected_side_price_and_payload(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        captured_payloads = []
+        submitted = self._configure_multi_submit_bot(
+            bot,
+            [],
+            captured_payloads=captured_payloads,
+            payload_extra={"canonical_marker": "unchanged"},
+        )
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXNBATOTAL-GAMEB-210", family="KXNBATOTAL", score=88, game_id="nba:game_b", side="no", price=0.42),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_payload")
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(submitted, ["KXNBATOTAL-GAMEB-210"])
+        self.assertEqual(len(captured_payloads), 1)
+        self.assertEqual(captured_payloads[0]["side"], "no")
+        self.assertEqual(captured_payloads[0]["selected_side"], "no")
+        self.assertEqual(captured_payloads[0]["price"], 0.42)
+        self.assertEqual(captured_payloads[0]["selected_price"], 0.42)
+        self.assertEqual(captured_payloads[0]["canonical_marker"], "unchanged")
 
     def test_sports_only_submit_live_order_hard_blocks_crypto(self):
         self._set_sports_only_mode(True)

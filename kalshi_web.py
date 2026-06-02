@@ -339,6 +339,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-CONFIDENCE-BLOCK",
     "AION-CONFIDENCE-ALLOW",
     "AION-LIVE-EXECUTION-RESTORE",
+    "AION-CONCURRENCY-AUDIT",
+    "AION-CONCURRENCY-BLOCK",
+    "AION-CONCURRENCY-ALLOW",
+    "AION-MULTI-SUBMIT-CYCLE",
     "SPORTS-SIDE-COMPARE",
     "SPORTS-SIDE-SELECT",
     "AION-ORDER-SIDE-PAYLOAD",
@@ -463,6 +467,8 @@ _AION_EXECUTION_CRITICAL_PREFIXES = (
     "LIVE-CASHOUT",
     "LIVE-EXIT",
     "AION-CONFIDENCE-",
+    "AION-CONCURRENCY-",
+    "AION-MULTI-SUBMIT-CYCLE",
     "AION-EXECUTION-BLOCKER",
     "AION-LIVE-EXECUTION",
     "LIVE-EXECUTION",
@@ -2179,13 +2185,19 @@ DEFAULT_LIVE_ORDER_ACTION = "buy"
 LIVE_MODE = False
 LIVE_ARMED = False
 LIVE_ENV_CONFIRMED = False
-LIVE_ORDER_RATE_LIMIT = 3
-LIVE_ORDER_RATE_WINDOW_SEC = 60
+AION_MAX_OPEN_POSITIONS = max(1, get_env_int("AION_MAX_OPEN_POSITIONS", 5))
+AION_MAX_SUBMITS_PER_CYCLE = max(1, get_env_int("AION_MAX_SUBMITS_PER_CYCLE", 3))
+AION_MAX_NEW_POSITIONS_PER_10MIN = max(1, get_env_int("AION_MAX_NEW_POSITIONS_PER_10MIN", 6))
+AION_MIN_SECONDS_BETWEEN_SUBMITS = max(0.0, get_env_float("AION_MIN_SECONDS_BETWEEN_SUBMITS", 10.0))
+AION_MAX_SAME_FAMILY_POSITIONS = max(1, get_env_int("AION_MAX_SAME_FAMILY_POSITIONS", 2))
+AION_MAX_SAME_GAME_POSITIONS = max(1, get_env_int("AION_MAX_SAME_GAME_POSITIONS", 2))
+LIVE_ORDER_RATE_LIMIT = max(1, get_env_int("LIVE_ORDER_RATE_LIMIT", get_env_int("AION_LIVE_ORDER_RATE_LIMIT", 3)))
+LIVE_ORDER_RATE_WINDOW_SEC = max(1, get_env_int("LIVE_ORDER_RATE_WINDOW_SEC", 60))
 LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
 LIVE_RECENT_ORDER_DUPLICATE_BLOCK_SECONDS = int(_env_float("KALSHI_RECENT_ORDER_DUPLICATE_BLOCK_SECONDS", 900))
-MAX_SIMULTANEOUS_LIVE_POSITIONS = 3
-MAX_SPORTS_LIVE_POSITIONS = 2
-MAX_CORRELATED_SPORTS_POSITIONS_PER_GAME = int(_env_float("KALSHI_MAX_CORRELATED_SPORTS_POSITIONS_PER_GAME", 2))
+MAX_SIMULTANEOUS_LIVE_POSITIONS = AION_MAX_OPEN_POSITIONS
+MAX_SPORTS_LIVE_POSITIONS = max(1, get_env_int("AION_MAX_SPORTS_OPEN_POSITIONS", AION_MAX_OPEN_POSITIONS))
+MAX_CORRELATED_SPORTS_POSITIONS_PER_GAME = AION_MAX_SAME_GAME_POSITIONS
 SPORTS_SPREAD_LADDER_CONFLICT_LINE_DISTANCE = _env_float("KALSHI_SPORTS_SPREAD_LADDER_CONFLICT_LINE_DISTANCE", 3.0)
 CORRELATED_SPORTS_TAKE_PROFIT_DELTA = _env_float("KALSHI_CORRELATED_SPORTS_TAKE_PROFIT_DELTA", 0.03)
 CORRELATED_SPORTS_STOP_LOSS_DELTA = _env_float("KALSHI_CORRELATED_SPORTS_STOP_LOSS_DELTA", 0.035)
@@ -26809,6 +26821,480 @@ class KalshiSniperBot:
             "count": payload.get("count") or (result.get("payload") or {}).get("count"),
         }
 
+    def _aion_concurrency_settings(self):
+        return {
+            "max_open_positions": max(1, int(AION_MAX_OPEN_POSITIONS or 1)),
+            "max_submits_per_cycle": max(1, int(AION_MAX_SUBMITS_PER_CYCLE or 1)),
+            "max_new_positions_per_10min": max(1, int(AION_MAX_NEW_POSITIONS_PER_10MIN or 1)),
+            "min_seconds_between_submits": max(0.0, float(AION_MIN_SECONDS_BETWEEN_SUBMITS or 0.0)),
+            "max_same_family_positions": max(1, int(AION_MAX_SAME_FAMILY_POSITIONS or 1)),
+            "max_same_game_positions": max(1, int(AION_MAX_SAME_GAME_POSITIONS or 1)),
+            "live_order_rate_limit": max(1, int(LIVE_ORDER_RATE_LIMIT or 1)),
+            "live_order_rate_window_sec": max(1, int(LIVE_ORDER_RATE_WINDOW_SEC or 60)),
+        }
+
+    def _emit_aion_concurrency_log(self, tag, payload):
+        try:
+            print(f"[{tag}] " + json.dumps(payload if isinstance(payload, dict) else {}, sort_keys=True, default=str))
+        except Exception:
+            pass
+
+    def _aion_concurrency_candidate_meta(self, candidate):
+        candidate = candidate if isinstance(candidate, dict) else {}
+        allocation = candidate.get("allocation") if isinstance(candidate.get("allocation"), dict) else {}
+        market = candidate.get("market") if isinstance(candidate.get("market"), dict) else {}
+        q = candidate.get("q")
+        ticker = str(candidate.get("ticker") or allocation.get("ticker") or getattr(q, "ticker", "") or market.get("ticker") or "").strip()
+        family = str(
+            candidate.get("family")
+            or allocation.get("family")
+            or getattr(q, "family", "")
+            or market.get("series_ticker")
+            or (self.get_market_family(market or {"ticker": ticker}) if ticker else "")
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+        selected_side = self._normalize_live_side(
+            allocation.get("selected_side")
+            or allocation.get("side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        selected_price = self.to_float(
+            allocation.get("selected_price")
+            or allocation.get("price")
+            or getattr(q, "selected_price", None),
+            None,
+        )
+        game_key = str(
+            allocation.get("game_id")
+            or allocation.get("sports_graph_game_id")
+            or getattr(q, "game_id", None)
+            or getattr(q, "sports_graph_game_id", None)
+            or market.get("game_id")
+            or market.get("event_ticker")
+            or ""
+        ).strip()
+        if not game_key and ticker:
+            try:
+                game_key = self._extract_sports_game_key(ticker, market=market)
+            except Exception:
+                game_key = ticker
+        return {
+            "ticker": ticker,
+            "family": family,
+            "q": q,
+            "market": market,
+            "allocation": allocation,
+            "lane": str(candidate.get("lane") or allocation.get("lane") or "").strip().upper(),
+            "selected_side": selected_side,
+            "selected_price": selected_price,
+            "game_key": game_key or None,
+            "edge": self.to_float(allocation.get("edge") or allocation.get("edge_after_cost") or allocation.get("EV"), None),
+            "confidence": self.to_float(allocation.get("confidence"), None),
+            "spread": self.to_float(allocation.get("spread"), None),
+            "liquidity": self.to_float(allocation.get("liquidity"), None),
+            "score": self._candidate_unified_score(candidate),
+            "decision": allocation.get("decision"),
+            "reason": allocation.get("reason"),
+        }
+
+    def _aion_concurrency_entry_from_meta(self, meta, *, source=None, count=None, price=None, side=None):
+        meta = meta if isinstance(meta, dict) else {}
+        return {
+            "ticker": str(meta.get("ticker") or "").strip(),
+            "family": str(meta.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN",
+            "game_key": str(meta.get("game_key") or "").strip() or None,
+            "side": self._normalize_live_side(side or meta.get("selected_side")),
+            "count": count,
+            "price": price,
+            "source": source,
+        }
+
+    def _aion_concurrency_snapshot(self, reserved_entries=None):
+        reserved_entries = [entry for entry in (reserved_entries or []) if isinstance(entry, dict)]
+        open_positions = list(self._get_open_live_positions() or [])
+        family_counts = Counter()
+        game_counts = Counter()
+        open_tickers = set()
+        for position in open_positions:
+            if not isinstance(position, dict):
+                continue
+            ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
+            if not ticker:
+                continue
+            open_tickers.add(ticker)
+            family = str(position.get("family") or position.get("series_ticker") or self.get_market_family({"ticker": ticker}) or "UNKNOWN").strip().upper() or "UNKNOWN"
+            family_counts[family] += 1
+            entry_context = position.get("entry_context") if isinstance(position.get("entry_context"), dict) else {}
+            game_key = str(entry_context.get("game_id") or entry_context.get("sports_graph_game_id") or position.get("game_id") or "").strip()
+            if not game_key:
+                try:
+                    game_key = self._extract_sports_game_key(ticker)
+                except Exception:
+                    game_key = ticker
+            if game_key:
+                game_counts[game_key] += 1
+        reserved_count = 0
+        for entry in reserved_entries:
+            ticker = str(entry.get("ticker") or "").strip()
+            if not ticker or ticker in open_tickers:
+                continue
+            reserved_count += 1
+            family = str(entry.get("family") or self.get_market_family({"ticker": ticker}) or "UNKNOWN").strip().upper() or "UNKNOWN"
+            family_counts[family] += 1
+            game_key = str(entry.get("game_key") or "").strip()
+            if not game_key:
+                try:
+                    game_key = self._extract_sports_game_key(ticker)
+                except Exception:
+                    game_key = ticker
+            if game_key:
+                game_counts[game_key] += 1
+        return {
+            "open_positions": open_positions,
+            "open_count": len(open_positions) + reserved_count,
+            "family_counts": family_counts,
+            "game_counts": game_counts,
+            "open_tickers": open_tickers,
+        }
+
+    def _evaluate_aion_concurrency_candidate(self, candidate, *, submitted_entries=None, source="multi_submit"):
+        submitted_entries = [entry for entry in (submitted_entries or []) if isinstance(entry, dict)]
+        settings = self._aion_concurrency_settings()
+        meta = self._aion_concurrency_candidate_meta(candidate)
+        ticker = meta.get("ticker")
+        family = meta.get("family")
+        game_key = meta.get("game_key")
+        snapshot = self._aion_concurrency_snapshot(submitted_entries)
+        try:
+            active_timestamps = list(self._active_live_order_timestamps() or [])
+        except Exception:
+            active_timestamps = []
+        try:
+            recent_10min = int(self.recent_submitted_order_count_total(window_seconds=600) or 0)
+        except Exception:
+            recent_10min = 0
+        last_submit_ts = max(active_timestamps) if active_timestamps else 0.0
+        seconds_since_submit = None if not last_submit_ts else max(0.0, time.time() - float(last_submit_ts))
+        pending_same_ticker = any(str(entry.get("ticker") or "").strip() == ticker for entry in submitted_entries)
+        same_family_count = int(snapshot["family_counts"].get(family, 0))
+        same_game_count = int(snapshot["game_counts"].get(game_key, 0)) if game_key else 0
+        block_reason = None
+        if not ticker:
+            block_reason = "missing_ticker"
+        elif meta.get("lane") != "SPORTS":
+            block_reason = "non_sports_lane"
+        elif len(submitted_entries) >= settings["max_submits_per_cycle"]:
+            block_reason = "max_submits_per_cycle"
+        elif len(active_timestamps) >= settings["live_order_rate_limit"]:
+            block_reason = "rate_limited"
+        elif (
+            settings["min_seconds_between_submits"] > 0.0
+            and not submitted_entries
+            and seconds_since_submit is not None
+            and seconds_since_submit < settings["min_seconds_between_submits"]
+        ):
+            block_reason = "min_seconds_between_submits"
+        elif recent_10min + len(submitted_entries) >= settings["max_new_positions_per_10min"]:
+            block_reason = "max_new_positions_per_10min"
+        elif snapshot["open_count"] >= settings["max_open_positions"]:
+            block_reason = "max_open_positions"
+        elif same_family_count >= settings["max_same_family_positions"]:
+            block_reason = "max_same_family_positions"
+        elif game_key and same_game_count >= settings["max_same_game_positions"]:
+            block_reason = "max_same_game_positions"
+        elif bool(getattr(self, "trading_halted", False)):
+            block_reason = "trading_halted"
+        elif self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS:
+            block_reason = "daily_loss_guard"
+        elif pending_same_ticker:
+            block_reason = "duplicate_cycle_ticker"
+        elif self.already_holding(ticker):
+            block_reason = "duplicate_position_guard"
+        duplicate = {"blocked": False}
+        if block_reason is None:
+            try:
+                duplicate = self.check_live_duplicate_position_api(ticker) or {"blocked": False}
+            except Exception as exc:
+                duplicate = {"blocked": True, "reason": f"duplicate_check_exception:{exc.__class__.__name__}"}
+            if duplicate.get("blocked"):
+                block_reason = duplicate.get("reason") or "duplicate_position_guard"
+        payload = {
+            "source": source,
+            "ticker": ticker,
+            "family": family,
+            "side": meta.get("selected_side"),
+            "selected_price": meta.get("selected_price"),
+            "game_key": game_key,
+            "edge_after_cost": meta.get("edge"),
+            "confidence": meta.get("confidence"),
+            "spread": meta.get("spread"),
+            "liquidity": meta.get("liquidity"),
+            "candidate_score": meta.get("score"),
+            "open_positions": snapshot["open_count"],
+            "same_family_count": same_family_count,
+            "same_game_count": same_game_count,
+            "submitted_this_cycle": len(submitted_entries),
+            "recent_new_positions_10min": recent_10min,
+            "active_order_timestamps": len(active_timestamps),
+            "settings": settings,
+            "duplicate_guard": duplicate,
+            "decision": "ALLOW" if block_reason is None else "BLOCK",
+            "reason": block_reason or "concurrency_capacity_available",
+            "subsystem": "multi_sports_submit",
+        }
+        self._emit_aion_concurrency_log("AION-CONCURRENCY-AUDIT", payload)
+        if block_reason is None:
+            self._emit_aion_concurrency_log("AION-CONCURRENCY-ALLOW", payload)
+            return {"allowed": True, "reason": "concurrency_capacity_available", "meta": meta, "audit": payload}
+        self._emit_aion_concurrency_log("AION-CONCURRENCY-BLOCK", payload)
+        return {"allowed": False, "reason": block_reason, "meta": meta, "audit": payload}
+
+    def _apply_multi_submit_candidate_metadata(self, q, allocation):
+        if q is None or not isinstance(allocation, dict):
+            return
+        for attr_name in (
+            "unified_opportunity_score",
+            "unified_size_multiplier",
+            "capital_duration_size_multiplier",
+            "capital_lock_penalty",
+            "time_to_event_minutes",
+            "time_to_expiry_minutes",
+            "sports_memory_context",
+            "sports_memory_dimensions",
+            "sports_memory_rank_adjustment",
+            "sports_memory_size_multiplier",
+            "sports_memory_aggression_multiplier",
+            "sports_memory_regime",
+            "sports_regime_context",
+            "sports_regime",
+            "sports_regime_type",
+            "sports_momentum_classification",
+            "sports_momentum_score",
+            "sports_regime_rank_adjustment",
+            "sports_regime_size_multiplier",
+            "sports_regime_aggression_multiplier",
+            "sports_graph_context",
+            "sports_graph_game_id",
+            "sports_graph_role",
+            "sports_graph_direction",
+            "sports_graph_relationship_types",
+            "sports_graph_lag_detected",
+            "sports_graph_rank_adjustment",
+            "sports_graph_size_multiplier",
+            "sports_graph_conflict_count",
+            "sports_graph_alignment_count",
+            "game_thesis_context",
+            "game_id",
+            "game_thesis_type",
+            "game_thesis_confidence",
+            "game_thesis_rank_boost",
+            "game_thesis_size_multiplier",
+            "game_thesis_aggression_multiplier",
+            "game_related_candidates",
+            "game_primary_candidate",
+            "game_secondary_candidates",
+        ):
+            attr_value = allocation.get(attr_name)
+            if attr_value is not None:
+                try:
+                    setattr(q, attr_name, attr_value)
+                except Exception:
+                    pass
+
+    def _execute_multi_sports_submit_cycle(self, *, primary_ticker=None, primary_lane=None, primary_result=None, source="multi_submit_cycle"):
+        candidates = sorted(
+            [candidate for candidate in (getattr(self, "last_dual_lane_buy_candidates", []) or []) if isinstance(candidate, dict)],
+            key=lambda item: self._candidate_unified_score(item),
+            reverse=True,
+        )
+        primary_ticker = str(primary_ticker or "").strip()
+        primary_lane = str(primary_lane or "").strip().upper()
+        primary_result = primary_result if isinstance(primary_result, dict) else {}
+        submitted_entries = []
+        if primary_ticker and primary_result.get("submitted"):
+            primary_meta = None
+            for candidate in candidates:
+                if str(candidate.get("ticker") or "").strip() == primary_ticker:
+                    primary_meta = self._aion_concurrency_candidate_meta(candidate)
+                    break
+            if primary_meta is None:
+                payload = primary_result.get("payload") if isinstance(primary_result.get("payload"), dict) else {}
+                primary_meta = {
+                    "ticker": primary_ticker,
+                    "family": self.get_market_family({"ticker": primary_ticker}),
+                    "game_key": None,
+                    "selected_side": payload.get("side") or payload.get("selected_side"),
+                }
+            submitted_entries.append(self._aion_concurrency_entry_from_meta(primary_meta, source="primary"))
+        submitted = []
+        skipped = []
+        stop_reasons = {
+            "max_submits_per_cycle",
+            "rate_limited",
+            "min_seconds_between_submits",
+            "max_new_positions_per_10min",
+            "max_open_positions",
+            "daily_loss_guard",
+            "trading_halted",
+        }
+        for candidate in candidates:
+            meta = self._aion_concurrency_candidate_meta(candidate)
+            ticker = str(meta.get("ticker") or "").strip()
+            family = str(meta.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN"
+            lane = str(meta.get("lane") or "").strip().upper()
+            allocation = meta.get("allocation") if isinstance(meta.get("allocation"), dict) else {}
+            if not ticker or lane != "SPORTS":
+                continue
+            if primary_ticker and ticker == primary_ticker:
+                skipped.append({"ticker": ticker, "reason": "primary_candidate_already_attempted"})
+                continue
+            if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
+                reason = allocation.get("final_quality_reason") or allocation.get("reason") or "weak_sports_quality_demoted"
+                skipped.append({"ticker": ticker, "reason": reason})
+                self._emit_aion_concurrency_log("AION-CONCURRENCY-BLOCK", {
+                    "source": source,
+                    "ticker": ticker,
+                    "family": family,
+                    "reason": reason,
+                    "decision": "BLOCK",
+                    "subsystem": "multi_sports_submit",
+                })
+                continue
+            if self._sports_only_execution_blocked(
+                family=family,
+                ticker=ticker,
+                market=meta.get("market") if isinstance(meta.get("market"), dict) else {},
+                q=meta.get("q"),
+                lane="SPORTS",
+                reason=self._sports_only_block_reason(family=family, ticker=ticker, market=meta.get("market"), q=meta.get("q"), lane="SPORTS"),
+                source=source,
+            ):
+                skipped.append({"ticker": ticker, "reason": "sports_only_non_sports_block"})
+                continue
+            concurrency = self._evaluate_aion_concurrency_candidate(candidate, submitted_entries=submitted_entries, source=source)
+            if not concurrency.get("allowed"):
+                reason = concurrency.get("reason") or "concurrency_block"
+                skipped.append({"ticker": ticker, "reason": reason})
+                if reason in stop_reasons:
+                    break
+                continue
+            q = meta.get("q")
+            if q is None:
+                skipped.append({"ticker": ticker, "reason": "missing_quote_object"})
+                continue
+            self._apply_multi_submit_candidate_metadata(q, allocation)
+            payload = self.build_live_order_payload(
+                q,
+                market=meta.get("market") if isinstance(meta.get("market"), dict) else {},
+                selected_ticker=ticker,
+                selection_stage="multi_sports_submit",
+                allow_orderbook_refresh=True,
+            )
+            if not isinstance(payload, dict):
+                skipped.append({"ticker": ticker, "reason": "selected_price_missing_or_invalid_payload"})
+                self._emit_aion_concurrency_log("AION-CONCURRENCY-BLOCK", {
+                    "source": source,
+                    "ticker": ticker,
+                    "family": family,
+                    "reason": "selected_price_missing_or_invalid_payload",
+                    "decision": "BLOCK",
+                    "subsystem": "multi_sports_submit",
+                })
+                continue
+            pre_submit_check = self._sports_momentum_pre_submit_check(
+                q=q,
+                market=meta.get("market") if isinstance(meta.get("market"), dict) else {},
+                payload=payload,
+                allocation=allocation,
+                source="multi_sports_submit_pre_submit",
+            )
+            if not pre_submit_check.get("allowed"):
+                reason = pre_submit_check.get("reason") or "sports_momentum_pre_submit_skip"
+                skipped.append({"ticker": ticker, "reason": reason})
+                self._emit_aion_concurrency_log("AION-CONCURRENCY-BLOCK", {
+                    "source": source,
+                    "ticker": ticker,
+                    "family": family,
+                    "reason": reason,
+                    "decision": "BLOCK",
+                    "subsystem": "multi_sports_submit",
+                })
+                continue
+            result = self.submit_live_order(
+                q,
+                lane="sports_multi_submit",
+                payload_override=payload,
+            )
+            if not isinstance(result, dict):
+                result = {"submitted": False, "reason": "submit_error", "payload": payload}
+            submitted_payload = result.get("payload") if isinstance(result.get("payload"), dict) else payload
+            if result.get("submitted"):
+                self.record_live_position(
+                    q,
+                    size=submitted_payload.get("count"),
+                    entry_price=submitted_payload.get("price"),
+                    side=submitted_payload.get("side"),
+                )
+                print(
+                    "[POSITION-OPEN] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": submitted_payload.get("side"),
+                            "price": submitted_payload.get("price"),
+                            "count": submitted_payload.get("count"),
+                            "subsystem": "kalshi_web.multi_sports_submit",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                submitted_entries.append(
+                    self._aion_concurrency_entry_from_meta(
+                        meta,
+                        source="multi_submit",
+                        count=submitted_payload.get("count"),
+                        price=submitted_payload.get("price"),
+                        side=submitted_payload.get("side"),
+                    )
+                )
+                submitted.append({
+                    "ticker": ticker,
+                    "family": family,
+                    "side": submitted_payload.get("side"),
+                    "price": submitted_payload.get("price"),
+                    "count": submitted_payload.get("count"),
+                })
+                continue
+            reason = result.get("reason") or "submit_blocked"
+            skipped.append({"ticker": ticker, "reason": reason})
+            self._emit_aion_concurrency_log("AION-CONCURRENCY-BLOCK", {
+                "source": source,
+                "ticker": ticker,
+                "family": family,
+                "reason": reason,
+                "decision": "BLOCK",
+                "subsystem": "multi_sports_submit",
+            })
+            if reason in stop_reasons:
+                break
+        summary = {
+            "source": source,
+            "primary_ticker": primary_ticker or None,
+            "primary_lane": primary_lane or None,
+            "primary_submitted": bool(primary_result.get("submitted")),
+            "submitted": bool(submitted),
+            "submitted_count": len(submitted),
+            "submitted_tickers": [entry.get("ticker") for entry in submitted],
+            "skipped": skipped[:12],
+            "settings": self._aion_concurrency_settings(),
+            "reason": "multi_submit_completed" if submitted else "no_additional_sports_submits",
+        }
+        self._emit_aion_concurrency_log("AION-MULTI-SUBMIT-CYCLE", summary)
+        return summary
+
     def _execute_dual_lane_secondary_candidate(self, *, primary_ticker=None, primary_lane=None, target_lane=None, source="parallel_lane_submit"):
         if not AION_DUAL_LANE_SECONDARY_ENABLED:
             return {"submitted": False, "reason": "dual_lane_secondary_disabled"}
@@ -27225,29 +27711,32 @@ class KalshiSniperBot:
             results["SPORTS_LADDER"] = sports_ladder_result
             if sports_ladder_result.get("submitted"):
                 already_submitted["SPORTS"] = True
-        for lane_name in lane_order:
-            if already_submitted.get(lane_name):
-                results[lane_name] = {
-                    "submitted": True,
-                    "reason": "sports_ladder_already_submitted" if lane_name == "SPORTS" and (results.get("SPORTS_LADDER") or {}).get("submitted") else "primary_lane_already_submitted",
-                    "ticker": primary_ticker,
-                }
-                continue
-            lane_result = self._execute_dual_lane_secondary_candidate(
-                primary_ticker=primary_ticker if primary_result.get("submitted") else None,
-                primary_lane=primary_lane if primary_result.get("submitted") else None,
-                target_lane=lane_name,
-                source=source,
-            )
-            results[lane_name] = lane_result if isinstance(lane_result, dict) else {"submitted": False, "reason": "unknown"}
+        sports_multi_result = self._execute_multi_sports_submit_cycle(
+            primary_ticker=primary_ticker,
+            primary_lane=primary_lane,
+            primary_result=primary_result,
+            source=source,
+        )
+        results["SPORTS_MULTI"] = sports_multi_result if isinstance(sports_multi_result, dict) else {"submitted": False, "reason": "unknown"}
+        if (results.get("SPORTS_MULTI") or {}).get("submitted"):
+            results["SPORTS"] = results["SPORTS_MULTI"]
+        elif already_submitted.get("SPORTS"):
+            results["SPORTS"] = {
+                "submitted": True,
+                "reason": "sports_ladder_already_submitted" if (results.get("SPORTS_LADDER") or {}).get("submitted") else "primary_lane_already_submitted",
+                "ticker": primary_ticker,
+            }
+        else:
+            results["SPORTS"] = results["SPORTS_MULTI"]
         summary = {
             "source": source,
             "primary_ticker": primary_ticker,
             "primary_lane": primary_lane,
             "primary_submitted": bool(primary_result.get("submitted")),
-            "sports_submitted": bool((results.get("SPORTS") or {}).get("submitted") or (results.get("SPORTS_LADDER") or {}).get("submitted")),
+            "sports_submitted": bool((results.get("SPORTS") or {}).get("submitted") or (results.get("SPORTS_LADDER") or {}).get("submitted") or (results.get("SPORTS_MULTI") or {}).get("submitted")),
             "sports_reason": (results.get("SPORTS") or {}).get("reason"),
             "sports_ladder_reason": (results.get("SPORTS_LADDER") or {}).get("reason"),
+            "sports_multi_submitted_count": (results.get("SPORTS_MULTI") or {}).get("submitted_count", 0),
             "results": results,
         }
         print("[AION-FINAL-ALLOCATION-TRUTH] " + json.dumps(summary, sort_keys=True, default=str))
