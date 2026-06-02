@@ -4925,6 +4925,29 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(details["sports_spread_context"]["allowed"])
         self.assertLess(details["sports_spread_context"]["size_multiplier"], 1.0)
 
+    def test_final_submit_treats_sports_tightness_label_as_stale_spread_blocker(self):
+        bot = self._make_bot()
+
+        sports_blockers = bot._aion_final_submit_stale_spread_blocker_reasons(
+            family="KXMLBTOTAL",
+            ticker="KXMLBTOTAL-26JUN012138COLLAA-14",
+        )
+        self.assertIn("spread_too_wide", sports_blockers)
+        self.assertIn("spread_not_tight_enough", sports_blockers)
+
+        crypto_blockers = bot._aion_final_submit_stale_spread_blocker_reasons(
+            family="KXBTC15M",
+            ticker="KXBTC15M-UNIT",
+            crypto_final_submit_lane=True,
+        )
+        self.assertIn("spread_not_tight_enough", crypto_blockers)
+
+        nonsports_blockers = bot._aion_final_submit_stale_spread_blocker_reasons(
+            family="KXHIGHNY",
+            ticker="KXHIGHNY-UNIT",
+        )
+        self.assertNotIn("spread_not_tight_enough", nonsports_blockers)
+
     def test_sports_smart_entry_demotes_timing_gate_to_execution_cost(self):
         bot = self._make_bot()
         bot.live_momentum_hard_block_log_last_seen = {}
@@ -5289,6 +5312,57 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["selected_side"], "yes")
         self.assertAlmostEqual(result["selected_price"], 0.22)
 
+    def test_execution_chokepoint_recovery_allows_thin_executable_sports_quote(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBTOTAL-THIN-YES",
+            family="KXMLBTOTAL",
+            selected_side="yes",
+            selected_price=0.37,
+            yes_ask=0.37,
+            yes_top_size=0,
+            no_top_size=0,
+        )
+
+        result = bot._should_apply_execution_chokepoint_recovery(
+            family=q.family,
+            market={"ticker": q.ticker, "series_ticker": q.family, "status": "open"},
+            q=q,
+            expectancy_summary={
+                "quote_ready": True,
+                "orderbook_ready": True,
+                "spread_bucket": "wide_but_possible",
+                "sports_edge_after_cost": 0.028,
+            },
+            candidate_forensics={
+                "quote_ready": True,
+                "orderbook_ready": True,
+                "unsafe_price_status": "safe",
+                "spread_bucket": "wide_but_possible",
+                "payload": {
+                    "selected_side": "yes",
+                    "selected_price": 0.37,
+                    "yes_ask": 0.37,
+                    "edge_after_cost": 0.028,
+                },
+            },
+            entry_timing_observation={"phase55_status": "trigger_wait"},
+            decision="SKIP",
+            hard_reject_reason="",
+            execution_safety_blocked=False,
+            spread=0.04,
+            candidate_edge_after_cost=0.028,
+            unsafe_price_status="safe",
+            candidate_quote_ready=True,
+            candidate_spread_bucket="wide_but_possible",
+        )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["selected_side"], "yes")
+        self.assertAlmostEqual(result["selected_price"], 0.37)
+        self.assertEqual(result["selected_top_size"], 0.0)
+        self.assertTrue(result["thin_executable_quote"])
+
     def test_execution_chokepoint_recovery_preserves_capital_safety_block(self):
         bot = self._make_bot()
         q = SimpleNamespace(
@@ -5471,13 +5545,12 @@ class StructuralEdgeTests(unittest.TestCase):
                     "canonical_tradeability": tradeability,
                     "live_arm_ok": True,
                 },
-            )
+        )
 
         self.assertFalse(result["tradeable"])
-        self.assertEqual(result["phase55_status"], "insufficient_sports_execution_evidence")
-        self.assertEqual(result["blocker"], "insufficient_sports_execution_evidence")
+        self.assertEqual(result["phase55_status"], "nonpositive_edge")
+        self.assertEqual(result["blocker"], "nonpositive_edge")
         self.assertNotEqual(result["phase55_status"], "probability_block")
-        self.assertIn("[SPORTS-PROBABILITY-BLOCK]", logs.getvalue())
 
     def _realm_confidence_tradeability(self, **overrides):
         tradeability = {
@@ -5516,7 +5589,7 @@ class StructuralEdgeTests(unittest.TestCase):
         tradeability.update(overrides)
         return tradeability
 
-    def _run_realm_confidence_case(self, bot, *, tradeability, edge=0.024, ev=0.024, confidence=0.54, duplicate_block=False, max_positions_block=False, live_arm_ok=True):
+    def _run_realm_confidence_case(self, bot, *, tradeability, edge=0.024, ev=0.024, confidence=0.54, duplicate_block=False, max_positions_block=False, live_arm_ok=True, profile="safe"):
         market = {
             "ticker": "KXNBA-CONFIDENCE-LIVE",
             "series_ticker": "KXNBA",
@@ -5562,7 +5635,7 @@ class StructuralEdgeTests(unittest.TestCase):
                     "market": market,
                     "ticker": q.ticker,
                     "family": "KXNBA",
-                    "profile": "safe",
+                    "profile": profile,
                     "selected_side": tradeability.get("selected_side"),
                     "edge_after_cost": edge,
                     "ev_edge": ev,
@@ -5614,11 +5687,40 @@ class StructuralEdgeTests(unittest.TestCase):
         )
 
         self.assertFalse(result["tradeable"])
-        self.assertEqual(result["blocker"], "confidence_below_threshold")
-        self.assertEqual(result["confidence_gate_action"], "block")
-        self.assertEqual(result["confidence_gate_reason"], "negative_ev")
-        self.assertIn("[AION-CONFIDENCE-BLOCK]", logs)
+        self.assertEqual(result["blocker"], "negative_ev")
+        self.assertEqual(result["edge_audit_action"], "block")
         self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+
+    def test_realm_vv_moderate_wide_spread_penalizes_positive_ev_instead_of_hard_block(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability(
+            unsafe_price_status="unsafe_spread",
+            spread_classification="UNSAFE",
+            spread_bucket="extreme_wide",
+            spread_cents=16,
+            spread=0.16,
+            blocker_class=None,
+            blocker=None,
+            blocker_detail=None,
+            edge_after_cost=0.032,
+            ev_edge=0.032,
+            expected_roi=0.06,
+            confidence_score=0.82,
+        )
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.032,
+            ev=0.032,
+            confidence=0.82,
+            profile="beast",
+        )
+
+        self.assertTrue(result["tradeable"])
+        self.assertEqual(result["decision"], "BUY")
+        self.assertTrue(result["spread_penalty_applied"])
+        self.assertLess(result["spread_size_multiplier"], 1.0)
 
     def test_realm_vv_spread_extreme_still_rejected_under_confidence_restore(self):
         bot = self._make_bot()
@@ -5646,6 +5748,29 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertNotEqual(result["confidence_gate_action"], "allow")
         self.assertIn("[AION-CONFIDENCE-AUDIT]", logs)
         self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+        self.assertNotIn("[SPORTS-PROBABILITY-OVERRIDE]", logs)
+
+    def test_realm_vv_nonpositive_edge_rejects_before_probability_override(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability(
+            edge_after_cost=-0.012,
+            ev_edge=-0.012,
+            expected_roi=-0.03,
+            confidence_score=0.90,
+        )
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=-0.012,
+            ev=-0.012,
+            confidence=0.90,
+            profile="beast",
+        )
+
+        self.assertFalse(result["tradeable"])
+        self.assertEqual(result["blocker"], "negative_ev")
+        self.assertEqual(result["edge_audit_action"], "block")
         self.assertNotIn("[SPORTS-PROBABILITY-OVERRIDE]", logs)
 
     def test_realm_vv_duplicate_guard_preserved_under_confidence_restore(self):
@@ -6596,6 +6721,99 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(payload["no_price"], 42)
         self.assertNotIn("yes_price", payload)
 
+    def test_final_readiness_uses_no_side_quote_fields(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBTOTAL-NO-FINAL",
+            family="KXMLBTOTAL",
+            selected_side="no",
+            side="no",
+            selected_price=0.42,
+            selected_price_dollars=0.42,
+            selected_price_cents=42,
+            no_bid=0.40,
+            no_ask=0.42,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            payload = bot._emit_aion_final_readiness_sync(
+                ticker=q.ticker,
+                family=q.family,
+                market={"ticker": q.ticker, "series_ticker": q.family, "status": "open"},
+                q=q,
+                quote_diag={
+                    "selected_side": "no",
+                    "selected_price": 0.42,
+                    "selected_price_cents": 42,
+                    "no_bid": 0.40,
+                    "no_ask": 0.42,
+                    "quote_ready": True,
+                    "quote_missing": False,
+                    "unsafe_price_status": "safe",
+                    "spread_bucket": "tight",
+                    "quote_content_pass": True,
+                    "decision": "BUY",
+                },
+                edge_after_cost=0.025,
+                phase55_status="entry_ready",
+                phase55_ready=True,
+                selector_decision="BUY",
+                payload_ready=True,
+                auth_ready=True,
+                duplicate_status="clear",
+                cooldown_status="clear",
+                quote_ready=True,
+                quote_missing=False,
+                spread_bucket="tight",
+                final_block_reason="all_guards_passed",
+            )
+
+        self.assertTrue(payload["direct_fields_ready"])
+        self.assertNotEqual(payload["final_block_reason"], "quote_invalid")
+        self.assertEqual(payload["canonical_quote_payload"]["selected_side"], "no")
+        self.assertAlmostEqual(payload["canonical_quote_payload"]["selected_price"], 0.42)
+
+    def test_final_readiness_detail_logs_exact_missing_price(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBTOTAL-MISSING-FINAL",
+            family="KXMLBTOTAL",
+            selected_side="yes",
+            side="yes",
+        )
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            payload = bot._emit_aion_final_readiness_sync(
+                ticker=q.ticker,
+                family=q.family,
+                market={"ticker": q.ticker, "series_ticker": q.family, "status": "open"},
+                q=q,
+                quote_diag={
+                    "selected_side": "yes",
+                    "quote_ready": True,
+                    "quote_missing": False,
+                    "unsafe_price_status": "safe",
+                    "spread_bucket": "tight",
+                    "decision": "BUY",
+                },
+                edge_after_cost=0.025,
+                phase55_status="entry_ready",
+                phase55_ready=True,
+                selector_decision="BUY",
+                payload_ready=True,
+                auth_ready=True,
+                duplicate_status="clear",
+                cooldown_status="clear",
+                quote_ready=True,
+                quote_missing=False,
+                spread_bucket="tight",
+                final_block_reason="final_not_ready_unknown",
+        )
+
+        self.assertFalse(payload["final_ready"])
+        self.assertEqual(payload["final_block_reason"], "selected_price_missing")
+
     def test_live_candidate_terminal_accounting_balances_every_sports_candidate(self):
         bot = self._make_bot()
         future_start = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
@@ -6644,6 +6862,80 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(outcomes["no_price"], 1)
         self.assertEqual(outcomes["low_edge"], 1)
         self.assertEqual(outcomes["submit_attempt"], 1)
+
+    def test_live_candidate_terminal_accounting_uses_realm_vv_gate_reason(self):
+        bot = self._make_bot()
+        ticker = "KXNBA-GATE-EDGE"
+        bot.realm_vv_live_execution_gate_by_ticker = {}
+        bot.phase55_live_execution_gate_by_ticker = bot.realm_vv_live_execution_gate_by_ticker
+        bot.realm_vv_live_execution_gate_by_ticker[bot.normalize_phase55_ticker_key(ticker)] = {
+            "ticker": ticker,
+            "family": "KXNBA",
+            "realm_vv_status": "nonpositive_edge",
+            "phase55_status": "nonpositive_edge",
+            "decision": "SKIP",
+            "blocker": "nonpositive_edge",
+            "edge_after_cost": -0.03,
+        }
+
+        accounting = bot._build_aion_live_candidate_terminal_accounting(
+            markets=[{"ticker": ticker, "series_ticker": "KXNBA", "in_play": True}],
+            quotes_by_ticker={
+                ticker: SimpleNamespace(
+                    ticker=ticker,
+                    selected_side="yes",
+                    selected_price=0.54,
+                    yes_ask=0.54,
+                    yes_bid=0.53,
+                    liquidity=90,
+                    volume=1000,
+                )
+            },
+            quote_hydration_summary={"attempted": 1, "success": 1, "failure": 0},
+            trade_readiness_records=[],
+            stage="post_selector",
+        )
+
+        outcomes = accounting["terminal_outcomes"]
+        raw_reasons = {item["reason"] for item in accounting["top_raw_reasons"]}
+        self.assertTrue(accounting["terminal_balance_ok"])
+        self.assertEqual(outcomes["low_edge"], 1)
+        self.assertIn("nonpositive_edge", raw_reasons)
+        self.assertNotIn("quote_side_price_valid_no_terminal_record", raw_reasons)
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            bot._emit_aion_live_candidate_terminal_accounting(accounting)
+        output = stream.getvalue()
+        self.assertIn("[AION-FINAL-REJECT]", output)
+        self.assertIn("nonpositive_edge", output)
+
+    def test_live_candidate_terminal_accounting_names_valid_quote_without_terminal_record(self):
+        bot = self._make_bot()
+        ticker = "KXNBA-NO-TERMINAL"
+
+        accounting = bot._build_aion_live_candidate_terminal_accounting(
+            markets=[{"ticker": ticker, "series_ticker": "KXNBA", "in_play": True}],
+            quotes_by_ticker={
+                ticker: SimpleNamespace(
+                    ticker=ticker,
+                    selected_side="yes",
+                    selected_price=0.45,
+                    yes_ask=0.45,
+                    yes_bid=0.44,
+                )
+            },
+            quote_hydration_summary={"attempted": 1, "success": 1, "failure": 0},
+            trade_readiness_records=[],
+            stage="post_selector",
+        )
+
+        outcomes = accounting["terminal_outcomes"]
+        raw_reasons = {item["reason"] for item in accounting["top_raw_reasons"]}
+        self.assertTrue(accounting["terminal_balance_ok"])
+        self.assertEqual(outcomes["final_readiness_failed"], 1)
+        self.assertIn("valid_quote_no_terminal_record", raw_reasons)
+        self.assertNotIn("quote_side_price_valid_no_terminal_record", raw_reasons)
 
     def test_live_candidate_terminal_accounting_fail_log_emits_on_mismatch(self):
         bot = self._make_bot()

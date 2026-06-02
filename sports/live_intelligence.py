@@ -9352,14 +9352,47 @@ def _should_apply_execution_chokepoint_recovery(
         market.get("yes_ask_size") if selected_side == "yes" else market.get("no_ask_size"),
         market.get("yes_ask_size_fp") if selected_side == "yes" else market.get("no_ask_size_fp"),
     )
+    selected_ask_price = _pick_float(
+        payload.get("yes_ask") if selected_side == "yes" else payload.get("no_ask"),
+        quote_diag.get("yes_ask") if selected_side == "yes" else quote_diag.get("no_ask"),
+        expectancy_summary.get("yes_ask") if selected_side == "yes" else expectancy_summary.get("no_ask"),
+        getattr(q, "yes_ask", None) if selected_side == "yes" else getattr(q, "no_ask", None),
+        selected_price,
+    )
+    if selected_ask_price is not None and 1.0 < float(selected_ask_price) <= 100.0:
+        selected_ask_price = round(float(selected_ask_price) / 100.0, 4)
+    selected_bid_price = _pick_float(
+        payload.get("yes_bid") if selected_side == "yes" else payload.get("no_bid"),
+        quote_diag.get("yes_bid") if selected_side == "yes" else quote_diag.get("no_bid"),
+        expectancy_summary.get("yes_bid") if selected_side == "yes" else expectancy_summary.get("no_bid"),
+        getattr(q, "yes_bid", None) if selected_side == "yes" else getattr(q, "no_bid", None),
+    )
+    if selected_bid_price is not None and 1.0 < float(selected_bid_price) <= 100.0:
+        selected_bid_price = round(float(selected_bid_price) / 100.0, 4)
+    selected_quote_executable = bool(
+        selected_ask_price is not None
+        and 0.0 < float(selected_ask_price) < 1.0
+        and abs(float(selected_ask_price) - float(selected_price)) <= 0.0101
+        and (
+            selected_bid_price is not None
+            or quote_ready
+            or candidate_forensics.get("orderbook_ready")
+            or expectancy_summary.get("orderbook_ready")
+        )
+    )
+    thin_executable_quote = False
     if selected_top_size is None or selected_top_size <= 0.0:
-        return {
-            "allowed": False,
-            "reason": "selected_side_liquidity_missing",
-            "selected_side": selected_side,
-            "selected_price": selected_price,
-            "selected_top_size": selected_top_size,
-        }
+        if selected_quote_executable:
+            thin_executable_quote = True
+            selected_top_size = 0.0
+        else:
+            return {
+                "allowed": False,
+                "reason": "selected_side_liquidity_missing",
+                "selected_side": selected_side,
+                "selected_price": selected_price,
+                "selected_top_size": selected_top_size,
+            }
 
     recovery_edge = max(
         self.to_float(candidate_edge_after_cost, 0.0),
@@ -9426,6 +9459,7 @@ def _should_apply_execution_chokepoint_recovery(
         "selected_price": round(float(selected_price), 4),
         "selected_price_cents": int(round(float(selected_price) * 100.0)),
         "selected_top_size": selected_top_size,
+        "thin_executable_quote": bool(thin_executable_quote),
         "edge_after_cost": recovery_edge,
         "fill_probability": fill_probability,
         "execution_quality_score": execution_quality,
