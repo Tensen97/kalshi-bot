@@ -26479,6 +26479,20 @@ class KalshiSniperBot:
     def _is_sports_only_allowed_candidate(self, *, family=None, ticker=None, market=None, q=None, lane=None):
         if not self._sports_only_mode_enabled():
             return True
+        lane = str(lane or "").strip().upper()
+        family = str(family or getattr(q, "family", "") or "").strip().upper()
+        ticker = str(ticker or getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip()
+        market = market if isinstance(market, dict) else {}
+        if lane in {"CRYPTO_LADDER", "BTC1H_LADDER", "CRYPTO"}:
+            return False
+        if lane == "SPORTS":
+            return True
+        if self.is_sports_family(family, ticker=ticker):
+            return True
+        if market and self.get_market_discovery_category(market) == "sports":
+            return True
+        if ticker and self.get_market_discovery_category({"ticker": ticker, "series_ticker": family}) == "sports":
+            return True
         if sports_calibration is not None and hasattr(sports_calibration, "is_sports_only_allowed_candidate"):
             try:
                 allowed = sports_calibration.is_sports_only_allowed_candidate(
@@ -26494,20 +26508,6 @@ class KalshiSniperBot:
                     return False
             except Exception:
                 pass
-        lane = str(lane or "").strip().upper()
-        family = str(family or getattr(q, "family", "") or "").strip().upper()
-        ticker = str(ticker or getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip()
-        market = market if isinstance(market, dict) else {}
-        if lane in {"CRYPTO_LADDER", "BTC1H_LADDER", "CRYPTO"}:
-            return False
-        if lane == "SPORTS":
-            return True
-        if self.is_sports_family(family, ticker=ticker):
-            return True
-        if market and self.get_market_discovery_category(market) == "sports":
-            return True
-        if ticker and self.get_market_discovery_category({"ticker": ticker, "series_ticker": family}) == "sports":
-            return True
         return False
 
     def _sports_only_block_reason(self, *, family=None, ticker=None, market=None, q=None, lane=None):
@@ -26534,6 +26534,11 @@ class KalshiSniperBot:
         lane = str(lane or "").strip().upper()
         if lane in {"CRYPTO_LADDER", "BTC1H_LADDER", "CRYPTO"}:
             return True
+        family = str(family or getattr(q, "family", "") or "").strip().upper()
+        ticker = str(ticker or getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip().upper()
+        market = market if isinstance(market, dict) else {}
+        if self.is_sports_family(family, ticker=ticker) or (market and self.get_market_discovery_category(market) == "sports"):
+            return False
         if sports_calibration is not None and hasattr(sports_calibration, "is_crypto_market_text"):
             try:
                 return bool(
@@ -26547,9 +26552,6 @@ class KalshiSniperBot:
                 )
             except Exception:
                 pass
-        family = str(family or getattr(q, "family", "") or "").strip().upper()
-        ticker = str(ticker or getattr(q, "ticker", "") or (market or {}).get("ticker", "") or "").strip().upper()
-        market = market if isinstance(market, dict) else {}
         if self._is_crypto_ladder_market(family=family, ticker=ticker, market=market, q=q):
             return True
         crypto_asset_tokens = (
@@ -30972,6 +30974,13 @@ class KalshiSniperBot:
             family = str(market_or_family or "").strip().upper()
             explicit_category = ""
             haystack = family
+        sports_prefixes = (
+            "KXNBA", "KXWNBA", "KXNHL", "KXMLB", "KXNFL", "KXNCAA", "KXNCAAB", "KXNCAAF",
+            "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXEPL", "KXSOCCER", "KXUFC",
+            "KXBOX", "KXMMA", "KXSQUASH", "KXGOLF", "KXCFB", "KXCBB"
+        )
+        if "sport" in explicit_category or family.startswith(sports_prefixes):
+            return "sports"
         crypto_markers = (
             "BTC",
             "BITCOIN",
@@ -31002,12 +31011,6 @@ class KalshiSniperBot:
             return "crypto"
         if "weather" in explicit_category or family.startswith(("KXTEMP", "KXRAIN", "KXSNOW", "KXWEATHER")):
             return "weather"
-        if "sport" in explicit_category or family.startswith((
-            "KXNBA", "KXWNBA", "KXNHL", "KXMLB", "KXNFL", "KXNCAA", "KXNCAAB", "KXNCAAF",
-            "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXEPL", "KXSOCCER", "KXUFC",
-            "KXBOX", "KXMMA", "KXSQUASH", "KXGOLF", "KXCFB", "KXCBB"
-        )):
-            return "sports"
         return "general"
 
     def get_market_discovery_soft_boost(self, market):

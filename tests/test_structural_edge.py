@@ -1908,6 +1908,23 @@ class StructuralEdgeTests(unittest.TestCase):
             self.assertIn(family, kw.TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS)
             self.assertTrue(bot.is_sports_family(family, ticker=f"{family}-26JUN01LIVE-TEST"))
 
+    def test_sports_only_keeps_squash_ticker_with_sol_player_code(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        market = {
+            "ticker": "KXSQUASHMATCH-26JUN02SOLELI-SOL",
+            "series_ticker": "KXSQUASHMATCH",
+            "category": "crypto",
+            "title": "Squash match Sol vs Eli",
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            kept = bot._filter_sports_only_markets([market], source="unit_test", force_log=True)
+
+        self.assertEqual(bot.get_market_family(market), "KXSQUASHMATCH")
+        self.assertEqual(bot.get_market_discovery_category(market), "sports")
+        self.assertEqual([entry["ticker"] for entry in kept], [market["ticker"]])
+
     def test_quote_hydration_propagates_canonical_side_and_price(self):
         bot = self._make_bot()
         quote = SimpleNamespace(
