@@ -1289,7 +1289,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["reason"], "sports_live_state_ok")
         self.assertEqual(result["scoreboard_key"], "game_status")
 
-    def test_sports_live_state_guard_blocks_future_occurrence_without_live_signal(self):
+    def test_sports_live_state_guard_relaxes_active_executable_future_occurrence(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
@@ -1312,6 +1312,34 @@ class StructuralEdgeTests(unittest.TestCase):
                 "selected_price": 0.44,
                 "orderbook_ready": True,
                 "selected_side_has_liquidity": True,
+            },
+            source="unit_test",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_state_ok")
+        self.assertEqual(result["live_state"], "live_evidence")
+        self.assertEqual(result["block_reason"], None)
+
+    def test_sports_live_state_guard_still_blocks_future_occurrence_without_executable_quote(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXITFMATCH",
+            "status": "active",
+            "occurrence_datetime": future_occurrence,
+            "expected_expiration_time": future_occurrence,
+        }
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXITFMATCH-26JUN01ITF-OPEN",
+                "family": "KXITFMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
             },
             source="unit_test",
         )
@@ -1608,7 +1636,7 @@ class StructuralEdgeTests(unittest.TestCase):
             "ticker": "KXATPCHALLENGERMATCH-26JUN02FUT-FUT",
             "series_ticker": "KXATPCHALLENGERMATCH",
             "title": "ATP Challenger tomorrow",
-            "status": "active",
+            "status": "scheduled",
             "occurrence_datetime": future_start,
             "yes_ask": 0.42,
             "yes_bid": 0.39,
@@ -1682,6 +1710,81 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
         self.assertEqual(summary["admitted_count"], 1)
         self.assertEqual(summary["reason_counts"]["fresh_executable_orderbook_ambiguous_ticker_date"], 1)
+
+    def test_live_discovery_relaxes_active_executable_occurrence_hint(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        live_market = {
+            "ticker": "KXITFMATCH-26JUN01ACTIVE-YES",
+            "series_ticker": "KXITFMATCH",
+            "title": "ITF active executable market",
+            "status": "active",
+            "occurrence_datetime": future_occurrence,
+            "expected_expiration_time": future_occurrence,
+            "yes_ask": 0.47,
+            "yes_bid": 0.45,
+            "no_ask": 0.55,
+            "no_bid": 0.53,
+            "volume": 500,
+        }
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [live_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
+        self.assertEqual(summary["admitted_count"], 1)
+        self.assertEqual(summary["admission_relaxed_count"], 1)
+        self.assertEqual(summary["reason_counts"]["active_executable_market_occurrence_hint"], 1)
+        self.assertIn("[AION-ADMISSION-RELAXED]", stream.getvalue())
+
+    def test_live_discovery_recovers_active_occurrence_with_fresh_orderbook(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        past_token = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%y%b%d").upper()
+        future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        live_market = {
+            "ticker": f"KXITFMATCH-{past_token}ACTIVE-HYDRATE",
+            "series_ticker": "KXITFMATCH",
+            "title": "ITF active market requiring orderbook hydration",
+            "status": "active",
+            "occurrence_datetime": future_occurrence,
+            "expected_expiration_time": future_occurrence,
+        }
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXITFMATCH",
+            "status": "active",
+            "occurrence_datetime": future_occurrence,
+            "expected_expiration_time": future_occurrence,
+        }
+        bot.get_live_market_orderbook = lambda ticker: {
+            "yes_bid": 0.45,
+            "yes_ask": 0.47,
+            "no_bid": 0.53,
+            "no_ask": 0.55,
+            "yes_top_size": 8,
+            "no_top_size": 9,
+        }
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [live_market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
+        self.assertEqual(summary["active_hydration_attempts"], 1)
+        self.assertEqual(summary["active_hydration_success"], 1)
+        self.assertEqual(summary["admission_relaxed_count"], 1)
+        self.assertIn("[AION-ADMISSION-RELAXED]", stream.getvalue())
 
     def test_live_discovery_hydrates_ambiguous_ticker_date_before_drop(self):
         self._set_sports_only_mode(True)
@@ -5674,6 +5777,27 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertIn("[AION-CONFIDENCE-ALLOW]", logs)
         self.assertIn("[AION-LIVE-EXECUTION-RESTORE]", logs)
 
+    def test_realm_vv_weak_confidence_positive_ev_can_submit_with_smaller_size(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability(confidence_score=0.30)
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.026,
+            ev=0.026,
+            confidence=0.30,
+        )
+
+        self.assertTrue(result["tradeable"])
+        self.assertEqual(result["decision"], "BUY")
+        self.assertEqual(result["confidence_gate_action"], "allow")
+        self.assertTrue(result["confidence_penalty_applied"])
+        self.assertLessEqual(result["confidence_size_multiplier"], 0.5)
+        self.assertEqual(result["selected_side"], "yes")
+        self.assertAlmostEqual(result["selected_price"], 0.42)
+        self.assertIn("[AION-ADMISSION-RELAXED]", logs)
+
     def test_realm_vv_negative_ev_still_rejected_under_confidence_restore(self):
         bot = self._make_bot()
         tradeability = self._realm_confidence_tradeability(ev_edge=-0.01)
@@ -6936,6 +7060,37 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(outcomes["final_readiness_failed"], 1)
         self.assertIn("valid_quote_no_terminal_record", raw_reasons)
         self.assertNotIn("quote_side_price_valid_no_terminal_record", raw_reasons)
+
+    def test_live_candidate_terminal_accounting_classifies_absurd_spread_without_terminal_record(self):
+        bot = self._make_bot()
+        ticker = "KXATPCHALLENGERMATCH-WIDE-SPREAD"
+
+        accounting = bot._build_aion_live_candidate_terminal_accounting(
+            markets=[{"ticker": ticker, "series_ticker": "KXATPCHALLENGERMATCH", "in_play": True}],
+            quotes_by_ticker={
+                ticker: SimpleNamespace(
+                    ticker=ticker,
+                    selected_side="yes",
+                    selected_price=0.99,
+                    yes_ask=0.99,
+                    yes_bid=0.01,
+                    no_ask=0.99,
+                    no_bid=0.01,
+                    yes_top_size=4800,
+                    no_top_size=4100,
+                )
+            },
+            quote_hydration_summary={"attempted": 1, "success": 1, "failure": 0},
+            trade_readiness_records=[],
+            stage="post_selector",
+        )
+
+        outcomes = accounting["terminal_outcomes"]
+        raw_reasons = {item["reason"] for item in accounting["top_raw_reasons"]}
+        self.assertTrue(accounting["terminal_balance_ok"])
+        self.assertEqual(outcomes["spread_block"], 1)
+        self.assertEqual(outcomes["final_readiness_failed"], 0)
+        self.assertIn("spread_absurd_unusable", raw_reasons)
 
     def test_live_candidate_terminal_accounting_fail_log_emits_on_mismatch(self):
         bot = self._make_bot()

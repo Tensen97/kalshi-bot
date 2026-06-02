@@ -339,6 +339,7 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-CONFIDENCE-BLOCK",
     "AION-CONFIDENCE-ALLOW",
     "AION-LIVE-EXECUTION-RESTORE",
+    "AION-LIVE-PARTICIPATION-RESTORED",
     "AION-CONCURRENCY-AUDIT",
     "AION-CONCURRENCY-BLOCK",
     "AION-CONCURRENCY-ALLOW",
@@ -467,6 +468,7 @@ _AION_EXECUTION_CRITICAL_PREFIXES = (
     "LIVE-CASHOUT",
     "LIVE-EXIT",
     "AION-CONFIDENCE-",
+    "AION-ADMISSION-",
     "AION-CONCURRENCY-",
     "AION-MULTI-SUBMIT-CYCLE",
     "AION-EXECUTION-BLOCKER",
@@ -3671,6 +3673,81 @@ class KalshiSniperBot:
                     return True, "executable_orderbook", selected_price or yes_price or no_price
         return False, None, None
 
+    def _sports_live_state_has_visible_liquidity(self, sources):
+        def _get(container, key):
+            try:
+                return container.get(key) if isinstance(container, dict) else getattr(container, key, None)
+            except Exception:
+                return None
+
+        def _positive(value):
+            value = self.to_float(value, None)
+            return value is not None and value > 0.0
+
+        def _containers(source):
+            containers = [source]
+            if isinstance(source, dict):
+                for key in ("orderbook", "order_book", "top_book", "book", "quote", "quote_diag", "canonical_tradeability"):
+                    value = source.get(key)
+                    if isinstance(value, dict):
+                        containers.append(value)
+            return containers
+
+        for source in sources or ():
+            if source is None:
+                continue
+            for container in _containers(source):
+                if bool(_get(container, "selected_side_has_liquidity")):
+                    return True
+                if bool(_get(container, "orderbook_ready") or _get(container, "orderbook_exists") or _get(container, "normalized_orderbook_present")):
+                    return True
+                for key in (
+                    "volume",
+                    "volume_24h",
+                    "open_interest",
+                    "open_interest_fp",
+                    "liquidity",
+                    "liquidity_depth",
+                    "yes_top_size",
+                    "no_top_size",
+                    "yes_ask_size",
+                    "no_ask_size",
+                    "yes_size",
+                    "no_size",
+                ):
+                    if _positive(_get(container, key)):
+                        return True
+        return False
+
+    def _sports_live_state_visible_tradable_signal(
+        self,
+        status_text=None,
+        executable_book=False,
+        market=None,
+        sources=None,
+        ticker_future_start=False,
+    ):
+        status_text = str(status_text or "").strip().lower()
+        active_status = status_text in {
+            "active",
+            "open",
+            "trading",
+            "available",
+            "accepting_orders",
+            "accepting orders",
+        }
+        if ticker_future_start or not active_status or not executable_book:
+            return False
+        market = market if isinstance(market, dict) else {}
+        if market:
+            if bool(market.get("disabled") or market.get("is_disabled")):
+                return False
+            if bool(market.get("closed") or market.get("is_closed") or market.get("settled")):
+                return False
+        if not self._sports_live_state_has_visible_liquidity(sources or ([market] if market else [])):
+            return False
+        return True
+
     def _emit_sports_live_state_guard_log(self, tag, payload):
         try:
             print(f"[{tag}] " + json.dumps(payload if isinstance(payload, dict) else {}, sort_keys=True, default=str))
@@ -3788,6 +3865,15 @@ class KalshiSniperBot:
             and status_text not in pregame_statuses
         )
         strong_live_signal = bool(explicit_live or status_text in live_statuses or scoreboard_live)
+        visible_tradable_signal = bool(
+            self._sports_live_state_visible_tradable_signal(
+                status_text=status_text,
+                executable_book=executable_book,
+                market=metadata[0] if metadata and isinstance(metadata[0], dict) else None,
+                sources=metadata,
+                ticker_future_start=bool(ambiguous_ticker_date_future or exact_ticker_future_start),
+            )
+        )
 
         reason = "unknown_sports_live_state"
         ok = False
@@ -3817,6 +3903,10 @@ class KalshiSniperBot:
             ok = True
             reason = "start_time_elapsed"
             live_state = "started"
+        elif future_occurrence_hint and visible_tradable_signal:
+            ok = True
+            reason = "active_executable_market_occurrence_hint"
+            live_state = "live_evidence"
         elif future_occurrence_hint and not strong_live_signal:
             reason = "future_occurrence_no_live_evidence"
             live_state = "future"
@@ -3853,9 +3943,20 @@ class KalshiSniperBot:
             "executable_book": bool(executable_book),
             "executable_book_key": executable_book_key,
             "executable_book_value": executable_book_value,
+            "visible_tradable_signal": bool(visible_tradable_signal),
             "detail_reason": detail_reason,
             "metadata_sources": len(metadata),
         }
+        if future_occurrence_hint and visible_tradable_signal and not strong_live_signal:
+            self._emit_sports_live_state_guard_log(
+                "AION-ADMISSION-RELAXED",
+                {
+                    **payload_log,
+                    "old_reason": "future_occurrence_no_live_evidence",
+                    "relaxation": "active_executable_market_occurrence_hint",
+                    "reason": "tradable_visible_sports_market",
+                },
+            )
         if future_occurrence_hint and strong_live_signal:
             self._emit_sports_live_state_guard_log(
                 "AION-LIVE-MARKET-MISMATCH",
@@ -3872,6 +3973,23 @@ class KalshiSniperBot:
                 "classification_rule": "hard_start_fields_block_future;occurrence_datetime_is_resolution_hint",
             },
         )
+        self._emit_sports_live_state_guard_log(
+            "AION-ADMISSION-AUDIT",
+            {
+                **payload_log,
+                "stage": "pre_submit_live_state_guard",
+                "decision": "ALLOW" if ok else "BLOCK",
+            },
+        )
+        if not ok:
+            self._emit_sports_live_state_guard_log(
+                "AION-ADMISSION-BLOCK",
+                {
+                    **payload_log,
+                    "stage": "pre_submit_live_state_guard",
+                    "block_reason": reason,
+                },
+            )
         self._emit_sports_live_state_guard_log("AION-SPORTS-LIVE-STATE-CHECK", payload_log)
         self._emit_sports_live_state_guard_log("AION-LIVE-SPORTS-ALLOW" if ok else "AION-PREGAME-SPORTS-BLOCK", payload_log)
         self._emit_sports_live_state_guard_log("AION-LIVE-GUARD-ALLOW" if ok else "AION-LIVE-GUARD-BLOCK", payload_log)
@@ -3936,6 +4054,15 @@ class KalshiSniperBot:
             and status_text not in pregame_statuses
         )
         strong_live_signal = bool(explicit_live or status_text in live_statuses or scoreboard_live)
+        visible_tradable_signal = bool(
+            self._sports_live_state_visible_tradable_signal(
+                status_text=status_text,
+                executable_book=executable_book,
+                market=market,
+                sources=metadata,
+                ticker_future_start=bool(ambiguous_ticker_date_future or exact_ticker_future_start),
+            )
+        )
 
         reason = "unknown_sports_live_state"
         live_state = "unknown"
@@ -3989,6 +4116,11 @@ class KalshiSniperBot:
             live_state = "started"
             admit = True
             priority = 70
+        elif future_occurrence_hint and visible_tradable_signal:
+            reason = "active_executable_market_occurrence_hint"
+            live_state = "live_evidence"
+            admit = True
+            priority = 62
         elif future_occurrence_hint and not strong_live_signal:
             reason = "future_occurrence_no_live_evidence"
             live_state = "future"
@@ -4026,6 +4158,7 @@ class KalshiSniperBot:
             "executable_book": bool(executable_book),
             "executable_book_key": executable_book_key,
             "executable_book_value": executable_book_value,
+            "visible_tradable_signal": bool(visible_tradable_signal),
         }
 
     def _aion_sports_only_live_selector_admission(self, market=None, *, selection_merge_source=None):
@@ -4099,9 +4232,14 @@ class KalshiSniperBot:
         ambiguous_hydration_attempts = 0
         ambiguous_hydration_success = 0
         ambiguous_hydration_failures = Counter()
+        active_hydration_attempts = 0
+        active_hydration_success = 0
+        active_hydration_failures = Counter()
         classification_examples = []
         mismatch_examples = []
         classification_fix_examples = []
+        relaxed_examples = []
+        block_examples = []
 
         def _should_hydrate_ambiguous_date_market(state):
             if not isinstance(state, dict):
@@ -4114,6 +4252,21 @@ class KalshiSniperBot:
                 and seconds_to_start > 30.0
                 and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
             )
+
+        def _should_hydrate_active_occurrence_market(state, market):
+            if not isinstance(state, dict) or not isinstance(market, dict):
+                return False
+            if state.get("reason") != "future_occurrence_no_live_evidence":
+                return False
+            if bool(state.get("executable_book")):
+                return False
+            status_text = str(market.get("status") or market.get("market_status") or "").strip().lower()
+            if status_text not in {"active", "open", "trading", "available", "accepting_orders", "accepting orders"}:
+                return False
+            seconds_to_start = self.to_float(state.get("seconds_to_start"), None)
+            if state.get("start_key") == "ticker_date" and seconds_to_start is not None and seconds_to_start > 30.0:
+                return False
+            return True
 
         def _hydrate_ambiguous_live_discovery_market(market, family):
             hydrated_market = dict(market or {})
@@ -4198,7 +4351,63 @@ class KalshiSniperBot:
                         pass
                 else:
                     ambiguous_hydration_failures[hydrated_state.get("reason") or hydration_reason or "unknown"] += 1
+            if (
+                not state.get("admit")
+                and _should_hydrate_active_occurrence_market(state, market)
+                and active_hydration_attempts < max(0, AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT)
+            ):
+                active_hydration_attempts += 1
+                hydrated_market, hydration_reason = _hydrate_ambiguous_live_discovery_market(market, family)
+                hydrated_state = self._aion_live_discovery_state(market=hydrated_market)
+                if hydrated_state.get("admit"):
+                    active_hydration_success += 1
+                    market = hydrated_market
+                    state = hydrated_state
+                    state["reason"] = state.get("reason") or "active_occurrence_hydrated_live"
+                    state["hydration_reason"] = hydration_reason
+                    self._emit_aion_live_discovery_summary(
+                        "AION-ADMISSION-RELAXED",
+                        {
+                            "source": source,
+                            "stage": "active_occurrence_hydration",
+                            "ticker": ticker or None,
+                            "family": family,
+                            "old_reason": "future_occurrence_no_live_evidence",
+                            "reason": state.get("reason"),
+                            "hydration_reason": hydration_reason,
+                            "live_state": state.get("live_state"),
+                            "executable_book": bool(state.get("executable_book")),
+                            "executable_book_key": state.get("executable_book_key"),
+                            "selected_price_hint": state.get("executable_book_value"),
+                        },
+                    )
+                else:
+                    active_hydration_failures[hydrated_state.get("reason") or hydration_reason or "unknown"] += 1
             reason_counts[state.get("reason") or "unknown"] += 1
+            if state.get("reason") == "active_executable_market_occurrence_hint":
+                relaxed_example = {
+                    "ticker": ticker or None,
+                    "event_ticker": market.get("event_ticker"),
+                    "family": family,
+                    "old_reason": "future_occurrence_no_live_evidence",
+                    "reason": state.get("reason"),
+                    "status": market.get("status"),
+                    "occurrence_key": state.get("occurrence_key"),
+                    "occurrence_time": state.get("occurrence_time"),
+                    "executable_book": bool(state.get("executable_book")),
+                    "executable_book_key": state.get("executable_book_key"),
+                    "selected_price_hint": state.get("executable_book_value"),
+                }
+                if len(relaxed_examples) < 12:
+                    relaxed_examples.append(relaxed_example)
+                self._emit_aion_live_discovery_summary(
+                    "AION-ADMISSION-RELAXED",
+                    {
+                        "source": source,
+                        "stage": "live_discovery",
+                        **relaxed_example,
+                    },
+                )
             if len(classification_examples) < 10:
                 classification_examples.append(
                     {
@@ -4266,6 +4475,17 @@ class KalshiSniperBot:
                 admitted_family_counts[family] += 1
                 admitted_entries.append((state, market))
             elif state.get("terminal_drop"):
+                if len(block_examples) < 12:
+                    block_examples.append(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "reason": state.get("reason"),
+                            "live_state": state.get("live_state"),
+                            "status": market.get("status"),
+                            "executable_book": bool(state.get("executable_book")),
+                        }
+                    )
                 if len(dropped_future) < 12:
                     dropped_future.append(
                         {
@@ -4328,8 +4548,43 @@ class KalshiSniperBot:
             "ambiguous_hydration_attempts": int(ambiguous_hydration_attempts),
             "ambiguous_hydration_success": int(ambiguous_hydration_success),
             "ambiguous_hydration_failures": dict(ambiguous_hydration_failures.most_common(10)),
+            "active_hydration_attempts": int(active_hydration_attempts),
+            "active_hydration_success": int(active_hydration_success),
+            "active_hydration_failures": dict(active_hydration_failures.most_common(10)),
             "classification_examples": classification_examples,
+            "admission_relaxed_count": int(reason_counts.get("active_executable_market_occurrence_hint", 0)),
+            "relaxed_examples": relaxed_examples,
+            "block_examples": block_examples,
         }
+        self._emit_aion_live_discovery_summary(
+            "AION-ADMISSION-AUDIT",
+            {
+                "source": source,
+                "input_count": int(len(markets)),
+                "admitted_count": int(len(admitted)),
+                "admission_relaxed_count": int(payload["admission_relaxed_count"]),
+                "active_hydration_attempts": int(active_hydration_attempts),
+                "active_hydration_success": int(active_hydration_success),
+                "active_hydration_failures": dict(active_hydration_failures.most_common(8)),
+                "dropped_future_or_pregame": int(payload["dropped_future_or_pregame"]),
+                "dropped_unknown": int(payload["dropped_unknown"]),
+                "reason_counts": dict(reason_counts),
+                "families_scanned": dict(family_counts.most_common(12)),
+                "admitted_families": dict(admitted_family_counts.most_common(12)),
+                "relaxed_examples": relaxed_examples[:5],
+                "block_examples": block_examples[:5],
+            },
+        )
+        if block_examples:
+            self._emit_aion_live_discovery_summary(
+                "AION-ADMISSION-BLOCK",
+                {
+                    "source": source,
+                    "stage": "live_discovery",
+                    "count": int(payload["dropped_future_or_pregame"] + payload["dropped_unknown"]),
+                    "examples": block_examples[:8],
+                },
+            )
         self._emit_aion_live_discovery_summary("AION-LIVE-DISCOVERY-SCAN", payload)
         now_log_ts = time.time()
         last_classification_log_ts = self.to_float(getattr(self, "_aion_live_classification_log_last_ts", 0.0), 0.0) or 0.0
@@ -4378,6 +4633,17 @@ class KalshiSniperBot:
                     "count": int(len(admitted)),
                     "families": dict(admitted_family_counts.most_common(12)),
                     "examples": payload["admitted_examples"],
+                },
+            )
+            self._emit_aion_live_discovery_summary(
+                "AION-LIVE-PARTICIPATION-RESTORED",
+                {
+                    "source": source,
+                    "admitted_count": int(len(admitted)),
+                    "admission_relaxed_count": int(payload.get("admission_relaxed_count", 0) or 0),
+                    "families": dict(admitted_family_counts.most_common(12)),
+                    "reason_counts": dict(reason_counts),
+                    "examples": payload["admitted_examples"][:5],
                 },
             )
         return admitted, payload
@@ -4750,6 +5016,15 @@ class KalshiSniperBot:
             and status_text not in pregame_statuses
         )
         strong_live_signal = bool(self._sports_live_state_bool(explicit_live_value) or status_text in {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"} or scoreboard_live)
+        visible_tradable_signal = bool(
+            self._sports_live_state_visible_tradable_signal(
+                status_text=status_text,
+                executable_book=executable_book,
+                market=market,
+                sources=metadata,
+                ticker_future_start=bool(ambiguous_ticker_date_future or exact_ticker_future_start),
+            )
+        )
         if (metadata_future_start or exact_ticker_future_start or (start_ts is not None and start_ts > now_ts + 30.0 and not ambiguous_ticker_date_live_evidence)):
             return {
                 "reason": "future_start_time",
@@ -4766,6 +5041,8 @@ class KalshiSniperBot:
                 "executable_book_value": executable_book_value,
             }
         if strong_live_signal or (start_ts is not None and start_ts <= now_ts + 30.0 and not start_key == "ticker_date"):
+            return None
+        if future_occurrence_hint and visible_tradable_signal:
             return None
         if future_occurrence_hint and not strong_live_signal:
             return {
@@ -4859,6 +5136,44 @@ class KalshiSniperBot:
             ticker_key = str(record.get("ticker") or "").strip()
             if ticker_key:
                 record_by_ticker[ticker_key] = _preferred_terminal_record(record_by_ticker.get(ticker_key), record)
+
+        def _spread_from_quote_fields(market=None, q=None, side=None):
+            side = self._aion_normalize_live_side(side)
+
+            def _price(value):
+                value = self.to_float(value, None)
+                if value is None:
+                    return None
+                if value > 1.0:
+                    value = value / 100.0
+                return value
+
+            def _field(*names):
+                for name in names:
+                    value = self._read_field(q, name, default=None)
+                    if value is not None:
+                        return value
+                    value = self._read_field(market, name, default=None)
+                    if value is not None:
+                        return value
+                return None
+
+            direct = _price(_field("spread", "spread_width", "sports_spread"))
+            if direct is not None:
+                return max(0.0, float(direct))
+
+            spreads = []
+            if side in {"yes", None}:
+                yes_ask = _price(_field("yes_ask", "yes_price"))
+                yes_bid = _price(_field("yes_bid"))
+                if yes_ask is not None and yes_bid is not None:
+                    spreads.append(max(0.0, yes_ask - yes_bid))
+            if side in {"no", None}:
+                no_ask = _price(_field("no_ask", "no_price"))
+                no_bid = _price(_field("no_bid"))
+                if no_ask is not None and no_bid is not None:
+                    spreads.append(max(0.0, no_ask - no_bid))
+            return max(spreads) if spreads else None
 
         buckets = self._aion_funnel_terminal_buckets()
         counts = Counter({bucket: 0 for bucket in buckets})
@@ -4963,8 +5278,34 @@ class KalshiSniperBot:
                                 outcome = mapped
                                 reason = dominant_reason
                             else:
-                                outcome = "final_readiness_failed"
-                                reason = dominant_reason or "valid_quote_no_terminal_record"
+                                quote_spread = _spread_from_quote_fields(market=market, q=q, side=side)
+                                quote_spread_bucket = str(
+                                    getattr(q, "spread_bucket", None)
+                                    or getattr(q, "sports_spread_bucket", None)
+                                    or market.get("spread_bucket")
+                                    or ""
+                                ).strip().lower()
+                                unsafe_price_status = str(
+                                    getattr(q, "unsafe_price_status", None)
+                                    or market.get("unsafe_price_status")
+                                    or ""
+                                ).strip().lower()
+                                spread_block_threshold = max(
+                                    self.to_float(AION_SPORTS_SPREAD_PREFILTER_MAX_EXECUTABLE, 0.42) or 0.42,
+                                    self.to_float(AION_SPORTS_MAX_SPREAD_HARD, 0.24) or 0.24,
+                                )
+                                if (
+                                    quote_spread is not None
+                                    and quote_spread > spread_block_threshold
+                                ) or quote_spread_bucket in {"unsafe", "too_wide", "wide_unsafe", "spread_absurd", "absurd"} or unsafe_price_status in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "catastrophic_spread"}:
+                                    outcome = "spread_block"
+                                    reason = "spread_absurd_unusable"
+                                elif quote_spread is not None and quote_spread > AION_SPORTS_MAX_SPREAD_SOFT:
+                                    outcome = "spread_block"
+                                    reason = "wide_spread"
+                                else:
+                                    outcome = "final_readiness_failed"
+                                    reason = dominant_reason or "valid_quote_no_terminal_record"
 
             counts[outcome] += 1
             raw_reasons[str(reason or outcome)] += 1
@@ -4977,7 +5318,7 @@ class KalshiSniperBot:
                     "reason": reason,
                     "side": side,
                     "selected_price": selected_price,
-                    "spread": self.to_float(getattr(q, "spread", None), None) if q is not None else self.to_float(market.get("spread"), None),
+                    "spread": _spread_from_quote_fields(market=market, q=q, side=side),
                     "liquidity": self.to_float(getattr(q, "liquidity", None), self.to_float(market.get("liquidity"), None)) if q is not None else self.to_float(market.get("liquidity"), None),
                     "volume": self.to_float(getattr(q, "volume", None), self.to_float(market.get("volume"), None)) if q is not None else self.to_float(market.get("volume"), None),
                     "subsystem": "live_candidate_terminal_accounting",
@@ -5020,6 +5361,33 @@ class KalshiSniperBot:
             builtins.print("[AION-FUNNEL-ACCOUNTING] " + json.dumps(compact_accounting, sort_keys=True, default=str))
             stage = str(accounting.get("stage") or "").strip().lower()
             if stage == "post_selector":
+                final_readiness_examples = [
+                    {
+                        "ticker": record.get("ticker"),
+                        "family": record.get("family"),
+                        "side": record.get("side"),
+                        "selected_price": record.get("selected_price"),
+                        "spread": record.get("spread"),
+                        "liquidity": record.get("liquidity"),
+                        "reason": record.get("reason") or "unknown",
+                    }
+                    for record in list(accounting.get("terminal_records") or [])
+                    if isinstance(record, dict) and str(record.get("terminal_outcome") or "").strip() == "final_readiness_failed"
+                ][:8]
+                if final_readiness_examples:
+                    builtins.print(
+                        "[AION-FINAL-READINESS-DETAIL] "
+                        + json.dumps(
+                            {
+                                "stage": accounting.get("stage"),
+                                "count": int((accounting.get("terminal_outcomes") or {}).get("final_readiness_failed", len(final_readiness_examples))),
+                                "examples": final_readiness_examples,
+                                "subsystem": "live_candidate_terminal_accounting",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
                 seen = getattr(self, "_aion_final_reject_seen_keys", None)
                 if not isinstance(seen, set):
                     seen = set()
@@ -56143,7 +56511,7 @@ class KalshiSniperBot:
             and spread_width_value is not None
             and spread_width_value > 0.03
         )
-        adaptive_confidence_floor = min(confidence_floor, max(0.35, confidence_floor - 0.20))
+        adaptive_confidence_floor = min(confidence_floor, max(0.25, confidence_floor - 0.30))
         confidence_penalty_applied = False
         confidence_rank_adjustment = 0.0
         confidence_size_multiplier = 1.0
@@ -56418,7 +56786,7 @@ class KalshiSniperBot:
         elif confidence < confidence_floor:
             if adaptive_confidence_allow:
                 confidence_gap = max(0.0, confidence_floor - confidence)
-                confidence_size_multiplier = max(0.45, min(1.0, 1.0 - min(0.45, confidence_gap * 1.8)))
+                confidence_size_multiplier = max(0.25, min(1.0, 1.0 - min(0.75, confidence_gap * 2.2)))
                 confidence_rank_adjustment = round(-max(0.25, min(8.0, confidence_gap * 20.0)), 4)
                 confidence_penalty_applied = True
                 confidence_gate_action = "allow"
@@ -56456,6 +56824,29 @@ class KalshiSniperBot:
                         setattr(quote_payload, attr_name, attr_value)
                     except Exception:
                         pass
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": selected_ticker,
+                            "family": family,
+                            "stage": "realm_vv_confidence_gate",
+                            "old_reason": "confidence_below_threshold",
+                            "reason": confidence_gate_reason,
+                            "confidence": confidence,
+                            "confidence_floor": confidence_floor,
+                            "adaptive_confidence_floor": adaptive_confidence_floor,
+                            "edge_after_cost": edge,
+                            "EV": ev_value,
+                            "selected_side": selected_side,
+                            "selected_price": selected_price,
+                            "size_multiplier": confidence_size_multiplier,
+                            "decision": "BUY",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
             else:
                 decision = "SKIP"
                 blocker = "confidence_below_threshold"
