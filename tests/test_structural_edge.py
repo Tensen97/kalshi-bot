@@ -3842,6 +3842,111 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(submitted, [])
         self.assertIn({"ticker": "KXMLBTOTAL-GAMEC-9", "reason": "max_same_family_positions"}, result["skipped"])
 
+    def test_slot_priority_profitable_mlb_outranks_mediocre_tennis(self):
+        bot = self._make_bot()
+        mlb = self._multi_sports_candidate("KXMLBKS-GAMEA-YES", family="KXMLBKS", score=72, game_id="mlb:game_a")
+        tennis = self._multi_sports_candidate("KXATPMATCH-GAMEB-YES", family="KXATPMATCH", score=91, game_id="tennis:game_b")
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            ranked = bot._rank_slot_allocation_candidates([tennis, mlb], source="unit_slot_priority_mlb")
+
+        self.assertEqual(ranked[0]["ticker"], "KXMLBKS-GAMEA-YES")
+        self.assertIn("[AION-FAMILY-PRIORITY]", logs.getvalue())
+
+    def test_slot_priority_profitable_ncaasb_outranks_mediocre_tennis(self):
+        bot = self._make_bot()
+        ncaasb = self._multi_sports_candidate("KXNCAASB-GAMEA-YES", family="KXNCAASB", score=70, game_id="ncaasb:game_a")
+        tennis = self._multi_sports_candidate("KXWTAMATCH-GAMEB-YES", family="KXWTAMATCH", score=89, game_id="tennis:game_b")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ranked = bot._rank_slot_allocation_candidates([tennis, ncaasb], source="unit_slot_priority_ncaasb")
+
+        self.assertEqual(ranked[0]["ticker"], "KXNCAASB-GAMEA-YES")
+
+    def test_tennis_exposure_cap_blocks_weak_tennis_after_two_open(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        self._configure_multi_submit_bot(bot, [])
+        bot.live_positions = [
+            {"ticker": "KXATPMATCH-GAMEA-YES", "family": "KXATPMATCH", "status": "open", "entry_context": {"game_id": "tennis:game_a"}},
+            {"ticker": "KXITFMATCH-GAMEB-YES", "family": "KXITFMATCH", "status": "open", "entry_context": {"game_id": "tennis:game_b"}},
+        ]
+        candidate = self._multi_sports_candidate("KXWTAMATCH-GAMEC-YES", family="KXWTAMATCH", score=82, game_id="tennis:game_c")
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot._evaluate_aion_concurrency_candidate(candidate, submitted_entries=[], source="unit_tennis_cap")
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "tennis_exposure_cap")
+        self.assertIn("[AION-TENNIS-CAP]", logs.getvalue())
+
+    def test_elite_tennis_can_exceed_exposure_cap(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        self._configure_multi_submit_bot(bot, [])
+        bot.live_positions = [
+            {"ticker": "KXATPMATCH-GAMEA-YES", "family": "KXATPMATCH", "status": "open", "entry_context": {"game_id": "tennis:game_a"}},
+            {"ticker": "KXITFMATCH-GAMEB-YES", "family": "KXITFMATCH", "status": "open", "entry_context": {"game_id": "tennis:game_b"}},
+        ]
+        candidate = self._multi_sports_candidate("KXWTAMATCH-GAMEC-YES", family="KXWTAMATCH", score=97, game_id="tennis:game_c")
+        candidate["allocation"].update({
+            "allocation_score": 97,
+            "unified_opportunity_score": 97,
+            "EV": 0.12,
+            "edge": 0.12,
+            "edge_after_cost": 0.12,
+            "liquidity": 500,
+            "sports_execution_quality_score": 94,
+        })
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBKS-GAMED-YES", family="KXMLBKS", score=84, game_id="mlb:game_d"),
+            candidate,
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot._evaluate_aion_concurrency_candidate(candidate, submitted_entries=[], source="unit_elite_tennis")
+
+        self.assertTrue(result["allowed"])
+        self.assertIn("[AION-TENNIS-ELITE-ALLOW]", logs.getvalue())
+
+    def test_multi_submit_fills_slots_without_weak_tennis_majority(self):
+        self._set_sports_only_mode(True)
+        old_values = {
+            "AION_MAX_OPEN_POSITIONS": kw.AION_MAX_OPEN_POSITIONS,
+            "AION_MAX_SUBMITS_PER_CYCLE": kw.AION_MAX_SUBMITS_PER_CYCLE,
+            "AION_MAX_SAME_GAME_POSITIONS": kw.AION_MAX_SAME_GAME_POSITIONS,
+        }
+        kw.AION_MAX_OPEN_POSITIONS = 8
+        kw.AION_MAX_SUBMITS_PER_CYCLE = 8
+        kw.AION_MAX_SAME_GAME_POSITIONS = 2
+        for name, value in old_values.items():
+            self.addCleanup(setattr, kw, name, value)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXATPMATCH-GAMEA-YES", family="KXATPMATCH", score=96, game_id="tennis:game_a"),
+            self._multi_sports_candidate("KXITFMATCH-GAMEB-YES", family="KXITFMATCH", score=95, game_id="tennis:game_b"),
+            self._multi_sports_candidate("KXWTAMATCH-GAMEC-YES", family="KXWTAMATCH", score=94, game_id="tennis:game_c"),
+            self._multi_sports_candidate("KXATPCHALLENGERMATCH-GAMED-YES", family="KXATPCHALLENGERMATCH", score=93, game_id="tennis:game_d"),
+            self._multi_sports_candidate("KXMLBKS-GAMEE-YES", family="KXMLBKS", score=72, game_id="mlb:game_e"),
+            self._multi_sports_candidate("KXMLBSPREAD-GAMEF-FAV", family="KXMLBSPREAD", score=71, game_id="mlb:game_f"),
+            self._multi_sports_candidate("KXMLBTOTAL-GAMEG-8", family="KXMLBTOTAL", score=70, game_id="mlb:game_g"),
+            self._multi_sports_candidate("KXNCAASB-GAMEH-YES", family="KXNCAASB", score=69, game_id="ncaasb:game_h"),
+            self._multi_sports_candidate("KXNCAAB-GAMEI-YES", family="KXNCAAB", score=68, game_id="ncaab:game_i"),
+            self._multi_sports_candidate("KXCBB-GAMEJ-YES", family="KXCBB", score=67, game_id="ncaab:game_j"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot._execute_multi_sports_submit_cycle(source="unit_slot_fill")
+
+        tennis_submits = [ticker for ticker in submitted if ticker.startswith(("KXATP", "KXITF", "KXWTA"))]
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["submitted_count"], 8)
+        self.assertEqual(len(submitted), 8)
+        self.assertLessEqual(len(tennis_submits), kw.AION_TENNIS_EXPOSURE_CAP)
+        self.assertGreaterEqual(result["submitted_family_counts"].get("KXNCAASB", 0), 1)
+        self.assertIn("[AION-SLOT-ALLOCATION]", logs.getvalue())
+
     def test_primary_sports_capacity_uses_max_open_position_cap_before_submit(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()

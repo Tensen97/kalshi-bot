@@ -475,6 +475,10 @@ _AION_EXECUTION_CRITICAL_PREFIXES = (
     "AION-ADMISSION-",
     "AION-CONCURRENCY-",
     "AION-MULTI-SUBMIT-CYCLE",
+    "AION-FAMILY-PRIORITY",
+    "AION-TENNIS-CAP",
+    "AION-TENNIS-ELITE-ALLOW",
+    "AION-SLOT-ALLOCATION",
     "AION-EXECUTION-BLOCKER",
     "AION-LIVE-EXECUTION",
     "LIVE-EXECUTION",
@@ -2107,6 +2111,14 @@ AION_WEAK_TENNIS_FAMILY_PREFIXES = (
     "WTA",
     "ITF",
 )
+AION_TENNIS_EXPOSURE_CAP_ENABLED = get_env_bool("AION_TENNIS_EXPOSURE_CAP_ENABLED", 1)
+AION_TENNIS_EXPOSURE_CAP = max(1, get_env_int("AION_TENNIS_EXPOSURE_CAP", 2))
+AION_TENNIS_ELITE_EV = get_env_float("AION_TENNIS_ELITE_EV", 0.08)
+AION_TENNIS_ELITE_EDGE_AFTER_COST = get_env_float("AION_TENNIS_ELITE_EDGE_AFTER_COST", 0.08)
+AION_TENNIS_ELITE_LIQUIDITY = get_env_float("AION_TENNIS_ELITE_LIQUIDITY", 250.0)
+AION_TENNIS_ELITE_MARKET_QUALITY = get_env_float("AION_TENNIS_ELITE_MARKET_QUALITY", 82.0)
+AION_TENNIS_ELITE_SCORE = get_env_float("AION_TENNIS_ELITE_SCORE", 90.0)
+AION_TENNIS_ELITE_SCORE_GAP = get_env_float("AION_TENNIS_ELITE_SCORE_GAP", 10.0)
 AION_LIVE_SPORTS_REGIME_ENABLED = get_env_bool("AION_LIVE_SPORTS_REGIME_ENABLED", 1)
 AION_SPORTS_REGIME_MAX_RANK_BOOST = get_env_float("AION_SPORTS_REGIME_MAX_RANK_BOOST", 6.0)
 AION_SPORTS_REGIME_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_REGIME_MAX_RANK_PENALTY", 5.0)
@@ -25499,6 +25511,247 @@ class KalshiSniperBot:
         family = self._normalize_family_for_profit_memory(family)
         return any(family.startswith(prefix) for prefix in AION_PROFITABLE_FAMILY_PREFIXES)
 
+    def _family_slot_priority_profile(self, family):
+        family = self._normalize_family_for_profit_memory(family)
+        weak_tennis = self._is_family_profitability_weak_tennis(family)
+        if weak_tennis:
+            return {
+                "family": family,
+                "priority_bucket": 6,
+                "priority_label": "losing_tennis",
+                "weak_tennis": True,
+                "profitable_family": False,
+            }
+        if family.startswith(("KXMLBSPREAD", "MLBSPREAD")):
+            bucket, label = 1, "profitable_mlb_spread"
+        elif family.startswith(("KXMLBTOTAL", "MLBTOTAL")):
+            bucket, label = 2, "profitable_mlb_total"
+        elif family.startswith(("KXMLB", "MLB")):
+            bucket, label = 0, "profitable_mlb"
+        elif family.startswith(("KXNCAASB", "NCAASB")):
+            bucket, label = 3, "profitable_ncaasb"
+        elif family.startswith(("KXNCAAB", "KXCBB", "NCAAB")):
+            bucket, label = 4, "profitable_ncaab"
+        else:
+            bucket, label = 5, "everything_else"
+        return {
+            "family": family,
+            "priority_bucket": bucket,
+            "priority_label": label,
+            "weak_tennis": False,
+            "profitable_family": bucket in {0, 1, 2, 3, 4},
+        }
+
+    def _candidate_market_quality_score(self, meta):
+        meta = meta if isinstance(meta, dict) else {}
+        allocation = meta.get("allocation") if isinstance(meta.get("allocation"), dict) else {}
+        context = allocation.get("unified_opportunity") if isinstance(allocation.get("unified_opportunity"), dict) else {}
+        q = meta.get("q")
+        quality_values = (
+            allocation.get("sports_execution_quality_score"),
+            allocation.get("market_quality"),
+            allocation.get("conviction_score"),
+            allocation.get("sports_conviction_score"),
+            allocation.get("sports_graph_rank_adjustment"),
+            context.get("sports_execution_quality_score"),
+            context.get("market_quality"),
+            context.get("conviction_score"),
+            getattr(q, "sports_execution_quality_score", None),
+            getattr(q, "market_quality", None),
+            getattr(q, "conviction_score", None),
+            meta.get("confidence"),
+        )
+        best_quality = 0.0
+        for value in quality_values:
+            best_quality = max(best_quality, self._opportunity_score_value(value, 0.0))
+        spread = self.to_float(meta.get("spread"), None)
+        liquidity = self.to_float(meta.get("liquidity"), None)
+        book_quality = 0.0
+        if spread is not None:
+            if spread <= 0.03:
+                book_quality = 86.0
+            elif spread <= 0.06:
+                book_quality = 74.0
+            elif spread <= 0.10:
+                book_quality = 58.0
+        if liquidity is not None and liquidity >= float(AION_TENNIS_ELITE_LIQUIDITY):
+            book_quality = max(book_quality, 82.0)
+        return round(max(best_quality, book_quality), 4)
+
+    def _candidate_ev_value(self, meta):
+        meta = meta if isinstance(meta, dict) else {}
+        allocation = meta.get("allocation") if isinstance(meta.get("allocation"), dict) else {}
+        context = allocation.get("unified_opportunity") if isinstance(allocation.get("unified_opportunity"), dict) else {}
+        q = meta.get("q")
+        for value in (
+            allocation.get("EV"),
+            allocation.get("expected_value"),
+            allocation.get("edge_after_cost"),
+            allocation.get("edge"),
+            context.get("edge_after_cost"),
+            context.get("EV"),
+            getattr(q, "EV", None),
+            getattr(q, "edge_after_cost", None),
+            getattr(q, "edge", None),
+            meta.get("edge"),
+        ):
+            numeric = self.to_float(value, None)
+            if numeric is not None:
+                return numeric
+        return 0.0
+
+    def _best_non_tennis_competing_score(self, competing_candidates=None, *, current_ticker=None):
+        best_score = None
+        current_ticker = str(current_ticker or "").strip()
+        for candidate in competing_candidates or []:
+            if not isinstance(candidate, dict):
+                continue
+            meta = self._aion_concurrency_candidate_meta(candidate)
+            ticker = str(meta.get("ticker") or "").strip()
+            if current_ticker and ticker == current_ticker:
+                continue
+            if self._is_family_profitability_weak_tennis(meta.get("family")):
+                continue
+            score = self.to_float(meta.get("score"), None)
+            if score is None:
+                continue
+            best_score = score if best_score is None else max(best_score, score)
+        return best_score
+
+    def _weak_tennis_count_from_family_counts(self, family_counts):
+        if not isinstance(family_counts, Counter):
+            family_counts = Counter(family_counts or {})
+        count = 0
+        for family, family_count in family_counts.items():
+            if self._is_family_profitability_weak_tennis(family):
+                count += int(self.to_float(family_count, 0.0) or 0)
+        return count
+
+    def _evaluate_tennis_exposure_cap(self, meta, *, snapshot=None, competing_candidates=None, source="slot_allocation"):
+        meta = meta if isinstance(meta, dict) else {}
+        family = str(meta.get("family") or "").strip().upper()
+        if not AION_TENNIS_EXPOSURE_CAP_ENABLED or not self._is_family_profitability_weak_tennis(family):
+            return {"allowed": True, "reason": "not_weak_tennis"}
+        snapshot = snapshot if isinstance(snapshot, dict) else self._aion_concurrency_snapshot([])
+        cap = max(1, int(AION_TENNIS_EXPOSURE_CAP or 1))
+        tennis_open_count = int(snapshot.get("weak_tennis_open_count", self._weak_tennis_count_from_family_counts(snapshot.get("family_counts"))))
+        score = self.to_float(meta.get("score"), 0.0) or 0.0
+        edge = self.to_float(meta.get("edge"), self._candidate_ev_value(meta)) or 0.0
+        ev = self._candidate_ev_value(meta)
+        liquidity = self.to_float(meta.get("liquidity"), 0.0) or 0.0
+        market_quality = self._candidate_market_quality_score(meta)
+        best_non_tennis_score = self._best_non_tennis_competing_score(
+            competing_candidates,
+            current_ticker=meta.get("ticker"),
+        )
+        score_gap_ok = True if best_non_tennis_score is None else score >= (best_non_tennis_score + float(AION_TENNIS_ELITE_SCORE_GAP))
+        checks = {
+            "EV_elite": ev >= float(AION_TENNIS_ELITE_EV),
+            "edge_after_cost_elite": edge >= float(AION_TENNIS_ELITE_EDGE_AFTER_COST),
+            "liquidity_strong": liquidity >= float(AION_TENNIS_ELITE_LIQUIDITY),
+            "market_quality_strong": market_quality >= float(AION_TENNIS_ELITE_MARKET_QUALITY),
+            "score_elite": score >= float(AION_TENNIS_ELITE_SCORE),
+            "score_materially_exceeds_non_tennis": bool(score_gap_ok),
+        }
+        payload = {
+            "source": source,
+            "ticker": meta.get("ticker"),
+            "family": family,
+            "cap": cap,
+            "weak_tennis_open_count": tennis_open_count,
+            "candidate_score": round(score, 4),
+            "EV": round(ev, 6),
+            "edge_after_cost": round(edge, 6),
+            "liquidity": round(liquidity, 4),
+            "market_quality": round(market_quality, 4),
+            "best_non_tennis_score": self._safe_round(best_non_tennis_score, 4, None),
+            "elite_checks": checks,
+        }
+        if tennis_open_count < cap:
+            payload.update({"decision": "ALLOW", "reason": "tennis_under_exposure_cap"})
+            self._emit_aion_concurrency_log("AION-TENNIS-CAP", payload)
+            return {"allowed": True, "reason": "tennis_under_exposure_cap", "audit": payload}
+        if all(checks.values()):
+            payload.update({"decision": "ALLOW", "reason": "elite_tennis_cap_exception"})
+            self._emit_aion_concurrency_log("AION-TENNIS-ELITE-ALLOW", payload)
+            self._emit_aion_concurrency_log("AION-TENNIS-CAP", payload)
+            return {"allowed": True, "reason": "elite_tennis_cap_exception", "audit": payload}
+        failed_checks = [name for name, passed in checks.items() if not passed]
+        payload.update({"decision": "BLOCK", "reason": "tennis_exposure_cap", "failed_checks": failed_checks})
+        self._emit_aion_concurrency_log("AION-TENNIS-CAP", payload)
+        return {"allowed": False, "reason": "tennis_exposure_cap", "audit": payload}
+
+    def _slot_allocation_candidate_sort_key(self, candidate, *, snapshot=None):
+        meta = self._aion_concurrency_candidate_meta(candidate)
+        priority = self._family_slot_priority_profile(meta.get("family"))
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        tennis_open_count = int(snapshot.get("weak_tennis_open_count", 0) or 0)
+        cap_pressure = 0
+        if priority.get("weak_tennis") and tennis_open_count >= int(AION_TENNIS_EXPOSURE_CAP or 1):
+            cap_pressure = 2
+        edge = self.to_float(meta.get("edge"), 0.0) or 0.0
+        spread = self.to_float(meta.get("spread"), 1.0)
+        liquidity = self.to_float(meta.get("liquidity"), 0.0) or 0.0
+        score = self.to_float(meta.get("score"), 0.0) or 0.0
+        return (
+            int(priority.get("priority_bucket", 5)) + cap_pressure,
+            -score,
+            -edge,
+            spread if spread is not None else 1.0,
+            -liquidity,
+            str(meta.get("ticker") or ""),
+        )
+
+    def _rank_slot_allocation_candidates(self, candidates, *, source="slot_allocation"):
+        candidates = [candidate for candidate in (candidates or []) if isinstance(candidate, dict)]
+        snapshot = self._aion_concurrency_snapshot([])
+        before_rows = []
+        after_rows = []
+        for candidate in candidates:
+            meta = self._aion_concurrency_candidate_meta(candidate)
+            priority = self._family_slot_priority_profile(meta.get("family"))
+            row = {
+                "ticker": meta.get("ticker"),
+                "family": meta.get("family"),
+                "candidate_score": self._safe_round(meta.get("score"), 4, None),
+                "edge_after_cost": self._safe_round(meta.get("edge"), 6, None),
+                "confidence": self._safe_round(meta.get("confidence"), 4, None),
+                "spread": self._safe_round(meta.get("spread"), 4, None),
+                "liquidity": self._safe_round(meta.get("liquidity"), 4, None),
+                "market_quality": self._safe_round(self._candidate_market_quality_score(meta), 4, None),
+                "priority_bucket": priority.get("priority_bucket"),
+                "priority_label": priority.get("priority_label"),
+                "weak_tennis": priority.get("weak_tennis"),
+                "profitable_family": priority.get("profitable_family"),
+            }
+            before_rows.append(row)
+        ranked = sorted(candidates, key=lambda item: self._slot_allocation_candidate_sort_key(item, snapshot=snapshot))
+        for rank, candidate in enumerate(ranked[:12], 1):
+            meta = self._aion_concurrency_candidate_meta(candidate)
+            priority = self._family_slot_priority_profile(meta.get("family"))
+            after_rows.append({
+                "rank": rank,
+                "ticker": meta.get("ticker"),
+                "family": meta.get("family"),
+                "candidate_score": self._safe_round(meta.get("score"), 4, None),
+                "priority_bucket": priority.get("priority_bucket"),
+                "priority_label": priority.get("priority_label"),
+                "weak_tennis": priority.get("weak_tennis"),
+                "profitable_family": priority.get("profitable_family"),
+            })
+        self._emit_aion_concurrency_log(
+            "AION-FAMILY-PRIORITY",
+            {
+                "source": source,
+                "candidate_count": len(candidates),
+                "weak_tennis_open_count": snapshot.get("weak_tennis_open_count"),
+                "tennis_exposure_cap": AION_TENNIS_EXPOSURE_CAP,
+                "before_score_top": sorted(before_rows, key=lambda row: self.to_float(row.get("candidate_score"), 0.0) or 0.0, reverse=True)[:8],
+                "after_priority_top": after_rows,
+            },
+        )
+        return ranked
+
     def _family_profitability_selected_price(self, *sources):
         for source in sources:
             if not isinstance(source, dict):
@@ -27773,7 +28026,7 @@ class KalshiSniperBot:
                 game_key = self._extract_sports_game_key(ticker, market=market)
             except Exception:
                 game_key = ticker
-        return {
+        meta = {
             "ticker": ticker,
             "family": family,
             "q": q,
@@ -27791,6 +28044,10 @@ class KalshiSniperBot:
             "decision": allocation.get("decision"),
             "reason": allocation.get("reason"),
         }
+        meta["EV"] = self._candidate_ev_value(meta)
+        meta["market_quality"] = self._candidate_market_quality_score(meta)
+        meta["slot_priority"] = self._family_slot_priority_profile(family)
+        return meta
 
     def _aion_concurrency_entry_from_meta(self, meta, *, source=None, count=None, price=None, side=None):
         meta = meta if isinstance(meta, dict) else {}
@@ -27844,12 +28101,15 @@ class KalshiSniperBot:
                     game_key = ticker
             if game_key:
                 game_counts[game_key] += 1
+        weak_tennis_open_count = self._weak_tennis_count_from_family_counts(family_counts)
         return {
             "open_positions": open_positions,
             "open_count": len(open_positions) + reserved_count,
             "family_counts": family_counts,
             "game_counts": game_counts,
             "open_tickers": open_tickers,
+            "weak_tennis_open_count": weak_tennis_open_count,
+            "tennis_exposure_cap": int(AION_TENNIS_EXPOSURE_CAP or 0),
         }
 
     def _evaluate_aion_concurrency_candidate(self, candidate, *, submitted_entries=None, source="multi_submit"):
@@ -27874,6 +28134,7 @@ class KalshiSniperBot:
         same_family_count = int(snapshot["family_counts"].get(family, 0))
         same_game_count = int(snapshot["game_counts"].get(game_key, 0)) if game_key else 0
         block_reason = None
+        tennis_cap = {"allowed": True, "reason": "not_checked"}
         if not ticker:
             block_reason = "missing_ticker"
         elif meta.get("lane") != "SPORTS":
@@ -27905,6 +28166,15 @@ class KalshiSniperBot:
             block_reason = "duplicate_cycle_ticker"
         elif self.already_holding(ticker):
             block_reason = "duplicate_position_guard"
+        else:
+            tennis_cap = self._evaluate_tennis_exposure_cap(
+                meta,
+                snapshot=snapshot,
+                competing_candidates=getattr(self, "last_dual_lane_buy_candidates", []),
+                source=source,
+            )
+            if not tennis_cap.get("allowed", True):
+                block_reason = tennis_cap.get("reason") or "tennis_exposure_cap"
         duplicate = {"blocked": False}
         if block_reason is None:
             try:
@@ -27922,16 +28192,22 @@ class KalshiSniperBot:
             "game_key": game_key,
             "edge_after_cost": meta.get("edge"),
             "confidence": meta.get("confidence"),
+            "EV": meta.get("EV"),
             "spread": meta.get("spread"),
             "liquidity": meta.get("liquidity"),
+            "market_quality": meta.get("market_quality"),
             "candidate_score": meta.get("score"),
+            "slot_priority": meta.get("slot_priority"),
             "open_positions": snapshot["open_count"],
+            "weak_tennis_open_count": snapshot.get("weak_tennis_open_count"),
+            "tennis_exposure_cap": snapshot.get("tennis_exposure_cap"),
             "same_family_count": same_family_count,
             "same_game_count": same_game_count,
             "submitted_this_cycle": len(submitted_entries),
             "recent_new_positions_10min": recent_10min,
             "active_order_timestamps": len(active_timestamps),
             "settings": settings,
+            "tennis_cap": tennis_cap.get("audit") if isinstance(tennis_cap, dict) else None,
             "duplicate_guard": duplicate,
             "decision": "ALLOW" if block_reason is None else "BLOCK",
             "reason": block_reason or "concurrency_capacity_available",
@@ -27997,10 +28273,9 @@ class KalshiSniperBot:
                     pass
 
     def _execute_multi_sports_submit_cycle(self, *, primary_ticker=None, primary_lane=None, primary_result=None, source="multi_submit_cycle"):
-        candidates = sorted(
+        candidates = self._rank_slot_allocation_candidates(
             [candidate for candidate in (getattr(self, "last_dual_lane_buy_candidates", []) or []) if isinstance(candidate, dict)],
-            key=lambda item: self._candidate_unified_score(item),
-            reverse=True,
+            source=source,
         )
         primary_ticker = str(primary_ticker or "").strip()
         primary_lane = str(primary_lane or "").strip().upper()
@@ -28174,6 +28449,9 @@ class KalshiSniperBot:
             })
             if reason in stop_reasons:
                 break
+        allocation_snapshot = self._aion_concurrency_snapshot(submitted_entries)
+        submitted_family_counts = Counter(str(entry.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN" for entry in submitted)
+        skipped_reason_counts = Counter(str(entry.get("reason") or "unknown") for entry in skipped)
         summary = {
             "source": source,
             "primary_ticker": primary_ticker or None,
@@ -28182,10 +28460,19 @@ class KalshiSniperBot:
             "submitted": bool(submitted),
             "submitted_count": len(submitted),
             "submitted_tickers": [entry.get("ticker") for entry in submitted],
+            "submitted_family_counts": dict(submitted_family_counts),
+            "weak_tennis_submitted_count": sum(
+                count for family, count in submitted_family_counts.items() if self._is_family_profitability_weak_tennis(family)
+            ),
+            "open_positions_after_estimate": allocation_snapshot.get("open_count"),
+            "weak_tennis_open_after_estimate": allocation_snapshot.get("weak_tennis_open_count"),
+            "tennis_exposure_cap": allocation_snapshot.get("tennis_exposure_cap"),
             "skipped": skipped[:12],
+            "skipped_reason_counts": dict(skipped_reason_counts),
             "settings": self._aion_concurrency_settings(),
             "reason": "multi_submit_completed" if submitted else "no_additional_sports_submits",
         }
+        self._emit_aion_concurrency_log("AION-SLOT-ALLOCATION", summary)
         self._emit_aion_concurrency_log("AION-MULTI-SUBMIT-CYCLE", summary)
         return summary
 
@@ -47014,6 +47301,59 @@ class KalshiSniperBot:
                 category="sports",
                 source="submit_live_order",
             )
+        if ticker and self._is_family_profitability_weak_tennis(family):
+            allocation = {
+                "lane": "SPORTS",
+                "ticker": ticker,
+                "family": family,
+                "selected_side": (payload_override or {}).get("side") if isinstance(payload_override, dict) else getattr(q, "selected_side", None),
+                "selected_price": (payload_override or {}).get("price") if isinstance(payload_override, dict) else getattr(q, "selected_price", None),
+                "edge": getattr(q, "edge", None),
+                "edge_after_cost": getattr(q, "edge_after_cost", None),
+                "EV": getattr(q, "EV", None),
+                "confidence": getattr(q, "confidence", None),
+                "spread": getattr(q, "spread", None),
+                "liquidity": getattr(q, "liquidity", None),
+                "sports_execution_quality_score": getattr(q, "sports_execution_quality_score", None),
+                "market_quality": getattr(q, "market_quality", None),
+                "unified_opportunity_score": getattr(q, "unified_opportunity_score", None),
+            }
+            if isinstance(payload_override, dict):
+                for key in ("edge", "edge_after_cost", "EV", "confidence", "spread", "liquidity", "sports_execution_quality_score", "market_quality", "unified_opportunity_score"):
+                    if allocation.get(key) is None and payload_override.get(key) is not None:
+                        allocation[key] = payload_override.get(key)
+            try:
+                meta = self._aion_concurrency_candidate_meta({
+                    "ticker": ticker,
+                    "family": family,
+                    "lane": "SPORTS",
+                    "q": q,
+                    "market": payload_override if isinstance(payload_override, dict) else {"ticker": ticker, "series_ticker": family},
+                    "allocation": allocation,
+                })
+                tennis_cap = self._evaluate_tennis_exposure_cap(
+                    meta,
+                    snapshot=self._aion_concurrency_snapshot([]),
+                    competing_candidates=getattr(self, "last_dual_lane_buy_candidates", []),
+                    source="submit_live_order",
+                )
+                if not tennis_cap.get("allowed", True):
+                    return {
+                        "submitted": False,
+                        "reason": tennis_cap.get("reason") or "tennis_exposure_cap",
+                        "payload": payload_override if isinstance(payload_override, dict) else None,
+                    }
+            except Exception as exc:
+                self._emit_aion_concurrency_log(
+                    "AION-TENNIS-CAP",
+                    {
+                        "source": "submit_live_order",
+                        "ticker": ticker,
+                        "family": family,
+                        "decision": "ALLOW",
+                        "reason": f"tennis_cap_check_exception:{exc.__class__.__name__}",
+                    },
+                )
         return kalshi_execution_module.submit_live_order(
             self,
             q,
