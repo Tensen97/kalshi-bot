@@ -3692,6 +3692,7 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.live_positions = [
             {"ticker": "KXMLBTOTAL-GAMEA-7", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_a"}},
             {"ticker": "KXMLBTOTAL-GAMEB-8", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_b"}},
+            {"ticker": "KXMLBTOTAL-GAMED-6", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_d"}},
         ]
         bot.last_dual_lane_buy_candidates = [
             self._multi_sports_candidate("KXMLBTOTAL-GAMEC-9", family="KXMLBTOTAL", score=90, game_id="mlb:game_c"),
@@ -3703,6 +3704,35 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertFalse(result["submitted"])
         self.assertEqual(submitted, [])
         self.assertIn({"ticker": "KXMLBTOTAL-GAMEC-9", "reason": "max_same_family_positions"}, result["skipped"])
+
+    def test_primary_sports_capacity_uses_max_open_position_cap_before_submit(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        bot.live_positions = [
+            {
+                "ticker": f"KXMLBMONEYLINE-GAME{i}-YES",
+                "family": "KXMLBMONEYLINE",
+                "status": "open",
+                "entry_context": {"game_id": f"mlb:game_{i}"},
+            }
+            for i in range(kw.AION_MAX_OPEN_POSITIONS)
+        ]
+        candidate = self._multi_sports_candidate(
+            "KXWTAMATCH-GAMEZ-YES",
+            family="KXWTAMATCH",
+            score=91,
+            game_id="tennis:game_z",
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._evaluate_aion_concurrency_candidate(
+                candidate,
+                submitted_entries=[],
+                source="unit_primary_preflight",
+            )
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "max_open_positions")
 
     def test_multi_submit_daily_loss_cap_and_risk_governor_blocks_preserved(self):
         self._set_sports_only_mode(True)
@@ -4230,7 +4260,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(context["final_quality_action"], "allow_exceptional_trash_pattern")
         self.assertIn("home_run_prop", context["trash_prop_patterns"])
 
-    def test_quality_calibration_demotes_ultra_low_tennis_longshot_despite_large_edge(self):
+    def test_quality_calibration_soft_demotes_ultra_low_tennis_longshot_despite_large_edge(self):
         bot = self._make_bot()
         q = SimpleNamespace(
             ticker="KXITFWMATCH-26JUN02ZHISHU-ZHI",
@@ -4273,9 +4303,11 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertFalse(context["exceptional_trash_quality"])
         self.assertTrue(context["fragile_trash_pattern"])
         self.assertIn("ultra_low_probability_longshot", context["trash_prop_patterns"])
-        self.assertLess(context["allocation_score"], context["pre_lane_score"])
+        self.assertGreater(context["trash_prop_penalty"], 0.0)
+        self.assertGreater(context["allocation_score"], 0.0)
+        self.assertLess(context["allocation_score"], context["pre_lane_score"] + context["sports_boost"])
 
-    def test_structured_profitable_sports_outranks_fragile_tennis_longshot(self):
+    def test_fragile_tennis_longshot_keeps_soft_penalty_without_starving_execution(self):
         bot = self._make_bot()
         bot._get_family_profit_memory_stats = lambda *args, **kwargs: {}
         tennis_q = SimpleNamespace(
@@ -4350,9 +4382,9 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreater(tennis_context["unified_score"], 0.0)
         self.assertGreater(tennis_context["sports_lottery_quality_penalty"], 0.0)
         self.assertIn("sports_lottery_quality_penalty", tennis_context["reason"])
-        self.assertLessEqual(tennis_context["size_multiplier"], 0.65)
+        self.assertGreaterEqual(tennis_context["size_multiplier"], 0.85)
+        self.assertLess(tennis_context["size_multiplier"], 1.0)
         self.assertEqual(mlb_allocation["final_quality_action"], "allow_structured_sports_ladder")
-        self.assertGreater(mlb_context["unified_score"], tennis_context["unified_score"])
         self.assertGreater(mlb_context["size_multiplier"], tennis_context["size_multiplier"])
 
     def test_dual_lane_secondary_executes_different_strong_lane_through_submit_guard(self):
@@ -5660,7 +5692,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertEqual(result["reason"], "execution_safety_blocked")
 
-    def test_realm_vv_edge_floor_probability_block_becomes_sports_probability_cost(self):
+    def test_realm_vv_edge_floor_positive_sports_becomes_relaxed_admission(self):
         bot = self._make_bot()
         market = {
             "ticker": "KXNBA-PROB-REALM",
@@ -5736,8 +5768,33 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["phase55_status"], "entry_ready")
         self.assertTrue(result["tradeable"])
         self.assertIsNone(result["blocker"])
-        self.assertIn("[SPORTS-PROBABILITY-OVERRIDE]", logs.getvalue())
-        self.assertEqual(getattr(q, "sports_probability_action"), "override")
+        self.assertIn("[AION-ADMISSION-RELAXED]", logs.getvalue())
+        self.assertIn("positive_executable_soft_gate_relaxed", logs.getvalue())
+
+    def test_realm_vv_positive_executable_low_edge_submits_with_soft_size_penalty(self):
+        bot = self._make_bot()
+        tradeability = self._realm_confidence_tradeability(
+            edge_after_cost=0.0002,
+            ev_edge=0.0002,
+            expected_roi=0.0005,
+            confidence_score=0.36,
+        )
+
+        result, logs, _, _ = self._run_realm_confidence_case(
+            bot,
+            tradeability=tradeability,
+            edge=0.0002,
+            ev=0.0002,
+            confidence=0.36,
+        )
+
+        self.assertTrue(result["tradeable"])
+        self.assertEqual(result["decision"], "BUY")
+        self.assertEqual(result["phase55_status"], "entry_ready")
+        self.assertIsNone(result["blocker"])
+        self.assertTrue(result["canonical_tradeability"]["edge_soft_penalty_applied"])
+        self.assertLess(result["canonical_tradeability"]["suggested_size_multiplier"], 1.0)
+        self.assertIn("positive_executable_edge_floor_relaxed", logs)
 
     def test_realm_vv_no_edge_probability_skip_uses_non_legacy_reason(self):
         bot = self._make_bot()
@@ -5951,7 +6008,8 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "BUY")
         self.assertEqual(result["confidence_gate_action"], "allow")
         self.assertTrue(result["confidence_penalty_applied"])
-        self.assertLessEqual(result["confidence_size_multiplier"], 0.5)
+        self.assertGreaterEqual(result["confidence_size_multiplier"], 0.85)
+        self.assertLess(result["confidence_size_multiplier"], 1.0)
         self.assertEqual(result["selected_side"], "yes")
         self.assertAlmostEqual(result["selected_price"], 0.42)
         self.assertIn("[AION-ADMISSION-RELAXED]", logs)
@@ -6932,7 +6990,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreater(weak_context["capital_lock_penalty"], elite_context["capital_lock_penalty"])
         self.assertGreater(elite_context["unified_score"], weak_context["unified_score"])
 
-    def test_low_bankroll_concentrates_capital_in_best_opportunity(self):
+    def test_low_bankroll_opportunity_cost_is_soft_not_submit_block(self):
         bot = self._make_bot()
         bot.available_cash = 10.0
         best = {
@@ -6949,10 +7007,10 @@ class StructuralEdgeTests(unittest.TestCase):
         }
 
         self.assertTrue(bot._opportunity_cost_gate(best, [best, weaker], source="unit_test")["allowed"])
-        blocked = bot._opportunity_cost_gate(weaker, [best, weaker], source="unit_test")
+        allowed = bot._opportunity_cost_gate(weaker, [best, weaker], source="unit_test")
 
-        self.assertFalse(blocked["allowed"])
-        self.assertEqual(blocked["reason"], "low_cash_concentrate_best_opportunity")
+        self.assertTrue(allowed["allowed"])
+        self.assertEqual(allowed["reason"], "low_cash_soft_opportunity_penalty_only")
 
     def test_unified_scoring_preserves_selected_no_side_into_payload(self):
         bot = self._make_bot()

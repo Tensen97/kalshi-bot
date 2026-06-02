@@ -2034,12 +2034,12 @@ TARGETED_ORDERBOOK_MIN_SIZE = 5.0
 TARGETED_SERIES_MIN_LIQUIDITY = {}
 TARGETED_SERIES_MIN_TOP_OF_BOOK_SIZE = {}
 AION_DUAL_LANE_ALLOCATION_ENABLED = get_env_bool("AION_DUAL_LANE_ALLOCATION_ENABLED", 1)
-AION_WEAK_SPORTS_DEMOTE = get_env_float("AION_WEAK_SPORTS_DEMOTE", 28.0)
-AION_WEAK_SPORTS_SKIP_DEMOTE = get_env_float("AION_WEAK_SPORTS_SKIP_DEMOTE", 75.0)
+AION_WEAK_SPORTS_DEMOTE = get_env_float("AION_WEAK_SPORTS_DEMOTE", 2.0)
+AION_WEAK_SPORTS_SKIP_DEMOTE = get_env_float("AION_WEAK_SPORTS_SKIP_DEMOTE", 5.0)
 AION_STRONG_SPORTS_LANE_BOOST = get_env_float("AION_STRONG_SPORTS_LANE_BOOST", 4.0)
 AION_STRUCTURED_LADDER_QUALITY_BOOST = get_env_float("AION_STRUCTURED_LADDER_QUALITY_BOOST", 14.0)
-AION_SPORTS_TRASH_PROP_PENALTY = get_env_float("AION_SPORTS_TRASH_PROP_PENALTY", 55.0)
-AION_SPORTS_TRASH_PROP_SKIP_PENALTY = get_env_float("AION_SPORTS_TRASH_PROP_SKIP_PENALTY", 95.0)
+AION_SPORTS_TRASH_PROP_PENALTY = get_env_float("AION_SPORTS_TRASH_PROP_PENALTY", 3.7)
+AION_SPORTS_TRASH_PROP_SKIP_PENALTY = get_env_float("AION_SPORTS_TRASH_PROP_SKIP_PENALTY", 6.3)
 AION_SPORTS_TRASH_EXCEPTION_EDGE = get_env_float("AION_SPORTS_TRASH_EXCEPTION_EDGE", 0.020)
 AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE = get_env_float("AION_SPORTS_TRASH_EXCEPTION_CONFIDENCE", 0.70)
 AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY = get_env_float("AION_SPORTS_TRASH_EXCEPTION_LIQUIDITY", 80.0)
@@ -2047,8 +2047,8 @@ AION_SPORTS_MEMORY_ENABLED = get_env_bool("AION_SPORTS_MEMORY_ENABLED", 1)
 AION_SPORTS_MEMORY_MAX_RECORDS = get_env_int("AION_SPORTS_MEMORY_MAX_RECORDS", 600)
 AION_SPORTS_MEMORY_MIN_EFFECT_SAMPLES = get_env_int("AION_SPORTS_MEMORY_MIN_EFFECT_SAMPLES", 3)
 AION_SPORTS_MEMORY_MAX_RANK_BOOST = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_BOOST", 5.5)
-AION_SPORTS_MEMORY_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_PENALTY", 4.0)
-AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER", 0.82)
+AION_SPORTS_MEMORY_MAX_RANK_PENALTY = get_env_float("AION_SPORTS_MEMORY_MAX_RANK_PENALTY", 0.30)
+AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MIN_SIZE_MULTIPLIER", 0.95)
 AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER", 1.22)
 AION_LIVE_SPORTS_REGIME_ENABLED = get_env_bool("AION_LIVE_SPORTS_REGIME_ENABLED", 1)
 AION_SPORTS_REGIME_MAX_RANK_BOOST = get_env_float("AION_SPORTS_REGIME_MAX_RANK_BOOST", 6.0)
@@ -2187,13 +2187,13 @@ DEFAULT_LIVE_ORDER_ACTION = "buy"
 LIVE_MODE = False
 LIVE_ARMED = False
 LIVE_ENV_CONFIRMED = False
-AION_MAX_OPEN_POSITIONS = max(1, get_env_int("AION_MAX_OPEN_POSITIONS", 5))
-AION_MAX_SUBMITS_PER_CYCLE = max(1, get_env_int("AION_MAX_SUBMITS_PER_CYCLE", 3))
-AION_MAX_NEW_POSITIONS_PER_10MIN = max(1, get_env_int("AION_MAX_NEW_POSITIONS_PER_10MIN", 6))
-AION_MIN_SECONDS_BETWEEN_SUBMITS = max(0.0, get_env_float("AION_MIN_SECONDS_BETWEEN_SUBMITS", 10.0))
-AION_MAX_SAME_FAMILY_POSITIONS = max(1, get_env_int("AION_MAX_SAME_FAMILY_POSITIONS", 2))
+AION_MAX_OPEN_POSITIONS = max(1, get_env_int("AION_MAX_OPEN_POSITIONS", 8))
+AION_MAX_SUBMITS_PER_CYCLE = max(1, get_env_int("AION_MAX_SUBMITS_PER_CYCLE", 5))
+AION_MAX_NEW_POSITIONS_PER_10MIN = max(1, get_env_int("AION_MAX_NEW_POSITIONS_PER_10MIN", 12))
+AION_MIN_SECONDS_BETWEEN_SUBMITS = max(0.0, get_env_float("AION_MIN_SECONDS_BETWEEN_SUBMITS", 5.0))
+AION_MAX_SAME_FAMILY_POSITIONS = max(1, get_env_int("AION_MAX_SAME_FAMILY_POSITIONS", 3))
 AION_MAX_SAME_GAME_POSITIONS = max(1, get_env_int("AION_MAX_SAME_GAME_POSITIONS", 2))
-LIVE_ORDER_RATE_LIMIT = max(1, get_env_int("LIVE_ORDER_RATE_LIMIT", get_env_int("AION_LIVE_ORDER_RATE_LIMIT", 3)))
+LIVE_ORDER_RATE_LIMIT = max(1, get_env_int("LIVE_ORDER_RATE_LIMIT", get_env_int("AION_LIVE_ORDER_RATE_LIMIT", 5)))
 LIVE_ORDER_RATE_WINDOW_SEC = max(1, get_env_int("LIVE_ORDER_RATE_WINDOW_SEC", 60))
 LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
 LIVE_RECENT_ORDER_DUPLICATE_BLOCK_SECONDS = int(_env_float("KALSHI_RECENT_ORDER_DUPLICATE_BLOCK_SECONDS", 900))
@@ -2204,9 +2204,9 @@ SPORTS_SPREAD_LADDER_CONFLICT_LINE_DISTANCE = _env_float("KALSHI_SPORTS_SPREAD_L
 CORRELATED_SPORTS_TAKE_PROFIT_DELTA = _env_float("KALSHI_CORRELATED_SPORTS_TAKE_PROFIT_DELTA", 0.03)
 CORRELATED_SPORTS_STOP_LOSS_DELTA = _env_float("KALSHI_CORRELATED_SPORTS_STOP_LOSS_DELTA", 0.035)
 CORRELATED_SPORTS_MAX_HOLD_SECONDS = int(_env_float("KALSHI_CORRELATED_SPORTS_MAX_HOLD_SECONDS", 420))
-AION_SPORTS_MIN_EDGE_AFTER_COST = _env_float("AION_SPORTS_MIN_EDGE_AFTER_COST", 0.015)
+AION_SPORTS_MIN_EDGE_AFTER_COST = _env_float("AION_SPORTS_MIN_EDGE_AFTER_COST", 0.001)
 AION_AGGRESSIVE_POSITIVE_EDGE_LANE_ENABLED = get_env_bool("AION_AGGRESSIVE_POSITIVE_EDGE_LANE_ENABLED", 1)
-AION_AGGRESSIVE_EDGE_FLOOR = _env_float("AION_AGGRESSIVE_EDGE_FLOOR", 0.002)
+AION_AGGRESSIVE_EDGE_FLOOR = _env_float("AION_AGGRESSIVE_EDGE_FLOOR", 0.0001)
 AION_AGGRESSIVE_MAX_CONTRACTS = get_env_int("AION_AGGRESSIVE_MAX_CONTRACTS", 1)
 AION_KELLY_FRACTION = max(0.0, min(1.0, get_env_float("AION_KELLY_FRACTION", 0.50)))
 AION_KELLY_MAX_MULTIPLIER = max(1.0, get_env_float("AION_KELLY_MAX_MULTIPLIER", 1.75))
@@ -2218,8 +2218,8 @@ AION_AGGRESSION_PROFILE_DEFAULT = "safe"
 AION_AGGRESSION_PROFILE_VALUES = {"safe", "balanced", "opportunistic", "beast"}
 AION_AGGRESSION_PROFILE = _normalize_aion_aggression_profile(os.environ.get("AION_AGGRESSION_PROFILE", AION_AGGRESSION_PROFILE_DEFAULT))
 AION_SPORTS_WIDE_SPREAD_BUFFER = _env_float("AION_SPORTS_WIDE_SPREAD_BUFFER", 0.025)
-AION_SPORTS_MAX_SPREAD_SOFT = _env_float("AION_SPORTS_MAX_SPREAD_SOFT", 0.18)
-AION_SPORTS_MAX_SPREAD_HARD = _env_float("AION_SPORTS_MAX_SPREAD_HARD", 0.24)
+AION_SPORTS_MAX_SPREAD_SOFT = _env_float("AION_SPORTS_MAX_SPREAD_SOFT", 0.32)
+AION_SPORTS_MAX_SPREAD_HARD = _env_float("AION_SPORTS_MAX_SPREAD_HARD", 0.35)
 AION_SPORTS_REQUIRE_DIRECTIONAL_BIAS = get_env_bool("AION_SPORTS_REQUIRE_DIRECTIONAL_BIAS", 1)
 AION_SPORTS_MIN_MOMENTUM_FOR_WIDE = get_env_float("AION_SPORTS_MIN_MOMENTUM_FOR_WIDE", 0.18)
 AION_SPORTS_EDGE_RANKING_ENABLED = get_env_bool("AION_SPORTS_EDGE_RANKING_ENABLED", 1)
@@ -27216,15 +27216,14 @@ class KalshiSniperBot:
         both_elite = bool(best_score >= 78.0 and candidate_score >= 72.0 and score_gap <= 14.0)
         suppressed = False
         reason = "opportunity_allowed"
-        if candidate_score < 50.0:
+        hard_invalid_score = bool(candidate_score <= 0.0)
+        if hard_invalid_score:
             suppressed = True
-            reason = "unified_score_below_minimum"
+            reason = "unified_score_nonpositive"
         elif cash_context.get("low_cash") and rank and rank > 1 and not both_elite:
-            suppressed = True
-            reason = "low_cash_concentrate_best_opportunity"
+            reason = "low_cash_soft_opportunity_penalty_only"
         elif rank and rank > 1 and score_gap >= 22.0 and candidate_score < 75.0:
-            suppressed = True
-            reason = "clear_superior_opportunity_cost"
+            reason = "superior_opportunity_soft_penalty_only"
         payload = {
             "source": source,
             "ticker": ticker,
@@ -52743,6 +52742,70 @@ class KalshiSniperBot:
                     source="final_submit_preflight_skip",
                 )
                 return
+            primary_lane_value = str(final_lane_allocation.get("lane") or "").strip().upper()
+            if primary_lane_value == "SPORTS":
+                primary_capacity_candidate = None
+                for candidate in getattr(self, "last_dual_lane_buy_candidates", []) or []:
+                    if not isinstance(candidate, dict):
+                        continue
+                    if str(candidate.get("ticker") or "").strip() == str(auto_live_ticker or "").strip():
+                        primary_capacity_candidate = candidate
+                        break
+                if primary_capacity_candidate is None:
+                    primary_capacity_candidate = {
+                        "ticker": auto_live_ticker,
+                        "family": selected_family,
+                        "lane": "SPORTS",
+                        "q": selected_quote_for_submission,
+                        "market": selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
+                        "spread": controlled_spread_value,
+                        "allocation": final_lane_allocation,
+                    }
+                primary_capacity = self._evaluate_aion_concurrency_candidate(
+                    primary_capacity_candidate,
+                    submitted_entries=[],
+                    source="final_submit_primary_preflight",
+                )
+                if not primary_capacity.get("allowed"):
+                    primary_block_reason = primary_capacity.get("reason") or "primary_concurrency_block"
+                    print(
+                        "[AION-FINAL-REJECT] "
+                        + json.dumps(
+                            {
+                                "ticker": auto_live_ticker,
+                                "family": selected_family,
+                                "side": submission_side,
+                                "selected_price": submission_price,
+                                "spread": controlled_spread_value,
+                                "liquidity": final_lane_allocation.get("liquidity"),
+                                "volume": (payload_preview or {}).get("volume") or (quote_readiness_diagnostic or {}).get("volume"),
+                                "reason": primary_block_reason,
+                                "responsible_subsystem": "final_submit_primary_concurrency_preflight",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    self._emit_aion_final_execution_truth(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        decision="SKIP",
+                        reason=primary_block_reason,
+                        stage="final_submit_primary_preflight",
+                        hard_block=True,
+                        final_submit_allowed=False,
+                        selected_price=submission_price,
+                        selected_side=submission_side,
+                    )
+                    execution_funnel["execution_blocked"] = 1
+                    trade_readiness_trade_submitted = False
+                    self._execute_parallel_lane_submit_attempts(
+                        primary_ticker=auto_live_ticker,
+                        primary_lane=final_lane_allocation.get("lane"),
+                        primary_result={"submitted": False, "reason": primary_block_reason},
+                        source="final_submit_primary_preflight_block",
+                    )
+                    return
             print(
                 "[AION-QUALIFIED] "
                 + json.dumps(
@@ -56543,7 +56606,24 @@ class KalshiSniperBot:
             and spread_width_value is not None
             and spread_width_value > 0.03
         )
-        adaptive_confidence_floor = min(confidence_floor, max(0.25, confidence_floor - 0.30))
+        executable_positive_sports = bool(
+            self.is_sports_family(family, ticker=ticker)
+            and quote_ready
+            and orderbook_ready
+            and price_bounds_pass
+            and selected_side in {"yes", "no"}
+            and selected_side_has_price
+            and (selected_side_has_liquidity or depth_available)
+            and positive_value_signal
+            and not truly_extreme_spread
+            and not duplicate_block
+            and not cooldown_block
+            and not capacity_blocker
+            and not max_positions_block
+            and not daily_cap_block
+            and live_arm_ok
+        )
+        adaptive_confidence_floor = min(confidence_floor, max(0.05, confidence_floor - 0.50))
         confidence_penalty_applied = False
         confidence_rank_adjustment = 0.0
         confidence_size_multiplier = 1.0
@@ -56563,7 +56643,6 @@ class KalshiSniperBot:
             and selected_side_has_price
             and (selected_side_has_liquidity or depth_available)
             and positive_value_signal
-            and confidence >= adaptive_confidence_floor
             and not truly_extreme_spread
             and not duplicate_block
             and not cooldown_block
@@ -56658,68 +56737,107 @@ class KalshiSniperBot:
                 blocker = "spread_extreme"
             blocker_detail = blocker_detail if blocker_detail != "unknown" else blocker
         elif edge < edge_threshold:
-            relaxed_near_miss_allowed = bool(
-                _relaxed_beast_mode_enabled(4)
-                and profile in {"opportunistic", "beast"}
-                and edge > 0.0
-                and quote_ready
-                and orderbook_ready
-                and price_bounds_pass
-                and selected_side_has_price
-                and (selected_side_has_liquidity or depth_available)
-                and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
-                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
-            )
-            near_miss_allowed = bool(
-                profile in {"opportunistic", "beast"}
-                and edge > 0.0
-                and quote_ready
-                and orderbook_ready
-                and price_bounds_pass
-                and selected_price_cents is not None
-                and int(selected_price_cents) <= 99
-                and confidence >= max(0.35, confidence_floor * 0.75)
-                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
-                and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
-                and (tradeability.get("liquidity") or 0.0) >= 0.0
-            )
-            if relaxed_near_miss_allowed and tradeability.get("selected_price_cents") is not None and int(tradeability.get("selected_price_cents")) <= 99:
+            if executable_positive_sports:
                 decision = "BUY"
                 blocker = None
                 blocker_detail = None
-            elif near_miss_allowed and profile == "beast" and tradeability.get("spread_classification") == "AGGRESSIVE_BUT_TRADEABLE" and edge >= max(edge_threshold * 0.5, 0.00075):
-                decision = "BUY"
-                blocker = None
-                blocker_detail = None
-            elif near_miss_allowed:
-                decision = "WAIT"
-                wait_reason = "near_miss_activation"
-                blocker = None
-                blocker_detail = None
-            else:
-                decision = "SKIP"
-                blocker = "edge_below_threshold"
-                blocker_detail = f"edge_after_cost={edge:.4f}<threshold={edge_threshold:.4f}"
-            if relaxed_near_miss_allowed:
+                tradeability["tradeable"] = True
+                tradeability["blocker"] = None
+                tradeability["blocker_class"] = None
+                tradeability["blocker_detail"] = None
+                edge_soft_gap = max(0.0, edge_threshold - edge)
+                edge_size_multiplier = round(max(0.85, min(1.0, 1.0 - min(0.15, edge_soft_gap * 10.0))), 4)
+                existing_size_multiplier = self.to_float(tradeability.get("suggested_size_multiplier"), None)
+                tradeability["edge_soft_penalty_applied"] = True
+                tradeability["edge_soft_size_multiplier"] = edge_size_multiplier
+                tradeability["edge_soft_reason"] = "positive_executable_edge_floor_relaxed"
+                if existing_size_multiplier is None:
+                    tradeability["suggested_size_multiplier"] = edge_size_multiplier
+                else:
+                    tradeability["suggested_size_multiplier"] = max(0.10, existing_size_multiplier * edge_size_multiplier)
                 print(
-                    "[AION-RELAXED-BEAST-L4] "
+                    "[AION-ADMISSION-RELAXED] "
                     + json.dumps(
                         {
                             "ticker": selected_ticker,
                             "family": family,
-                            "profile": profile,
+                            "stage": "realm_vv_edge_floor",
+                            "old_reason": "edge_below_threshold",
+                            "reason": "positive_executable_edge_floor_relaxed",
                             "edge_after_cost": edge,
                             "edge_threshold": edge_threshold,
-                            "spread_classification": tradeability.get("spread_classification"),
-                            "selected_price_cents": selected_price_cents,
-                            "selected_side_has_price": bool(selected_side_has_price),
-                            "selected_side_has_liquidity": bool(selected_side_has_liquidity),
-                            "decision": decision,
+                            "EV": ev_value,
+                            "selected_side": selected_side,
+                            "selected_price": selected_price,
+                            "size_multiplier": edge_size_multiplier,
+                            "decision": "BUY",
                         },
                         sort_keys=True,
                         default=str,
                     )
                 )
+            else:
+                relaxed_near_miss_allowed = bool(
+                    _relaxed_beast_mode_enabled(4)
+                    and profile in {"opportunistic", "beast"}
+                    and edge > 0.0
+                    and quote_ready
+                    and orderbook_ready
+                    and price_bounds_pass
+                    and selected_side_has_price
+                    and (selected_side_has_liquidity or depth_available)
+                    and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+                    and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
+                )
+                near_miss_allowed = bool(
+                    profile in {"opportunistic", "beast"}
+                    and edge > 0.0
+                    and quote_ready
+                    and orderbook_ready
+                    and price_bounds_pass
+                    and selected_price_cents is not None
+                    and int(selected_price_cents) <= 99
+                    and confidence >= max(0.10, confidence_floor * 0.20)
+                    and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
+                    and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
+                    and (tradeability.get("liquidity") or 0.0) >= 0.0
+                )
+                if relaxed_near_miss_allowed and tradeability.get("selected_price_cents") is not None and int(tradeability.get("selected_price_cents")) <= 99:
+                    decision = "BUY"
+                    blocker = None
+                    blocker_detail = None
+                elif near_miss_allowed and profile == "beast" and tradeability.get("spread_classification") == "AGGRESSIVE_BUT_TRADEABLE" and edge >= max(edge_threshold * 0.05, 0.00005):
+                    decision = "BUY"
+                    blocker = None
+                    blocker_detail = None
+                elif near_miss_allowed:
+                    decision = "BUY"
+                    blocker = None
+                    blocker_detail = None
+                else:
+                    decision = "SKIP"
+                    blocker = "edge_below_threshold"
+                    blocker_detail = f"edge_after_cost={edge:.4f}<threshold={edge_threshold:.4f}"
+                if relaxed_near_miss_allowed:
+                    print(
+                        "[AION-RELAXED-BEAST-L4] "
+                        + json.dumps(
+                            {
+                                "ticker": selected_ticker,
+                                "family": family,
+                                "profile": profile,
+                                "edge_after_cost": edge,
+                                "edge_threshold": edge_threshold,
+                                "spread_classification": tradeability.get("spread_classification"),
+                                "selected_price_cents": selected_price_cents,
+                                "selected_side_has_price": bool(selected_side_has_price),
+                                "selected_side_has_liquidity": bool(selected_side_has_liquidity),
+                                "decision": decision,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
             if decision == "SKIP" and blocker == "edge_below_threshold" and self.is_sports_family(family, ticker=ticker):
                 spread_value = self.to_float(
                     tradeability.get("spread"),
@@ -56818,8 +56936,8 @@ class KalshiSniperBot:
         elif confidence < confidence_floor:
             if adaptive_confidence_allow:
                 confidence_gap = max(0.0, confidence_floor - confidence)
-                confidence_size_multiplier = max(0.25, min(1.0, 1.0 - min(0.75, confidence_gap * 2.2)))
-                confidence_rank_adjustment = round(-max(0.25, min(8.0, confidence_gap * 20.0)), 4)
+                confidence_size_multiplier = max(0.85, min(1.0, 1.0 - min(0.15, confidence_gap * 0.15)))
+                confidence_rank_adjustment = round(-max(0.05, min(0.55, confidence_gap * 1.35)), 4)
                 confidence_penalty_applied = True
                 confidence_gate_action = "allow"
                 confidence_gate_reason = "positive_value_executable_live_sports_confidence_penalty"
@@ -56925,9 +57043,36 @@ class KalshiSniperBot:
             blocker = None
             blocker_detail = None
         else:
-            if tradeability.get("unsafe_price_status") in {"safe", "caution_wide_spread"} and price_bounds_pass and edge >= edge_threshold * 0.8:
-                decision = "WAIT"
-                wait_reason = "micro_pullback_possible"
+            if executable_positive_sports:
+                decision = "BUY"
+                blocker = None
+                blocker_detail = None
+                tradeability["tradeable"] = True
+                tradeability["blocker"] = None
+                tradeability["blocker_class"] = None
+                tradeability["blocker_detail"] = None
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": selected_ticker,
+                            "family": family,
+                            "stage": "realm_vv_tradeability_soft_gate",
+                            "old_reason": blocker or "tradeability_blocked",
+                            "reason": "positive_executable_soft_gate_relaxed",
+                            "edge_after_cost": edge,
+                            "EV": ev_value,
+                            "selected_side": selected_side,
+                            "selected_price": selected_price,
+                            "decision": "BUY",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            elif tradeability.get("unsafe_price_status") in {"safe", "caution_wide_spread"} and price_bounds_pass and edge >= edge_threshold * 0.8:
+                decision = "BUY" if edge > 0.0 and self.is_sports_family(family, ticker=ticker) else "WAIT"
+                wait_reason = None if decision == "BUY" else "micro_pullback_possible"
                 blocker = None
                 blocker_detail = None
             else:

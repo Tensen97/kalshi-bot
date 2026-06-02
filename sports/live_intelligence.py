@@ -22672,31 +22672,31 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     sports_lottery_quality_penalty = 0.0
     if lane == "SPORTS":
         if allocation.get("decision") == "DEMOTE_WEAK_SPORT" or final_quality_action == "demote":
-            sports_lottery_quality_penalty += 10.0
+            sports_lottery_quality_penalty += 0.65
         elif final_quality_action == "allow_exceptional_trash_pattern":
-            sports_lottery_quality_penalty += 5.0
+            sports_lottery_quality_penalty += 0.35
         if "ultra_low_probability_longshot" in trash_patterns:
-            sports_lottery_quality_penalty += 14.0
+            sports_lottery_quality_penalty += 0.95
         elif "low_probability_longshot" in trash_patterns:
-            sports_lottery_quality_penalty += 8.0
+            sports_lottery_quality_penalty += 0.55
         if "weak_tennis_player_pick" in trash_patterns:
-            sports_lottery_quality_penalty += 12.0
+            sports_lottery_quality_penalty += 0.80
         if "multi_home_run_moonshot" in trash_patterns:
-            sports_lottery_quality_penalty += 16.0
+            sports_lottery_quality_penalty += 1.10
         if "weak_family_performance" in trash_patterns:
-            sports_lottery_quality_penalty += 8.0
+            sports_lottery_quality_penalty += 0.55
         if "thin_player_prop" in trash_patterns or "low_liquidity_market" in trash_patterns:
-            sports_lottery_quality_penalty += 6.0
+            sports_lottery_quality_penalty += 0.40
         if selected_price is not None and trash_patterns:
             if selected_price <= 0.10:
-                sports_lottery_quality_penalty += 10.0
+                sports_lottery_quality_penalty += 0.70
             elif selected_price <= 0.14:
-                sports_lottery_quality_penalty += 6.0
+                sports_lottery_quality_penalty += 0.40
             elif selected_price <= 0.20:
-                sports_lottery_quality_penalty += 3.0
-        sports_lottery_quality_penalty = min(34.0, max(0.0, sports_lottery_quality_penalty))
+                sports_lottery_quality_penalty += 0.20
+        sports_lottery_quality_penalty = min(2.5, max(0.0, sports_lottery_quality_penalty))
         if sports_lottery_quality_penalty > 0.0 and payout_component > 0.0:
-            payout_component *= 0.25 if sports_lottery_quality_penalty >= 20.0 else 0.55
+            payout_component *= 0.92
     allocation_component = min(16.0, max(0.0, allocation_score) / 6.0)
     edge_component = min(24.0, max(0.0, edge) / 0.04 * 24.0)
     if edge < 0.0:
@@ -22733,8 +22733,8 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
             historical_boost * 1.3
             + family_adjustment * 2.0
             + max(0.0, family_pnl) * 0.30
-            - max(0.0, -family_pnl) * 0.45
-            - max(0.0, loss_streak - 1.0) * 1.5
+            - max(0.0, -family_pnl) * 0.03
+            - max(0.0, loss_streak - 1.0) * 0.10
             + sports_live_memory_component,
         ),
     )
@@ -22761,9 +22761,9 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
     turnover_boost = self.to_float(duration.get("capital_turnover_boost"), 0.0) or 0.0
     unified_score = 20.0 + allocation_component + edge_component + liquidity_component + spread_component + lane_component + memory_component + regime_component + sports_spread_component + sports_execution_component + sports_ml_component + graph_component + confidence_component + target_component + payout_component + turnover_boost - capital_lock_penalty - cheap_unsupported_penalty - sports_lottery_quality_penalty
     if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
-        unified_score -= 30.0
+        unified_score -= 2.0 if lane == "SPORTS" and edge > 0.0 else 30.0
     elif allocation.get("decision") == "DEMOTE_WEAK_SPORT" or allocation.get("final_quality_action") == "demote":
-        unified_score -= 10.0
+        unified_score -= 0.65
     unified_score = round(max(0.0, min(100.0, unified_score)), 4)
     size_multiplier = 1.0
     if unified_score >= 85.0 and capital_lock_penalty <= 5.0:
@@ -22780,12 +22780,12 @@ def _build_unified_opportunity_context(self, item=None, *, market=None, allocati
         size_multiplier = min(size_multiplier, 0.55)
     elif capital_lock_penalty >= 10.0:
         size_multiplier = min(size_multiplier, 0.75)
-    if sports_lottery_quality_penalty >= 24.0:
-        size_multiplier = min(size_multiplier, 0.50)
-    elif sports_lottery_quality_penalty >= 14.0:
-        size_multiplier = min(size_multiplier, 0.65)
-    elif sports_lottery_quality_penalty > 0.0:
+    if sports_lottery_quality_penalty >= 2.0:
         size_multiplier = min(size_multiplier, 0.85)
+    elif sports_lottery_quality_penalty >= 1.0:
+        size_multiplier = min(size_multiplier, 0.92)
+    elif sports_lottery_quality_penalty > 0.0:
+        size_multiplier = min(size_multiplier, 0.97)
     if lane == "SPORTS" and sports_memory_size_multiplier > 0.0:
         pre_memory_size_multiplier = size_multiplier
         size_multiplier = max(0.35, min(1.65, size_multiplier * sports_memory_size_multiplier))
