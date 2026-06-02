@@ -2090,7 +2090,9 @@ AION_FAMILY_PROFITABILITY_PRIORS = {
     "KXATPCHALLENGERMATCH": {"family_pnl": -1.61, "wins": 0, "losses": 26, "trade_count": 26},
 }
 AION_PROFITABLE_FAMILY_PREFIXES = (
-    "KXMLB",
+    "KXMLBSPREAD",
+    "KXMLBTOTAL",
+    "KXMLBMONEYLINE",
     "MLB",
     "KXNCAASB",
     "NCAASB",
