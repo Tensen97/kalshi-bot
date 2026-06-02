@@ -1184,7 +1184,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(posted[0]["time_in_force"], "immediate_or_cancel")
         self.assertNotIn("no_price", posted[0])
 
-    def test_sports_live_state_guard_blocks_future_start_time(self):
+    def test_sports_live_state_guard_allows_future_start_time(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         posted = []
@@ -1224,10 +1224,10 @@ class StructuralEdgeTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(result["submitted"])
-        self.assertEqual(result["reason"], "pregame_sports_market")
-        self.assertEqual(result["sports_live_state_guard"]["block_reason"], "future_start_time")
-        self.assertEqual(posted, [])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(posted[0]["ticker"], "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN")
+        self.assertEqual(posted[0]["side"], "yes")
+        self.assertEqual(posted[0]["yes_price"], 46)
 
     def test_sports_live_state_guard_allows_atp_live_flag_despite_future_occurrence(self):
         self._set_sports_only_mode(True)
@@ -1321,7 +1321,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["live_state"], "live_evidence")
         self.assertEqual(result["block_reason"], None)
 
-    def test_sports_live_state_guard_still_blocks_future_occurrence_without_executable_quote(self):
+    def test_sports_live_state_guard_does_not_block_future_occurrence_without_executable_quote(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
@@ -1344,8 +1344,10 @@ class StructuralEdgeTests(unittest.TestCase):
             source="unit_test",
         )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["block_reason"], "future_occurrence_no_live_evidence")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_requirement_disabled")
+        self.assertEqual(result["classification_reason"], "future_occurrence_no_live_evidence")
+        self.assertIsNone(result["block_reason"])
 
     def test_sports_live_state_guard_blocks_timezone_offset_future_start(self):
         self._set_sports_only_mode(True)
@@ -1372,10 +1374,12 @@ class StructuralEdgeTests(unittest.TestCase):
             source="unit_test",
         )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["block_reason"], "future_start_time")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_requirement_disabled")
+        self.assertEqual(result["classification_reason"], "future_start_time")
+        self.assertIsNone(result["block_reason"])
 
-    def test_sports_live_state_guard_blocks_missing_live_metadata(self):
+    def test_sports_live_state_guard_allows_missing_live_metadata(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         bot.get_live_market_detail = lambda ticker: {}
@@ -1393,9 +1397,10 @@ class StructuralEdgeTests(unittest.TestCase):
             source="unit_test",
         )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "pregame_sports_market")
-        self.assertEqual(result["block_reason"], "unknown_sports_live_state")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_requirement_disabled")
+        self.assertEqual(result["classification_reason"], "unknown_sports_live_state")
+        self.assertIsNone(result["block_reason"])
 
     def test_sports_live_state_guard_allows_missing_start_with_executable_book(self):
         self._set_sports_only_mode(True)
@@ -1444,7 +1449,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(posted[0]["yes_price"], 49)
         self.assertNotIn("no_price", posted[0])
 
-    def test_sports_live_state_guard_blocks_future_even_with_executable_book(self):
+    def test_sports_live_state_guard_allows_future_with_executable_book(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         posted = []
@@ -1489,10 +1494,10 @@ class StructuralEdgeTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(result["submitted"])
-        self.assertEqual(result["reason"], "pregame_sports_market")
-        self.assertEqual(result["sports_live_state_guard"]["block_reason"], "future_start_time")
-        self.assertEqual(posted, [])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(posted[0]["ticker"], future_ticker)
+        self.assertEqual(posted[0]["side"], "yes")
+        self.assertEqual(posted[0]["yes_price"], 49)
 
     def test_sports_live_state_guard_allows_elapsed_start_with_executable_book(self):
         self._set_sports_only_mode(True)
@@ -1618,7 +1623,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["skipped"])
         self.assertEqual(result["reason"], "not_sports_buy")
 
-    def test_live_discovery_drops_future_sports_before_ranking(self):
+    def test_live_discovery_admits_future_sports_before_ranking(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
@@ -1650,11 +1655,15 @@ class StructuralEdgeTests(unittest.TestCase):
                 limit=10,
             )
 
-        self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
-        self.assertEqual(summary["dropped_future_or_pregame"], 1)
-        self.assertEqual(summary["admitted_count"], 1)
+        self.assertEqual(
+            [market["ticker"] for market in admitted],
+            [live_market["ticker"], future_market["ticker"]],
+        )
+        self.assertEqual(summary["dropped_future_or_pregame"], 0)
+        self.assertEqual(summary["admitted_future_or_pregame"], 1)
+        self.assertEqual(summary["admitted_count"], 2)
 
-    def test_live_discovery_drops_future_ticker_date_without_metadata(self):
+    def test_live_discovery_admits_future_ticker_date_without_metadata(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         token = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
@@ -1675,8 +1684,9 @@ class StructuralEdgeTests(unittest.TestCase):
                 limit=10,
             )
 
-        self.assertEqual(admitted, [])
-        self.assertEqual(summary["dropped_future_or_pregame"], 1)
+        self.assertEqual([market["ticker"] for market in admitted], [future_market["ticker"]])
+        self.assertEqual(summary["dropped_future_or_pregame"], 0)
+        self.assertEqual(summary["admitted_future_or_pregame"], 1)
         self.assertEqual(summary["reason_counts"]["future_start_time"], 1)
 
     def test_live_discovery_admits_ambiguous_ticker_date_with_executable_book(self):
@@ -1781,12 +1791,12 @@ class StructuralEdgeTests(unittest.TestCase):
             )
 
         self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
-        self.assertEqual(summary["active_hydration_attempts"], 1)
-        self.assertEqual(summary["active_hydration_success"], 1)
-        self.assertEqual(summary["admission_relaxed_count"], 1)
-        self.assertIn("[AION-ADMISSION-RELAXED]", stream.getvalue())
+        self.assertEqual(summary["active_hydration_attempts"], 0)
+        self.assertEqual(summary["active_hydration_success"], 0)
+        self.assertEqual(summary["admitted_future_or_pregame"], 1)
+        self.assertEqual(summary["dropped_future_or_pregame"], 0)
 
-    def test_live_discovery_hydrates_ambiguous_ticker_date_before_drop(self):
+    def test_live_discovery_admits_ambiguous_ticker_date_without_drop(self):
         self._set_sports_only_mode(True)
         old_window = kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS
         old_limit = kw.AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT
@@ -1825,10 +1835,11 @@ class StructuralEdgeTests(unittest.TestCase):
             )
 
         self.assertEqual([market["ticker"] for market in admitted], [thin_live_market["ticker"]])
-        self.assertEqual(summary["ambiguous_hydration_attempts"], 1)
-        self.assertEqual(summary["ambiguous_hydration_success"], 1)
+        self.assertEqual(summary["ambiguous_hydration_attempts"], 0)
+        self.assertEqual(summary["ambiguous_hydration_success"], 0)
+        self.assertEqual(summary["dropped_future_or_pregame"], 0)
 
-    def test_live_discovery_hydration_preserves_exact_future_metadata_block(self):
+    def test_live_discovery_hydration_does_not_block_exact_future_metadata(self):
         self._set_sports_only_mode(True)
         old_window = kw.AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS
         old_limit = kw.AION_LIVE_DISCOVERY_AMBIGUOUS_HYDRATION_LIMIT
@@ -1868,12 +1879,13 @@ class StructuralEdgeTests(unittest.TestCase):
                 limit=10,
             )
 
-        self.assertEqual(admitted, [])
-        self.assertEqual(summary["ambiguous_hydration_attempts"], 1)
+        self.assertEqual([market["ticker"] for market in admitted], [thin_future_market["ticker"]])
+        self.assertEqual(summary["ambiguous_hydration_attempts"], 0)
         self.assertEqual(summary["ambiguous_hydration_success"], 0)
-        self.assertEqual(summary["dropped_future_or_pregame"], 1)
+        self.assertEqual(summary["dropped_future_or_pregame"], 0)
+        self.assertEqual(summary["admitted_future_or_pregame"], 1)
 
-    def test_live_discovery_drops_future_ticker_even_with_ambiguous_elapsed_timestamp(self):
+    def test_live_discovery_admits_future_ticker_even_with_ambiguous_elapsed_timestamp(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_token = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
@@ -1896,8 +1908,9 @@ class StructuralEdgeTests(unittest.TestCase):
                 limit=10,
             )
 
-        self.assertEqual(admitted, [])
-        self.assertEqual(summary["dropped_future_or_pregame"], 1)
+        self.assertEqual([market["ticker"] for market in admitted], [future_market["ticker"]])
+        self.assertEqual(summary["dropped_future_or_pregame"], 0)
+        self.assertEqual(summary["admitted_future_or_pregame"], 1)
         self.assertEqual(summary["reason_counts"]["future_start_time"], 1)
 
     def test_live_discovery_admits_itf_atp_wta_match_series(self):
@@ -2052,8 +2065,11 @@ class StructuralEdgeTests(unittest.TestCase):
                 scan_depth=1,
             )
 
-        self.assertEqual([market["ticker"] for market in admitted], [live_market["ticker"]])
-        self.assertEqual(summary["root_summary"]["dropped_future_or_pregame"], 1)
+        self.assertEqual(
+            [market["ticker"] for market in admitted],
+            [live_market["ticker"], future_market["ticker"]],
+        )
+        self.assertEqual(summary["root_summary"]["dropped_future_or_pregame"], 0)
         self.assertGreaterEqual(summary["unique_discovered"], 2)
 
     def test_sports_only_live_selector_admits_started_live_market(self):
@@ -2078,7 +2094,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(admitted)
         self.assertIn(state["reason"], {"live_status", "scoreboard_live_state", "explicit_live_flag"})
 
-    def test_sports_only_live_selector_rejects_future_market(self):
+    def test_sports_only_live_selector_admits_future_market(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
@@ -2098,7 +2114,7 @@ class StructuralEdgeTests(unittest.TestCase):
             selection_merge_source="provided_markets",
         )
 
-        self.assertFalse(admitted)
+        self.assertTrue(admitted)
         self.assertEqual(state["reason"], "future_start_time")
 
     def test_sports_only_live_selector_retries_keep_authoritative_live_markets(self):
@@ -6997,12 +7013,13 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(accounting["terminal_balance_ok"])
         self.assertEqual(accounting["terminal_total"], len(markets))
         self.assertEqual(sum(outcomes.values()), len(markets))
-        self.assertEqual(outcomes["future_start_time_block"], 1)
+        self.assertEqual(outcomes["future_start_time_block"], 0)
         self.assertEqual(outcomes["no_quote"], 1)
         self.assertEqual(outcomes["no_side"], 1)
         self.assertEqual(outcomes["no_price"], 1)
         self.assertEqual(outcomes["low_edge"], 1)
         self.assertEqual(outcomes["submit_attempt"], 1)
+        self.assertEqual(outcomes["final_readiness_failed"], 1)
 
     def test_live_candidate_terminal_accounting_uses_realm_vv_gate_reason(self):
         bot = self._make_bot()

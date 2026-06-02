@@ -3919,12 +3919,23 @@ class KalshiSniperBot:
         if selected_price is None:
             price_key = "yes_price" if side == "yes" else "no_price" if side == "no" else None
             selected_price = payload.get(price_key) if price_key else None
+        live_only_block_reasons = {
+            "future_start_time",
+            "pregame_status",
+            "future_occurrence_no_live_evidence",
+            "unknown_sports_live_state",
+        }
+        live_state_classification_ok = bool(ok)
+        live_only_bypassed = bool(not ok and reason in live_only_block_reasons)
+        guard_ok = bool(ok or live_only_bypassed)
         payload_log = {
             "ticker": ticker or None,
             "family": family or None,
             "side": side,
             "selected_price": selected_price,
-            "ok": bool(ok),
+            "ok": bool(guard_ok),
+            "live_state_classification_ok": bool(live_state_classification_ok),
+            "live_only_bypassed": bool(live_only_bypassed),
             "reason": reason,
             "source": source,
             "live_state": live_state,
@@ -3978,10 +3989,10 @@ class KalshiSniperBot:
             {
                 **payload_log,
                 "stage": "pre_submit_live_state_guard",
-                "decision": "ALLOW" if ok else "BLOCK",
+                "decision": "ALLOW" if guard_ok else "BLOCK",
             },
         )
-        if not ok:
+        if not guard_ok:
             self._emit_sports_live_state_guard_log(
                 "AION-ADMISSION-BLOCK",
                 {
@@ -3990,14 +4001,25 @@ class KalshiSniperBot:
                     "block_reason": reason,
                 },
             )
+        elif live_only_bypassed:
+            self._emit_sports_live_state_guard_log(
+                "AION-ADMISSION-RELAXED",
+                {
+                    **payload_log,
+                    "stage": "pre_submit_live_state_guard",
+                    "relaxation": "live_only_sports_requirement_removed",
+                    "block_reason": None,
+                },
+            )
         self._emit_sports_live_state_guard_log("AION-SPORTS-LIVE-STATE-CHECK", payload_log)
-        self._emit_sports_live_state_guard_log("AION-LIVE-SPORTS-ALLOW" if ok else "AION-PREGAME-SPORTS-BLOCK", payload_log)
-        self._emit_sports_live_state_guard_log("AION-LIVE-GUARD-ALLOW" if ok else "AION-LIVE-GUARD-BLOCK", payload_log)
+        self._emit_sports_live_state_guard_log("AION-LIVE-SPORTS-ALLOW" if guard_ok else "AION-LIVE-GUARD-BLOCK", payload_log)
+        self._emit_sports_live_state_guard_log("AION-LIVE-GUARD-ALLOW" if guard_ok else "AION-LIVE-GUARD-BLOCK", payload_log)
         return {
             **payload_log,
-            "ok": bool(ok),
-            "reason": "sports_live_state_ok" if ok else "pregame_sports_market",
-            "block_reason": None if ok else reason,
+            "ok": bool(guard_ok),
+            "reason": "sports_live_state_ok" if live_state_classification_ok else ("sports_live_requirement_disabled" if guard_ok else "sports_market_not_executable"),
+            "classification_reason": reason,
+            "block_reason": None if guard_ok else reason,
             "start_time_raw": start_raw,
             "occurrence_time_raw": occurrence_raw,
         }
@@ -4091,7 +4113,8 @@ class KalshiSniperBot:
         elif metadata_future_start or exact_ticker_future_start:
             reason = "future_start_time"
             live_state = "future"
-            terminal_drop = True
+            admit = True
+            priority = 45
         elif (
             ticker_start_ts is not None
             and ticker_start_ts > now_ts + 30.0
@@ -4102,15 +4125,18 @@ class KalshiSniperBot:
         ):
             reason = "future_start_time"
             live_state = "future"
-            terminal_drop = True
+            admit = True
+            priority = 45
         elif start_ts is not None and start_ts > now_ts + 30.0 and not ambiguous_ticker_date_live_evidence:
             reason = "future_start_time"
             live_state = "future"
-            terminal_drop = True
+            admit = True
+            priority = 45
         elif status_text in pregame_statuses and not explicit_live and not scoreboard_live:
             reason = "pregame_status"
             live_state = "pregame"
-            terminal_drop = True
+            admit = True
+            priority = 45
         elif start_ts is not None and start_ts <= now_ts + 30.0 and start_key != "ticker_date":
             reason = "start_time_elapsed"
             live_state = "started"
@@ -4124,7 +4150,8 @@ class KalshiSniperBot:
         elif future_occurrence_hint and not strong_live_signal:
             reason = "future_occurrence_no_live_evidence"
             live_state = "future"
-            terminal_drop = True
+            admit = True
+            priority = 45
         elif executable_book:
             reason = "fresh_executable_orderbook_ambiguous_ticker_date" if ambiguous_ticker_date_live_evidence else "fresh_executable_orderbook_no_future_start"
             live_state = "live_evidence"
@@ -4133,7 +4160,8 @@ class KalshiSniperBot:
         else:
             reason = "unknown_sports_live_state"
             live_state = "unknown"
-            priority = 10
+            admit = True
+            priority = 40
 
         return {
             "admit": bool(admit),
@@ -4240,6 +4268,7 @@ class KalshiSniperBot:
         classification_fix_examples = []
         relaxed_examples = []
         block_examples = []
+        terminal_future_or_pregame_drops = 0
 
         def _should_hydrate_ambiguous_date_market(state):
             if not isinstance(state, dict):
@@ -4475,6 +4504,8 @@ class KalshiSniperBot:
                 admitted_family_counts[family] += 1
                 admitted_entries.append((state, market))
             elif state.get("terminal_drop"):
+                if state.get("reason") in {"future_start_time", "future_occurrence_no_live_evidence", "pregame_status"}:
+                    terminal_future_or_pregame_drops += 1
                 if len(block_examples) < 12:
                     block_examples.append(
                         {
@@ -4522,10 +4553,13 @@ class KalshiSniperBot:
             "source": source,
             "input_count": int(len(markets)),
             "admitted_count": int(len(admitted)),
-            "dropped_future_or_pregame": int(
-                reason_counts.get("future_start_time", 0)
-                + reason_counts.get("future_occurrence_no_live_evidence", 0)
-                + reason_counts.get("pregame_status", 0)
+            "dropped_future_or_pregame": int(terminal_future_or_pregame_drops),
+            "admitted_future_or_pregame": int(
+                sum(
+                    1
+                    for state, _market in admitted_entries
+                    if state.get("reason") in {"future_start_time", "future_occurrence_no_live_evidence", "pregame_status"}
+                )
             ),
             "dropped_unknown": int(reason_counts.get("unknown_sports_live_state", 0)),
             "reason_counts": dict(reason_counts),
@@ -4567,6 +4601,7 @@ class KalshiSniperBot:
                 "active_hydration_success": int(active_hydration_success),
                 "active_hydration_failures": dict(active_hydration_failures.most_common(8)),
                 "dropped_future_or_pregame": int(payload["dropped_future_or_pregame"]),
+                "admitted_future_or_pregame": int(payload["admitted_future_or_pregame"]),
                 "dropped_unknown": int(payload["dropped_unknown"]),
                 "reason_counts": dict(reason_counts),
                 "families_scanned": dict(family_counts.most_common(12)),
@@ -4794,8 +4829,6 @@ class KalshiSniperBot:
         reason_text = str(reason or "").strip().lower()
         if not reason_text:
             return "other"
-        if any(token in reason_text for token in ("future_start_time", "future_occurrence", "pregame", "pre_game", "not_started", "not started", "scheduled", "upcoming", "lifecycle_not_allowed")):
-            return "future_start_time_block"
         if any(token in reason_text for token in ("missing_quote", "no_quote", "quote_missing", "no_quote_ready", "missing_prices_and_sizes", "quote_invalid", "quote_crossed_or_invalid")):
             return "no_quote"
         if any(token in reason_text for token in ("missing_side", "no_side", "selected_side_missing", "side_missing")):
@@ -5206,11 +5239,7 @@ class KalshiSniperBot:
                 outcome = "submit_attempt"
                 reason = "submit_attempt"
             else:
-                future_detail = self._aion_funnel_future_or_pregame_reason(market=market, q=q)
-                if future_detail:
-                    outcome = "future_start_time_block"
-                    reason = future_detail.get("reason") or "future_start_time"
-                elif q is None:
+                if q is None:
                     outcome = "no_quote"
                     reason = "missing_quote_object"
                 else:
