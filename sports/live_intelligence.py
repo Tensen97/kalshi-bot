@@ -6866,6 +6866,43 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
     remaining_game_capacity = max(0, game_exposure_cap - existing_exposure)
     submitted = []
     skipped = []
+    submitted_entries = []
+    stop_reasons = {
+        "max_submits_per_cycle",
+        "rate_limited",
+        "min_seconds_between_submits",
+        "max_new_positions_per_10min",
+        "max_open_positions",
+        "daily_loss_guard",
+        "trading_halted",
+    }
+    if primary_ticker and primary_submitted:
+        primary_meta = None
+        for leg in plan.get("legs") or []:
+            if str(leg.get("ticker") or "").strip() != primary_ticker:
+                continue
+            primary_candidate = leg.get("candidate") if isinstance(leg.get("candidate"), dict) else {}
+            primary_allocation = primary_candidate.get("allocation") if isinstance(primary_candidate.get("allocation"), dict) else {}
+            primary_allocation = {**primary_allocation, "lane": "SPORTS"}
+            primary_meta_candidate = {
+                **primary_candidate,
+                "ticker": primary_ticker,
+                "family": leg.get("family") or primary_candidate.get("family"),
+                "lane": "SPORTS",
+                "q": leg.get("q") or primary_candidate.get("q"),
+                "market": leg.get("market") if isinstance(leg.get("market"), dict) else primary_candidate.get("market"),
+                "allocation": primary_allocation,
+            }
+            primary_meta = self._aion_concurrency_candidate_meta(primary_meta_candidate)
+            break
+        if primary_meta is None:
+            primary_meta = {
+                "ticker": primary_ticker,
+                "family": self.get_market_family({"ticker": primary_ticker}),
+                "game_key": game_id or None,
+                "selected_side": None,
+            }
+        submitted_entries.append(self._aion_concurrency_entry_from_meta(primary_meta, source="sports_ladder_primary"))
     if remaining_game_capacity <= 0:
         self._emit_sports_ladder_log(
             "SPORTS-LADDER-SKIP",
@@ -6991,6 +7028,43 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
                     marker=("SPORTS-LADDER-SKIP", source, ticker, risk_reason or "risk_guard", int(time.time() // 180)),
                 )
                 continue
+        preflight_allocation = {**allocation, "lane": "SPORTS", "ticker": ticker, "family": family}
+        if preflight_allocation.get("selected_side") is None and q is not None:
+            preflight_allocation["selected_side"] = getattr(q, "selected_side", None) or getattr(q, "side", None)
+        if preflight_allocation.get("selected_price") is None and q is not None:
+            preflight_allocation["selected_price"] = getattr(q, "selected_price", None) or getattr(q, "price", None)
+        preflight_candidate = {
+            **candidate,
+            "ticker": ticker,
+            "family": family,
+            "lane": "SPORTS",
+            "q": q,
+            "market": market,
+            "allocation": preflight_allocation,
+        }
+        concurrency = self._evaluate_aion_concurrency_candidate(
+            preflight_candidate,
+            submitted_entries=submitted_entries,
+            source=f"{source}_ladder_preflight",
+        )
+        if not concurrency.get("allowed"):
+            reason = concurrency.get("reason") or "concurrency_block"
+            skipped.append({"ticker": ticker, "reason": reason})
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-SKIP",
+                {
+                    "source": source,
+                    "plan_id": plan.get("plan_id"),
+                    "game_id": game_id,
+                    "ticker": ticker,
+                    "role": leg.get("role"),
+                    "reason": reason,
+                },
+                marker=("SPORTS-LADDER-SKIP", source, ticker, reason, int(time.time() // 180)),
+            )
+            if reason in stop_reasons:
+                break
+            continue
         planned_size = max(1, min(int(leg.get("size_cap") or 1), remaining_game_capacity, int(MAX_LIVE_ORDER_SIZE or 1)))
         self._apply_sports_ladder_leg_metadata(q=q, allocation=allocation, leg={**leg, "size_cap": planned_size}, plan=plan)
         self._emit_sports_ladder_log(
@@ -7194,6 +7268,18 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
             actual_count = max(1, int(round(self.to_float(submitted_payload.get("count"), planned_size) or planned_size)))
             remaining_game_capacity = max(0, remaining_game_capacity - actual_count)
             submitted.append({"ticker": ticker, "count": actual_count, "role": leg.get("role")})
+            concurrency_meta = concurrency.get("meta") if isinstance(concurrency, dict) else None
+            if not isinstance(concurrency_meta, dict):
+                concurrency_meta = self._aion_concurrency_candidate_meta(preflight_candidate)
+            submitted_entries.append(
+                self._aion_concurrency_entry_from_meta(
+                    concurrency_meta,
+                    source="sports_ladder",
+                    count=actual_count,
+                    price=submitted_payload.get("price"),
+                    side=submitted_payload.get("side"),
+                )
+            )
             if remaining_game_capacity <= 0:
                 break
         else:
