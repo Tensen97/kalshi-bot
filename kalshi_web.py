@@ -3472,6 +3472,20 @@ class KalshiSniperBot:
             return False
         return False
 
+    def _sports_live_state_timestamp_from_keys(self, sources, keys):
+        for source in sources:
+            if source is None:
+                continue
+            for key in keys:
+                try:
+                    raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
+                except Exception:
+                    raw = None
+                ts = self._parse_market_timestamp(raw)
+                if ts is not None:
+                    return ts, key, raw
+        return None, None, None
+
     def _sports_live_state_timestamp(self, sources):
         keys = (
             "event_start_time",
@@ -3487,18 +3501,31 @@ class KalshiSniperBot:
             "match_start_time",
             "match_start_time_ts",
         )
-        for source in sources:
-            if source is None:
-                continue
-            for key in keys:
-                try:
-                    raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
-                except Exception:
-                    raw = None
-                ts = self._parse_market_timestamp(raw)
-                if ts is not None:
-                    return ts, key, raw
-        return None, None, None
+        return self._sports_live_state_timestamp_from_keys(sources, keys)
+
+    def _sports_live_state_hard_start_timestamp(self, sources):
+        keys = (
+            "event_start_time",
+            "event_start_time_ts",
+            "start_time",
+            "start_time_ts",
+            "scheduled_start_time",
+            "scheduled_start_time_ts",
+            "game_start_time",
+            "game_start_time_ts",
+            "match_start_time",
+            "match_start_time_ts",
+        )
+        return self._sports_live_state_timestamp_from_keys(sources, keys)
+
+    def _sports_live_state_occurrence_timestamp(self, sources):
+        keys = (
+            "occurrence_datetime",
+            "occurrence_datetime_ts",
+            "expected_expiration_time",
+            "expected_expiration_time_ts",
+        )
+        return self._sports_live_state_timestamp_from_keys(sources, keys)
 
     def _sports_live_state_has_scoreboard(self, sources):
         live_values = {"live", "in_play", "inplay", "in-play", "started", "in_progress", "running", "midgame", "halftime", "intermission", "between_periods", "top", "bottom"}
@@ -3715,7 +3742,8 @@ class KalshiSniperBot:
                 detail_reason = f"market_detail_{exc.__class__.__name__}"
 
         now_ts = time.time()
-        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_timestamp(metadata)
+        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_hard_start_timestamp(metadata)
+        occurrence_ts, occurrence_key, occurrence_raw = self._sports_live_state_occurrence_timestamp(metadata)
         start_ts, start_key, start_raw = metadata_start_ts, metadata_start_key, metadata_start_raw
         if start_ts is None:
             start_ts, start_key, start_raw = self._aion_ticker_embedded_start_timestamp(ticker)
@@ -3730,7 +3758,9 @@ class KalshiSniperBot:
         live_statuses = {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"}
 
         seconds_to_start = float(start_ts - now_ts) if start_ts is not None else None
+        seconds_to_occurrence = float(occurrence_ts - now_ts) if occurrence_ts is not None else None
         metadata_future_start = bool(metadata_start_ts is not None and metadata_start_ts > now_ts + 30.0)
+        future_occurrence_hint = bool(occurrence_ts is not None and occurrence_ts > now_ts + 30.0)
         exact_ticker_future_start = bool(start_key == "ticker_datetime" and start_ts is not None and start_ts > now_ts + 30.0)
         ambiguous_ticker_date_future = bool(start_key == "ticker_date" and start_ts is not None and start_ts > now_ts + 30.0)
         ambiguous_ticker_date_live_evidence = bool(
@@ -3740,6 +3770,7 @@ class KalshiSniperBot:
             and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
             and status_text not in pregame_statuses
         )
+        strong_live_signal = bool(explicit_live or status_text in live_statuses or scoreboard_live)
 
         reason = "unknown_sports_live_state"
         ok = False
@@ -3747,12 +3778,6 @@ class KalshiSniperBot:
         if status_text in closed_statuses:
             reason = "sports_market_closed"
             live_state = "closed"
-        elif metadata_future_start or exact_ticker_future_start or (ambiguous_ticker_date_future and not ambiguous_ticker_date_live_evidence):
-            reason = "future_start_time"
-            live_state = "future"
-        elif status_text in pregame_statuses:
-            reason = "pregame_status"
-            live_state = "pregame"
         elif explicit_live:
             ok = True
             reason = "explicit_live_flag"
@@ -3765,10 +3790,19 @@ class KalshiSniperBot:
             ok = True
             reason = "scoreboard_live_state"
             live_state = "live"
+        elif metadata_future_start or exact_ticker_future_start or (ambiguous_ticker_date_future and not ambiguous_ticker_date_live_evidence):
+            reason = "future_start_time"
+            live_state = "future"
+        elif status_text in pregame_statuses:
+            reason = "pregame_status"
+            live_state = "pregame"
         elif start_ts is not None and start_ts <= now_ts + 30.0 and start_key != "ticker_date":
             ok = True
             reason = "start_time_elapsed"
             live_state = "started"
+        elif future_occurrence_hint and not strong_live_signal:
+            reason = "future_occurrence_no_live_evidence"
+            live_state = "future"
         elif executable_book:
             ok = True
             reason = "fresh_executable_orderbook_ambiguous_ticker_date" if ambiguous_ticker_date_live_evidence else "fresh_executable_orderbook_no_future_start"
@@ -3790,6 +3824,9 @@ class KalshiSniperBot:
             "start_key": start_key,
             "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if start_ts is not None else None,
             "seconds_to_start": round(float(start_ts - now_ts), 3) if start_ts is not None else None,
+            "occurrence_key": occurrence_key,
+            "occurrence_time": datetime.fromtimestamp(occurrence_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if occurrence_ts is not None else None,
+            "seconds_to_occurrence": round(float(seconds_to_occurrence), 3) if seconds_to_occurrence is not None else None,
             "status_key": status_key,
             "status": status_value,
             "explicit_live_key": explicit_live_key,
@@ -3802,6 +3839,22 @@ class KalshiSniperBot:
             "detail_reason": detail_reason,
             "metadata_sources": len(metadata),
         }
+        if future_occurrence_hint and strong_live_signal:
+            self._emit_sports_live_state_guard_log(
+                "AION-LIVE-MARKET-MISMATCH",
+                {
+                    **payload_log,
+                    "mismatch": "future_occurrence_datetime_with_live_signal",
+                    "fix": "live_signal_overrides_occurrence_resolution_hint",
+                },
+            )
+        self._emit_sports_live_state_guard_log(
+            "AION-LIVE-CLASSIFICATION",
+            {
+                **payload_log,
+                "classification_rule": "hard_start_fields_block_future;occurrence_datetime_is_resolution_hint",
+            },
+        )
         self._emit_sports_live_state_guard_log("AION-SPORTS-LIVE-STATE-CHECK", payload_log)
         self._emit_sports_live_state_guard_log("AION-LIVE-SPORTS-ALLOW" if ok else "AION-PREGAME-SPORTS-BLOCK", payload_log)
         self._emit_sports_live_state_guard_log("AION-LIVE-GUARD-ALLOW" if ok else "AION-LIVE-GUARD-BLOCK", payload_log)
@@ -3811,13 +3864,15 @@ class KalshiSniperBot:
             "reason": "sports_live_state_ok" if ok else "pregame_sports_market",
             "block_reason": None if ok else reason,
             "start_time_raw": start_raw,
+            "occurrence_time_raw": occurrence_raw,
         }
 
     def _aion_live_discovery_state(self, market=None, q=None, side=None):
         market = market if isinstance(market, dict) else {}
         metadata = [source for source in (market, q) if source is not None]
         now_ts = time.time()
-        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_timestamp(metadata)
+        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_hard_start_timestamp(metadata)
+        occurrence_ts, occurrence_key, occurrence_raw = self._sports_live_state_occurrence_timestamp(metadata)
         start_ts, start_key, start_raw = metadata_start_ts, metadata_start_key, metadata_start_raw
         ticker_value = str(market.get("ticker") or self._read_field(q, "ticker", default="") or "").strip()
         ticker_start_ts, ticker_start_key, ticker_start_raw = self._aion_ticker_embedded_start_timestamp(ticker_value)
@@ -3851,7 +3906,9 @@ class KalshiSniperBot:
         pregame_statuses = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}
         live_statuses = {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"}
         seconds_to_start = float(start_ts - now_ts) if start_ts is not None else None
+        seconds_to_occurrence = float(occurrence_ts - now_ts) if occurrence_ts is not None else None
         metadata_future_start = bool(metadata_start_ts is not None and metadata_start_ts > now_ts + 30.0)
+        future_occurrence_hint = bool(occurrence_ts is not None and occurrence_ts > now_ts + 30.0)
         exact_ticker_future_start = bool(start_key == "ticker_datetime" and start_ts is not None and start_ts > now_ts + 30.0)
         ambiguous_ticker_date_future = bool(start_key == "ticker_date" and start_ts is not None and start_ts > now_ts + 30.0)
         ambiguous_ticker_date_live_evidence = bool(
@@ -3861,6 +3918,7 @@ class KalshiSniperBot:
             and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
             and status_text not in pregame_statuses
         )
+        strong_live_signal = bool(explicit_live or status_text in live_statuses or scoreboard_live)
 
         reason = "unknown_sports_live_state"
         live_state = "unknown"
@@ -3871,6 +3929,21 @@ class KalshiSniperBot:
             reason = "sports_market_closed"
             live_state = "closed"
             terminal_drop = True
+        elif explicit_live:
+            reason = "explicit_live_flag"
+            live_state = "live"
+            admit = True
+            priority = 90
+        elif status_text in live_statuses:
+            reason = "live_status"
+            live_state = "live"
+            admit = True
+            priority = 85
+        elif scoreboard_live:
+            reason = "scoreboard_live_state"
+            live_state = "live"
+            admit = True
+            priority = 80
         elif metadata_future_start or exact_ticker_future_start:
             reason = "future_start_time"
             live_state = "future"
@@ -3894,26 +3967,15 @@ class KalshiSniperBot:
             reason = "pregame_status"
             live_state = "pregame"
             terminal_drop = True
-        elif explicit_live:
-            reason = "explicit_live_flag"
-            live_state = "live"
-            admit = True
-            priority = 90
-        elif status_text in live_statuses:
-            reason = "live_status"
-            live_state = "live"
-            admit = True
-            priority = 85
-        elif scoreboard_live:
-            reason = "scoreboard_live_state"
-            live_state = "live"
-            admit = True
-            priority = 80
         elif start_ts is not None and start_ts <= now_ts + 30.0 and start_key != "ticker_date":
             reason = "start_time_elapsed"
             live_state = "started"
             admit = True
             priority = 70
+        elif future_occurrence_hint and not strong_live_signal:
+            reason = "future_occurrence_no_live_evidence"
+            live_state = "future"
+            terminal_drop = True
         elif executable_book:
             reason = "fresh_executable_orderbook_ambiguous_ticker_date" if ambiguous_ticker_date_live_evidence else "fresh_executable_orderbook_no_future_start"
             live_state = "live_evidence"
@@ -3934,6 +3996,10 @@ class KalshiSniperBot:
             "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if start_ts is not None else None,
             "seconds_to_start": round(float(start_ts - now_ts), 3) if start_ts is not None else None,
             "start_time_raw": start_raw,
+            "occurrence_key": occurrence_key,
+            "occurrence_time": datetime.fromtimestamp(occurrence_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if occurrence_ts is not None else None,
+            "seconds_to_occurrence": round(float(seconds_to_occurrence), 3) if seconds_to_occurrence is not None else None,
+            "occurrence_time_raw": occurrence_raw,
             "status_key": status_key,
             "status": status_value,
             "explicit_live_key": explicit_live_key,
@@ -4016,6 +4082,9 @@ class KalshiSniperBot:
         ambiguous_hydration_attempts = 0
         ambiguous_hydration_success = 0
         ambiguous_hydration_failures = Counter()
+        classification_examples = []
+        mismatch_examples = []
+        classification_fix_examples = []
 
         def _should_hydrate_ambiguous_date_market(state):
             if not isinstance(state, dict):
@@ -4113,6 +4182,69 @@ class KalshiSniperBot:
                 else:
                     ambiguous_hydration_failures[hydrated_state.get("reason") or hydration_reason or "unknown"] += 1
             reason_counts[state.get("reason") or "unknown"] += 1
+            if len(classification_examples) < 10:
+                classification_examples.append(
+                    {
+                        "ticker": ticker or None,
+                        "event_ticker": market.get("event_ticker"),
+                        "family": family,
+                        "status": market.get("status"),
+                        "event_status": market.get("event_status"),
+                        "game_status": market.get("game_status"),
+                        "in_play": market.get("in_play", market.get("is_in_play")),
+                        "start_key": state.get("start_key"),
+                        "start_time": state.get("start_time"),
+                        "occurrence_key": state.get("occurrence_key"),
+                        "occurrence_time": state.get("occurrence_time"),
+                        "expected_expiration_time": market.get("expected_expiration_time"),
+                        "close_time": market.get("close_time"),
+                        "scoreboard_key": state.get("scoreboard_key"),
+                        "scoreboard_value": state.get("scoreboard_value"),
+                        "executable_book": bool(state.get("executable_book")),
+                        "aion_classification": state.get("reason"),
+                        "live_state": state.get("live_state"),
+                    }
+                )
+            if state.get("occurrence_key") and state.get("reason") in {"explicit_live_flag", "live_status", "scoreboard_live_state"}:
+                if len(classification_fix_examples) < 10:
+                    classification_fix_examples.append(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "reason": state.get("reason"),
+                            "occurrence_key": state.get("occurrence_key"),
+                            "occurrence_time": state.get("occurrence_time"),
+                            "fix": "occurrence_datetime_did_not_override_live_signal",
+                        }
+                    )
+            if (
+                state.get("occurrence_key")
+                and state.get("reason") in {"future_occurrence_no_live_evidence", "future_start_time"}
+                and bool(state.get("executable_book") or self._aion_market_liquidity_rank_value(market) > 0.0)
+                and len(mismatch_examples) < 10
+            ):
+                mismatch_examples.append(
+                    {
+                        "ticker": ticker or None,
+                        "event_ticker": market.get("event_ticker"),
+                        "family": family,
+                        "status": market.get("status"),
+                        "app_visible_state": "active_open_odds_possible",
+                        "aion_classification": state.get("reason"),
+                        "correct_classification": state.get("reason"),
+                        "mismatch_explanation": "active_orderbook_or_volume_without_scoreboard_or_in_play_flag_is_not_sufficient_for_live_only_sports_entry",
+                        "start_key": state.get("start_key"),
+                        "start_time": state.get("start_time"),
+                        "occurrence_key": state.get("occurrence_key"),
+                        "occurrence_time": state.get("occurrence_time"),
+                        "expected_expiration_time": market.get("expected_expiration_time"),
+                        "scoreboard_key": state.get("scoreboard_key"),
+                        "scoreboard_value": state.get("scoreboard_value"),
+                        "executable_book": bool(state.get("executable_book")),
+                        "volume_fp": market.get("volume_fp"),
+                        "open_interest_fp": market.get("open_interest_fp"),
+                    }
+                )
             if state.get("admit"):
                 admitted_family_counts[family] += 1
                 admitted_entries.append((state, market))
@@ -4153,7 +4285,11 @@ class KalshiSniperBot:
             "source": source,
             "input_count": int(len(markets)),
             "admitted_count": int(len(admitted)),
-            "dropped_future_or_pregame": int(reason_counts.get("future_start_time", 0) + reason_counts.get("pregame_status", 0)),
+            "dropped_future_or_pregame": int(
+                reason_counts.get("future_start_time", 0)
+                + reason_counts.get("future_occurrence_no_live_evidence", 0)
+                + reason_counts.get("pregame_status", 0)
+            ),
             "dropped_unknown": int(reason_counts.get("unknown_sports_live_state", 0)),
             "reason_counts": dict(reason_counts),
             "families_scanned": dict(family_counts.most_common(20)),
@@ -4175,8 +4311,39 @@ class KalshiSniperBot:
             "ambiguous_hydration_attempts": int(ambiguous_hydration_attempts),
             "ambiguous_hydration_success": int(ambiguous_hydration_success),
             "ambiguous_hydration_failures": dict(ambiguous_hydration_failures.most_common(10)),
+            "classification_examples": classification_examples,
         }
         self._emit_aion_live_discovery_summary("AION-LIVE-DISCOVERY-SCAN", payload)
+        now_log_ts = time.time()
+        last_classification_log_ts = self.to_float(getattr(self, "_aion_live_classification_log_last_ts", 0.0), 0.0) or 0.0
+        if now_log_ts - last_classification_log_ts >= 60.0:
+            self._aion_live_classification_log_last_ts = now_log_ts
+            self._emit_aion_live_discovery_summary(
+                "AION-LIVE-CLASSIFICATION",
+                {
+                    "source": source,
+                    "rule": "hard_start_fields_block_future;occurrence_datetime_is_resolution_hint;live_signal_overrides_occurrence_hint",
+                    "examples": classification_examples,
+                    "reason_counts": dict(reason_counts),
+                },
+            )
+            if mismatch_examples:
+                self._emit_aion_live_discovery_summary(
+                    "AION-LIVE-MARKET-MISMATCH",
+                    {
+                        "source": source,
+                        "mismatch_type": "active_odds_without_live_state",
+                        "examples": mismatch_examples,
+                    },
+                )
+            if classification_fix_examples:
+                self._emit_aion_live_discovery_summary(
+                    "AION-LIVE-CLASSIFICATION-FIX",
+                    {
+                        "source": source,
+                        "examples": classification_fix_examples,
+                    },
+                )
         if dropped_future:
             self._emit_aion_live_discovery_summary(
                 "AION-FUTURE-MARKET-DROPPED-EARLY",
@@ -4343,7 +4510,7 @@ class KalshiSniperBot:
         reason_text = str(reason or "").strip().lower()
         if not reason_text:
             return "other"
-        if any(token in reason_text for token in ("future_start_time", "pregame", "pre_game", "not_started", "not started", "scheduled", "upcoming", "lifecycle_not_allowed")):
+        if any(token in reason_text for token in ("future_start_time", "future_occurrence", "pregame", "pre_game", "not_started", "not started", "scheduled", "upcoming", "lifecycle_not_allowed")):
             return "future_start_time_block"
         if any(token in reason_text for token in ("missing_quote", "no_quote", "quote_missing", "no_quote_ready", "missing_prices_and_sizes")):
             return "no_quote"
@@ -4528,7 +4695,8 @@ class KalshiSniperBot:
     def _aion_funnel_future_or_pregame_reason(self, market=None, q=None):
         metadata = [source for source in (market, q) if source is not None]
         now_ts = time.time()
-        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_timestamp(metadata)
+        metadata_start_ts, metadata_start_key, metadata_start_raw = self._sports_live_state_hard_start_timestamp(metadata)
+        occurrence_ts, occurrence_key, occurrence_raw = self._sports_live_state_occurrence_timestamp(metadata)
         start_ts, start_key, start_raw = metadata_start_ts, metadata_start_key, metadata_start_raw
         if start_ts is None:
             ticker_value = str(self._read_field(market, "ticker", default="") or self._read_field(q, "ticker", default="") or "").strip()
@@ -4549,7 +4717,9 @@ class KalshiSniperBot:
         executable_book, executable_book_key, executable_book_value = self._sports_live_state_has_executable_orderbook(metadata)
         pregame_statuses = {"scheduled", "pregame", "pre_game", "not_started", "not started", "upcoming", "preview"}
         seconds_to_start = float(start_ts - now_ts) if start_ts is not None else None
+        seconds_to_occurrence = float(occurrence_ts - now_ts) if occurrence_ts is not None else None
         metadata_future_start = bool(metadata_start_ts is not None and metadata_start_ts > now_ts + 30.0)
+        future_occurrence_hint = bool(occurrence_ts is not None and occurrence_ts > now_ts + 30.0)
         exact_ticker_future_start = bool(start_key == "ticker_datetime" and start_ts is not None and start_ts > now_ts + 30.0)
         ambiguous_ticker_date_future = bool(start_key == "ticker_date" and start_ts is not None and start_ts > now_ts + 30.0)
         ambiguous_ticker_date_live_evidence = bool(
@@ -4559,12 +4729,34 @@ class KalshiSniperBot:
             and seconds_to_start <= max(0, AION_TICKER_DATE_LIVE_AMBIGUITY_SECONDS)
             and status_text not in pregame_statuses
         )
+        strong_live_signal = bool(self._sports_live_state_bool(explicit_live_value) or status_text in {"live", "in_play", "inplay", "in-play", "in_progress", "running", "started", "midgame", "halftime", "intermission", "between_periods"} or scoreboard_live)
         if (metadata_future_start or exact_ticker_future_start or (start_ts is not None and start_ts > now_ts + 30.0 and not ambiguous_ticker_date_live_evidence)):
             return {
                 "reason": "future_start_time",
                 "start_key": start_key,
                 "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
                 "seconds_to_start": round(float(start_ts - now_ts), 3),
+                "start_time_raw": start_raw,
+                "occurrence_key": occurrence_key,
+                "occurrence_time": datetime.fromtimestamp(occurrence_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if occurrence_ts is not None else None,
+                "seconds_to_occurrence": round(float(seconds_to_occurrence), 3) if seconds_to_occurrence is not None else None,
+                "occurrence_time_raw": occurrence_raw,
+                "executable_book": bool(executable_book),
+                "executable_book_key": executable_book_key,
+                "executable_book_value": executable_book_value,
+            }
+        if strong_live_signal or (start_ts is not None and start_ts <= now_ts + 30.0 and not start_key == "ticker_date"):
+            return None
+        if future_occurrence_hint and not strong_live_signal:
+            return {
+                "reason": "future_occurrence_no_live_evidence",
+                "occurrence_key": occurrence_key,
+                "occurrence_time": datetime.fromtimestamp(occurrence_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                "seconds_to_occurrence": round(float(seconds_to_occurrence), 3),
+                "occurrence_time_raw": occurrence_raw,
+                "start_key": start_key,
+                "start_time": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z") if start_ts is not None else None,
+                "seconds_to_start": round(float(seconds_to_start), 3) if seconds_to_start is not None else None,
                 "start_time_raw": start_raw,
                 "executable_book": bool(executable_book),
                 "executable_book_key": executable_book_key,

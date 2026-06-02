@@ -1193,7 +1193,7 @@ class StructuralEdgeTests(unittest.TestCase):
             "ticker": ticker,
             "series_ticker": "KXATPCHALLENGERMATCH",
             "status": "active",
-            "occurrence_datetime": future_start,
+            "start_time": future_start,
         }
         bot.live_positions = []
         bot.load_live_position_state = lambda: {}
@@ -1228,6 +1228,124 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["reason"], "pregame_sports_market")
         self.assertEqual(result["sports_live_state_guard"]["block_reason"], "future_start_time")
         self.assertEqual(posted, [])
+
+    def test_sports_live_state_guard_allows_atp_live_flag_despite_future_occurrence(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "status": "active",
+            "event_status": "in_play",
+            "occurrence_datetime": future_occurrence,
+            "expected_expiration_time": future_occurrence,
+        }
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01BIRM-LIVE",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 44,
+                "selected_price": 0.44,
+            },
+            source="unit_test",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_state_ok")
+        self.assertEqual(result["occurrence_key"], "occurrence_datetime")
+
+    def test_sports_live_state_guard_allows_itf_scoreboard_despite_future_occurrence(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXITFMATCH",
+            "status": "active",
+            "occurrence_datetime": future_occurrence,
+            "scoreboard": {"set": 2, "game_status": "in_progress", "clock": "live"},
+        }
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXITFMATCH-26JUN01ITF-LIVE",
+                "family": "KXITFMATCH",
+                "side": "no",
+                "action": "buy",
+                "count": 1,
+                "no_price": 57,
+                "selected_price": 0.57,
+                "selected_side": "no",
+            },
+            source="unit_test",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "sports_live_state_ok")
+        self.assertEqual(result["scoreboard_key"], "game_status")
+
+    def test_sports_live_state_guard_blocks_future_occurrence_without_live_signal(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXITFMATCH",
+            "status": "active",
+            "occurrence_datetime": future_occurrence,
+            "expected_expiration_time": future_occurrence,
+        }
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXITFMATCH-26JUN01ITF-OPEN",
+                "family": "KXITFMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 44,
+                "selected_price": 0.44,
+                "orderbook_ready": True,
+                "selected_side_has_liquidity": True,
+            },
+            source="unit_test",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["block_reason"], "future_occurrence_no_live_evidence")
+
+    def test_sports_live_state_guard_blocks_timezone_offset_future_start(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_dt = datetime.now(timezone.utc) + timedelta(hours=2)
+        future_start = future_dt.astimezone(timezone(timedelta(hours=-4))).isoformat()
+        bot.get_live_market_detail = lambda ticker: {
+            "ticker": ticker,
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "status": "active",
+            "start_time": future_start,
+        }
+
+        result = bot.evaluate_sports_live_state_pre_submit_guard(
+            {
+                "ticker": "KXATPCHALLENGERMATCH-26JUN01TZ-FUT",
+                "family": "KXATPCHALLENGERMATCH",
+                "side": "yes",
+                "action": "buy",
+                "count": 1,
+                "yes_price": 44,
+                "selected_price": 0.44,
+            },
+            source="unit_test",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["block_reason"], "future_start_time")
 
     def test_sports_live_state_guard_blocks_missing_live_metadata(self):
         self._set_sports_only_mode(True)
@@ -1748,6 +1866,35 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertEqual(len(admitted), 1)
         self.assertEqual(admitted[0]["ticker"], market["ticker"])
+        self.assertEqual(summary["admitted_count"], 1)
+        self.assertIn("scoreboard_live_state", summary["reason_counts"])
+
+    def test_live_discovery_admits_live_tennis_despite_future_occurrence(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
+        market = {
+            "ticker": "KXATPCHALLENGERMATCH-26JUN01BIRM-LIVE",
+            "series_ticker": "KXATPCHALLENGERMATCH",
+            "event_ticker": "KXATPCHALLENGERMATCH-26JUN01BIRM",
+            "title": "ATP Challenger Birmingham live",
+            "status": "active",
+            "event_status": "in_play",
+            "occurrence_datetime": future_occurrence,
+            "expected_expiration_time": future_occurrence,
+            "yes_ask": 0.57,
+            "yes_bid": 0.53,
+            "volume": 125,
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            admitted, summary = bot._filter_live_sports_discovery_markets(
+                [market],
+                source="unit_test",
+                limit=10,
+            )
+
+        self.assertEqual([item["ticker"] for item in admitted], [market["ticker"]])
         self.assertEqual(summary["admitted_count"], 1)
         self.assertIn("scoreboard_live_state", summary["reason_counts"])
 
