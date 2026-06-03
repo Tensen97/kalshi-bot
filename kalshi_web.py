@@ -25694,13 +25694,13 @@ class KalshiSniperBot:
         failed_checks = [name for name, passed in checks.items() if not passed]
         pressure = max(0.55, min(0.75, 0.65 if checks["EV_elite"] else 0.6))
         payload.update({
-            "decision": "ALLOW",
+            "decision": "BLOCK",
             "reason": "tennis_exposure_cap",
             "failed_checks": failed_checks,
             "pressure_factor": pressure,
         })
         self._emit_aion_concurrency_log("AION-TENNIS-CAP", payload)
-        return {"allowed": True, "reason": "tennis_exposure_cap", "audit": payload}
+        return {"allowed": False, "reason": "tennis_exposure_cap", "audit": payload}
 
     def _slot_allocation_candidate_sort_key(self, candidate, *, snapshot=None):
         meta = self._aion_concurrency_candidate_meta(candidate)
@@ -31622,6 +31622,59 @@ class KalshiSniperBot:
         if market.get("can_close") is False or market.get("can_open") is False:
             self._record_live_reject_telemetry(reason="not_tradable", ticker=ticker, family=family, spread=None, stage="prefilter", category="general")
             return False, "not_tradable"
+        if str(family or "").strip().upper().startswith("KXATPCHALLENGERMATCH"):
+            selected_side = str(
+                getattr(q, "selected_side", None)
+                or getattr(q, "side", None)
+                or ""
+            ).strip().lower() or None
+            selected_price = self.to_float(getattr(q, "selected_price", None), None)
+            if selected_price is None and selected_side == "no":
+                selected_price = self.to_float(getattr(q, "no_ask", None), None)
+            if selected_price is None:
+                selected_price = self.to_float(getattr(q, "yes_ask", None), None)
+            yes_bid_for_reject = self.to_float(getattr(q, "yes_bid", None), None)
+            yes_ask_for_reject = self.to_float(getattr(q, "yes_ask", None), None)
+            spread_for_reject = self.to_float(getattr(q, "spread", None), None)
+            if spread_for_reject is None and yes_bid_for_reject is not None and yes_ask_for_reject is not None:
+                spread_for_reject = round(float(yes_ask_for_reject) - float(yes_bid_for_reject), 4)
+            liquidity_for_reject = self.to_float(getattr(q, "liquidity", None), None)
+            volume_for_reject = self.to_float(getattr(q, "volume", None), None)
+            self._record_live_reject_telemetry(
+                reason="recent_pnl_leak_kxatpchallenger",
+                ticker=ticker,
+                family=family,
+                spread=spread_for_reject,
+                stage="prefilter",
+                category="sports",
+                details={
+                    "subsystem": "kalshi_web._filter_live_entry_candidate",
+                    "side": selected_side,
+                    "selected_price": selected_price,
+                    "liquidity": liquidity_for_reject,
+                    "volume": volume_for_reject,
+                },
+                subsystem="kalshi_web._filter_live_entry_candidate",
+            )
+            builtins.print(
+                "[AION-FINAL-REJECT] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "side": selected_side,
+                        "selected_price": selected_price,
+                        "spread": spread_for_reject,
+                        "liquidity": liquidity_for_reject,
+                        "volume": volume_for_reject,
+                        "reason": "recent_pnl_leak_kxatpchallenger",
+                        "responsible_subsystem": "kalshi_web._filter_live_entry_candidate",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            return False, "recent_pnl_leak_kxatpchallenger"
         yes_bid = getattr(q, "yes_bid", 0.0) or 0.0
         yes_ask = getattr(q, "yes_ask", 0.0) or 0.0
         if yes_bid <= 0 or yes_ask <= 0:
