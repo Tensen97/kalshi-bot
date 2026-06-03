@@ -1,9 +1,12 @@
 """Memory helpers owned outside the kalshi_web.py orchestrator."""
 
 import csv
+import json
 import os
 import sqlite3
 import time
+from collections import deque
+from datetime import datetime, timezone
 
 
 def normalize_memory_family_value(family=None, ticker=None, default="UNKNOWN"):
@@ -112,11 +115,93 @@ def family_profit_memory_rows_from_csv(bot, *, lookback, limit=None):
     return rows
 
 
+def _archive_timestamp_to_epoch(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return float(parsed.timestamp())
+    except Exception:
+        return 0.0
+
+
+def _first_present(mapping, *keys):
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def family_profit_memory_rows_from_learning_archive(bot, *, archive_path=None, lookback, limit=None):
+    if not bool(getattr(bot, "family_profit_memory_learning_archive_enabled", False)):
+        return []
+    path = str(
+        getattr(bot, "aion_learning_archive_file", None)
+        or archive_path
+        or os.path.join("data", "aion_learning_archive.jsonl")
+    ).strip()
+    if not path or not os.path.exists(path):
+        return []
+    limit_value = max(1, int(limit or lookback or 400))
+    rows = deque(maxlen=limit_value)
+    try:
+        with open(path, "r", encoding="utf-8") as archive_file:
+            for line in archive_file:
+                if '"trade_closed"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(event, dict) or event.get("event_type") != "trade_closed":
+                    continue
+                timestamp = (
+                    event.get("close_timestamp_utc")
+                    or event.get("timestamp_utc")
+                    or event.get("timestamp")
+                )
+                rows.append(
+                    {
+                        "timestamp": timestamp,
+                        "timestamp_ts": (
+                            _first_present(event, "close_timestamp_ts", "timestamp_ts", "ts")
+                            or _archive_timestamp_to_epoch(timestamp)
+                        ),
+                        "ticker": event.get("ticker") or event.get("market_ticker"),
+                        "family": event.get("family") or event.get("series_ticker"),
+                        "realized_pnl_delta": _first_present(
+                            event,
+                            "pnl_dollars",
+                            "realized_pnl",
+                            "realized_pnl_delta",
+                            "pnl",
+                        ),
+                        "outcome": event.get("result") or event.get("outcome"),
+                    }
+                )
+        return list(rows)
+    except Exception:
+        return []
+
+
 def build_family_profit_memory_stats(bot, *, lookback, recent_window, limit=None):
     limit_value = max(1, int(limit or lookback or 400))
     rows = bot._family_profit_memory_rows_from_sqlite(limit=limit_value)
     rows.extend(bot._family_profit_memory_rows_from_csv(limit=limit_value))
+    rows.extend(bot._family_profit_memory_rows_from_learning_archive(limit=limit_value))
+    rows.sort(key=lambda row: bot.to_float(row.get("timestamp_ts"), 0.0) or 0.0, reverse=True)
     stats_by_family = {}
+    seen_trade_keys = set()
 
     def _ensure_stats(family_key):
         return stats_by_family.setdefault(
@@ -144,6 +229,15 @@ def build_family_profit_memory_stats(bot, *, lookback, recent_window, limit=None
             continue
         if pnl is None:
             pnl = 1.0 if outcome == "win" else -1.0 if outcome == "loss" else 0.0
+        trade_key = (
+            family,
+            str(row.get("ticker") or "").strip().upper(),
+            str(row.get("timestamp") or row.get("timestamp_ts") or "").strip(),
+            round(float(pnl or 0.0), 6),
+        )
+        if trade_key in seen_trade_keys:
+            continue
+        seen_trade_keys.add(trade_key)
         stats = _ensure_stats(family)
         stats["trade_count"] += 1
         stats["family_pnl"] += float(pnl or 0.0)

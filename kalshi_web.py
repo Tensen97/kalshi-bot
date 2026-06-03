@@ -2548,6 +2548,8 @@ class KalshiSniperBot:
         self.live_family_perf_stats = {}
         self.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
         self.family_profit_memory_log_markers = {}
+        self.aion_learning_archive_file = AION_LEARNING_ARCHIVE_FILE
+        self.family_profit_memory_learning_archive_enabled = True
         self.orderbook_imbalance_log_markers = {}
         self.elite_public_signal_cache = {"loaded_at": 0.0, "signals": [], "summary": {}}
         self.elite_public_signal_log_markers = {}
@@ -25481,6 +25483,14 @@ class KalshiSniperBot:
     def _family_profit_memory_rows_from_csv(self, limit=None):
         return kalshi_memory_module.family_profit_memory_rows_from_csv(
             self,
+            lookback=KALSHI_FAMILY_PROFIT_MEMORY_LOOKBACK,
+            limit=limit,
+        )
+
+    def _family_profit_memory_rows_from_learning_archive(self, limit=None):
+        return kalshi_memory_module.family_profit_memory_rows_from_learning_archive(
+            self,
+            archive_path=AION_LEARNING_ARCHIVE_FILE,
             lookback=KALSHI_FAMILY_PROFIT_MEMORY_LOOKBACK,
             limit=limit,
         )

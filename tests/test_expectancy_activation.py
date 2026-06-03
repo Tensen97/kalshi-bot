@@ -21,6 +21,13 @@ class ExpectancyActivationTests(unittest.TestCase):
         bot.trading_halted = False
         bot.realized_pnl = 0.0
         bot.live_realized_pnl_today = 0.0
+        bot.live_family_perf_stats = {}
+        bot.live_realized_pnl_by_family_today = {}
+        bot.live_recent_family_pnl_events = []
+        bot.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
+        bot.family_profit_memory_log_markers = {}
+        bot.seraph_memory_db_path = "/tmp/aion_missing_seraph_memory.sqlite3"
+        bot.trade_log_csv = "/tmp/aion_missing_trade_history.csv"
         bot.live_post_loss_family_cooldowns = {
             "KXNBA": {
                 "ticker": "OTHER",
@@ -132,6 +139,45 @@ class ExpectancyActivationTests(unittest.TestCase):
             reloaded = bot._load_aion_expectancy_state()
             self.assertIn("shadow_trades", reloaded)
             self.assertGreaterEqual(len(reloaded["shadow_trades"]), 1)
+
+    def test_family_profit_memory_reads_learning_archive_trade_closes(self):
+        bot = self._make_bot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = os.path.join(tmpdir, "aion_learning_archive.jsonl")
+            bot.aion_learning_archive_file = archive_path
+            bot.family_profit_memory_learning_archive_enabled = True
+            events = [
+                {"event_type": "candidate_seen", "ticker": "KXARCH-IGNORED", "family": "KXARCH"},
+                {
+                    "event_type": "trade_closed",
+                    "timestamp_utc": "2026-06-03T01:00:00+00:00",
+                    "close_timestamp_utc": "2026-06-03T01:00:00+00:00",
+                    "ticker": "KXARCH-OLD",
+                    "family": "KXARCH",
+                    "pnl_dollars": 0.40,
+                    "result": "win",
+                },
+                {
+                    "event_type": "trade_closed",
+                    "timestamp_utc": "2026-06-03T02:00:00+00:00",
+                    "close_timestamp_utc": "2026-06-03T02:00:00+00:00",
+                    "ticker": "KXARCH-NEW",
+                    "family": "KXARCH",
+                    "pnl_dollars": -0.25,
+                    "result": "loss",
+                },
+            ]
+            with open(archive_path, "w", encoding="utf-8") as fh:
+                for event in events:
+                    fh.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+
+            stats = bot._get_family_profit_memory_stats("KXARCH", refresh=True)
+
+        self.assertEqual(stats["trade_count"], 2)
+        self.assertEqual(stats["wins"], 1)
+        self.assertEqual(stats["losses"], 1)
+        self.assertAlmostEqual(stats["family_pnl"], 0.15, places=6)
+        self.assertAlmostEqual(stats["recent_pnl"], 0.15, places=6)
 
 
 if __name__ == "__main__":
