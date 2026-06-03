@@ -24,6 +24,11 @@ class ExpectancyActivationTests(unittest.TestCase):
         bot.live_family_perf_stats = {}
         bot.live_realized_pnl_by_family_today = {}
         bot.live_recent_family_pnl_events = []
+        bot.live_post_loss_ticker_cooldowns = {}
+        bot.live_recent_negative_exit_events = []
+        bot.live_positions = []
+        bot.positions = []
+        bot.market_cooldowns = {}
         bot.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
         bot.family_profit_memory_log_markers = {}
         bot.seraph_memory_db_path = "/tmp/aion_missing_seraph_memory.sqlite3"
@@ -111,6 +116,214 @@ class ExpectancyActivationTests(unittest.TestCase):
         self.assertEqual(details["family"], "KXNBA")
         self.assertGreater(details["expectancy_score"], 0.80)
         self.assertGreater(details["sports_edge_after_cost"], 0.0)
+
+    def test_post_loss_family_cooldown_becomes_size_pressure(self):
+        bot = self._make_bot()
+        pressure = bot._get_post_loss_entry_pressure(
+            ticker="KXNBA_TEST",
+            family="KXNBA",
+            now_ts=time.time(),
+        )
+        self.assertTrue(pressure["allowed"])
+        self.assertFalse(pressure["blocked"])
+        self.assertEqual(pressure["reason"], "post_loss_family_soft_pressure")
+        self.assertEqual(pressure["scope"], "family")
+        self.assertGreater(pressure["size_multiplier"], 0.0)
+        self.assertLess(pressure["size_multiplier"], 1.0)
+
+    def test_post_loss_ticker_cooldown_remains_hard_block(self):
+        bot = self._make_bot()
+        now_ts = time.time()
+        bot.live_post_loss_ticker_cooldowns["KXNBA_TEST"] = {
+            "ticker": "KXNBA_TEST",
+            "family": "KXNBA",
+            "realized_pnl": -0.11,
+            "reason": "stop_loss",
+            "expires_at": now_ts + 120.0,
+        }
+        pressure = bot._get_post_loss_entry_pressure(
+            ticker="KXNBA_TEST",
+            family="KXNBA",
+            now_ts=now_ts,
+        )
+        self.assertFalse(pressure["allowed"])
+        self.assertTrue(pressure["blocked"])
+        self.assertEqual(pressure["reason"], "post_loss_ticker_cooldown")
+        self.assertEqual(pressure["scope"], "ticker")
+        self.assertEqual(pressure["size_multiplier"], 0.0)
+
+    def test_entry_ready_buy_records_seed_final_candidate_when_ranker_empty(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBSPREAD-UNIT",
+            family="KXMLBSPREAD",
+            selected_side=None,
+            selected_price=None,
+            yes_bid=0.51,
+            yes_ask=0.53,
+            no_bid=0.47,
+            no_ask=0.49,
+            liquidity=75.0,
+            volume=500.0,
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": "KXMLBSPREAD",
+            "family": "KXMLBSPREAD",
+            "status": "open",
+            "can_open": True,
+            "can_close": True,
+        }
+        summary = bot._seed_entry_ready_candidates_from_readiness(
+            trade_readiness_records=[
+                {
+                    "ticker": q.ticker,
+                    "family": "KXMLBSPREAD",
+                    "decision": "BUY",
+                    "final_disposition": "entry_ready",
+                    "edge_after_cost": 0.04,
+                    "selected_side": "yes",
+                    "selected_price": 0.53,
+                    "spread": 0.02,
+                    "spread_bucket": "tight",
+                    "confidence": 0.78,
+                    "liquidity": 75.0,
+                }
+            ],
+            quotes_by_ticker={q.ticker: q},
+            markets_by_ticker={q.ticker: market},
+        )
+        self.assertEqual(summary["seeded_count"], 1)
+        score, seeded_q = summary["candidates"][0]
+        self.assertGreater(score, 0.0)
+        self.assertIs(seeded_q, q)
+        self.assertEqual(q.selected_side, "yes")
+        self.assertAlmostEqual(q.selected_price, 0.53, places=4)
+        self.assertTrue(q.entry_ready_seeded)
+
+    def test_entry_ready_seed_uses_gate_records_when_readiness_list_empty(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBKS-UNIT",
+            family="KXMLBKS",
+            selected_side="yes",
+            selected_price=0.46,
+            yes_bid=0.45,
+            yes_ask=0.46,
+            no_bid=0.54,
+            no_ask=0.55,
+            liquidity=25.0,
+            volume=120.0,
+        )
+        market = {
+            "ticker": q.ticker,
+            "series_ticker": "KXMLBKS",
+            "family": "KXMLBKS",
+            "status": "open",
+            "can_open": True,
+            "can_close": True,
+        }
+        bot._get_realm_vv_live_execution_gate_record = lambda ticker, stage=None: {
+            "ticker": ticker,
+            "family": "KXMLBKS",
+            "decision": "BUY",
+            "realm_vv_status": "entry_ready",
+            "edge_after_cost": 0.03,
+            "selected_side": "yes",
+            "selected_price": 0.46,
+        }
+        summary = bot._seed_entry_ready_candidates_from_readiness(
+            trade_readiness_records=[],
+            markets=[market],
+            quotes_by_ticker={q.ticker: q},
+            markets_by_ticker={q.ticker: market},
+        )
+        self.assertEqual(summary["seeded_count"], 1)
+        self.assertEqual(summary["top"][0]["ticker"], q.ticker)
+
+    def test_entry_ready_seed_does_not_block_success_reason(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXMLBTOTAL-UNIT",
+            family="KXMLBTOTAL",
+            selected_side="no",
+            selected_price=0.48,
+            yes_bid=0.51,
+            yes_ask=0.52,
+            no_bid=0.47,
+            no_ask=0.48,
+            liquidity=42.0,
+            volume=220.0,
+        )
+        summary = bot._seed_entry_ready_candidates_from_readiness(
+            trade_readiness_records=[
+                {
+                    "ticker": q.ticker,
+                    "family": "KXMLBTOTAL",
+                    "decision": "BUY",
+                    "final_disposition": "entry_ready",
+                    "edge_after_cost": 0.025,
+                    "selected_side": "no",
+                    "selected_price": 0.48,
+                    "canonical_final_block_reason": "all_guards_passed",
+                }
+            ],
+            quotes_by_ticker={q.ticker: q},
+            markets_by_ticker={
+                q.ticker: {
+                    "ticker": q.ticker,
+                    "series_ticker": "KXMLBTOTAL",
+                    "family": "KXMLBTOTAL",
+                    "status": "open",
+                    "can_open": True,
+                    "can_close": True,
+                }
+            },
+        )
+        self.assertEqual(summary["seeded_count"], 1)
+        self.assertEqual(summary["skipped"].get("record_hard_block", 0), 0)
+        self.assertEqual(q.selected_side, "no")
+
+    def test_entry_ready_seed_preserves_atp_challenger_leak_block(self):
+        bot = self._make_bot()
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-UNIT",
+            family="KXATPCHALLENGERMATCH",
+            selected_side="yes",
+            selected_price=0.53,
+            yes_bid=0.51,
+            yes_ask=0.53,
+            no_bid=0.47,
+            no_ask=0.49,
+            liquidity=75.0,
+            volume=500.0,
+        )
+        summary = bot._seed_entry_ready_candidates_from_readiness(
+            trade_readiness_records=[
+                {
+                    "ticker": q.ticker,
+                    "family": "KXATPCHALLENGERMATCH",
+                    "decision": "BUY",
+                    "final_disposition": "entry_ready",
+                    "edge_after_cost": 0.20,
+                    "selected_side": "yes",
+                    "selected_price": 0.53,
+                }
+            ],
+            quotes_by_ticker={q.ticker: q},
+            markets_by_ticker={
+                q.ticker: {
+                    "ticker": q.ticker,
+                    "series_ticker": "KXATPCHALLENGERMATCH",
+                    "family": "KXATPCHALLENGERMATCH",
+                    "status": "open",
+                    "can_open": True,
+                    "can_close": True,
+                }
+            },
+        )
+        self.assertEqual(summary["seeded_count"], 0)
+        self.assertEqual(summary["skipped"].get("recent_pnl_leak_kxatpchallenger"), 1)
 
     def test_expectancy_state_round_trip(self):
         bot = self._make_bot()
