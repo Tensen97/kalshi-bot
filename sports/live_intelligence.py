@@ -6870,7 +6870,6 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
     stop_reasons = {
         "max_submits_per_cycle",
         "rate_limited",
-        "min_seconds_between_submits",
         "max_new_positions_per_10min",
         "max_open_positions",
         "daily_loss_guard",

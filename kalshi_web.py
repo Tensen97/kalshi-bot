@@ -28169,6 +28169,13 @@ class KalshiSniperBot:
             capacity_pressure = min(capacity_pressure, 0.65)
         if game_key and same_game_count >= settings["max_same_game_positions"]:
             capacity_pressure = min(capacity_pressure, 0.65)
+        submit_gap_active = bool(
+            settings["min_seconds_between_submits"] > 0.0
+            and seconds_since_submit is not None
+            and seconds_since_submit < settings["min_seconds_between_submits"]
+        )
+        if submit_gap_active:
+            capacity_pressure = min(capacity_pressure, 0.85)
         block_reason = None
         tennis_cap = {"allowed": True, "reason": "not_checked"}
         if not ticker:
@@ -28179,13 +28186,6 @@ class KalshiSniperBot:
             block_reason = "max_submits_per_cycle"
         elif len(active_timestamps) >= settings["live_order_rate_limit"]:
             block_reason = "rate_limited"
-        elif (
-            settings["min_seconds_between_submits"] > 0.0
-            and not submitted_entries
-            and seconds_since_submit is not None
-            and seconds_since_submit < settings["min_seconds_between_submits"]
-        ):
-            block_reason = "min_seconds_between_submits"
         elif recent_10min + len(submitted_entries) >= settings["max_new_positions_per_10min"]:
             block_reason = "max_new_positions_per_10min"
         elif snapshot["open_count"] >= settings["max_open_positions"]:
@@ -28239,6 +28239,8 @@ class KalshiSniperBot:
             "submitted_this_cycle": len(submitted_entries),
             "recent_new_positions_10min": recent_10min,
             "active_order_timestamps": len(active_timestamps),
+            "seconds_since_submit": seconds_since_submit,
+            "submit_gap_active": submit_gap_active,
             "settings": settings,
             "capacity_pressure": round(capacity_pressure, 4),
             "tennis_cap": tennis_cap.get("audit") if isinstance(tennis_cap, dict) else None,
@@ -28335,7 +28337,6 @@ class KalshiSniperBot:
         stop_reasons = {
             "max_submits_per_cycle",
             "rate_limited",
-            "min_seconds_between_submits",
             "max_new_positions_per_10min",
             "max_open_positions",
             "daily_loss_guard",

@@ -3825,6 +3825,57 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertIn("[AION-CONCURRENCY-ALLOW]", logs.getvalue())
         self.assertIn("[AION-MULTI-SUBMIT-CYCLE]", logs.getvalue())
 
+    def test_multi_submit_recent_submit_gap_does_not_starve_profitable_batch(self):
+        self._set_sports_only_mode(True)
+        old_values = {
+            "AION_MIN_SECONDS_BETWEEN_SUBMITS": kw.AION_MIN_SECONDS_BETWEEN_SUBMITS,
+            "LIVE_ORDER_RATE_LIMIT": kw.LIVE_ORDER_RATE_LIMIT,
+        }
+        kw.AION_MIN_SECONDS_BETWEEN_SUBMITS = 5.0
+        kw.LIVE_ORDER_RATE_LIMIT = 5
+        for name, value in old_values.items():
+            self.addCleanup(setattr, kw, name, value)
+        bot = self._make_bot()
+        captured_payloads = []
+        submitted = self._configure_multi_submit_bot(bot, [], captured_payloads=captured_payloads, payload_extra={"count": 4})
+        bot._active_live_order_timestamps = lambda: [time.time() - 1.0]
+        bot.recent_submitted_order_count_total = lambda window_seconds=None: 1
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBSPREAD-GAMEA-FAV", family="KXMLBSPREAD", score=90, game_id="mlb:game_a"),
+            self._multi_sports_candidate("KXMLBTOTAL-GAMEB-8", family="KXMLBTOTAL", score=88, game_id="mlb:game_b"),
+            self._multi_sports_candidate("KXNCAASB-GAMEC-YES", family="KXNCAASB", score=86, game_id="ncaasb:game_c"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_recent_gap")
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["submitted_count"], 3)
+        self.assertEqual(submitted, ["KXMLBSPREAD-GAMEA-FAV", "KXMLBTOTAL-GAMEB-8", "KXNCAASB-GAMEC-YES"])
+        self.assertEqual([payload["count"] for payload in captured_payloads], [3, 3, 3])
+        self.assertNotIn("min_seconds_between_submits", result["skipped_reason_counts"])
+        self.assertIn('"submit_gap_active": true', logs.getvalue())
+
+    def test_multi_submit_rate_limit_still_hard_blocks_when_window_full(self):
+        self._set_sports_only_mode(True)
+        old_limit = kw.LIVE_ORDER_RATE_LIMIT
+        kw.LIVE_ORDER_RATE_LIMIT = 2
+        self.addCleanup(setattr, kw, "LIVE_ORDER_RATE_LIMIT", old_limit)
+        bot = self._make_bot()
+        submitted = self._configure_multi_submit_bot(bot, [])
+        bot._active_live_order_timestamps = lambda: [time.time() - 1.0, time.time() - 2.0]
+        bot.last_dual_lane_buy_candidates = [
+            self._multi_sports_candidate("KXMLBTOTAL-GAMEA-8", family="KXMLBTOTAL", score=88, game_id="mlb:game_a"),
+            self._multi_sports_candidate("KXNCAASB-GAMEB-YES", family="KXNCAASB", score=86, game_id="ncaasb:game_b"),
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = bot._execute_multi_sports_submit_cycle(source="unit_multi_rate_limit")
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(submitted, [])
+        self.assertIn({"ticker": "KXMLBTOTAL-GAMEA-8", "reason": "rate_limited"}, result["skipped"])
+
     def test_multi_submit_three_candidates_respect_max_submits_per_cycle(self):
         self._set_sports_only_mode(True)
         old_cap = kw.AION_MAX_SUBMITS_PER_CYCLE
@@ -3859,10 +3910,11 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(submitted, ["KXMLBTOTAL-GAMEA-8"])
         self.assertIn({"ticker": "KXMLBTOTAL-GAMEA-8", "reason": "duplicate_cycle_ticker"}, result["skipped"])
 
-    def test_multi_submit_same_game_cap_still_blocks(self):
+    def test_multi_submit_same_game_cap_soft_scales_instead_of_starving_batch(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
-        submitted = self._configure_multi_submit_bot(bot, [])
+        captured_payloads = []
+        submitted = self._configure_multi_submit_bot(bot, [], captured_payloads=captured_payloads, payload_extra={"count": 4})
         bot.live_positions = [
             {"ticker": "KXMLBTOTAL-GAMEA-7", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_a"}},
             {"ticker": "KXMLBSPREAD-GAMEA-MIL3", "family": "KXMLBSPREAD", "status": "open", "entry_context": {"game_id": "mlb:game_a"}},
@@ -3874,14 +3926,16 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             result = bot._execute_multi_sports_submit_cycle(source="unit_multi_same_game")
 
-        self.assertFalse(result["submitted"])
-        self.assertEqual(submitted, [])
-        self.assertIn({"ticker": "KXMLBMONEYLINE-GAMEA-MIL", "reason": "max_same_game_positions"}, result["skipped"])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(submitted, ["KXMLBMONEYLINE-GAMEA-MIL"])
+        self.assertEqual(captured_payloads[0]["count"], 3)
+        self.assertEqual(result["submitted_family_counts"].get("KXMLBMONEYLINE"), 1)
 
-    def test_multi_submit_same_family_cap_still_blocks(self):
+    def test_multi_submit_same_family_cap_soft_scales_instead_of_starving_batch(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
-        submitted = self._configure_multi_submit_bot(bot, [])
+        captured_payloads = []
+        submitted = self._configure_multi_submit_bot(bot, [], captured_payloads=captured_payloads, payload_extra={"count": 4})
         bot.live_positions = [
             {"ticker": "KXMLBTOTAL-GAMEA-7", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_a"}},
             {"ticker": "KXMLBTOTAL-GAMEB-8", "family": "KXMLBTOTAL", "status": "open", "entry_context": {"game_id": "mlb:game_b"}},
@@ -3894,9 +3948,10 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             result = bot._execute_multi_sports_submit_cycle(source="unit_multi_same_family")
 
-        self.assertFalse(result["submitted"])
-        self.assertEqual(submitted, [])
-        self.assertIn({"ticker": "KXMLBTOTAL-GAMEC-9", "reason": "max_same_family_positions"}, result["skipped"])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(submitted, ["KXMLBTOTAL-GAMEC-9"])
+        self.assertEqual(captured_payloads[0]["count"], 3)
+        self.assertEqual(result["submitted_family_counts"].get("KXMLBTOTAL"), 1)
 
     def test_slot_priority_profitable_mlb_outranks_mediocre_tennis(self):
         bot = self._make_bot()
@@ -4680,8 +4735,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreater(tennis_context["unified_score"], 0.0)
         self.assertGreater(tennis_context["sports_lottery_quality_penalty"], 0.0)
         self.assertIn("sports_lottery_quality_penalty", tennis_context["reason"])
-        self.assertGreaterEqual(tennis_context["size_multiplier"], 0.85)
-        self.assertLess(tennis_context["size_multiplier"], 1.0)
+        self.assertLess(tennis_context["size_multiplier"], 0.85)
         self.assertEqual(mlb_allocation["final_quality_action"], "allow_structured_sports_ladder")
         self.assertGreater(mlb_context["size_multiplier"], tennis_context["size_multiplier"])
 
