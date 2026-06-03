@@ -5161,6 +5161,7 @@ class KalshiSniperBot:
                     except Exception:
                         gate_record = {}
                 if not isinstance(gate_record, dict) or not gate_record:
+                    skipped["missing_gate_record"] += 1
                     continue
                 record = dict(gate_record)
                 record.setdefault("ticker", ticker)
@@ -50909,7 +50910,7 @@ class KalshiSniperBot:
         expectancy_summary_by_ticker = dict(getattr(self, "last_auto_live_expectancy_summary_by_ticker", {}) or {})
         trade_readiness_records = list(getattr(self, "last_auto_live_trade_readiness_records", []) or [])
         entry_ready_seed_summary = {}
-        if not candidates and (trade_readiness_records or markets):
+        if not auto_live_ticker and (trade_readiness_records or markets):
             try:
                 entry_ready_seed_summary = self._seed_entry_ready_candidates_from_readiness(
                     trade_readiness_records=trade_readiness_records,
@@ -50920,7 +50921,19 @@ class KalshiSniperBot:
                 )
                 seeded_candidates = list(entry_ready_seed_summary.get("candidates") or [])
                 if seeded_candidates:
-                    candidates = seeded_candidates
+                    if candidates:
+                        merged_candidates = []
+                        merged_tickers = set()
+                        for candidate_score, candidate_quote in seeded_candidates + list(candidates):
+                            candidate_ticker = str(getattr(candidate_quote, "ticker", "") or "").strip()
+                            if candidate_ticker and candidate_ticker in merged_tickers:
+                                continue
+                            if candidate_ticker:
+                                merged_tickers.add(candidate_ticker)
+                            merged_candidates.append((candidate_score, candidate_quote))
+                        candidates = merged_candidates
+                    else:
+                        candidates = seeded_candidates
                     if not auto_live_ticker:
                         seed_quote = candidates[0][1]
                         auto_live_ticker = str(getattr(seed_quote, "ticker", "") or "").strip() or None

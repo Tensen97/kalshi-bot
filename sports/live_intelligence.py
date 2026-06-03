@@ -15779,6 +15779,52 @@ def find_best_live_ticker(self, markets=None):
     candidates = []
     final_family_counts = {}
     strict_reject_reason_counts = {}
+    if prefilter_pool or family_adaptive_probe_pool:
+        def _blocked_recent_pnl_leak_candidate(item):
+            try:
+                prescore, market = item
+            except (TypeError, ValueError):
+                return False
+            family = str(
+                (prescore if isinstance(prescore, dict) else {}).get("family")
+                or self.get_market_family(market if isinstance(market, dict) else {})
+                or ""
+            ).strip().upper()
+            return family.startswith("KXATPCHALLENGERMATCH")
+
+        prefilter_before_pnl_leak_filter = len(prefilter_pool)
+        adaptive_before_pnl_leak_filter = len(family_adaptive_probe_pool)
+        prefilter_pool = [
+            item for item in prefilter_pool
+            if not _blocked_recent_pnl_leak_candidate(item)
+        ]
+        family_adaptive_probe_pool = [
+            item for item in family_adaptive_probe_pool
+            if not _blocked_recent_pnl_leak_candidate(item)
+        ]
+        removed_recent_pnl_leak = (
+            prefilter_before_pnl_leak_filter
+            + adaptive_before_pnl_leak_filter
+            - len(prefilter_pool)
+            - len(family_adaptive_probe_pool)
+        )
+        if removed_recent_pnl_leak > 0:
+            print(
+                "[LIVE-SELECT-STRICT-PREFILTER] "
+                + json.dumps(
+                    {
+                        "reason": "recent_pnl_leak_kxatpchallenger",
+                        "removed": int(removed_recent_pnl_leak),
+                        "prefilter_before": int(prefilter_before_pnl_leak_filter),
+                        "prefilter_after": int(len(prefilter_pool)),
+                        "adaptive_before": int(adaptive_before_pnl_leak_filter),
+                        "adaptive_after": int(len(family_adaptive_probe_pool)),
+                        "next_action": "fill_strict_pool_from_remaining_candidates",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
     strict_pool = (
         prefilter_pool[:effective_strict_validation_pool_cap]
         + family_adaptive_probe_pool[:effective_adaptive_probe_pool_cap]
