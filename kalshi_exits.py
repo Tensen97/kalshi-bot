@@ -443,6 +443,81 @@ def _profit_lock_position_key(ticker, side):
     return f"{ticker}|{side}"
 
 
+def _load_persisted_live_exit_peak(bot, ticker, side):
+    ticker = str(ticker or "").strip()
+    if not ticker or not callable(getattr(bot, "load_live_position_state", None)):
+        return None
+    try:
+        state = bot.load_live_position_state()
+    except Exception:
+        return None
+    entry = state.get(ticker) if isinstance(state, dict) and isinstance(state.get(ticker), dict) else None
+    if not entry:
+        return None
+    normalize_side = getattr(bot, "_normalize_live_side", None)
+    requested_side = normalize_side(side) if callable(normalize_side) else str(side or "").strip().lower()
+    persisted_side = normalize_side(entry.get("live_exit_peak_side") or entry.get("side")) if callable(normalize_side) else str(entry.get("live_exit_peak_side") or entry.get("side") or "").strip().lower()
+    if persisted_side in {"yes", "no"} and requested_side in {"yes", "no"} and persisted_side != requested_side:
+        return None
+    peak_value = bot.to_float(entry.get("live_exit_peak_value"), None)
+    if peak_value is None:
+        return None
+    return {
+        "ticker": ticker,
+        "side": requested_side or persisted_side,
+        "peak_value": round(float(peak_value), 4),
+        "entry_cost": bot.to_float(entry.get("live_exit_peak_entry_cost"), None),
+        "max_payout": bot.to_float(entry.get("live_exit_peak_max_payout"), None),
+        "updated_ts": bot.to_float(entry.get("live_exit_peak_updated_ts"), 0.0) or 0.0,
+        "source": "live_position_state",
+    }
+
+
+def _persist_live_exit_peak_value(bot, ticker, side, peak_record):
+    ticker = str(ticker or "").strip()
+    if (
+        not ticker
+        or not isinstance(peak_record, dict)
+        or not callable(getattr(bot, "load_live_position_state", None))
+        or not callable(getattr(bot, "save_live_position_state", None))
+    ):
+        return False
+    try:
+        state = bot.load_live_position_state()
+    except Exception:
+        return False
+    entry = state.get(ticker) if isinstance(state, dict) and isinstance(state.get(ticker), dict) else None
+    if not isinstance(entry, dict):
+        return False
+    peak_value = bot.to_float(peak_record.get("peak_value"), None)
+    if peak_value is None:
+        return False
+    updated_ts = bot.to_float(peak_record.get("updated_ts"), 0.0) or 0.0
+    existing_peak = bot.to_float(entry.get("live_exit_peak_value"), None)
+    existing_ts = bot.to_float(entry.get("live_exit_peak_updated_ts"), 0.0) or 0.0
+    normalize_side = getattr(bot, "_normalize_live_side", None)
+    normalized_side = normalize_side(side) if callable(normalize_side) else str(side or "").strip().lower()
+    if (
+        existing_peak is not None
+        and abs(float(existing_peak) - float(peak_value)) < 0.0001
+        and abs(float(existing_ts) - float(updated_ts)) < 0.001
+        and str(entry.get("live_exit_peak_side") or normalized_side or "").strip().lower() == str(normalized_side or "").strip().lower()
+    ):
+        return False
+    updated_entry = dict(entry)
+    updated_entry["live_exit_peak_side"] = normalized_side or str(side or "").strip().lower()
+    updated_entry["live_exit_peak_value"] = round(float(peak_value), 4)
+    updated_entry["live_exit_peak_entry_cost"] = round(float(bot.to_float(peak_record.get("entry_cost"), 0.0) or 0.0), 4)
+    updated_entry["live_exit_peak_max_payout"] = round(float(bot.to_float(peak_record.get("max_payout"), 0.0) or 0.0), 4)
+    updated_entry["live_exit_peak_updated_ts"] = updated_ts
+    state[ticker] = updated_entry
+    try:
+        bot.save_live_position_state(dict(state))
+        return True
+    except Exception:
+        return False
+
+
 def update_live_exit_peak_value(bot, *, ticker, side, entry_cost, current_value, cashout_value, max_payout, now_ts=None):
     key = _profit_lock_position_key(ticker, side)
     now_ts = float(now_ts or time.time())
@@ -454,9 +529,15 @@ def update_live_exit_peak_value(bot, *, ticker, side, entry_cost, current_value,
     if not isinstance(peak_map, dict):
         peak_map = {}
     previous = peak_map.get(key) if isinstance(peak_map.get(key), dict) else {}
+    if not previous:
+        persisted_previous = _load_persisted_live_exit_peak(bot, ticker, side)
+        if persisted_previous:
+            previous = persisted_previous
+            peak_map[key] = dict(persisted_previous)
+            bot.live_exit_peak_values = peak_map
     previous_peak = bot.to_float(previous.get("peak_value"), None)
     if previous_peak is None or observed_value > previous_peak + 0.005:
-        peak_map[key] = {
+        peak_record = {
             "ticker": ticker,
             "side": side,
             "peak_value": round(float(observed_value), 4),
@@ -464,12 +545,15 @@ def update_live_exit_peak_value(bot, *, ticker, side, entry_cost, current_value,
             "max_payout": round(float(max_payout or 0.0), 4),
             "updated_ts": now_ts,
         }
+        peak_map[key] = peak_record
         bot.live_exit_peak_values = peak_map
         peak_value = float(observed_value)
         updated = True
+        _persist_live_exit_peak_value(bot, ticker, side, peak_record)
     else:
         peak_value = float(previous_peak)
         updated = False
+        _persist_live_exit_peak_value(bot, ticker, side, previous)
     entry_cost = bot.to_float(entry_cost, 0.0) or 0.0
     current_profit = max(0.0, float(observed_value) - float(entry_cost))
     peak_profit = max(0.0, float(peak_value) - float(entry_cost))

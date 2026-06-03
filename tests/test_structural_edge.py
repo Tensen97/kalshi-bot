@@ -5365,6 +5365,87 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertGreaterEqual(result["peak_giveback_pct"], 0.25)
         self.assertTrue(any(tag == "AION-TRAILING-PROFIT-EXIT" for tag, _payload in bot.position_management_test_logs))
 
+    def test_trailing_profit_exit_uses_persisted_peak_after_restart(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-PERSISTED-PEAK"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 180}
+        state = bot.load_live_position_state()
+        state[ticker] = dict(position, status="open")
+        peak_q = SimpleNamespace(
+            ticker=ticker,
+            family="KXMLBSPREAD",
+            yes_bid=0.70,
+            yes_ask=0.72,
+            no_bid=0.28,
+            no_ask=0.30,
+            yes_top_size=20,
+            no_top_size=20,
+        )
+
+        first = bot._evaluate_momentum_reversal_exit(
+            position,
+            {
+                "ticker": ticker,
+                "family": "KXMLBSPREAD",
+                "side": "yes",
+                "action": "hold",
+                "entry_price": 0.50,
+                "current_price": 0.70,
+                "exit_price": 0.70,
+                "count": 2,
+                "hold_seconds": 180,
+                "pnl_per_contract": 0.20,
+                "unrealized_pnl": 0.40,
+                "spread": 0.02,
+                "recent_delta": 0.02,
+                "last_step_delta": 0.02,
+                "side_support": 0.15,
+            },
+            quotes_by_ticker={ticker: peak_q},
+        )
+        self.assertEqual(first["action"], "hold")
+        self.assertAlmostEqual(bot.load_live_position_state()[ticker]["live_exit_peak_value"], 1.40)
+
+        bot.live_exit_peak_values = {}
+        retrace_q = SimpleNamespace(
+            ticker=ticker,
+            family="KXMLBSPREAD",
+            yes_bid=0.58,
+            yes_ask=0.60,
+            no_bid=0.40,
+            no_ask=0.42,
+            yes_top_size=20,
+            no_top_size=20,
+        )
+        result = bot._evaluate_momentum_reversal_exit(
+            position,
+            {
+                "ticker": ticker,
+                "family": "KXMLBSPREAD",
+                "side": "yes",
+                "action": "hold",
+                "entry_price": 0.50,
+                "current_price": 0.58,
+                "exit_price": 0.58,
+                "count": 2,
+                "hold_seconds": 240,
+                "pnl_per_contract": 0.08,
+                "unrealized_pnl": 0.16,
+                "spread": 0.02,
+                "recent_delta": -0.02,
+                "last_step_delta": -0.02,
+                "side_support": 0.01,
+            },
+            quotes_by_ticker={ticker: retrace_q},
+        )
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "trailing_profit_giveback")
+        self.assertTrue(result["trailing_profit_exit"])
+        self.assertAlmostEqual(result["peak_value"], 1.40)
+        self.assertGreater(result["unrealized_pnl"], 0.0)
+
     def test_reversal_exit_preserves_profit_when_opponent_recovers(self):
         self._set_position_management_config(winner_min_hold=0.0)
         bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
