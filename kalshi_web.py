@@ -438,6 +438,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-PROFIT-LOCK-CHECK",
     "AION-PROFIT-LOCK-EXIT",
     "AION-TRAILING-PROFIT-EXIT",
+    "AION-MOMENTUM-PRESS-CHECK",
+    "AION-MOMENTUM-PRESS-ADD",
+    "AION-REVERSAL-EXIT-CHECK",
+    "AION-REVERSAL-EXIT",
     "SPORTS-PROFIT-LOCK-EXIT",
     "AION-PEAK-VALUE-UPDATE",
     "AION-EXIT-SKIP",
@@ -481,6 +485,9 @@ _AION_EXECUTION_CRITICAL_PREFIXES = (
     "AION-SLOT-ALLOCATION",
     "AION-WINNER-SCALE-",
     "AION-DEAD-POSITION-",
+    "AION-MOMENTUM-PRESS-",
+    "AION-REVERSAL-EXIT",
+    "AION-TRAILING-PROFIT-EXIT",
     "AION-EXECUTION-BLOCKER",
     "AION-LIVE-EXECUTION",
     "LIVE-EXECUTION",
@@ -2278,6 +2285,13 @@ AION_DEAD_POSITION_MIN_HOLD_SECONDS = max(60.0, get_env_float("AION_DEAD_POSITIO
 AION_DEAD_POSITION_FLAT_PNL_PER_CONTRACT = max(0.0, get_env_float("AION_DEAD_POSITION_FLAT_PNL_PER_CONTRACT", 0.005))
 AION_DEAD_POSITION_FLAT_DELTA = max(0.0, get_env_float("AION_DEAD_POSITION_FLAT_DELTA", 0.004))
 AION_DEAD_POSITION_MAX_SPREAD = max(0.01, get_env_float("AION_DEAD_POSITION_MAX_SPREAD", 0.18))
+AION_MOMENTUM_PRESS_ENABLED = get_env_bool("AION_MOMENTUM_PRESS_ENABLED", 1)
+AION_MOMENTUM_PRESS_MIN_DELTA = max(0.0005, get_env_float("AION_MOMENTUM_PRESS_MIN_DELTA", KALSHI_DYNAMIC_EXIT_MOMENTUM_EPSILON))
+AION_REVERSAL_EXIT_ENABLED = get_env_bool("AION_REVERSAL_EXIT_ENABLED", 1)
+AION_REVERSAL_EXIT_MAX_SPREAD = max(0.01, get_env_float("AION_REVERSAL_EXIT_MAX_SPREAD", MAX_EXIT_SPREAD))
+AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT = max(0.05, min(0.90, get_env_float("AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT", 0.30)))
+AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT = max(0.05, min(AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT, get_env_float("AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT", 0.25)))
+AION_REVERSAL_EXIT_SHARP_OPPONENT_DELTA = max(0.006, get_env_float("AION_REVERSAL_EXIT_SHARP_OPPONENT_DELTA", 0.018))
 LIVE_ORDER_RATE_LIMIT = max(1, get_env_int("LIVE_ORDER_RATE_LIMIT", get_env_int("AION_LIVE_ORDER_RATE_LIMIT", 5)))
 LIVE_ORDER_RATE_WINDOW_SEC = max(1, get_env_int("LIVE_ORDER_RATE_WINDOW_SEC", 60))
 LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
@@ -2571,6 +2585,8 @@ class KalshiSniperBot:
         self.live_exit_cooldowns = {}
         self.live_exit_pending_tickers = set()
         self.live_exit_price_history = {}
+        self.live_exit_peak_values = {}
+        self.live_opponent_price_history = {}
         self.position_flip_cooldowns = {}
         self.position_flip_log_markers = {}
         self.dynamic_exit_log_markers = {}
@@ -46913,6 +46929,30 @@ class KalshiSniperBot:
                 return value
         return None
 
+    def _record_position_management_price_observation(self, state_attr, key, price, now_ts=None):
+        key = str(key or "").strip()
+        price = self._position_flip_price_value(price)
+        now_ts = float(now_ts or time.time())
+        if not key or price is None:
+            return {"recent_delta": 0.0, "last_step_delta": 0.0, "samples": 0}
+        history_map = getattr(self, state_attr, None)
+        if not isinstance(history_map, dict):
+            history_map = {}
+        history = [
+            item for item in list(history_map.get(key, []) or [])
+            if isinstance(item, dict) and now_ts - float(item.get("ts", 0.0) or 0.0) <= 900.0
+        ]
+        history.append({"ts": now_ts, "price": price})
+        history = history[-8:]
+        history_map[key] = history
+        setattr(self, state_attr, history_map)
+        recent_delta = 0.0
+        last_step_delta = 0.0
+        if len(history) >= 2:
+            recent_delta = round(price - (self.to_float(history[0].get("price"), price) or price), 4)
+            last_step_delta = round(price - (self.to_float(history[-2].get("price"), price) or price), 4)
+        return {"recent_delta": recent_delta, "last_step_delta": last_step_delta, "samples": len(history)}
+
     def _build_position_monitor_context(self, position, decision=None, quotes_by_ticker=None):
         position = position if isinstance(position, dict) else {}
         decision = decision if isinstance(decision, dict) else {}
@@ -46936,6 +46976,18 @@ class KalshiSniperBot:
             selected_ask = self._position_flip_price_value(price_context.get("yes_ask"))
         elif side == "no":
             selected_ask = self._position_flip_price_value(price_context.get("no_ask"))
+        opponent_side = "no" if side == "yes" else "yes" if side == "no" else None
+        opponent_bid = self._position_flip_price_value(price_context.get(f"{opponent_side}_bid")) if opponent_side else None
+        opponent_ask = self._position_flip_price_value(price_context.get(f"{opponent_side}_ask")) if opponent_side else None
+        yes_top_size = self.to_float(self._read_field(q, "yes_top_size", "yes_ask_size", "yes_size", default=None), None) if q is not None else None
+        no_top_size = self.to_float(self._read_field(q, "no_top_size", "no_ask_size", "no_size", default=None), None) if q is not None else None
+        if isinstance(market, dict):
+            if yes_top_size is None:
+                yes_top_size = self.to_float(market.get("yes_top_size", market.get("yes_ask_size")), None)
+            if no_top_size is None:
+                no_top_size = self.to_float(market.get("no_top_size", market.get("no_ask_size")), None)
+        side_liquidity = yes_top_size if side == "yes" else no_top_size if side == "no" else None
+        opponent_liquidity = no_top_size if side == "yes" else yes_top_size if side == "no" else None
         count = self.to_float(decision.get("count") or metadata.get("count") or position.get("count") or position.get("position") or 0.0, 0.0) or 0.0
         if count < 0:
             count = abs(count)
@@ -46955,6 +47007,24 @@ class KalshiSniperBot:
         spread = self.to_float(decision.get("spread"), self.to_float(price_context.get("spread"), None))
         recent_delta = self.to_float(decision.get("recent_delta"), 0.0) or 0.0
         last_step_delta = self.to_float(decision.get("last_step_delta"), 0.0) or 0.0
+        opponent_recent_delta = self.to_float(decision.get("opponent_recent_delta"), None)
+        opponent_last_step_delta = self.to_float(decision.get("opponent_last_step_delta"), None)
+        opponent_samples = self.to_float(decision.get("opponent_samples"), None)
+        if opponent_recent_delta is None or opponent_last_step_delta is None:
+            opponent_history = self._record_position_management_price_observation(
+                "live_opponent_price_history",
+                f"{ticker}|{side}|opponent",
+                opponent_bid,
+            )
+            if opponent_recent_delta is None:
+                opponent_recent_delta = self.to_float(opponent_history.get("recent_delta"), 0.0) or 0.0
+            if opponent_last_step_delta is None:
+                opponent_last_step_delta = self.to_float(opponent_history.get("last_step_delta"), 0.0) or 0.0
+            if opponent_samples is None:
+                opponent_samples = self.to_float(opponent_history.get("samples"), 0.0) or 0.0
+        opponent_recent_delta = opponent_recent_delta or 0.0
+        opponent_last_step_delta = opponent_last_step_delta or 0.0
+        opponent_samples = opponent_samples or 0.0
         side_support = self.to_float(decision.get("side_support"), 0.0) or 0.0
         market_quality = self._position_monitor_market_quality(q, price_context)
         flat_delta = float(AION_DEAD_POSITION_FLAT_DELTA or 0.0)
@@ -46979,6 +47049,12 @@ class KalshiSniperBot:
             "current_cashout_price": exit_price,
             "exit_price": exit_price,
             "selected_ask": selected_ask,
+            "opponent_side": opponent_side,
+            "opponent_bid": opponent_bid,
+            "opponent_ask": opponent_ask,
+            "opponent_recent_delta": round(float(opponent_recent_delta), 4),
+            "opponent_last_step_delta": round(float(opponent_last_step_delta), 4),
+            "opponent_samples": int(opponent_samples or 0.0),
             "count": count,
             "entry_ts": entry_ts,
             "hold_seconds": hold_seconds,
@@ -46993,6 +47069,10 @@ class KalshiSniperBot:
             "yes_ask": price_context.get("yes_ask"),
             "no_bid": price_context.get("no_bid"),
             "no_ask": price_context.get("no_ask"),
+            "yes_top_size": yes_top_size,
+            "no_top_size": no_top_size,
+            "side_liquidity": side_liquidity,
+            "opponent_liquidity": opponent_liquidity,
             "recent_delta": recent_delta,
             "last_step_delta": last_step_delta,
             "side_support": side_support,
@@ -47018,6 +47098,74 @@ class KalshiSniperBot:
         if gain_pct >= 0.05:
             return {"tier": "small", "threshold": 0.05, "base_add_count": 1}
         return None
+
+    def _momentum_press_state(self, context):
+        context = context if isinstance(context, dict) else {}
+        eps = max(0.0005, float(AION_MOMENTUM_PRESS_MIN_DELTA or KALSHI_DYNAMIC_EXIT_MOMENTUM_EPSILON or 0.004))
+        neutral_band = max(0.0, float(KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND or 0.0))
+        recent_delta = self.to_float(context.get("recent_delta"), 0.0) or 0.0
+        last_step_delta = self.to_float(context.get("last_step_delta"), 0.0) or 0.0
+        opponent_recent_delta = self.to_float(context.get("opponent_recent_delta"), 0.0) or 0.0
+        opponent_last_step_delta = self.to_float(context.get("opponent_last_step_delta"), 0.0) or 0.0
+        opponent_samples = int(self.to_float(context.get("opponent_samples"), 0.0) or 0.0)
+        side_support = self.to_float(context.get("side_support"), 0.0) or 0.0
+        spread = self.to_float(context.get("spread"), None)
+        selected_ask = self._position_flip_price_value(context.get("selected_ask"))
+        side_liquidity = self.to_float(context.get("side_liquidity"), None)
+        current_cashout_price = self._position_flip_price_value(context.get("current_cashout_price") or context.get("exit_price"))
+        opponent_recover_threshold = max(0.006, eps * 1.5)
+        opponent_step_threshold = max(0.004, eps)
+        sharp_opponent_threshold = max(opponent_recover_threshold, float(AION_REVERSAL_EXIT_SHARP_OPPONENT_DELTA or 0.018))
+        current_side_improving = bool(recent_delta >= eps and last_step_delta >= 0.0)
+        cashout_improving = bool(current_cashout_price is not None and recent_delta >= eps)
+        opponent_recovering = bool(
+            opponent_recent_delta >= opponent_recover_threshold
+            or opponent_last_step_delta >= opponent_step_threshold
+            or side_support < -neutral_band
+        )
+        opponent_sharp_recovery = bool(
+            opponent_recent_delta >= sharp_opponent_threshold
+            or opponent_last_step_delta >= max(opponent_step_threshold, sharp_opponent_threshold * 0.66)
+            or side_support < -(neutral_band + 0.18)
+        )
+        opponent_weakening = bool(
+            opponent_samples < 2 and side_support >= neutral_band
+            or opponent_samples >= 2 and opponent_recent_delta <= eps and opponent_last_step_delta <= opponent_step_threshold
+            or side_support > neutral_band
+        )
+        executable_book = bool(
+            selected_ask is not None
+            and 0.0 < float(selected_ask) < 1.0
+            and (spread is None or spread <= float(AION_WINNER_SCALE_MAX_SPREAD))
+            and (side_liquidity is None or side_liquidity > 0.0)
+        )
+        if not AION_MOMENTUM_PRESS_ENABLED:
+            reason = "momentum_press_disabled"
+        elif not executable_book:
+            reason = "press_book_not_executable"
+        elif not current_side_improving:
+            reason = "momentum_not_improving"
+        elif not cashout_improving:
+            reason = "cashout_not_improving"
+        elif opponent_recovering:
+            reason = "opponent_recovering"
+        elif not opponent_weakening:
+            reason = "opponent_not_weakening"
+        else:
+            reason = "momentum_press_allowed"
+        return {
+            "allowed": reason == "momentum_press_allowed",
+            "reason": reason,
+            "current_side_improving": current_side_improving,
+            "cashout_improving": cashout_improving,
+            "opponent_weakening": opponent_weakening,
+            "opponent_recovering": opponent_recovering,
+            "opponent_sharp_recovery": opponent_sharp_recovery,
+            "executable_book": executable_book,
+            "momentum_epsilon": round(eps, 6),
+            "opponent_recover_threshold": round(opponent_recover_threshold, 6),
+            "sharp_opponent_threshold": round(sharp_opponent_threshold, 6),
+        }
 
     def _winner_scale_state_for(self, ticker):
         state = getattr(self, "winner_scale_state", None)
@@ -47110,6 +47258,9 @@ class KalshiSniperBot:
         selected_ask = self._position_flip_price_value(context.get("selected_ask"))
         if selected_ask is None or not (0.0 < float(selected_ask) < 1.0):
             return {"allowed": False, "reason": "missing_scale_entry_ask", "tier": tier}
+        press_state = self._momentum_press_state(context)
+        if not press_state.get("allowed"):
+            return {"allowed": False, "reason": press_state.get("reason") or "momentum_press_blocked", "tier": tier, "momentum_press": press_state}
         scale_state = self._winner_scale_state_for(ticker)
         completed_tiers = set(str(item) for item in (scale_state.get("tiers") or []))
         if tier.get("tier") in completed_tiers:
@@ -47152,6 +47303,7 @@ class KalshiSniperBot:
             "current_exposure": round(current_exposure, 4),
             "post_scale_exposure": round(current_exposure + add_count * float(selected_ask), 4),
             "max_exposure": float(AION_WINNER_SCALE_MAX_TICKER_EXPOSURE),
+            "momentum_press": press_state,
         }
 
     def _build_winner_scale_payload(self, context, preflight):
@@ -47207,7 +47359,9 @@ class KalshiSniperBot:
             "add_count": preflight.get("add_count"),
             "post_scale_exposure": preflight.get("post_scale_exposure"),
             "max_ticker_exposure": AION_WINNER_SCALE_MAX_TICKER_EXPOSURE,
+            "momentum_press": preflight.get("momentum_press"),
         }
+        self._emit_position_management_log("AION-MOMENTUM-PRESS-CHECK", check_payload)
         self._emit_position_management_log("AION-WINNER-SCALE-CHECK", check_payload)
         if not preflight.get("allowed"):
             self._emit_position_management_log("AION-WINNER-SCALE-BLOCK", check_payload)
@@ -47246,11 +47400,137 @@ class KalshiSniperBot:
                 status_code=result.get("status_code"),
             )
             self._emit_position_management_log("AION-WINNER-SCALE-ADD", {**check_payload, "submitted": True, "payload": payload, "result_reason": result.get("reason")})
+            self._emit_position_management_log("AION-MOMENTUM-PRESS-ADD", {**check_payload, "submitted": True, "payload": payload, "result_reason": result.get("reason")})
             result["payload"] = payload
             return result
         self._emit_position_management_log("AION-WINNER-SCALE-BLOCK", {**check_payload, "reason": result.get("reason") or "submit_blocked", "payload": payload})
         result["payload"] = payload
         return result
+
+    def _evaluate_momentum_reversal_exit(self, position, decision, *, quotes_by_ticker=None):
+        context = self._build_position_monitor_context(position, decision=decision, quotes_by_ticker=quotes_by_ticker)
+        press_state = self._momentum_press_state(context)
+        entry_cost = self.to_float(context.get("entry_cost"), 0.0) or 0.0
+        current_value = self.to_float(context.get("current_value"), None)
+        cashout_value = self.to_float(context.get("cashout_value"), current_value)
+        max_payout = self.to_float(context.get("count"), 0.0) or 0.0
+        peak_value = self.to_float(decision.get("peak_value"), None)
+        peak_profit = self.to_float(decision.get("peak_profit"), None)
+        peak_giveback_pct = self.to_float(decision.get("peak_giveback_pct"), None)
+        if peak_value is None or peak_profit is None or peak_giveback_pct is None:
+            peak_context = kalshi_exits_module.update_live_exit_peak_value(
+                self,
+                ticker=context.get("ticker"),
+                side=context.get("side"),
+                entry_cost=entry_cost,
+                current_value=current_value,
+                cashout_value=cashout_value,
+                max_payout=max_payout,
+            )
+            peak_value = self.to_float(peak_context.get("peak_value"), peak_value)
+            peak_profit = self.to_float(peak_context.get("peak_profit"), peak_profit)
+            peak_giveback_pct = self.to_float(peak_context.get("peak_giveback_pct"), peak_giveback_pct)
+        peak_profit = peak_profit or 0.0
+        peak_giveback_pct = peak_giveback_pct or 0.0
+        current_profit = round(float(cashout_value or 0.0) - float(entry_cost or 0.0), 4)
+        recent_delta = self.to_float(context.get("recent_delta"), 0.0) or 0.0
+        last_step_delta = self.to_float(context.get("last_step_delta"), 0.0) or 0.0
+        spread = self.to_float(context.get("spread"), None)
+        executable_exit = bool(
+            context.get("exit_price") is not None
+            and 0.0 < float(context.get("exit_price")) < 1.0
+            and (spread is None or spread <= float(AION_REVERSAL_EXIT_MAX_SPREAD))
+        )
+        small_account_threshold = float(AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT or 0.25)
+        normal_threshold = float(AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT or 0.30)
+        trail_threshold = small_account_threshold if entry_cost <= float(AION_WINNER_SCALE_MAX_TICKER_EXPOSURE or 20.0) else normal_threshold
+        opponent_recovering = bool(press_state.get("opponent_recovering"))
+        opponent_sharp_recovery = bool(press_state.get("opponent_sharp_recovery"))
+        reversal_threshold = trail_threshold
+        if opponent_sharp_recovery:
+            reversal_threshold = min(reversal_threshold, 0.15)
+        elif opponent_recovering:
+            reversal_threshold = min(reversal_threshold, 0.20)
+        peak_profit_floor = max(0.03, min(0.25, float(entry_cost or 0.0) * 0.03))
+        was_winning = bool(peak_profit >= peak_profit_floor)
+        side_stopped_improving = bool(recent_delta <= 0.0 or last_step_delta <= 0.0)
+        cashout_dropping = bool(peak_giveback_pct > 0.0 and ((cashout_value or 0.0) < (peak_value or 0.0) or last_step_delta < 0.0))
+        profit_shrinking = bool(current_profit > 0.0 and cashout_dropping)
+        trailing_exit = bool(
+            AION_REVERSAL_EXIT_ENABLED
+            and executable_exit
+            and was_winning
+            and current_profit > 0.0
+            and peak_giveback_pct >= trail_threshold
+        )
+        reversal_exit = bool(
+            AION_REVERSAL_EXIT_ENABLED
+            and executable_exit
+            and was_winning
+            and current_profit > 0.0
+            and profit_shrinking
+            and side_stopped_improving
+            and opponent_recovering
+            and peak_giveback_pct >= reversal_threshold
+        )
+        check_payload = {
+            **{key: value for key, value in context.items() if key not in {"q", "market"}},
+            "peak_value": peak_value,
+            "peak_profit": round(float(peak_profit), 4),
+            "peak_giveback_pct": round(float(peak_giveback_pct), 4),
+            "current_profit": current_profit,
+            "peak_profit_floor": round(float(peak_profit_floor), 4),
+            "trail_threshold": round(float(trail_threshold), 4),
+            "reversal_threshold": round(float(reversal_threshold), 4),
+            "was_winning": was_winning,
+            "cashout_dropping": cashout_dropping,
+            "profit_shrinking": profit_shrinking,
+            "side_stopped_improving": side_stopped_improving,
+            "opponent_recovering": opponent_recovering,
+            "opponent_sharp_recovery": opponent_sharp_recovery,
+            "exit_executable": executable_exit,
+            "momentum_press": press_state,
+        }
+        self._emit_position_management_log("AION-REVERSAL-EXIT-CHECK", check_payload)
+        if str(decision.get("action") or "").strip().lower() == "exit":
+            if decision.get("trailing_profit_exit"):
+                self._emit_position_management_log("AION-TRAILING-PROFIT-EXIT", {**check_payload, "reason": decision.get("reason")})
+            if decision.get("momentum_reversal_exit"):
+                self._emit_position_management_log("AION-REVERSAL-EXIT", {**check_payload, "reason": decision.get("reason")})
+            return decision
+        if not trailing_exit and not reversal_exit:
+            return {"action": "hold", "reason": "momentum_reversal_not_triggered", "context": context, "check": check_payload}
+        exit_reason = "trailing_profit_giveback" if trailing_exit else "momentum_reversal_profit_protect"
+        exit_decision = dict(decision)
+        exit_decision.update({
+            "ticker": context.get("ticker"),
+            "family": context.get("family"),
+            "side": context.get("side"),
+            "action": "exit",
+            "reason": exit_reason,
+            "entry_price": context.get("entry_price"),
+            "current_price": context.get("current_price"),
+            "exit_price": context.get("exit_price"),
+            "spread": context.get("spread"),
+            "count": context.get("count"),
+            "hold_seconds": context.get("hold_seconds"),
+            "pnl_per_contract": context.get("pnl_per_contract"),
+            "unrealized_pnl": current_profit,
+            "cashout_value": context.get("cashout_value"),
+            "entry_cost": entry_cost,
+            "peak_value": peak_value,
+            "peak_profit": round(float(peak_profit), 4),
+            "peak_giveback_pct": round(float(peak_giveback_pct), 4),
+            "trailing_profit_exit": bool(trailing_exit),
+            "momentum_reversal_exit": bool(reversal_exit),
+            "opponent_recovering": opponent_recovering,
+            "opponent_sharp_recovery": opponent_sharp_recovery,
+        })
+        if reversal_exit:
+            self._emit_position_management_log("AION-REVERSAL-EXIT", {**check_payload, "reason": exit_reason})
+        if trailing_exit:
+            self._emit_position_management_log("AION-TRAILING-PROFIT-EXIT", {**check_payload, "reason": exit_reason})
+        return exit_decision
 
     def _evaluate_dead_position_exit(self, position, decision, *, quotes_by_ticker=None):
         context = self._build_position_monitor_context(position, decision=decision, quotes_by_ticker=quotes_by_ticker)
@@ -47344,6 +47624,7 @@ class KalshiSniperBot:
             "max_payout_profit_lock",
             "near_expiry_profit_lock",
             "dead_position_no_improvement",
+            "momentum_reversal_profit_protect",
         }
         if reason in protective_reasons:
             return True
@@ -47360,6 +47641,7 @@ class KalshiSniperBot:
             "stop_loss_exit",
             "dead_prop_exit",
             "dead_position_exit",
+            "momentum_reversal_exit",
         )
         return any(bool(decision.get(flag)) for flag in protective_flags)
 
@@ -48326,6 +48608,13 @@ class KalshiSniperBot:
             )
             if position_flip_decision.get("action") == "exit":
                 decision = position_flip_decision
+            reversal_decision = self._evaluate_momentum_reversal_exit(
+                position,
+                decision,
+                quotes_by_ticker=quotes_by_ticker,
+            )
+            if reversal_decision.get("action") == "exit":
+                decision = reversal_decision
             scale_result = {"submitted": False, "reason": "not_attempted"}
             if not self._is_protective_position_exit_decision(decision):
                 winner_scale_attempts += 1
@@ -48407,6 +48696,8 @@ class KalshiSniperBot:
                     "winner_scale_submitted": bool(scale_result.get("submitted")),
                     "winner_scale_reason": scale_result.get("reason"),
                     "dead_position_exit": bool(decision.get("dead_position_exit")),
+                    "momentum_reversal_exit": bool(decision.get("momentum_reversal_exit")),
+                    "trailing_profit_exit": bool(decision.get("trailing_profit_exit")),
                 }
             )
         post_exit_reconcile = None

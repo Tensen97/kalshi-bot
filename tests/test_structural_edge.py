@@ -93,17 +93,29 @@ class StructuralEdgeTests(unittest.TestCase):
             "AION_WINNER_SCALE_MIN_HOLD_SECONDS": kw.AION_WINNER_SCALE_MIN_HOLD_SECONDS,
             "AION_DEAD_POSITION_EXIT_ENABLED": kw.AION_DEAD_POSITION_EXIT_ENABLED,
             "AION_DEAD_POSITION_MIN_HOLD_SECONDS": kw.AION_DEAD_POSITION_MIN_HOLD_SECONDS,
+            "AION_MOMENTUM_PRESS_ENABLED": kw.AION_MOMENTUM_PRESS_ENABLED,
+            "AION_MOMENTUM_PRESS_MIN_DELTA": kw.AION_MOMENTUM_PRESS_MIN_DELTA,
+            "AION_REVERSAL_EXIT_ENABLED": kw.AION_REVERSAL_EXIT_ENABLED,
+            "AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT": kw.AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT,
+            "AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT": kw.AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT,
         }
         kw.AION_WINNER_SCALE_ENABLED = bool(winner_enabled)
         kw.AION_WINNER_SCALE_MAX_TICKER_EXPOSURE = float(winner_cap)
         kw.AION_WINNER_SCALE_MIN_HOLD_SECONDS = float(winner_min_hold)
         kw.AION_DEAD_POSITION_EXIT_ENABLED = bool(dead_enabled)
         kw.AION_DEAD_POSITION_MIN_HOLD_SECONDS = float(dead_min_hold)
+        kw.AION_MOMENTUM_PRESS_ENABLED = True
+        kw.AION_MOMENTUM_PRESS_MIN_DELTA = 0.004
+        kw.AION_REVERSAL_EXIT_ENABLED = True
+        kw.AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT = 0.30
+        kw.AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT = 0.25
         for name, value in old_values.items():
             self.addCleanup(setattr, kw, name, value)
 
     def _configure_position_management_bot(self, bot, family="KXMLBSPREAD"):
         bot.live_exit_price_history = {}
+        bot.live_exit_peak_values = {}
+        bot.live_opponent_price_history = {}
         bot.dynamic_exit_log_markers = {}
         bot.profit_lock_log_markers = {}
         bot.sports_harvest_log_markers = {}
@@ -5258,6 +5270,149 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertAlmostEqual(bot.live_positions[0]["count"], 7.0)
         self.assertIn("medium", bot.live_positions[0]["winner_scale_tiers"])
         self.assertTrue(any(tag == "AION-WINNER-SCALE-ADD" for tag, _payload in bot.position_management_test_logs))
+        self.assertTrue(any(tag == "AION-MOMENTUM-PRESS-CHECK" and payload.get("decision") == "ALLOW" for tag, payload in bot.position_management_test_logs))
+        self.assertTrue(any(tag == "AION-MOMENTUM-PRESS-ADD" for tag, _payload in bot.position_management_test_logs))
+
+    def test_momentum_press_does_not_scale_when_opponent_recovers(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-OPPONENT-RECOVERY"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 4, "entry_ts": time.time() - 120}
+        bot.live_positions = [position]
+        bot.live_opponent_price_history = {
+            f"{ticker}|yes|opponent": [{"ts": time.time() - 30, "price": 0.38}]
+        }
+        submitted_payloads = []
+        bot.place_live_order = lambda payload: submitted_payloads.append(dict(payload)) or {"submitted": True, "reason": "submitted"}
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXMLBSPREAD",
+            yes_bid=0.56,
+            yes_ask=0.57,
+            no_bid=0.46,
+            no_ask=0.47,
+            yes_edge_after_cost=0.04,
+            yes_top_size=20,
+            no_top_size=20,
+        )
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.56,
+            "exit_price": 0.56,
+            "count": 4,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.06,
+            "unrealized_pnl": 0.24,
+            "spread": 0.01,
+            "recent_delta": 0.008,
+            "last_step_delta": 0.004,
+            "side_support": 0.08,
+        }
+
+        result = bot._maybe_scale_winning_position(position, decision, quotes_by_ticker={ticker: q}, allow_real_submit=True)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "opponent_recovering")
+        self.assertEqual(submitted_payloads, [])
+        self.assertTrue(any(tag == "AION-MOMENTUM-PRESS-CHECK" and payload.get("reason") == "opponent_recovering" for tag, payload in bot.position_management_test_logs))
+
+    def test_trailing_profit_exit_after_peak_retracement(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-TRAILING-EXIT"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 180}
+        bot.live_exit_peak_values = {
+            f"{ticker}|yes": {"ticker": ticker, "side": "yes", "peak_value": 1.40, "entry_cost": 1.00, "max_payout": 2.0}
+        }
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXMLBSPREAD",
+            yes_bid=0.62,
+            yes_ask=0.64,
+            no_bid=0.36,
+            no_ask=0.38,
+            yes_top_size=15,
+            no_top_size=15,
+        )
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.62,
+            "exit_price": 0.62,
+            "count": 2,
+            "hold_seconds": 180,
+            "pnl_per_contract": 0.12,
+            "unrealized_pnl": 0.24,
+            "spread": 0.02,
+            "recent_delta": -0.02,
+            "last_step_delta": -0.02,
+            "side_support": 0.02,
+        }
+
+        result = bot._evaluate_momentum_reversal_exit(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "trailing_profit_giveback")
+        self.assertTrue(result["trailing_profit_exit"])
+        self.assertGreater(result["unrealized_pnl"], 0.0)
+        self.assertGreaterEqual(result["peak_giveback_pct"], 0.25)
+        self.assertTrue(any(tag == "AION-TRAILING-PROFIT-EXIT" for tag, _payload in bot.position_management_test_logs))
+
+    def test_reversal_exit_preserves_profit_when_opponent_recovers(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-REVERSAL-EXIT"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 180}
+        bot.live_exit_peak_values = {
+            f"{ticker}|yes": {"ticker": ticker, "side": "yes", "peak_value": 1.20, "entry_cost": 1.00, "max_payout": 2.0}
+        }
+        bot.live_opponent_price_history = {
+            f"{ticker}|yes|opponent": [{"ts": time.time() - 30, "price": 0.34}]
+        }
+        q = SimpleNamespace(
+            ticker=ticker,
+            family="KXMLBSPREAD",
+            yes_bid=0.58,
+            yes_ask=0.60,
+            no_bid=0.42,
+            no_ask=0.44,
+            yes_top_size=20,
+            no_top_size=20,
+        )
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "entry_price": 0.50,
+            "current_price": 0.58,
+            "exit_price": 0.58,
+            "count": 2,
+            "hold_seconds": 180,
+            "pnl_per_contract": 0.08,
+            "unrealized_pnl": 0.16,
+            "spread": 0.02,
+            "recent_delta": -0.006,
+            "last_step_delta": -0.006,
+            "side_support": -0.02,
+        }
+
+        result = bot._evaluate_momentum_reversal_exit(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "momentum_reversal_profit_protect")
+        self.assertTrue(result["momentum_reversal_exit"])
+        self.assertGreater(result["unrealized_pnl"], 0.0)
+        self.assertLess(result["peak_giveback_pct"], 0.25)
+        self.assertTrue(any(tag == "AION-REVERSAL-EXIT-CHECK" for tag, _payload in bot.position_management_test_logs))
+        self.assertTrue(any(tag == "AION-REVERSAL-EXIT" for tag, _payload in bot.position_management_test_logs))
 
     def test_winner_scaling_respects_twenty_dollar_ticker_cap(self):
         self._set_position_management_config(winner_min_hold=0.0, winner_cap=20.0)
