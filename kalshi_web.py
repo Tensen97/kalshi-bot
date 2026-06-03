@@ -25692,9 +25692,15 @@ class KalshiSniperBot:
             self._emit_aion_concurrency_log("AION-TENNIS-CAP", payload)
             return {"allowed": True, "reason": "elite_tennis_cap_exception", "audit": payload}
         failed_checks = [name for name, passed in checks.items() if not passed]
-        payload.update({"decision": "BLOCK", "reason": "tennis_exposure_cap", "failed_checks": failed_checks})
+        pressure = max(0.55, min(0.75, 0.65 if checks["EV_elite"] else 0.6))
+        payload.update({
+            "decision": "ALLOW",
+            "reason": "tennis_exposure_cap",
+            "failed_checks": failed_checks,
+            "pressure_factor": pressure,
+        })
         self._emit_aion_concurrency_log("AION-TENNIS-CAP", payload)
-        return {"allowed": False, "reason": "tennis_exposure_cap", "audit": payload}
+        return {"allowed": True, "reason": "tennis_exposure_cap", "audit": payload}
 
     def _slot_allocation_candidate_sort_key(self, candidate, *, snapshot=None):
         meta = self._aion_concurrency_candidate_meta(candidate)
@@ -25841,8 +25847,8 @@ class KalshiSniperBot:
         unified_adjustment -= longshot_penalty * 0.75
         if preferred_family and family_pnl > 0.0:
             size_multiplier = max(size_multiplier, 1.25)
-        if weak_tennis and (family_pnl < 0.0 or longshot_penalty > 0.0):
-            size_multiplier = max(0.85, min(size_multiplier, 0.95))
+        if weak_tennis and longshot_penalty > 0.0:
+            size_multiplier = min(size_multiplier, 0.60)
         size_multiplier = self._family_profitability_clamp(
             size_multiplier,
             AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER,
@@ -25953,8 +25959,8 @@ class KalshiSniperBot:
             float(AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER),
             min(float(AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER), base_size_multiplier * family_size_multiplier),
         )
-        if profile.get("weak_tennis"):
-            final_size_multiplier = max(0.85, min(0.95, final_size_multiplier))
+        if profile.get("weak_tennis") and self.to_float(profile.get("longshot_penalty"), 0.0) > 0.0:
+            final_size_multiplier = min(final_size_multiplier, 0.60)
         context["size_multiplier"] = round(final_size_multiplier, 4)
         reason = str(context.get("reason") or "").strip()
         profitability_reason = f"family_profitability_{profile.get('capital_preference', 'neutral')}"
@@ -28189,6 +28195,7 @@ class KalshiSniperBot:
                 competing_candidates=getattr(self, "last_dual_lane_buy_candidates", []),
                 source=source,
             )
+            capacity_pressure = min(capacity_pressure, self.to_float((tennis_cap.get("audit") or {}).get("pressure_factor"), 1.0))
             if not tennis_cap.get("allowed", True):
                 block_reason = tennis_cap.get("reason") or "tennis_exposure_cap"
         duplicate = {"blocked": False}
