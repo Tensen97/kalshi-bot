@@ -338,6 +338,9 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-NO-SIDE-AUDIT",
     "AION-NO-SIDE-ALLOW",
     "AION-NO-SIDE-BLOCK",
+    "AION-LOSS-BUCKET-BLOCK",
+    "AION-FAMILY-BLOCK",
+    "AION-PRICE-ZONE-BLOCK",
     "AION-BIDIRECTIONAL-RANKING",
     "AION-CONFIDENCE-AUDIT",
     "AION-CONFIDENCE-BLOCK",
@@ -6914,6 +6917,213 @@ class KalshiSniperBot:
         }
         print("[AION-FINAL-REJECT] " + json.dumps(payload, sort_keys=True, default=str))
         return payload
+
+    def evaluate_loss_bucket_entry_block(
+        self,
+        payload=None,
+        q=None,
+        *,
+        market=None,
+        family=None,
+        ticker=None,
+        side=None,
+        selected_price=None,
+        selected_price_cents=None,
+        candidate_score=None,
+        source=None,
+    ):
+        payload = payload if isinstance(payload, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        action = str(payload.get("action") or DEFAULT_LIVE_ORDER_ACTION or "buy").strip().lower()
+        reduce_only = bool(
+            payload.get("reduce_only")
+            or payload.get("exit_order")
+            or payload.get("exit_reason")
+            or action in {"sell", "exit", "close"}
+        )
+        if reduce_only or action not in {"", "buy"}:
+            return {"ok": True, "blocked": False, "reason": "exit_or_non_buy_allowed"}
+
+        ticker_value = str(
+            ticker
+            or payload.get("ticker")
+            or getattr(q, "ticker", "")
+            or market.get("ticker", "")
+            or ""
+        ).strip()
+        family_value = str(
+            family
+            or payload.get("family")
+            or market.get("series_ticker")
+            or market.get("family")
+            or ""
+        ).strip().upper()
+        if not family_value and ticker_value:
+            try:
+                family_value = str(self.get_market_family(market if market else {"ticker": ticker_value}) or "").strip().upper()
+            except Exception:
+                family_value = ticker_value.split("-")[0].upper()
+        family_value = family_value or "UNKNOWN"
+        side_value = self._aion_normalize_live_side(
+            side
+            or payload.get("selected_side")
+            or payload.get("side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+            or market.get("selected_side")
+        )
+
+        def _to_cents(value):
+            numeric = self.to_float(value, None)
+            if numeric is None:
+                return None
+            try:
+                if 0.0 < float(numeric) <= 1.0:
+                    return int(round(float(numeric) * 100.0))
+                return int(round(float(numeric)))
+            except Exception:
+                return None
+
+        cents_value = _to_cents(selected_price_cents)
+        if cents_value is None:
+            cents_value = _to_cents(payload.get("selected_price_cents"))
+        if cents_value is None and side_value == "yes":
+            cents_value = _to_cents(payload.get("yes_price"))
+        if cents_value is None and side_value == "no":
+            cents_value = _to_cents(payload.get("no_price"))
+        price_value = self.to_float(
+            selected_price
+            if selected_price is not None
+            else payload.get("selected_price_dollars")
+            if payload.get("selected_price_dollars") is not None
+            else payload.get("selected_price")
+            if payload.get("selected_price") is not None
+            else payload.get("price"),
+            None,
+        )
+        if cents_value is None:
+            cents_value = _to_cents(price_value)
+        if price_value is not None and price_value > 1.0 and price_value <= 99.0:
+            price_value = round(float(price_value) / 100.0, 4)
+        if price_value is None and cents_value is not None:
+            price_value = round(float(cents_value) / 100.0, 4)
+
+        if cents_value is None:
+            price_zone = "unknown"
+        elif cents_value >= 90:
+            price_zone = "90-100"
+        else:
+            lower = max(0, int(cents_value // 10) * 10)
+            price_zone = f"{lower}-{lower + 10}"
+
+        score_value = candidate_score
+        if score_value is None:
+            for container in (payload, market):
+                for key in (
+                    "candidate_score",
+                    "unified_opportunity_score",
+                    "unified_score",
+                    "rank_score",
+                    "score",
+                    "sports_execution_quality_score",
+                    "sports_momentum_score",
+                    "EV",
+                    "edge_after_cost",
+                    "edge",
+                ):
+                    if isinstance(container, dict) and container.get(key) is not None:
+                        score_value = container.get(key)
+                        break
+                if score_value is not None:
+                    break
+        if score_value is None and q is not None:
+            for key in (
+                "candidate_score",
+                "unified_opportunity_score",
+                "unified_score",
+                "rank_score",
+                "score",
+                "sports_execution_quality_score",
+                "sports_momentum_score",
+                "EV",
+                "edge_after_cost",
+                "edge",
+            ):
+                try:
+                    score_value = getattr(q, key, None)
+                except Exception:
+                    score_value = None
+                if score_value is not None:
+                    break
+
+        block_reasons = []
+        specific_tags = []
+        if family_value in {"KXATPCHALLENGERMATCH", "KXITFWMATCH"}:
+            block_reasons.append("family_loss_bucket")
+            specific_tags.append("AION-FAMILY-BLOCK")
+        if side_value == "no":
+            block_reasons.append("no_side_loss_bucket")
+            specific_tags.append("AION-NO-SIDE-BLOCK")
+        if cents_value is not None and 30 <= int(cents_value) < 50:
+            block_reasons.append("entry_price_zone_30_50_loss_bucket")
+            specific_tags.append("AION-PRICE-ZONE-BLOCK")
+
+        if not block_reasons:
+            return {
+                "ok": True,
+                "blocked": False,
+                "reason": "loss_bucket_clear",
+                "ticker": ticker_value or None,
+                "family": family_value,
+                "side": side_value,
+                "selected_price": price_value,
+                "selected_price_cents": cents_value,
+                "price_zone": price_zone,
+            }
+
+        primary_reason = block_reasons[0]
+        log_payload = {
+            "ticker": ticker_value or None,
+            "family": family_value,
+            "side": side_value,
+            "selected_price": price_value,
+            "selected_price_cents": cents_value,
+            "price_zone": price_zone,
+            "candidate_score": score_value,
+            "block_reason": primary_reason,
+            "block_reasons": block_reasons,
+            "action": action or "buy",
+            "reduce_only": False,
+            "source": source or "loss_bucket_entry_block",
+            "responsible_subsystem": "loss_bucket_entry_block",
+        }
+        for tag in ["AION-LOSS-BUCKET-BLOCK", *specific_tags]:
+            try:
+                tag_payload = dict(log_payload)
+                if tag == "AION-FAMILY-BLOCK":
+                    tag_payload["block_reason"] = "family_loss_bucket"
+                elif tag == "AION-NO-SIDE-BLOCK":
+                    tag_payload["block_reason"] = "no_side_loss_bucket"
+                elif tag == "AION-PRICE-ZONE-BLOCK":
+                    tag_payload["block_reason"] = "entry_price_zone_30_50_loss_bucket"
+                print(f"[{tag}] " + json.dumps(tag_payload, sort_keys=True, default=str))
+            except Exception:
+                pass
+        try:
+            self._emit_aion_final_reject(
+                ticker=ticker_value,
+                family=family_value,
+                side=side_value,
+                selected_price=price_value,
+                spread=payload.get("spread") or market.get("spread"),
+                liquidity=payload.get("liquidity") or payload.get("liquidity_depth") or market.get("liquidity"),
+                volume=payload.get("volume") or market.get("volume"),
+                exact_rejection_reason="loss_bucket_block:" + "|".join(block_reasons),
+                subsystem="loss_bucket_entry_block",
+            )
+        except Exception:
+            pass
+        return dict(log_payload, ok=False, blocked=True, reason=primary_reason)
 
     def _record_live_reject_telemetry(self, *, reason, ticker=None, family=None, spread=None, stage=None, category=None, details=None, subsystem=None):
         self._record_execution_failure_audit(reason=reason, stage=stage, category=category)
@@ -61764,6 +61974,19 @@ class KalshiSniperBot:
                 "no_bid": orderbook_resolution.get("no_bid"),
             }
         )
+        loss_bucket_guard = self.evaluate_loss_bucket_entry_block(
+            sizing_context,
+            q=q,
+            market=market,
+            family=family,
+            ticker=ticker,
+            side=intended_side,
+            selected_price=sizing_context.get("selected_price_dollars") or sizing_context.get("selected_price"),
+            selected_price_cents=sizing_context.get("selected_price_cents"),
+            source=selection_stage or "build_live_order_payload",
+        )
+        if loss_bucket_guard.get("blocked"):
+            return None
         requested_count = self._resolve_dynamic_live_entry_size(
             q,
             explicit_size=size,
@@ -62083,6 +62306,20 @@ class KalshiSniperBot:
         if selected_price_cents is None or selected_price_cents < 1 or selected_price_cents > 99:
             return None
         selected_price = round(float(selected_price_cents) / 100.0, 4)
+        loss_bucket_guard = self.evaluate_loss_bucket_entry_block(
+            payload,
+            q=q,
+            market=market,
+            family=family,
+            ticker=ticker,
+            side=intended_side,
+            selected_price=selected_price,
+            selected_price_cents=selected_price_cents,
+            candidate_score=quote_diag.get("unified_opportunity_score") or quote_diag.get("candidate_score") or quote_diag.get("sports_execution_quality_score"),
+            source=selection_stage or "build_live_order_payload",
+        )
+        if loss_bucket_guard.get("blocked"):
+            return None
         if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
             return None
         def _emit_order_side_payload(payload_obj):
