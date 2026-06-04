@@ -2340,13 +2340,6 @@ AION_PI_RUN_MIN_DELTA = max(0.0005, get_env_float("AION_PI_RUN_MIN_DELTA", KALSH
 AION_PI_MAX_EXIT_SPREAD = max(0.01, get_env_float("AION_PI_MAX_EXIT_SPREAD", max(MAX_EXIT_SPREAD, 0.18)))
 AION_PI_SETTLEMENT_HOLD_PRICE = max(0.50, min(0.99, get_env_float("AION_PI_SETTLEMENT_HOLD_PRICE", 0.88)))
 AION_PI_BETTER_CANDIDATE_SCORE_DELTA = max(0.0, get_env_float("AION_PI_BETTER_CANDIDATE_SCORE_DELTA", 8.0))
-AION_POSITION_REDUCTION_COOLDOWN_SECONDS = max(60.0, get_env_float("AION_POSITION_REDUCTION_COOLDOWN_SECONDS", 600.0))
-AION_POSITION_REDUCTION_SEVERE_DRIFT = max(0.02, get_env_float("AION_POSITION_REDUCTION_SEVERE_DRIFT", 0.07))
-AION_POSITION_REDUCTION_SEVERE_LOSS_PER_CONTRACT = max(0.02, get_env_float("AION_POSITION_REDUCTION_SEVERE_LOSS_PER_CONTRACT", 0.08))
-AION_POSITION_REDUCTION_SEVERE_EDGE_DELTA = max(
-    float(AION_POSITION_FLIP_MIN_EDGE_DELTA or 0.08),
-    get_env_float("AION_POSITION_REDUCTION_SEVERE_EDGE_DELTA", 0.12),
-)
 LIVE_ORDER_RATE_LIMIT = max(1, get_env_int("LIVE_ORDER_RATE_LIMIT", get_env_int("AION_LIVE_ORDER_RATE_LIMIT", 5)))
 LIVE_ORDER_RATE_WINDOW_SEC = max(1, get_env_int("LIVE_ORDER_RATE_WINDOW_SEC", 60))
 LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
@@ -2639,7 +2632,6 @@ class KalshiSniperBot:
         self.live_pending_entry_ticker = None
         self.live_exit_cooldowns = {}
         self.live_exit_pending_tickers = set()
-        self.live_position_reduction_markers = {}
         self.live_exit_price_history = {}
         self.live_exit_peak_values = {}
         self.live_opponent_price_history = {}
@@ -48949,10 +48941,6 @@ class KalshiSniperBot:
                     "peak_value": peak_value,
                     "peak_profit": round(float(peak_profit), 4),
                     "peak_giveback_pct": round(float(peak_giveback_pct), 4),
-                    "probability_drift": drift_context,
-                    "recent_delta": recent_delta,
-                    "last_step_delta": last_step_delta,
-                    "opponent_recovery": bool(drift_context.get("opponent_recovery")),
                     "trailing_profit_exit": True,
                 },
             )
@@ -48963,13 +48951,7 @@ class KalshiSniperBot:
                 context,
                 reason="position_intelligence_fast_cut",
                 label=decision_label,
-                extra={
-                    "probability_drift": drift_context,
-                    "recent_delta": recent_delta,
-                    "last_step_delta": last_step_delta,
-                    "opponent_recovery": bool(drift_context.get("opponent_recovery")),
-                    "fast_cut_exit": True,
-                },
+                extra={"fast_cut_exit": True},
             )
         elif profit_protect:
             decision_label = "PROFIT_PROTECT"
@@ -48978,13 +48960,7 @@ class KalshiSniperBot:
                 context,
                 reason="position_intelligence_profit_protect",
                 label=decision_label,
-                extra={
-                    "probability_drift": drift_context,
-                    "recent_delta": recent_delta,
-                    "last_step_delta": last_step_delta,
-                    "opponent_recovery": bool(drift_context.get("opponent_recovery")),
-                    "profit_protect_exit": True,
-                },
+                extra={"profit_protect_exit": True},
             )
         elif stagnant_quality:
             decision_label = "CAPITAL_RECYCLE"
@@ -48993,14 +48969,7 @@ class KalshiSniperBot:
                 context,
                 reason="position_intelligence_capital_recycle",
                 label=decision_label,
-                extra={
-                    "probability_drift": drift_context,
-                    "recent_delta": recent_delta,
-                    "last_step_delta": last_step_delta,
-                    "opponent_recovery": bool(drift_context.get("opponent_recovery")),
-                    "capital_recycle_exit": True,
-                    "better_candidate": better_candidate,
-                },
+                extra={"capital_recycle_exit": True, "better_candidate": better_candidate},
             )
         elif current_profit > 0.0 and strengthening:
             decision_label = "PROFIT_RUN"
@@ -49400,219 +49369,6 @@ class KalshiSniperBot:
                 if exit_reason:
                     position["exit_reason"] = str(exit_reason)
 
-    def _live_position_reduction_severity(self, decision):
-        decision = decision if isinstance(decision, dict) else {}
-        reason = str(decision.get("reason") or "").strip().lower()
-        severe_reasons = {
-            "position_intelligence_fast_cut",
-            "adverse_fast_cut",
-            "severe_stop_loss",
-            "stop_loss",
-            "dead_prop_exit",
-            "late_game_decay_exit",
-            "stale_sports_exit",
-            "defensive_exit",
-        }
-        if reason in severe_reasons:
-            return {"severe": True, "reason": f"severe_exit_reason:{reason}"}
-        severe_flags = (
-            "fast_cut_exit",
-            "adverse_fast_cut_exit",
-            "severe_stop_loss_exit",
-            "stop_loss_exit",
-            "dead_prop_exit",
-            "late_game_decay_exit",
-            "stale_sports_exit",
-            "defensive_exit",
-        )
-        for flag in severe_flags:
-            if bool(decision.get(flag)):
-                return {"severe": True, "reason": f"severe_exit_flag:{flag}"}
-
-        severe_loss = float(AION_POSITION_REDUCTION_SEVERE_LOSS_PER_CONTRACT or 0.08)
-        pnl_per_contract = self.to_float(decision.get("pnl_per_contract"), None)
-        if pnl_per_contract is None:
-            count = abs(self.to_float(decision.get("count"), 0.0) or 0.0)
-            total_pnl = self.to_float(decision.get("unrealized_pnl"), None)
-            if count > 0 and total_pnl is not None:
-                pnl_per_contract = float(total_pnl) / float(count)
-        if pnl_per_contract is not None and float(pnl_per_contract) <= -severe_loss:
-            return {
-                "severe": True,
-                "reason": "severe_loss_per_contract",
-                "pnl_per_contract": round(float(pnl_per_contract), 4),
-                "threshold": severe_loss,
-            }
-
-        severe_drift = float(AION_POSITION_REDUCTION_SEVERE_DRIFT or 0.07)
-        raw_drift_context = decision.get("probability_drift") if decision.get("probability_drift") is not None else decision.get("drift_context")
-        drift_context = raw_drift_context if isinstance(raw_drift_context, dict) else {}
-        probability_drift = self.to_float(
-            decision.get("probability_drift_value")
-            if decision.get("probability_drift_value") is not None
-            else drift_context.get("probability_drift")
-            if isinstance(drift_context, dict) and drift_context
-            else raw_drift_context,
-            None,
-        )
-        if probability_drift is None:
-            entry_probability = self.to_float(drift_context.get("entry_probability"), None)
-            current_probability = self.to_float(drift_context.get("current_probability"), None)
-            if entry_probability is not None and current_probability is not None:
-                probability_drift = float(current_probability) - float(entry_probability)
-        recent_delta = self.to_float(
-            decision.get("recent_delta") if decision.get("recent_delta") is not None else drift_context.get("recent_delta"),
-            None,
-        )
-        last_step_delta = self.to_float(
-            decision.get("last_step_delta") if decision.get("last_step_delta") is not None else drift_context.get("last_step_delta"),
-            None,
-        )
-        opponent_recovery = bool(decision.get("opponent_recovery") or drift_context.get("opponent_recovery"))
-        if probability_drift is not None and float(probability_drift) <= -severe_drift:
-            return {
-                "severe": True,
-                "reason": "severe_probability_drift",
-                "probability_drift": round(float(probability_drift), 4),
-                "threshold": severe_drift,
-            }
-        if recent_delta is not None and float(recent_delta) <= -severe_drift:
-            return {
-                "severe": True,
-                "reason": "severe_recent_delta",
-                "recent_delta": round(float(recent_delta), 4),
-                "threshold": severe_drift,
-            }
-        if last_step_delta is not None and float(last_step_delta) <= -severe_drift:
-            return {
-                "severe": True,
-                "reason": "severe_last_step_delta",
-                "last_step_delta": round(float(last_step_delta), 4),
-                "threshold": severe_drift,
-            }
-        opponent_threshold = -max(0.02, severe_drift * 0.65)
-        if opponent_recovery and recent_delta is not None and float(recent_delta) <= opponent_threshold:
-            return {
-                "severe": True,
-                "reason": "severe_opponent_recovery",
-                "recent_delta": round(float(recent_delta), 4),
-                "threshold": round(float(opponent_threshold), 4),
-            }
-
-        severe_edge_delta = float(AION_POSITION_REDUCTION_SEVERE_EDGE_DELTA or 0.12)
-        flip_context = decision.get("position_flip") if isinstance(decision.get("position_flip"), dict) else {}
-        edge_delta = self.to_float(flip_context.get("edge_delta"), None)
-        if edge_delta is None:
-            current_edge = self.to_float(flip_context.get("current_edge"), None)
-            opposite_edge = self.to_float(flip_context.get("opposite_edge"), None)
-            if current_edge is not None and opposite_edge is not None:
-                edge_delta = float(opposite_edge) - float(current_edge)
-        if edge_delta is not None and float(edge_delta) >= severe_edge_delta:
-            return {
-                "severe": True,
-                "reason": "severe_opposite_edge_delta",
-                "edge_delta": round(float(edge_delta), 4),
-                "threshold": severe_edge_delta,
-            }
-        return {
-            "severe": False,
-            "reason": "nonsevere_reduction",
-            "pnl_per_contract": None if pnl_per_contract is None else round(float(pnl_per_contract), 4),
-            "probability_drift": None if probability_drift is None else round(float(probability_drift), 4),
-            "recent_delta": None if recent_delta is None else round(float(recent_delta), 4),
-            "last_step_delta": None if last_step_delta is None else round(float(last_step_delta), 4),
-            "edge_delta": None if edge_delta is None else round(float(edge_delta), 4),
-        }
-
-    def _recent_live_position_reduction_marker(self, ticker, *, now_ts=None):
-        ticker = str(ticker or "").strip()
-        if not ticker:
-            return None
-        now_ts = time.time() if now_ts is None else float(now_ts)
-        cooldown_seconds = float(AION_POSITION_REDUCTION_COOLDOWN_SECONDS or LIVE_EXIT_COOLDOWN_SECONDS or 60)
-        candidates = []
-        markers = getattr(self, "live_position_reduction_markers", None)
-        if not isinstance(markers, dict):
-            self.live_position_reduction_markers = {}
-            markers = self.live_position_reduction_markers
-        marker = markers.get(ticker)
-        if isinstance(marker, dict):
-            marker_ts = self.to_float(marker.get("ts"), None)
-            if marker_ts is not None and now_ts - float(marker_ts) < cooldown_seconds:
-                candidates.append({**marker, "source": marker.get("source") or "memory", "ts": float(marker_ts)})
-            elif marker_ts is not None and now_ts - float(marker_ts) >= cooldown_seconds:
-                markers.pop(ticker, None)
-
-        state_entry = None
-        if callable(getattr(self, "load_live_position_state", None)):
-            try:
-                state = self.load_live_position_state()
-                state_entry = state.get(ticker) if isinstance(state, dict) and isinstance(state.get(ticker), dict) else None
-            except Exception:
-                state_entry = None
-        if isinstance(state_entry, dict):
-            pending_ts = self.to_float(state_entry.get("exit_pending_ts"), None)
-            status = str(state_entry.get("status") or "").strip().lower()
-            if pending_ts is not None and status == "exit_pending" and now_ts - float(pending_ts) < cooldown_seconds:
-                candidates.append(
-                    {
-                        "source": "state",
-                        "ts": float(pending_ts),
-                        "reason": state_entry.get("exit_reason"),
-                        "price": state_entry.get("exit_pending_price") or state_entry.get("exit_price"),
-                        "order_id": state_entry.get("exit_order_id"),
-                    }
-                )
-        if not candidates:
-            return None
-        latest = max(candidates, key=lambda item: float(item.get("ts") or 0.0))
-        latest["age_seconds"] = round(max(0.0, now_ts - float(latest.get("ts") or now_ts)), 3)
-        latest["cooldown_remaining"] = round(max(0.0, cooldown_seconds - float(latest["age_seconds"])), 3)
-        latest["cooldown_seconds"] = cooldown_seconds
-        return latest
-
-    def _should_defer_live_position_reduction(self, ticker, decision, *, now_ts=None):
-        ticker = str(ticker or "").strip()
-        if not ticker:
-            return {"defer": False, "reason": "missing_ticker"}
-        now_ts = time.time() if now_ts is None else float(now_ts)
-        severity = self._live_position_reduction_severity(decision)
-        if bool(severity.get("severe")):
-            return {"defer": False, "reason": "severe_reduction_bypass", "severity": severity}
-        marker = self._recent_live_position_reduction_marker(ticker, now_ts=now_ts)
-        if not marker:
-            return {"defer": False, "reason": "no_recent_reduction", "severity": severity}
-        return {
-            "defer": True,
-            "reason": "position_reduction_cooldown_active",
-            "ticker": ticker,
-            "marker": marker,
-            "severity": severity,
-            "cooldown_remaining": marker.get("cooldown_remaining"),
-            "cooldown_seconds": marker.get("cooldown_seconds"),
-        }
-
-    def _mark_recent_live_position_reduction(self, ticker, decision=None, payload=None, result=None, *, now_ts=None):
-        ticker = str(ticker or "").strip()
-        if not ticker:
-            return
-        markers = getattr(self, "live_position_reduction_markers", None)
-        if not isinstance(markers, dict):
-            self.live_position_reduction_markers = {}
-            markers = self.live_position_reduction_markers
-        decision = decision if isinstance(decision, dict) else {}
-        payload = payload if isinstance(payload, dict) else {}
-        result = result if isinstance(result, dict) else {}
-        markers[ticker] = {
-            "source": "memory",
-            "ts": time.time() if now_ts is None else float(now_ts),
-            "reason": decision.get("reason"),
-            "position_intelligence_label": decision.get("position_intelligence_label"),
-            "count": payload.get("count") or decision.get("count"),
-            "price": payload.get("price") or decision.get("exit_price"),
-            "order_id": (((result.get("response") or {}) if isinstance(result.get("response"), dict) else {}).get("order_id") or result.get("order_id")),
-        }
-
     def submit_live_exit_order(self, position, decision):
         position = position if isinstance(position, dict) else {}
         decision = decision if isinstance(decision, dict) else {}
@@ -49628,29 +49384,6 @@ class KalshiSniperBot:
         recent_order = self.recent_submitted_order_for_ticker(ticker, window_seconds=LIVE_EXIT_COOLDOWN_SECONDS)
         if recent_order:
             return {"submitted": False, "reason": "recent_order_pending_confirmation", "recent_order": recent_order}
-        reduction_defer = self._should_defer_live_position_reduction(ticker, decision, now_ts=now_ts)
-        if reduction_defer.get("defer"):
-            log_payload = {
-                "ticker": ticker,
-                "family": decision.get("family") or position.get("family"),
-                "side": decision.get("side") or position.get("side"),
-                "count": decision.get("count") or position.get("count"),
-                "exit_reason": decision.get("reason"),
-                "position_intelligence_label": decision.get("position_intelligence_label"),
-                "cooldown_remaining": reduction_defer.get("cooldown_remaining"),
-                "cooldown_seconds": reduction_defer.get("cooldown_seconds"),
-                "marker": reduction_defer.get("marker"),
-                "severity": reduction_defer.get("severity"),
-                "reason": reduction_defer.get("reason"),
-            }
-            self._emit_position_management_log("AION-REDUCTION-COOLDOWN-HOLD", log_payload)
-            return {
-                "submitted": False,
-                "reason": "position_reduction_cooldown_active",
-                "cooldown_remaining": reduction_defer.get("cooldown_remaining"),
-                "cooldown_seconds": reduction_defer.get("cooldown_seconds"),
-                "severity": reduction_defer.get("severity"),
-            }
         payload = self._build_live_exit_order_payload(position, decision)
         if not payload:
             return {"submitted": False, "reason": "invalid_exit_payload"}
@@ -49689,7 +49422,6 @@ class KalshiSniperBot:
             if result.get("submitted"):
                 self._live_order_timestamps.append(time.time())
                 self.live_exit_cooldowns[ticker] = time.time() + float(LIVE_EXIT_COOLDOWN_SECONDS or 60)
-                self._mark_recent_live_position_reduction(ticker, decision=decision, payload=payload, result=result)
                 self._mark_live_exit_pending(
                     ticker,
                     order_id=order_id,

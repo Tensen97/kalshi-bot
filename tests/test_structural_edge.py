@@ -74,7 +74,6 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.position_flip_log_markers = {}
         bot.live_exit_cooldowns = {}
         bot.live_exit_pending_tickers = set()
-        bot.live_position_reduction_markers = {}
         bot.get_live_entry_metadata = lambda _ticker: {}
         bot.get_live_market_detail = lambda _ticker: {}
         bot.get_market_family = lambda _market: family
@@ -155,7 +154,6 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.position_flip_log_markers = {}
         bot.live_exit_cooldowns = {}
         bot.live_exit_pending_tickers = set()
-        bot.live_position_reduction_markers = {}
         bot.winner_scale_state = {}
         bot._live_order_timestamps = []
         bot.live_trade_count_today = 0
@@ -5953,66 +5951,6 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["submitted"])
         self.assertIn("[EXIT_SUBMITTED]", out.getvalue())
         self.assertIn("PROFIT_PROTECT", out.getvalue())
-
-    def test_recent_nonsevere_position_reduction_is_deferred(self):
-        bot = self._configure_position_management_bot(self._make_bot(), family="KXITFWMATCH")
-        ticker = "KXITFWMATCH-REDUCE-COOLDOWN"
-        now_ts = time.time()
-        bot.live_position_reduction_markers[ticker] = {
-            "ts": now_ts - 90.0,
-            "reason": "trailing_profit_giveback",
-            "count": 1,
-            "price": 0.51,
-        }
-        decision = {
-            "ticker": ticker,
-            "family": "KXITFWMATCH",
-            "side": "yes",
-            "action": "exit",
-            "reason": "position_intelligence_profit_protect",
-            "count": 1,
-            "pnl_per_contract": 0.01,
-            "unrealized_pnl": 0.01,
-        }
-
-        result = bot._should_defer_live_position_reduction(ticker, decision, now_ts=now_ts)
-
-        self.assertTrue(result["defer"])
-        self.assertEqual(result["reason"], "position_reduction_cooldown_active")
-        self.assertGreater(result["cooldown_remaining"], 0)
-        self.assertFalse(result["severity"]["severe"])
-
-    def test_severe_position_reduction_bypasses_recent_cooldown(self):
-        bot = self._configure_position_management_bot(self._make_bot(), family="KXITFWMATCH")
-        ticker = "KXITFWMATCH-SEVERE-REDUCE"
-        now_ts = time.time()
-        bot.live_position_reduction_markers[ticker] = {
-            "ts": now_ts - 90.0,
-            "reason": "trailing_profit_giveback",
-            "count": 1,
-            "price": 0.51,
-        }
-        decision = {
-            "ticker": ticker,
-            "family": "KXITFWMATCH",
-            "side": "yes",
-            "action": "exit",
-            "reason": "position_intelligence_profit_protect",
-            "count": 1,
-            "pnl_per_contract": -0.01,
-            "unrealized_pnl": -0.01,
-            "probability_drift": {
-                "probability_drift": -0.09,
-                "recent_delta": -0.09,
-                "opponent_recovery": True,
-            },
-        }
-
-        result = bot._should_defer_live_position_reduction(ticker, decision, now_ts=now_ts)
-
-        self.assertFalse(result["defer"])
-        self.assertEqual(result["reason"], "severe_reduction_bypass")
-        self.assertTrue(result["severity"]["severe"])
 
     def test_winner_scaling_respects_twenty_dollar_ticker_cap(self):
         self._set_position_management_config(winner_min_hold=0.0, winner_cap=20.0)
