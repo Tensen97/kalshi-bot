@@ -469,6 +469,16 @@ def _load_persisted_live_exit_peak(bot, ticker, side):
         "entry_cost": bot.to_float(entry.get("live_exit_peak_entry_cost"), None),
         "max_payout": bot.to_float(entry.get("live_exit_peak_max_payout"), None),
         "updated_ts": bot.to_float(entry.get("live_exit_peak_updated_ts"), 0.0) or 0.0,
+        "mfe_value": bot.to_float(entry.get("live_exit_mfe_value"), peak_value),
+        "mfe_profit": bot.to_float(entry.get("live_exit_mfe_profit"), None),
+        "mfe_timestamp": bot.to_float(entry.get("live_exit_mfe_timestamp"), None),
+        "mae_value": bot.to_float(entry.get("live_exit_mae_value"), None),
+        "mae_loss": bot.to_float(entry.get("live_exit_mae_loss"), None),
+        "mae_timestamp": bot.to_float(entry.get("live_exit_mae_timestamp"), None),
+        "best_cashout_price": bot.to_float(entry.get("live_exit_best_cashout_price"), None),
+        "worst_cashout_price": bot.to_float(entry.get("live_exit_worst_cashout_price"), None),
+        "observation_count": int(bot.to_float(entry.get("live_exit_observation_count"), 0.0) or 0),
+        "last_observed_price": bot.to_float(entry.get("live_exit_last_observed_price"), None),
         "source": "live_position_state",
     }
 
@@ -510,6 +520,25 @@ def _persist_live_exit_peak_value(bot, ticker, side, peak_record):
     updated_entry["live_exit_peak_entry_cost"] = round(float(bot.to_float(peak_record.get("entry_cost"), 0.0) or 0.0), 4)
     updated_entry["live_exit_peak_max_payout"] = round(float(bot.to_float(peak_record.get("max_payout"), 0.0) or 0.0), 4)
     updated_entry["live_exit_peak_updated_ts"] = updated_ts
+    for source_key, state_key in (
+        ("mfe_value", "live_exit_mfe_value"),
+        ("mfe_profit", "live_exit_mfe_profit"),
+        ("mfe_timestamp", "live_exit_mfe_timestamp"),
+        ("mae_value", "live_exit_mae_value"),
+        ("mae_loss", "live_exit_mae_loss"),
+        ("mae_timestamp", "live_exit_mae_timestamp"),
+        ("best_cashout_price", "live_exit_best_cashout_price"),
+        ("worst_cashout_price", "live_exit_worst_cashout_price"),
+        ("observation_count", "live_exit_observation_count"),
+        ("last_observed_price", "live_exit_last_observed_price"),
+    ):
+        value = peak_record.get(source_key)
+        if value is None:
+            continue
+        if source_key == "observation_count":
+            updated_entry[state_key] = int(bot.to_float(value, 0.0) or 0)
+        else:
+            updated_entry[state_key] = round(float(bot.to_float(value, 0.0) or 0.0), 4)
     state[ticker] = updated_entry
     try:
         bot.save_live_position_state(dict(state))
@@ -536,35 +565,77 @@ def update_live_exit_peak_value(bot, *, ticker, side, entry_cost, current_value,
             peak_map[key] = dict(persisted_previous)
             bot.live_exit_peak_values = peak_map
     previous_peak = bot.to_float(previous.get("peak_value"), None)
-    if previous_peak is None or observed_value > previous_peak + 0.005:
-        peak_record = {
-            "ticker": ticker,
-            "side": side,
-            "peak_value": round(float(observed_value), 4),
-            "entry_cost": round(float(entry_cost or 0.0), 4),
-            "max_payout": round(float(max_payout or 0.0), 4),
-            "updated_ts": now_ts,
-        }
-        peak_map[key] = peak_record
-        bot.live_exit_peak_values = peak_map
-        peak_value = float(observed_value)
-        updated = True
-        _persist_live_exit_peak_value(bot, ticker, side, peak_record)
-    else:
-        peak_value = float(previous_peak)
-        updated = False
-        _persist_live_exit_peak_value(bot, ticker, side, previous)
     entry_cost = bot.to_float(entry_cost, 0.0) or 0.0
+    max_payout = bot.to_float(max_payout, 0.0) or 0.0
+    observed_price = None
+    if max_payout > 0.0:
+        observed_price = max(0.0, min(1.0, float(observed_value) / float(max_payout)))
+    elif 0.0 <= float(observed_value) <= 1.0:
+        observed_price = float(observed_value)
+
+    previous_mae_value = bot.to_float(previous.get("mae_value"), None)
+    previous_mfe_ts = bot.to_float(previous.get("mfe_timestamp"), None)
+    previous_mae_ts = bot.to_float(previous.get("mae_timestamp"), None)
+    previous_best_price = bot.to_float(previous.get("best_cashout_price"), None)
+    previous_worst_price = bot.to_float(previous.get("worst_cashout_price"), None)
+    observation_count = int(bot.to_float(previous.get("observation_count"), 0.0) or 0) + 1
+
+    mfe_updated = previous_peak is None or observed_value > previous_peak + 0.005
+    mae_updated = previous_mae_value is None or observed_value < previous_mae_value - 0.005
+    peak_value = float(observed_value) if mfe_updated else float(previous_peak)
+    mae_value = float(observed_value) if mae_updated else float(previous_mae_value)
+    mfe_timestamp = now_ts if mfe_updated else previous_mfe_ts
+    mae_timestamp = now_ts if mae_updated else previous_mae_ts
+
+    if observed_price is not None:
+        if previous_best_price is None or observed_price > previous_best_price:
+            best_cashout_price = observed_price
+        else:
+            best_cashout_price = previous_best_price
+        if previous_worst_price is None or observed_price < previous_worst_price:
+            worst_cashout_price = observed_price
+        else:
+            worst_cashout_price = previous_worst_price
+    else:
+        best_cashout_price = previous_best_price
+        worst_cashout_price = previous_worst_price
+
     current_profit = max(0.0, float(observed_value) - float(entry_cost))
     peak_profit = max(0.0, float(peak_value) - float(entry_cost))
+    mae_loss = max(0.0, float(entry_cost) - float(mae_value))
     peak_giveback_pct = 0.0
     if peak_profit > 0.0:
         peak_giveback_pct = max(0.0, min(1.0, (peak_profit - current_profit) / peak_profit))
-    return {
+    peak_record = {
+        "ticker": ticker,
+        "side": side,
         "peak_value": round(float(peak_value), 4),
+        "entry_cost": round(float(entry_cost or 0.0), 4),
+        "max_payout": round(float(max_payout or 0.0), 4),
+        "updated_ts": now_ts,
+        "mfe_value": round(float(peak_value), 4),
         "peak_profit": round(float(peak_profit), 4),
+        "mfe_profit": round(float(peak_profit), 4),
+        "mfe_timestamp": mfe_timestamp,
+        "mae_value": round(float(mae_value), 4),
+        "mae_loss": round(float(mae_loss), 4),
+        "mae_timestamp": mae_timestamp,
+        "best_cashout_price": round(float(best_cashout_price), 4) if best_cashout_price is not None else None,
+        "worst_cashout_price": round(float(worst_cashout_price), 4) if worst_cashout_price is not None else None,
+        "observation_count": observation_count,
+        "last_observed_price": round(float(observed_price), 4) if observed_price is not None else None,
+    }
+    peak_map[key] = peak_record
+    bot.live_exit_peak_values = peak_map
+    updated = bool(mfe_updated or mae_updated)
+    if updated or observation_count == 1 or observation_count % 20 == 0:
+        _persist_live_exit_peak_value(bot, ticker, side, peak_record)
+    return {
+        **peak_record,
         "peak_giveback_pct": round(float(peak_giveback_pct), 4),
         "updated": bool(updated),
+        "mfe_updated": bool(mfe_updated),
+        "mae_updated": bool(mae_updated),
         "observed_value": round(float(observed_value), 4),
     }
 

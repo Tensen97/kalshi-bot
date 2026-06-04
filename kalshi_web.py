@@ -451,6 +451,10 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-FAMILY-CAPITAL",
     "AION-ADAPTIVE-EXIT",
     "AION-WINNER-LOSER-PROFILE",
+    "AION-MFE-MAE",
+    "AION-TRADE-GRADE",
+    "AION-EXIT-GRADE-DETAIL",
+    "AION-LEARNED-THRESHOLD-UPDATE",
     "AION-REALLOCATE",
     "AION-SIZE-UP",
     "AION-SIZE-DOWN",
@@ -48256,9 +48260,10 @@ class KalshiSniperBot:
 
     def _aion_profit_engine_default_state(self):
         return {
-            "version": 1,
+            "version": 2,
             "pending": {},
             "completed": [],
+            "family_learning": {},
             "last_grade_ts": 0.0,
             "summary": {},
         }
@@ -48276,6 +48281,7 @@ class KalshiSniperBot:
         loaded = {**default, **loaded}
         loaded["pending"] = loaded.get("pending") if isinstance(loaded.get("pending"), dict) else {}
         loaded["completed"] = loaded.get("completed") if isinstance(loaded.get("completed"), list) else []
+        loaded["family_learning"] = loaded.get("family_learning") if isinstance(loaded.get("family_learning"), dict) else {}
         loaded["summary"] = loaded.get("summary") if isinstance(loaded.get("summary"), dict) else {}
         self.aion_profit_engine_state = loaded
         return loaded
@@ -48312,6 +48318,284 @@ class KalshiSniperBot:
                 break
         return records
 
+    def _aion_price_zone(self, selected_price):
+        price = self._opportunity_price_dollars(selected_price)
+        if price is None:
+            return "unknown"
+        if price <= 0.25:
+            return "low"
+        if price >= 0.75:
+            return "high"
+        return "mid"
+
+    def _aion_exit_learning_bucket_key(self, *, family=None, side=None, selected_price=None):
+        family_key = self._normalize_family_for_profit_memory(family) if family else "UNKNOWN"
+        side_key = self._normalize_live_side(side) or "unknown"
+        price_zone = self._aion_price_zone(selected_price)
+        return f"{family_key}|{side_key}|{price_zone}", family_key, side_key, price_zone
+
+    def _aion_family_learning_summary(self, *, family=None, side=None, selected_price=None):
+        state = self._load_aion_profit_engine_state()
+        key, family_key, side_key, price_zone = self._aion_exit_learning_bucket_key(
+            family=family,
+            side=side,
+            selected_price=selected_price,
+        )
+        learning = state.get("family_learning") if isinstance(state.get("family_learning"), dict) else {}
+        bucket = learning.get(key) if isinstance(learning.get(key), dict) else {}
+        return {
+            "bucket_key": key,
+            "family": family_key,
+            "side": side_key,
+            "price_zone": price_zone,
+            "samples": int(self.to_float(bucket.get("samples"), 0.0) or 0),
+            "realized_pnl_ewma": self._safe_round(bucket.get("realized_pnl_ewma"), 5, 0.0),
+            "pnl_per_dollar_ewma": self._safe_round(bucket.get("pnl_per_dollar_ewma"), 5, 0.0),
+            "win_rate_ewma": self._safe_round(bucket.get("win_rate_ewma"), 5, None),
+            "avg_hold_seconds_ewma": self._safe_round(bucket.get("avg_hold_seconds_ewma"), 3, None),
+            "mfe_capture_ratio_ewma": self._safe_round(bucket.get("mfe_capture_ratio_ewma"), 5, None),
+            "mae_recovery_ratio_ewma": self._safe_round(bucket.get("mae_recovery_ratio_ewma"), 5, None),
+            "fill_quality_ewma": self._safe_round(bucket.get("fill_quality_ewma"), 5, None),
+            "exit_quality_ewma": self._safe_round(bucket.get("exit_quality_ewma"), 5, 0.0),
+            "protected_profit_value_ewma": self._safe_round(bucket.get("protected_profit_value_ewma"), 5, 0.0),
+            "missed_profit_value_ewma": self._safe_round(bucket.get("missed_profit_value_ewma"), 5, 0.0),
+            "saved_loss_value_ewma": self._safe_round(bucket.get("saved_loss_value_ewma"), 5, 0.0),
+            "good_recycle_ewma": self._safe_round(bucket.get("good_recycle_ewma"), 5, 0.0),
+            "bad_recycle_ewma": self._safe_round(bucket.get("bad_recycle_ewma"), 5, 0.0),
+            "family_learning_score": self._safe_round(bucket.get("family_learning_score"), 5, 0.0),
+            "family_learning_size_multiplier": self._safe_round(bucket.get("family_learning_size_multiplier"), 4, 1.0),
+            "capital_preference": bucket.get("capital_preference") or "neutral",
+            "updated_ts": bucket.get("updated_ts"),
+        }
+
+    def _aion_family_learning_multiplier(self, summary):
+        summary = summary if isinstance(summary, dict) else {}
+        score = self.to_float(summary.get("family_learning_score"), 0.0) or 0.0
+        samples = int(self.to_float(summary.get("samples"), 0.0) or 0)
+        if samples <= 0:
+            return 1.0
+        if score >= 0.18:
+            return round(self._family_profitability_clamp(1.10 + min(0.15, score * 0.30), 1.10, 1.25), 4)
+        if score <= -0.12:
+            return round(self._family_profitability_clamp(0.90 + max(-0.20, score * 0.30), 0.70, 0.90), 4)
+        return round(self._family_profitability_clamp(1.0 + score * 0.25, 0.95, 1.08), 4)
+
+    def _aion_update_family_exit_learning(self, state, graded):
+        state = state if isinstance(state, dict) else self._load_aion_profit_engine_state()
+        graded = graded if isinstance(graded, dict) else {}
+        key, family_key, side_key, price_zone = self._aion_exit_learning_bucket_key(
+            family=graded.get("family"),
+            side=graded.get("side"),
+            selected_price=graded.get("entry_price") if graded.get("entry_price") is not None else graded.get("exit_price"),
+        )
+        learning = state.get("family_learning") if isinstance(state.get("family_learning"), dict) else {}
+        bucket = dict(learning.get(key) or {})
+        samples = int(self.to_float(bucket.get("samples"), 0.0) or 0) + 1
+        alpha = 0.32 if samples <= 2 else max(0.12, min(0.28, 2.0 / (min(samples, 18) + 1.0)))
+
+        def ewma(field, value, default=0.0):
+            numeric = self.to_float(value, None)
+            if numeric is None:
+                return self.to_float(bucket.get(field), default)
+            previous = self.to_float(bucket.get(field), numeric)
+            if previous is None:
+                previous = numeric
+            return float(previous) + alpha * (float(numeric) - float(previous))
+
+        labels = set(str(label or "").strip().lower() for label in (graded.get("grade_labels") or []))
+        exit_pnl = self.to_float(graded.get("exit_pnl"), 0.0) or 0.0
+        count = self.to_float(graded.get("count"), 0.0) or 0.0
+        entry_price = self._position_flip_price_value(graded.get("entry_price"))
+        entry_cost = self.to_float(graded.get("entry_cost"), None)
+        if entry_cost is None and entry_price is not None:
+            entry_cost = float(entry_price) * float(count)
+        deployed = max(0.01, abs(self.to_float(entry_cost, 0.0) or 0.0))
+        pnl_per_dollar = exit_pnl / deployed
+        win_value = 1.0 if exit_pnl > 0.0 else 0.0
+        recycle_good = 1.0 if "recycled_capital_well" in labels else 0.0
+        recycle_bad = 1.0 if "recycled_capital_poorly" in labels else 0.0
+
+        bucket.update(
+            {
+                "bucket_key": key,
+                "family": family_key,
+                "side": side_key,
+                "price_zone": price_zone,
+                "samples": samples,
+                "realized_pnl_ewma": round(ewma("realized_pnl_ewma", exit_pnl), 5),
+                "pnl_per_dollar_ewma": round(ewma("pnl_per_dollar_ewma", pnl_per_dollar), 5),
+                "win_rate_ewma": round(ewma("win_rate_ewma", win_value, win_value), 5),
+                "avg_hold_seconds_ewma": round(ewma("avg_hold_seconds_ewma", graded.get("hold_seconds"), graded.get("hold_seconds") or 0.0), 3),
+                "mfe_capture_ratio_ewma": round(ewma("mfe_capture_ratio_ewma", graded.get("mfe_capture_ratio"), graded.get("mfe_capture_ratio") or 0.0), 5),
+                "mae_recovery_ratio_ewma": round(ewma("mae_recovery_ratio_ewma", graded.get("mae_recovery_ratio"), graded.get("mae_recovery_ratio") or 0.0), 5),
+                "fill_quality_ewma": round(ewma("fill_quality_ewma", graded.get("fill_quality"), graded.get("fill_quality") or 1.0), 5),
+                "exit_quality_ewma": round(ewma("exit_quality_ewma", graded.get("decision_quality_score"), graded.get("decision_quality_score") or 0.0), 5),
+                "protected_profit_value_ewma": round(ewma("protected_profit_value_ewma", graded.get("protected_profit_value"), 0.0), 5),
+                "missed_profit_value_ewma": round(ewma("missed_profit_value_ewma", graded.get("missed_profit_value"), 0.0), 5),
+                "saved_loss_value_ewma": round(ewma("saved_loss_value_ewma", graded.get("saved_loss_value"), 0.0), 5),
+                "good_recycle_ewma": round(ewma("good_recycle_ewma", recycle_good), 5),
+                "bad_recycle_ewma": round(ewma("bad_recycle_ewma", recycle_bad), 5),
+                "updated_ts": time.time(),
+            }
+        )
+        pnl_signal = self._family_profitability_clamp((bucket.get("pnl_per_dollar_ewma") or 0.0) * 8.0, -1.0, 1.0)
+        win_signal = self._family_profitability_clamp(((bucket.get("win_rate_ewma") or 0.5) - 0.5) * 2.0, -1.0, 1.0)
+        exit_signal = self._family_profitability_clamp(bucket.get("exit_quality_ewma") or 0.0, -1.0, 1.0)
+        capture_signal = self._family_profitability_clamp(((bucket.get("mfe_capture_ratio_ewma") or 0.0) - 0.45) * 1.4, -1.0, 1.0)
+        recycle_signal = self._family_profitability_clamp((bucket.get("good_recycle_ewma") or 0.0) - (bucket.get("bad_recycle_ewma") or 0.0), -1.0, 1.0)
+        score = (
+            pnl_signal * 0.34
+            + win_signal * 0.22
+            + exit_signal * 0.26
+            + capture_signal * 0.10
+            + recycle_signal * 0.08
+        )
+        sample_factor = min(1.0, max(0.20, samples / 5.0))
+        score = self._family_profitability_clamp(score * sample_factor, -1.0, 1.0)
+        bucket["family_learning_score"] = round(score, 5)
+        bucket["sample_factor"] = round(sample_factor, 4)
+        bucket["family_learning_size_multiplier"] = self._aion_family_learning_multiplier({**bucket, "samples": samples, "family_learning_score": score})
+        bucket["capital_preference"] = "strong" if score >= 0.18 else "weak" if score <= -0.12 else "neutral"
+        learning[key] = bucket
+        state["family_learning"] = learning
+        return dict(bucket)
+
+    def _aion_exit_grade_horizons(self, record):
+        record = record if isinstance(record, dict) else {}
+        sport_state = record.get("sport_state") if isinstance(record.get("sport_state"), dict) else {}
+        sport = str(record.get("sport") or sport_state.get("sport") or "").strip().lower()
+        if sport == "tennis":
+            return [30.0, 90.0, 180.0]
+        if sport in {"mlb", "basketball"}:
+            return [60.0, 180.0, 300.0]
+        return [60.0, 180.0, 300.0]
+
+    def _aion_exit_grade_label_upper(self, label):
+        return str(label or "").strip().upper()
+
+    def _aion_build_exit_horizon_grade(self, record, context, *, current_price, horizon_seconds, age):
+        record = record if isinstance(record, dict) else {}
+        context = context if isinstance(context, dict) else {}
+        exit_price = self._position_flip_price_value(record.get("exit_price"))
+        current_price = self._position_flip_price_value(current_price)
+        if exit_price is None or current_price is None:
+            return None
+        count = self.to_float(record.get("count"), 0.0) or 0.0
+        exit_pnl = self.to_float(record.get("exit_pnl"), 0.0) or 0.0
+        move_after_exit = round(float(current_price) - float(exit_price), 4)
+        min_move = float(AION_EXIT_OUTCOME_MIN_MARKET_MOVE or 0.015)
+        good_move = float(AION_EXIT_OUTCOME_GOOD_MARKET_MOVE or 0.035)
+        mfe_profit = self.to_float(record.get("mfe_profit"), self.to_float(record.get("peak_profit"), None))
+        mae_loss = self.to_float(record.get("mae_loss"), None)
+        labels = []
+        if exit_pnl > 0.0 and move_after_exit <= -min_move:
+            labels.append("protected_profit")
+        if exit_pnl <= 0.0 and move_after_exit <= -min_move:
+            labels.append("saved_loss")
+        if move_after_exit >= min_move:
+            labels.append("exited_too_early")
+            labels.append("missed_profit")
+        if move_after_exit >= good_move or (current_price >= 0.88 and move_after_exit > 0.0):
+            labels.append("would_have_settled_better")
+        if move_after_exit <= -good_move or (current_price <= 0.08 and move_after_exit < 0.0):
+            labels.append("would_have_decayed_to_zero")
+        mfe_capture_ratio = None
+        if mfe_profit is not None and float(mfe_profit) > 0.0:
+            mfe_capture_ratio = self._family_profitability_clamp(exit_pnl / max(0.0001, float(mfe_profit)), 0.0, 1.25)
+            if float(mfe_profit) >= min_move * max(1.0, count) and mfe_capture_ratio <= 0.35:
+                labels.append("exited_too_late")
+        mae_recovery_ratio = None
+        if mae_loss is not None and float(mae_loss) > 0.0:
+            mae_recovery_ratio = self._family_profitability_clamp((exit_pnl + float(mae_loss)) / max(0.0001, float(mae_loss)), 0.0, 1.25)
+        if bool(record.get("better_candidate_available")):
+            if move_after_exit <= min_move:
+                labels.append("recycled_capital_well")
+            elif move_after_exit >= good_move:
+                labels.append("recycled_capital_poorly")
+        if not labels:
+            labels.append("neutral_exit")
+
+        decision_quality_score = 0.0
+        for label in labels:
+            if label in {"protected_profit", "saved_loss"}:
+                decision_quality_score += 1.0
+            elif label in {"would_have_decayed_to_zero", "recycled_capital_well"}:
+                decision_quality_score += 0.7
+            elif label in {"exited_too_early", "exited_too_late"}:
+                decision_quality_score -= 1.0
+            elif label in {"missed_profit", "would_have_settled_better", "recycled_capital_poorly"}:
+                decision_quality_score -= 0.7
+        protected_profit_value = max(0.0, -move_after_exit) * count if exit_pnl > 0.0 else 0.0
+        saved_loss_value = max(0.0, -move_after_exit) * count if exit_pnl <= 0.0 else 0.0
+        missed_profit_value = max(0.0, move_after_exit) * count
+        spread = self.to_float(record.get("spread_at_exit"), self.to_float(context.get("spread"), None))
+        fill_quality = 1.0
+        if spread is not None:
+            fill_quality = max(0.0, min(1.0, 1.0 - max(0.0, float(spread) - 0.02) * 4.0))
+        return {
+            "horizon_seconds": round(float(horizon_seconds), 3),
+            "grade_age_seconds": round(float(age), 3),
+            "market_price_after_exit": self._safe_round(current_price, 4, None),
+            "move_after_exit": round(move_after_exit, 4),
+            "grade_labels": sorted(set(labels)),
+            "grade_labels_upper": sorted({self._aion_exit_grade_label_upper(label) for label in labels}),
+            "protected_profit_value": round(float(protected_profit_value), 4),
+            "saved_loss_value": round(float(saved_loss_value), 4),
+            "missed_profit_value": round(float(missed_profit_value), 4),
+            "mfe_capture_ratio": self._safe_round(mfe_capture_ratio, 4, None),
+            "mae_recovery_ratio": self._safe_round(mae_recovery_ratio, 4, None),
+            "decision_quality_score": round(float(decision_quality_score), 4),
+            "fill_quality": round(float(fill_quality), 4),
+            "capital_recycle_grade": "GOOD_RECYCLE" if "recycled_capital_well" in labels else "BAD_RECYCLE" if "recycled_capital_poorly" in labels else None,
+        }
+
+    def _aion_aggregate_exit_horizon_grades(self, record, horizon_grades):
+        record = record if isinstance(record, dict) else {}
+        grades = []
+        if isinstance(horizon_grades, dict):
+            for _, grade in sorted(horizon_grades.items(), key=lambda item: self.to_float((item[1] or {}).get("horizon_seconds"), 0.0) or 0.0):
+                if isinstance(grade, dict):
+                    grades.append(grade)
+        elif isinstance(horizon_grades, list):
+            grades = [grade for grade in horizon_grades if isinstance(grade, dict)]
+        if not grades:
+            return None
+        labels = sorted({label for grade in grades for label in (grade.get("grade_labels") or [])})
+        if not labels:
+            labels = ["neutral_exit"]
+        decision_scores = [self.to_float(grade.get("decision_quality_score"), None) for grade in grades]
+        decision_scores = [score for score in decision_scores if score is not None]
+        fill_scores = [self.to_float(grade.get("fill_quality"), None) for grade in grades]
+        fill_scores = [score for score in fill_scores if score is not None]
+        mfe_capture_values = [self.to_float(grade.get("mfe_capture_ratio"), None) for grade in grades]
+        mfe_capture_values = [value for value in mfe_capture_values if value is not None]
+        mae_recovery_values = [self.to_float(grade.get("mae_recovery_ratio"), None) for grade in grades]
+        mae_recovery_values = [value for value in mae_recovery_values if value is not None]
+        latest = grades[-1]
+        decision_quality = sum(decision_scores) / max(1, len(decision_scores))
+        fill_quality = sum(fill_scores) / max(1, len(fill_scores)) if fill_scores else 1.0
+        return {
+            **record,
+            "status": "graded",
+            "graded_ts": time.time(),
+            "graded_timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "grade_horizons_completed": [grade.get("horizon_seconds") for grade in grades],
+            "horizon_grades": {str(int(grade.get("horizon_seconds") or 0)): grade for grade in grades},
+            "market_price_after_exit": latest.get("market_price_after_exit"),
+            "move_after_exit": latest.get("move_after_exit"),
+            "grade_labels": labels,
+            "grade_labels_upper": sorted({self._aion_exit_grade_label_upper(label) for label in labels}),
+            "protected_profit_value": round(max(self.to_float(grade.get("protected_profit_value"), 0.0) or 0.0 for grade in grades), 4),
+            "saved_loss_value": round(max(self.to_float(grade.get("saved_loss_value"), 0.0) or 0.0 for grade in grades), 4),
+            "missed_profit_value": round(max(self.to_float(grade.get("missed_profit_value"), 0.0) or 0.0 for grade in grades), 4),
+            "mfe_capture_ratio": self._safe_round(sum(mfe_capture_values) / max(1, len(mfe_capture_values)) if mfe_capture_values else None, 4, None),
+            "mae_recovery_ratio": self._safe_round(sum(mae_recovery_values) / max(1, len(mae_recovery_values)) if mae_recovery_values else None, 4, None),
+            "decision_quality_score": round(float(decision_quality), 4),
+            "fill_quality": round(float(fill_quality), 4),
+            "exit_quality_score": round(float(decision_quality), 4),
+            "capital_recycle_grade": "GOOD_RECYCLE" if "recycled_capital_well" in labels else "BAD_RECYCLE" if "recycled_capital_poorly" in labels else None,
+        }
+
     def _aion_exit_learning_profile(self, *, family=None, side=None, selected_price=None, source="unknown", emit=False):
         family_key = self._normalize_family_for_profit_memory(family) if family else "UNKNOWN"
         side = self._normalize_live_side(side)
@@ -48321,6 +48605,7 @@ class KalshiSniperBot:
         saved_loss = 0
         too_early = 0
         too_late = 0
+        missed_profit = 0
         recycle_good = 0
         recycle_poor = 0
         settled_better = 0
@@ -48329,12 +48614,20 @@ class KalshiSniperBot:
         hold_total = 0.0
         fill_quality_total = 0.0
         exit_quality_total = 0.0
+        protected_profit_value_total = 0.0
+        saved_loss_value_total = 0.0
+        missed_profit_value_total = 0.0
+        mfe_capture_total = 0.0
+        mfe_capture_count = 0
+        mae_recovery_total = 0.0
+        mae_recovery_count = 0
         for record in records:
-            labels = set(str(label or "").strip() for label in (record.get("grade_labels") or []))
+            labels = set(str(label or "").strip().lower() for label in (record.get("grade_labels") or []))
             protected_profit += int("protected_profit" in labels)
             saved_loss += int("saved_loss" in labels)
             too_early += int("exited_too_early" in labels)
             too_late += int("exited_too_late" in labels)
+            missed_profit += int("missed_profit" in labels)
             recycle_good += int("recycled_capital_well" in labels)
             recycle_poor += int("recycled_capital_poorly" in labels)
             settled_better += int("would_have_settled_better" in labels)
@@ -48342,7 +48635,18 @@ class KalshiSniperBot:
             pnl_total += self.to_float(record.get("exit_pnl"), 0.0) or 0.0
             hold_total += self.to_float(record.get("hold_seconds"), 0.0) or 0.0
             fill_quality_total += self.to_float(record.get("fill_quality"), 0.0) or 0.0
-            exit_quality_total += self.to_float(record.get("exit_quality_score"), 0.0) or 0.0
+            exit_quality_total += self.to_float(record.get("decision_quality_score"), self.to_float(record.get("exit_quality_score"), 0.0)) or 0.0
+            protected_profit_value_total += self.to_float(record.get("protected_profit_value"), 0.0) or 0.0
+            saved_loss_value_total += self.to_float(record.get("saved_loss_value"), 0.0) or 0.0
+            missed_profit_value_total += self.to_float(record.get("missed_profit_value"), 0.0) or 0.0
+            mfe_capture = self.to_float(record.get("mfe_capture_ratio"), None)
+            if mfe_capture is not None:
+                mfe_capture_total += float(mfe_capture)
+                mfe_capture_count += 1
+            mae_recovery = self.to_float(record.get("mae_recovery_ratio"), None)
+            if mae_recovery is not None:
+                mae_recovery_total += float(mae_recovery)
+                mae_recovery_count += 1
         family_profile = {}
         try:
             family_profile = self._get_family_profitability_profile(
@@ -48358,42 +48662,46 @@ class KalshiSniperBot:
         family_win_rate = self.to_float(family_profile.get("win_rate"), None)
         base_n = max(1, count)
         giveback_rate = (too_late + decayed_zero) / base_n
-        too_early_rate = (too_early + settled_better) / base_n
+        too_early_rate = (too_early + missed_profit + settled_better) / base_n
         protected_rate = (protected_profit + saved_loss) / base_n
         recycle_score = (recycle_good - recycle_poor) / base_n
-        exit_quality_score = ((protected_profit * 1.2) + saved_loss + (recycle_good * 0.45) - (too_early * 0.9) - too_late - (recycle_poor * 0.45)) / base_n
+        exit_quality_score = ((protected_profit * 1.2) + saved_loss + (recycle_good * 0.45) - (too_early * 0.75) - (missed_profit * 0.7) - too_late - (recycle_poor * 0.45)) / base_n
         if count:
             avg_hold_seconds = hold_total / base_n
             avg_fill_quality = fill_quality_total / base_n
             avg_exit_quality = exit_quality_total / base_n
+            avg_mfe_capture_ratio = (mfe_capture_total / mfe_capture_count) if mfe_capture_count else None
+            avg_mae_recovery_ratio = (mae_recovery_total / mae_recovery_count) if mae_recovery_count else None
         else:
             avg_hold_seconds = None
             avg_fill_quality = None
             avg_exit_quality = None
+            avg_mfe_capture_ratio = None
+            avg_mae_recovery_ratio = None
         trail_multiplier = 1.0
         profit_protect_multiplier = 1.0
         fast_cut_multiplier = 1.0
         recycle_hold_multiplier = 1.0
-        if too_early_rate > giveback_rate + 0.14:
-            trail_multiplier *= 1.16
-            profit_protect_multiplier *= 1.12
-            fast_cut_multiplier *= 1.10
-            recycle_hold_multiplier *= 1.10
+        if too_early_rate > giveback_rate + 0.12:
+            trail_multiplier *= 1.08
+            profit_protect_multiplier *= 1.06
+            fast_cut_multiplier *= 1.04
+            recycle_hold_multiplier *= 1.06
         elif giveback_rate > too_early_rate + 0.10:
-            trail_multiplier *= 0.84
-            profit_protect_multiplier *= 0.88
-            recycle_hold_multiplier *= 0.92
+            trail_multiplier *= 0.90
+            profit_protect_multiplier *= 0.92
+            recycle_hold_multiplier *= 0.94
         if protected_rate >= 0.35 and giveback_rate >= too_early_rate:
-            trail_multiplier *= 0.94
-            profit_protect_multiplier *= 0.94
+            trail_multiplier *= 0.96
+            profit_protect_multiplier *= 0.96
         if saved_loss > too_early:
-            fast_cut_multiplier *= 0.92
+            fast_cut_multiplier *= 0.94
         elif too_early > saved_loss and count >= 4:
-            fast_cut_multiplier *= 1.12
+            fast_cut_multiplier *= 1.08
         if recycle_good > recycle_poor:
-            recycle_hold_multiplier *= 0.88
+            recycle_hold_multiplier *= 0.92
         elif recycle_poor > recycle_good:
-            recycle_hold_multiplier *= 1.14
+            recycle_hold_multiplier *= 1.08
         min_mult = float(AION_ADAPTIVE_EXIT_MIN_MULTIPLIER or 0.70)
         max_mult = float(AION_ADAPTIVE_EXIT_MAX_MULTIPLIER or 1.35)
         trail_multiplier = self._family_profitability_clamp(trail_multiplier, min_mult, max_mult)
@@ -48401,7 +48709,13 @@ class KalshiSniperBot:
         fast_cut_multiplier = self._family_profitability_clamp(fast_cut_multiplier, min_mult, max_mult)
         recycle_hold_multiplier = self._family_profitability_clamp(recycle_hold_multiplier, min_mult, max_mult)
         family_signal = self.to_float(family_profile.get("profitability_signal"), 0.0) or 0.0
-        entry_size_multiplier = 1.0 + (family_signal * 0.16) + (exit_quality_score * 0.10) + (recycle_score * 0.06)
+        family_learning = self._aion_family_learning_summary(
+            family=family_key,
+            side=side,
+            selected_price=selected_price,
+        )
+        learned_size_multiplier = self._aion_family_learning_multiplier(family_learning)
+        entry_size_multiplier = (1.0 + (family_signal * 0.16) + (exit_quality_score * 0.08) + (recycle_score * 0.06)) * learned_size_multiplier
         entry_size_multiplier = self._family_profitability_clamp(
             entry_size_multiplier,
             AION_PROFIT_ENGINE_MIN_SIZE_MULTIPLIER,
@@ -48416,6 +48730,7 @@ class KalshiSniperBot:
             "saved_loss": saved_loss,
             "exited_too_early": too_early,
             "exited_too_late": too_late,
+            "missed_profit": missed_profit,
             "recycled_capital_well": recycle_good,
             "recycled_capital_poorly": recycle_poor,
             "would_have_settled_better": settled_better,
@@ -48424,12 +48739,19 @@ class KalshiSniperBot:
             "avg_exit_quality": self._safe_round(avg_exit_quality, 4, None),
             "avg_hold_seconds": self._safe_round(avg_hold_seconds, 3, None),
             "avg_fill_quality": self._safe_round(avg_fill_quality, 4, None),
+            "avg_mfe_capture_ratio": self._safe_round(avg_mfe_capture_ratio, 4, None),
+            "avg_mae_recovery_ratio": self._safe_round(avg_mae_recovery_ratio, 4, None),
+            "protected_profit_value_total": round(protected_profit_value_total, 4),
+            "saved_loss_value_total": round(saved_loss_value_total, 4),
+            "missed_profit_value_total": round(missed_profit_value_total, 4),
             "exit_pnl_total": round(pnl_total, 4),
             "family_trade_count": family_trade_count,
             "family_pnl": round(family_pnl, 4),
             "family_win_rate": self._safe_round(family_win_rate, 4, None),
             "family_profitability_signal": family_profile.get("profitability_signal"),
             "family_capital_preference": family_profile.get("capital_preference"),
+            "family_learning": family_learning,
+            "family_learning_size_multiplier": learned_size_multiplier,
             "trail_multiplier": round(trail_multiplier, 4),
             "profit_protect_multiplier": round(profit_protect_multiplier, 4),
             "fast_cut_multiplier": round(fast_cut_multiplier, 4),
@@ -48448,6 +48770,26 @@ class KalshiSniperBot:
                 "AION-FAMILY-CAPITAL",
                 profile,
                 cooldown_key=f"family-capital:{source}:{family_key}:{side}",
+                cooldown_seconds=60.0,
+            )
+            self._emit_aion_profit_engine_log(
+                "AION-LEARNED-THRESHOLD-UPDATE",
+                {
+                    "source": source,
+                    "family": family_key,
+                    "side": side,
+                    "price_zone": family_learning.get("price_zone"),
+                    "graded_exit_count": count,
+                    "too_early_rate": round(float(too_early_rate), 4),
+                    "giveback_rate": round(float(giveback_rate), 4),
+                    "protected_rate": round(float(protected_rate), 4),
+                    "trail_multiplier": round(trail_multiplier, 4),
+                    "profit_protect_multiplier": round(profit_protect_multiplier, 4),
+                    "fast_cut_multiplier": round(fast_cut_multiplier, 4),
+                    "recycle_hold_multiplier": round(recycle_hold_multiplier, 4),
+                    "family_learning_size_multiplier": learned_size_multiplier,
+                },
+                cooldown_key=f"learned-threshold:{source}:{family_key}:{side}:{family_learning.get('price_zone')}",
                 cooldown_seconds=60.0,
             )
         return profile
@@ -48907,29 +49249,64 @@ class KalshiSniperBot:
         sport_state = self._aion_infer_sport_state(context, drift_context=drift_context, emit=False, source="exit_pending")
         exit_price = self._position_flip_price_value(payload.get("price") or decision.get("exit_price") or context.get("exit_price"))
         entry_price = self._position_flip_price_value(decision.get("entry_price") or context.get("entry_price"))
+        entry_ts = self.to_float(decision.get("entry_ts"), self.to_float(context.get("entry_ts"), None))
+        exit_ts = time.time()
+        selected_outcome = (
+            decision.get("selected_outcome")
+            or context.get("selected_outcome")
+            or (context.get("entry_context") or {}).get("selected_outcome")
+            or (context.get("entry_context") or {}).get("outcome")
+            or self._normalize_live_side(payload.get("side") or decision.get("side") or context.get("side"))
+        )
+        peak_profit = self.to_float(decision.get("peak_profit"), self.to_float(context.get("peak_profit"), None))
+        mfe_profit = self.to_float(decision.get("mfe_profit"), peak_profit)
+        mae_loss = self.to_float(decision.get("mae_loss"), self.to_float(context.get("mae_loss"), None))
+        spread_at_exit = self.to_float(decision.get("spread"), self.to_float(context.get("spread"), None))
+        liquidity_at_exit = self.to_float(context.get("side_liquidity"), None)
         pending[key] = {
             "key": key,
             "order_id": order_id or None,
             "ticker": ticker,
             "family": decision.get("family") or context.get("family") or position.get("family"),
+            "sport": sport_state.get("sport"),
             "side": self._normalize_live_side(payload.get("side") or decision.get("side") or context.get("side")),
+            "selected_outcome": selected_outcome,
             "exit_reason": decision.get("reason"),
             "position_intelligence_label": decision.get("position_intelligence_label"),
             "entry_price": entry_price,
+            "price_zone": self._aion_price_zone(entry_price if entry_price is not None else exit_price),
             "exit_price": exit_price,
+            "entry_ts": entry_ts,
+            "entry_timestamp": datetime.fromtimestamp(entry_ts, timezone.utc).isoformat().replace("+00:00", "Z") if entry_ts is not None else None,
             "count": self.to_float(payload.get("count") or decision.get("count") or context.get("count"), 0.0) or 0.0,
+            "entry_cost": self.to_float(decision.get("entry_cost"), self.to_float(context.get("entry_cost"), None)),
             "exit_pnl": self.to_float(decision.get("unrealized_pnl"), self.to_float(context.get("unrealized_pnl"), 0.0)) or 0.0,
             "pnl_per_contract": self.to_float(decision.get("pnl_per_contract"), context.get("pnl_per_contract")),
             "hold_seconds": self.to_float(decision.get("hold_seconds"), context.get("hold_seconds")),
-            "peak_profit": self.to_float(decision.get("peak_profit"), None),
-            "peak_value": self.to_float(decision.get("peak_value"), None),
-            "peak_giveback_pct": self.to_float(decision.get("peak_giveback_pct"), None),
+            "peak_profit": peak_profit,
+            "peak_value": self.to_float(decision.get("peak_value"), self.to_float(context.get("peak_value"), None)),
+            "peak_giveback_pct": self.to_float(decision.get("peak_giveback_pct"), self.to_float(context.get("peak_giveback_pct"), None)),
+            "mfe_value": self.to_float(decision.get("mfe_value"), self.to_float(context.get("mfe_value"), None)),
+            "mfe_profit": mfe_profit,
+            "mfe_timestamp": self.to_float(decision.get("mfe_timestamp"), self.to_float(context.get("mfe_timestamp"), None)),
+            "mae_value": self.to_float(decision.get("mae_value"), self.to_float(context.get("mae_value"), None)),
+            "mae_loss": mae_loss,
+            "mae_timestamp": self.to_float(decision.get("mae_timestamp"), self.to_float(context.get("mae_timestamp"), None)),
+            "best_cashout_price": self.to_float(decision.get("best_cashout_price"), self.to_float(context.get("best_cashout_price"), None)),
+            "worst_cashout_price": self.to_float(decision.get("worst_cashout_price"), self.to_float(context.get("worst_cashout_price"), None)),
+            "observation_count": int(self.to_float(decision.get("observation_count"), self.to_float(context.get("observation_count"), 0.0)) or 0),
+            "last_observed_price": self.to_float(decision.get("last_observed_price"), self.to_float(context.get("last_observed_price"), None)),
+            "spread_at_exit": spread_at_exit,
+            "liquidity_at_exit": liquidity_at_exit,
+            "drift_at_exit": drift_context.get("probability_drift"),
             "better_candidate_available": bool((decision.get("better_candidate") or {}).get("available")) if isinstance(decision.get("better_candidate"), dict) else False,
             "market_title": context.get("market_title"),
             "drift_context": drift_context,
             "sport_state": sport_state,
-            "exit_ts": time.time(),
-            "exit_timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "exit_ts": exit_ts,
+            "exit_timestamp": datetime.fromtimestamp(exit_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "exit_timestamp_utc": datetime.fromtimestamp(exit_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "horizon_grades": {},
         }
         if len(pending) > int(AION_EXIT_OUTCOME_MAX_PENDING or 160):
             ordered = sorted(pending.items(), key=lambda item: self.to_float((item[1] or {}).get("exit_ts"), 0.0) or 0.0)
@@ -48953,17 +49330,13 @@ class KalshiSniperBot:
         completed = state.get("completed") if isinstance(state.get("completed"), list) else []
         now_ts = time.time()
         graded_records = []
+        horizon_grade_count = 0
         retained = {}
-        min_age = float(AION_EXIT_OUTCOME_GRADE_SECONDS or 180.0)
-        min_move = float(AION_EXIT_OUTCOME_MIN_MARKET_MOVE or 0.015)
-        good_move = float(AION_EXIT_OUTCOME_GOOD_MARKET_MOVE or 0.035)
+        state_changed = False
         for key, record in pending.items():
             if not isinstance(record, dict):
                 continue
             age = now_ts - (self.to_float(record.get("exit_ts"), now_ts) or now_ts)
-            if not force and age < min_age:
-                retained[key] = record
-                continue
             ticker = str(record.get("ticker") or "").strip()
             side = self._normalize_live_side(record.get("side"))
             if not ticker or side not in {"yes", "no"}:
@@ -48972,58 +49345,63 @@ class KalshiSniperBot:
             context = self._build_position_monitor_context(record, decision=record, quotes_by_ticker=quotes_by_ticker)
             current_price = self._position_flip_price_value(context.get("current_cashout_price") or context.get("exit_price") or context.get("current_price"))
             exit_price = self._position_flip_price_value(record.get("exit_price"))
+            horizons = self._aion_exit_grade_horizons(record)
+            existing_horizon_grades = record.get("horizon_grades") if isinstance(record.get("horizon_grades"), dict) else {}
+            horizon_grades = dict(existing_horizon_grades)
             if current_price is None or exit_price is None:
-                if age < max(min_age * 6.0, 1800.0):
+                if age < max(max(horizons or [180.0]) * 6.0, 1800.0) and not force:
                     retained[key] = record
                     continue
                 current_price = exit_price
-            move_after_exit = round(float(current_price) - float(exit_price), 4)
-            exit_pnl = self.to_float(record.get("exit_pnl"), 0.0) or 0.0
-            peak_profit = self.to_float(record.get("peak_profit"), None)
-            labels = []
-            if exit_pnl > 0.0 and move_after_exit <= -min_move:
-                labels.append("protected_profit")
-            if exit_pnl <= 0.0 and move_after_exit <= -min_move:
-                labels.append("saved_loss")
-            if move_after_exit >= min_move:
-                labels.append("exited_too_early")
-            if move_after_exit >= good_move or (current_price >= 0.88 and move_after_exit > 0.0):
-                labels.append("would_have_settled_better")
-            if move_after_exit <= -good_move or (current_price <= 0.08 and move_after_exit < 0.0):
-                labels.append("would_have_decayed_to_zero")
-            if peak_profit is not None and peak_profit > 0.0 and exit_pnl <= max(0.0, float(peak_profit) * 0.25):
-                labels.append("exited_too_late")
-            if bool(record.get("better_candidate_available")):
-                if move_after_exit <= min_move:
-                    labels.append("recycled_capital_well")
-                elif move_after_exit >= good_move:
-                    labels.append("recycled_capital_poorly")
-            if not labels:
-                labels.append("neutral_exit")
-            exit_quality_score = 0.0
-            for label in labels:
-                if label in {"protected_profit", "saved_loss", "recycled_capital_well", "would_have_decayed_to_zero"}:
-                    exit_quality_score += 1.0
-                elif label in {"exited_too_early", "exited_too_late", "recycled_capital_poorly", "would_have_settled_better"}:
-                    exit_quality_score -= 1.0
-            spread = self.to_float(context.get("spread"), None)
-            fill_quality = 1.0
-            if spread is not None:
-                fill_quality = max(0.0, min(1.0, 1.0 - max(0.0, float(spread) - 0.02) * 4.0))
-            graded = {
-                **record,
-                "status": "graded",
-                "grade_age_seconds": round(age, 3),
-                "graded_ts": now_ts,
-                "graded_timestamp_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "market_price_after_exit": self._safe_round(current_price, 4, None),
-                "move_after_exit": round(move_after_exit, 4),
-                "grade_labels": labels,
-                "exit_quality_score": round(exit_quality_score, 4),
-                "fill_quality": round(fill_quality, 4),
-            }
+            for horizon_seconds in horizons:
+                horizon_key = str(int(horizon_seconds))
+                if horizon_key in horizon_grades and not force:
+                    continue
+                if not force and age < float(horizon_seconds):
+                    continue
+                horizon_grade = self._aion_build_exit_horizon_grade(
+                    record,
+                    context,
+                    current_price=current_price,
+                    horizon_seconds=horizon_seconds,
+                    age=age,
+                )
+                if not isinstance(horizon_grade, dict):
+                    continue
+                horizon_grades[horizon_key] = horizon_grade
+                horizon_grade_count += 1
+                state_changed = True
+                self._emit_aion_profit_engine_log(
+                    "AION-EXIT-GRADE-DETAIL",
+                    {
+                        **{k: v for k, v in record.items() if k not in {"horizon_grades", "drift_context", "sport_state"}},
+                        **horizon_grade,
+                        "status": "horizon_graded",
+                        "pending_key": key,
+                    },
+                    cooldown_key=f"exit-horizon-grade:{key}:{horizon_key}",
+                    cooldown_seconds=0.0,
+                )
+            completed_all_horizons = all(str(int(horizon)) in horizon_grades for horizon in horizons)
+            if not completed_all_horizons and not force:
+                retained[key] = {**record, "horizon_grades": horizon_grades}
+                continue
+            graded = self._aion_aggregate_exit_horizon_grades(record, horizon_grades)
+            if not isinstance(graded, dict):
+                retained[key] = {**record, "horizon_grades": horizon_grades}
+                continue
+            family_learning = self._aion_update_family_exit_learning(state, graded)
+            graded["family_learning"] = family_learning
+            graded["family_learning_size_multiplier"] = family_learning.get("family_learning_size_multiplier")
             graded_records.append(graded)
             completed.append(graded)
+            state_changed = True
+            self._emit_aion_profit_engine_log(
+                "AION-TRADE-GRADE",
+                graded,
+                cooldown_key=f"trade-grade:{key}",
+                cooldown_seconds=0.0,
+            )
             self._emit_aion_profit_engine_log(
                 "AION-EXIT-OUTCOME-LEARNING",
                 graded,
@@ -49038,10 +49416,11 @@ class KalshiSniperBot:
             "pending": len(retained),
             "completed": len(state["completed"]),
             "graded_this_pass": len(graded_records),
+            "horizon_grades_this_pass": horizon_grade_count,
             "last_grade_ts": now_ts,
         }
         self.aion_profit_engine_state = state
-        if graded_records:
+        if state_changed or graded_records:
             self._save_aion_profit_engine_state(reason="exit_grade")
         self._emit_aion_profit_engine_log(
             "AION-EXIT-OUTCOME-LEARNING",
@@ -49049,7 +49428,7 @@ class KalshiSniperBot:
             cooldown_key="exit-grade-summary",
             cooldown_seconds=60.0,
         )
-        return {"graded": len(graded_records), "pending": len(retained), "completed": len(state["completed"])}
+        return {"graded": len(graded_records), "horizon_graded": horizon_grade_count, "pending": len(retained), "completed": len(state["completed"])}
 
     def _winner_scale_tier(self, gain_pct):
         gain_pct = self.to_float(gain_pct, None)
@@ -49719,6 +50098,19 @@ class KalshiSniperBot:
                 "unrealized_pnl": current_profit,
                 "cashout_value": context.get("cashout_value"),
                 "entry_cost": context.get("entry_cost"),
+                "peak_value": context.get("peak_value"),
+                "peak_profit": context.get("peak_profit"),
+                "peak_giveback_pct": context.get("peak_giveback_pct"),
+                "mfe_value": context.get("mfe_value"),
+                "mfe_profit": context.get("mfe_profit"),
+                "mfe_timestamp": context.get("mfe_timestamp"),
+                "mae_value": context.get("mae_value"),
+                "mae_loss": context.get("mae_loss"),
+                "mae_timestamp": context.get("mae_timestamp"),
+                "best_cashout_price": context.get("best_cashout_price"),
+                "worst_cashout_price": context.get("worst_cashout_price"),
+                "observation_count": context.get("observation_count"),
+                "last_observed_price": context.get("last_observed_price"),
                 "is_sports_position": True,
                 "position_intelligence_label": label,
                 "position_intelligence_exit": True,
@@ -49778,6 +50170,46 @@ class KalshiSniperBot:
             current_value=current_value,
             cashout_value=cashout_value,
             max_payout=max_payout,
+        )
+        context.update(
+            {
+                "peak_value": peak_context.get("peak_value"),
+                "peak_profit": peak_context.get("peak_profit"),
+                "peak_giveback_pct": peak_context.get("peak_giveback_pct"),
+                "mfe_value": peak_context.get("mfe_value"),
+                "mfe_profit": peak_context.get("mfe_profit"),
+                "mfe_timestamp": peak_context.get("mfe_timestamp"),
+                "mae_value": peak_context.get("mae_value"),
+                "mae_loss": peak_context.get("mae_loss"),
+                "mae_timestamp": peak_context.get("mae_timestamp"),
+                "best_cashout_price": peak_context.get("best_cashout_price"),
+                "worst_cashout_price": peak_context.get("worst_cashout_price"),
+                "observation_count": peak_context.get("observation_count"),
+                "last_observed_price": peak_context.get("last_observed_price"),
+            }
+        )
+        self._emit_aion_profit_engine_log(
+            "AION-MFE-MAE",
+            {
+                "source": "position_monitor",
+                "ticker": ticker,
+                "family": family,
+                "side": context.get("side"),
+                "mfe_value": peak_context.get("mfe_value"),
+                "mfe_profit": peak_context.get("mfe_profit"),
+                "mfe_timestamp": peak_context.get("mfe_timestamp"),
+                "mae_value": peak_context.get("mae_value"),
+                "mae_loss": peak_context.get("mae_loss"),
+                "mae_timestamp": peak_context.get("mae_timestamp"),
+                "best_cashout_price": peak_context.get("best_cashout_price"),
+                "worst_cashout_price": peak_context.get("worst_cashout_price"),
+                "observation_count": peak_context.get("observation_count"),
+                "last_observed_price": peak_context.get("last_observed_price"),
+                "mfe_updated": peak_context.get("mfe_updated"),
+                "mae_updated": peak_context.get("mae_updated"),
+            },
+            cooldown_key=f"mfe-mae:{ticker}:{context.get('side')}",
+            cooldown_seconds=20.0,
         )
         peak_profit = self.to_float(decision.get("peak_profit"), self.to_float(peak_context.get("peak_profit"), 0.0)) or 0.0
         peak_value = self.to_float(decision.get("peak_value"), self.to_float(peak_context.get("peak_value"), None))
@@ -49938,7 +50370,24 @@ class KalshiSniperBot:
             )
         elif existing_action == "exit":
             decision_label = self._position_intelligence_existing_exit_label(decision)
-            updated.update({"position_intelligence_label": decision_label})
+            updated.update(
+                {
+                    "position_intelligence_label": decision_label,
+                    "peak_value": context.get("peak_value"),
+                    "peak_profit": context.get("peak_profit"),
+                    "peak_giveback_pct": context.get("peak_giveback_pct"),
+                    "mfe_value": context.get("mfe_value"),
+                    "mfe_profit": context.get("mfe_profit"),
+                    "mfe_timestamp": context.get("mfe_timestamp"),
+                    "mae_value": context.get("mae_value"),
+                    "mae_loss": context.get("mae_loss"),
+                    "mae_timestamp": context.get("mae_timestamp"),
+                    "best_cashout_price": context.get("best_cashout_price"),
+                    "worst_cashout_price": context.get("worst_cashout_price"),
+                    "observation_count": context.get("observation_count"),
+                    "last_observed_price": context.get("last_observed_price"),
+                }
+            )
         elif settlement_hold:
             decision_label = "SETTLEMENT_HOLD"
             updated.update({"action": "hold", "reason": "position_intelligence_settlement_hold", "position_intelligence_label": decision_label})
