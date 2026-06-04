@@ -455,6 +455,11 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-TRADE-GRADE",
     "AION-EXIT-GRADE-DETAIL",
     "AION-LEARNED-THRESHOLD-UPDATE",
+    "AION-THESIS-DETECTED",
+    "AION-THESIS-EXPOSURE",
+    "AION-EXPOSURE-COMPRESS",
+    "AION-THESIS-ROUTING",
+    "AION-RELATED-CONTRACT",
     "AION-REALLOCATE",
     "AION-SIZE-UP",
     "AION-SIZE-DOWN",
@@ -24817,6 +24822,9 @@ class KalshiSniperBot:
             "entry_ts": time.time(),
             "order_id": summary.get("order_id") or order_id,
             "entry_context": entry_context if isinstance(entry_context, dict) else None,
+            "thesis_profile": (payload or {}).get("thesis_profile") if isinstance((payload or {}).get("thesis_profile"), dict) else (entry_context or {}).get("thesis_profile") if isinstance(entry_context, dict) else None,
+            "thesis_exposure": (payload or {}).get("thesis_exposure") if isinstance((payload or {}).get("thesis_exposure"), dict) else (entry_context or {}).get("thesis_exposure") if isinstance(entry_context, dict) else None,
+            "thesis_key": (payload or {}).get("thesis_key") or ((entry_context or {}).get("thesis_key") if isinstance(entry_context, dict) else None),
             "aion_relaxation_used": bool((payload or {}).get("aion_relaxation_used")),
             "aion_relaxation_reason": (payload or {}).get("aion_relaxation_reason"),
         }
@@ -24877,6 +24885,9 @@ class KalshiSniperBot:
             "entry_ts": entry_ts,
             "last_update_ts": updated_ts if updated_ts is not None else time.time(),
             "entry_context": position_summary.get("entry_context") if isinstance(position_summary.get("entry_context"), dict) else existing.get("entry_context") if isinstance(existing, dict) else None,
+            "thesis_profile": position_summary.get("thesis_profile") if isinstance(position_summary.get("thesis_profile"), dict) else existing.get("thesis_profile") if isinstance(existing, dict) else None,
+            "thesis_exposure": position_summary.get("thesis_exposure") if isinstance(position_summary.get("thesis_exposure"), dict) else existing.get("thesis_exposure") if isinstance(existing, dict) else None,
+            "thesis_key": position_summary.get("thesis_key") or (existing.get("thesis_key") if isinstance(existing, dict) else None),
             "aion_relaxation_used": bool(existing.get("aion_relaxation_used")) if isinstance(existing, dict) else False,
             "aion_relaxation_reason": existing.get("aion_relaxation_reason") if isinstance(existing, dict) else None,
         }
@@ -29103,6 +29114,14 @@ class KalshiSniperBot:
             "profit_engine_exit_quality_score": context.get("profit_engine_exit_quality_score"),
             "unified_score_before_profit_engine": context.get("unified_score_before_profit_engine"),
             "size_multiplier_before_profit_engine": context.get("size_multiplier_before_profit_engine"),
+            "thesis": context.get("thesis"),
+            "thesis_key": context.get("thesis_key"),
+            "thesis_exposure_score": context.get("thesis_exposure_score"),
+            "THESIS_EXPOSURE_SCORE": context.get("THESIS_EXPOSURE_SCORE"),
+            "thesis_exposure_size_multiplier": context.get("thesis_exposure_size_multiplier"),
+            "thesis_exposure_rank_adjustment": context.get("thesis_exposure_rank_adjustment"),
+            "thesis_position_count": context.get("thesis_position_count"),
+            "related_position_count": context.get("related_position_count"),
             "payout_multiple": context.get("payout_multiple"),
             "time_to_event_minutes": context.get("time_to_event_minutes"),
             "time_to_expiry_minutes": context.get("time_to_expiry_minutes"),
@@ -29302,6 +29321,9 @@ class KalshiSniperBot:
                 "size_multiplier": round(multiplier, 4),
                 "profit_engine_size_multiplier": context.get("profit_engine_size_multiplier") or getattr(q, "profit_engine_size_multiplier", None),
                 "profit_engine_capital_preference": context.get("profit_engine_capital_preference") or getattr(q, "profit_engine_capital_preference", None),
+                "thesis_key": context.get("thesis_key") or getattr(q, "thesis_key", None),
+                "thesis_exposure_score": context.get("thesis_exposure_score") or getattr(q, "thesis_exposure_score", None),
+                "thesis_exposure_size_multiplier": context.get("thesis_exposure_size_multiplier") or getattr(q, "thesis_exposure_size_multiplier", None),
                 "reason": "unified_opportunity_size_pressure",
                 "no_hard_block": True,
             }
@@ -31508,6 +31530,8 @@ class KalshiSniperBot:
                 market_quality=_metric("sports_execution_quality_score", "market_quality", "conviction_score"),
                 unified_score=_metric("unified_score", "unified_opportunity_score"),
                 q=q,
+                market=payload if isinstance(payload, dict) else None,
+                context=ev_context if isinstance(ev_context, dict) else None,
                 source=kwargs.get("source") or "dynamic_live_entry_size",
             )
             for target in sources:
@@ -31517,6 +31541,10 @@ class KalshiSniperBot:
                     ("profit_engine_signal", profit_signal),
                     ("profit_engine_size_multiplier", profit_signal.get("profit_engine_size_multiplier")),
                     ("profit_engine_capital_preference", profit_signal.get("capital_preference")),
+                    ("thesis_exposure_context", profit_signal.get("thesis_exposure")),
+                    ("thesis_exposure_size_multiplier", profit_signal.get("thesis_exposure_size_multiplier")),
+                    ("thesis_exposure_score", profit_signal.get("thesis_exposure_score")),
+                    ("thesis_key", profit_signal.get("thesis_key")),
                     ("profit_engine_size_multiplier_applied", True),
                 ):
                     try:
@@ -31544,7 +31572,13 @@ class KalshiSniperBot:
                             setattr(q, "capital_duration_size_multiplier", round(profit_multiplier, 4))
                 except Exception:
                     pass
-        return _call_sports_live_intelligence("_resolve_dynamic_live_entry_size", self, *args, **kwargs)
+        resolved_size = _call_sports_live_intelligence("_resolve_dynamic_live_entry_size", self, *args, **kwargs)
+        return self._aion_apply_thesis_exposure_to_size(
+            resolved_size,
+            sources=sources,
+            q=q,
+            source=kwargs.get("source") or "dynamic_live_entry_size",
+        )
 
     def _validate_elite_live_entry_size(self, *args, **kwargs):
         return _call_sports_live_intelligence("_validate_elite_live_entry_size", self, *args, **kwargs)
@@ -48198,6 +48232,9 @@ class KalshiSniperBot:
             "side": side,
             "market_title": market_title,
             "entry_context": entry_context,
+            "thesis_profile": position.get("thesis_profile") if isinstance(position.get("thesis_profile"), dict) else entry_context.get("thesis_profile") if isinstance(entry_context.get("thesis_profile"), dict) else None,
+            "thesis_exposure": position.get("thesis_exposure") if isinstance(position.get("thesis_exposure"), dict) else entry_context.get("thesis_exposure") if isinstance(entry_context.get("thesis_exposure"), dict) else None,
+            "thesis_key": position.get("thesis_key") or entry_context.get("thesis_key"),
             "entry_price": entry_price,
             "current_mark": current_price,
             "current_price": current_price,
@@ -48333,6 +48370,393 @@ class KalshiSniperBot:
         side_key = self._normalize_live_side(side) or "unknown"
         price_zone = self._aion_price_zone(selected_price)
         return f"{family_key}|{side_key}|{price_zone}", family_key, side_key, price_zone
+
+    def _aion_thesis_token(self, value, fallback="UNKNOWN"):
+        text = str(value or "").strip().upper()
+        if not text:
+            return fallback
+        text = re.sub(r"[^A-Z0-9]+", "_", text).strip("_")
+        return (text[:96] if text else fallback) or fallback
+
+    def _aion_thesis_read(self, sources, *keys):
+        for source in sources or []:
+            if source is None:
+                continue
+            for key in keys:
+                value = None
+                if isinstance(source, dict):
+                    value = source.get(key)
+                else:
+                    try:
+                        value = getattr(source, key, None)
+                    except Exception:
+                        value = None
+                if value not in (None, "", [], {}):
+                    return value
+        return None
+
+    def _aion_thesis_sources(self, *, q=None, market=None, payload=None, context=None, position=None):
+        sources = []
+        for item in (context, payload, position, market):
+            if isinstance(item, dict):
+                sources.append(item)
+                entry_context = item.get("entry_context") if isinstance(item.get("entry_context"), dict) else None
+                if entry_context:
+                    sources.append(entry_context)
+        if q is not None:
+            sources.append(q)
+        return sources
+
+    def _aion_thesis_event_key(self, *, ticker=None, family=None, q=None, market=None, payload=None, context=None, position=None):
+        ticker = str(ticker or self._aion_thesis_read(self._aion_thesis_sources(q=q, market=market, payload=payload, context=context, position=position), "ticker", "market_ticker") or "").strip()
+        family_key = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q) if family or ticker or q is not None else "UNKNOWN"
+        sources = self._aion_thesis_sources(q=q, market=market, payload=payload, context=context, position=position)
+        explicit_event = self._aion_thesis_read(
+            sources,
+            "thesis_event_key",
+            "event_key",
+            "game_id",
+            "sports_graph_game_id",
+            "sports_ladder_game_id",
+            "event_ticker",
+        )
+        if explicit_event not in (None, ""):
+            return f"{self._aion_thesis_token(family_key)}:{self._aion_thesis_token(explicit_event)}"
+        parts = ticker.split("-") if ticker else []
+        if len(parts) >= 2:
+            return f"{self._aion_thesis_token(family_key)}:{self._aion_thesis_token(parts[1])}"
+        if ticker:
+            return f"{self._aion_thesis_token(family_key)}:{self._aion_thesis_token(ticker)}"
+        return f"{self._aion_thesis_token(family_key)}:UNKNOWN_EVENT"
+
+    def _aion_thesis_outcome_slot(self, *, ticker=None, q=None, market=None, payload=None, context=None, position=None):
+        ticker = str(ticker or self._aion_thesis_read(self._aion_thesis_sources(q=q, market=market, payload=payload, context=context, position=position), "ticker", "market_ticker") or "").strip()
+        parts = ticker.split("-") if ticker else []
+        if len(parts) >= 3 and str(parts[-1] or "").strip():
+            return self._aion_thesis_token(parts[-1], fallback="")
+        sources = self._aion_thesis_sources(q=q, market=market, payload=payload, context=context, position=position)
+        outcome = self._aion_thesis_read(sources, "outcome_slot", "selected_outcome", "outcome", "subtitle", "market_title", "title")
+        token = self._aion_thesis_token(outcome, fallback="")
+        if token in {"YES", "NO", "Y", "N"}:
+            return ""
+        return token
+
+    def _aion_infer_paired_outcome_slot(self, *, ticker=None, outcome_slot=None, event_key=None, related_positions=None):
+        ticker = str(ticker or "").strip()
+        outcome_slot = self._aion_thesis_token(outcome_slot, fallback="")
+        if not outcome_slot:
+            return ""
+        parts = ticker.split("-") if ticker else []
+        if len(parts) >= 2:
+            event_code = self._aion_thesis_token(parts[1], fallback="")
+            tail = re.sub(r"^\d{2}[A-Z]{3}\d{2}\d*", "", event_code)
+            token_len = len(outcome_slot)
+            if outcome_slot.isalpha() and 2 <= token_len <= 4 and len(tail) == token_len * 2:
+                left = tail[:token_len]
+                right = tail[token_len:]
+                if outcome_slot == left and right:
+                    return right
+                if outcome_slot == right and left:
+                    return left
+        related_slots = set()
+        for position in related_positions or []:
+            if not isinstance(position, dict):
+                continue
+            pos_ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
+            if not pos_ticker:
+                continue
+            try:
+                pos_event = self._aion_thesis_event_key(ticker=pos_ticker, position=position)
+            except Exception:
+                pos_event = ""
+            if event_key and pos_event and pos_event != event_key:
+                continue
+            slot = self._aion_thesis_outcome_slot(ticker=pos_ticker, position=position)
+            if slot and slot != outcome_slot:
+                related_slots.add(slot)
+        if len(related_slots) == 1:
+            return next(iter(related_slots))
+        return ""
+
+    def _aion_directional_thesis_subject(self, *, side=None, outcome_slot=None, paired_outcome_slot=None):
+        side = self._normalize_live_side(side)
+        outcome_slot = self._aion_thesis_token(outcome_slot, fallback="")
+        paired_outcome_slot = self._aion_thesis_token(paired_outcome_slot, fallback="")
+        if side == "yes":
+            return outcome_slot or "YES"
+        if side == "no":
+            return paired_outcome_slot or (f"NOT_{outcome_slot}" if outcome_slot else "NO")
+        return outcome_slot or "UNKNOWN"
+
+    def _aion_thesis_profile(self, *, ticker=None, family=None, side=None, q=None, market=None, payload=None, context=None, position=None, related_positions=None, emit=False, source="thesis"):
+        sources = self._aion_thesis_sources(q=q, market=market, payload=payload, context=context, position=position)
+        ticker = str(ticker or self._aion_thesis_read(sources, "ticker", "market_ticker") or "").strip()
+        family_key = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q) if family or ticker or q is not None else "UNKNOWN"
+        side = self._normalize_live_side(side or self._aion_thesis_read(sources, "selected_side", "side"))
+        event_key = self._aion_thesis_event_key(ticker=ticker, family=family_key, q=q, market=market, payload=payload, context=context, position=position)
+        outcome_slot = self._aion_thesis_outcome_slot(ticker=ticker, q=q, market=market, payload=payload, context=context, position=position)
+        paired_outcome_slot = self._aion_infer_paired_outcome_slot(
+            ticker=ticker,
+            outcome_slot=outcome_slot,
+            event_key=event_key,
+            related_positions=related_positions,
+        )
+        thesis_subject = self._aion_directional_thesis_subject(side=side, outcome_slot=outcome_slot, paired_outcome_slot=paired_outcome_slot)
+        market_title = self._aion_thesis_read(sources, "market_title", "title", "event_title", "subtitle")
+        profile = {
+            "source": source,
+            "ticker": ticker,
+            "family": family_key,
+            "event": event_key,
+            "event_key": event_key,
+            "thesis": thesis_subject,
+            "thesis_key": f"{event_key}:{self._aion_thesis_token(thesis_subject)}",
+            "side": side,
+            "outcome_slot": outcome_slot,
+            "paired_outcome_slot": paired_outcome_slot or None,
+            "selected_outcome": thesis_subject,
+            "market_title": market_title,
+            "exclusive_outcome_family": bool(any(token in str(family_key or "").upper() for token in ("MONEYLINE", "MATCH", "WINNER", "GAME", "SPREAD"))),
+        }
+        if emit:
+            self._emit_aion_profit_engine_log(
+                "AION-THESIS-DETECTED",
+                profile,
+                cooldown_key=f"thesis-detected:{source}:{profile.get('ticker')}:{profile.get('side')}:{profile.get('thesis_key')}",
+                cooldown_seconds=30.0,
+            )
+        return profile
+
+    def _aion_same_event_thesis_equivalence(self, candidate_profile, position_profile):
+        candidate_profile = candidate_profile if isinstance(candidate_profile, dict) else {}
+        position_profile = position_profile if isinstance(position_profile, dict) else {}
+        if not candidate_profile.get("event_key") or candidate_profile.get("event_key") != position_profile.get("event_key"):
+            return False, "different_event"
+        if candidate_profile.get("family") != position_profile.get("family"):
+            return False, "different_family"
+        if candidate_profile.get("thesis_key") and candidate_profile.get("thesis_key") == position_profile.get("thesis_key"):
+            return True, "same_directional_thesis"
+        candidate_side = self._normalize_live_side(candidate_profile.get("side"))
+        position_side = self._normalize_live_side(position_profile.get("side"))
+        candidate_outcome = self._aion_thesis_token(candidate_profile.get("outcome_slot"), fallback="")
+        position_outcome = self._aion_thesis_token(position_profile.get("outcome_slot"), fallback="")
+        exclusive = bool(candidate_profile.get("exclusive_outcome_family") or position_profile.get("exclusive_outcome_family"))
+        if exclusive and candidate_side in {"yes", "no"} and position_side in {"yes", "no"}:
+            if candidate_side != position_side and candidate_outcome and position_outcome and candidate_outcome != position_outcome:
+                return True, "yes_one_no_other_same_event"
+            if candidate_side == position_side and candidate_outcome and candidate_outcome == position_outcome:
+                return True, "same_outcome_same_side"
+        return False, "related_same_event_different_thesis"
+
+    def _aion_thesis_position_exposure_value(self, position, selected_price=None):
+        position = position if isinstance(position, dict) else {}
+        count = abs(self.to_float(position.get("count") or position.get("position") or position.get("position_fp"), 0.0) or 0.0)
+        exposure = self.to_float(position.get("market_exposure_dollars"), None)
+        if exposure is None:
+            exposure_cents = self.to_float(position.get("market_exposure_cents"), None)
+            if exposure_cents is not None:
+                exposure = exposure_cents / 100.0
+        price = self.normalize_contract_price(
+            position.get("entry_price") or position.get("avg_price") or position.get("average_price"),
+            ticker=position.get("ticker"),
+            source="aion_thesis_position_exposure",
+        )
+        if exposure is None and price is not None:
+            exposure = count * float(price)
+        if exposure is None:
+            fallback_price = self._opportunity_price_dollars(selected_price) or 0.50
+            exposure = count * fallback_price
+        return round(max(0.0, float(exposure or 0.0)), 4)
+
+    def _aion_thesis_exposure_context(self, *, ticker=None, family=None, side=None, selected_price=None, q=None, market=None, payload=None, context=None, source="entry", emit=True):
+        ticker = str(ticker or "").strip()
+        family_key = self._normalize_family_for_profit_memory(family, ticker=ticker, market=market, q=q) if family or ticker or q is not None else "UNKNOWN"
+        side = self._normalize_live_side(side)
+        selected_price = self._opportunity_price_dollars(selected_price)
+        if self.get_market_discovery_category(family_key) != "sports":
+            return {"enabled": False, "reason": "non_sports", "thesis_exposure_size_multiplier": 1.0}
+        open_positions = list(self._get_open_live_positions() or [])
+        candidate_profile = self._aion_thesis_profile(
+            ticker=ticker,
+            family=family_key,
+            side=side,
+            q=q,
+            market=market,
+            payload=payload,
+            context=context,
+            related_positions=open_positions,
+            emit=emit,
+            source=source,
+        )
+        equivalent_positions = []
+        related_positions = []
+        equivalent_capital = 0.0
+        related_capital = 0.0
+        for position in open_positions:
+            if not isinstance(position, dict):
+                continue
+            pos_ticker = str(position.get("ticker") or position.get("market_ticker") or "").strip()
+            if not pos_ticker:
+                continue
+            pos_family = self._normalize_family_for_profit_memory(position.get("family"), ticker=pos_ticker, q=None)
+            if self.get_market_discovery_category(pos_family) != "sports":
+                continue
+            position_profile = self._aion_thesis_profile(
+                ticker=pos_ticker,
+                family=pos_family,
+                side=position.get("side"),
+                position=position,
+                related_positions=open_positions,
+                emit=False,
+                source="open_position",
+            )
+            if position_profile.get("event_key") != candidate_profile.get("event_key"):
+                continue
+            exposure_value = self._aion_thesis_position_exposure_value(position, selected_price=selected_price)
+            equivalent, reason = self._aion_same_event_thesis_equivalence(candidate_profile, position_profile)
+            row = {
+                "ticker": pos_ticker,
+                "family": pos_family,
+                "side": position_profile.get("side"),
+                "outcome_slot": position_profile.get("outcome_slot"),
+                "thesis": position_profile.get("thesis"),
+                "thesis_key": position_profile.get("thesis_key"),
+                "count": self.to_float(position.get("count") or position.get("position"), None),
+                "capital_allocated": exposure_value,
+                "relation": reason,
+            }
+            related_positions.append(row)
+            related_capital += exposure_value
+            if equivalent:
+                equivalent_positions.append(row)
+                equivalent_capital += exposure_value
+        equivalent_count = len(equivalent_positions)
+        related_count = len(related_positions)
+        if equivalent_count <= 0:
+            size_multiplier = 1.0
+        elif equivalent_count == 1:
+            size_multiplier = 0.50
+        else:
+            size_multiplier = 0.25
+        max_reference = max(10.0, float(MAX_LIVE_ORDER_SIZE or 1))
+        exposure_score = min(
+            1.0,
+            (equivalent_count * 0.35)
+            + min(0.35, equivalent_capital / max_reference)
+            + min(0.15, max(0, related_count - equivalent_count) * 0.05),
+        )
+        rank_adjustment = -round(min(4.0, exposure_score * 4.0), 4) if equivalent_count else 0.0
+        context_payload = {
+            "source": source,
+            "enabled": True,
+            "ticker": ticker,
+            "family": family_key,
+            "side": side,
+            "selected_price": self._safe_round(selected_price, 4, None),
+            "event": candidate_profile.get("event_key"),
+            "event_key": candidate_profile.get("event_key"),
+            "thesis": candidate_profile.get("thesis"),
+            "thesis_key": candidate_profile.get("thesis_key"),
+            "outcome_slot": candidate_profile.get("outcome_slot"),
+            "paired_outcome_slot": candidate_profile.get("paired_outcome_slot"),
+            "position_count": equivalent_count,
+            "related_position_count": related_count,
+            "total_exposure": round(float(equivalent_capital), 4),
+            "capital_allocated": round(float(equivalent_capital), 4),
+            "related_capital_allocated": round(float(related_capital), 4),
+            "THESIS_EXPOSURE_SCORE": round(float(exposure_score), 4),
+            "thesis_exposure_score": round(float(exposure_score), 4),
+            "thesis_exposure_size_multiplier": round(float(size_multiplier), 4),
+            "thesis_exposure_rank_adjustment": rank_adjustment,
+            "capital_preference": "size_down" if size_multiplier < 1.0 else "normal",
+            "equivalent_positions": equivalent_positions[:8],
+            "related_positions": related_positions[:8],
+            "no_hard_block": True,
+            "reason": "equivalent_thesis_size_compression" if size_multiplier < 1.0 else "no_existing_equivalent_thesis",
+        }
+        if emit:
+            if related_positions:
+                self._emit_aion_profit_engine_log(
+                    "AION-RELATED-CONTRACT",
+                    context_payload,
+                    cooldown_key=f"related-contract:{source}:{candidate_profile.get('event_key')}:{ticker}",
+                    cooldown_seconds=30.0,
+                )
+            self._emit_aion_profit_engine_log(
+                "AION-THESIS-EXPOSURE",
+                context_payload,
+                cooldown_key=f"thesis-exposure:{source}:{ticker}:{candidate_profile.get('thesis_key')}",
+                cooldown_seconds=30.0,
+            )
+            if size_multiplier < 1.0:
+                self._emit_aion_profit_engine_log(
+                    "AION-EXPOSURE-COMPRESS",
+                    context_payload,
+                    cooldown_key=f"thesis-compress:{source}:{ticker}:{candidate_profile.get('thesis_key')}",
+                    cooldown_seconds=15.0,
+                )
+                self._emit_aion_profit_engine_log(
+                    "AION-THESIS-ROUTING",
+                    {**context_payload, "routing_preference": "prefer_unrelated_or_stronger_momentum"},
+                    cooldown_key=f"thesis-routing:{source}:{ticker}:{candidate_profile.get('thesis_key')}",
+                    cooldown_seconds=30.0,
+                )
+        return context_payload
+
+    def _aion_apply_thesis_exposure_to_size(self, resolved_size, *, sources=None, q=None, source="dynamic_live_entry_size"):
+        try:
+            numeric_size = self.to_float(resolved_size, None)
+            if numeric_size is None or numeric_size <= 0.0:
+                return resolved_size
+            requested = max(1, int(round(numeric_size)))
+        except Exception:
+            return resolved_size
+        thesis_context = None
+        for item in sources or []:
+            if isinstance(item, dict) and isinstance(item.get("thesis_exposure"), dict):
+                thesis_context = item.get("thesis_exposure")
+                break
+        if thesis_context is None and q is not None:
+            try:
+                candidate = getattr(q, "thesis_exposure_context", None)
+            except Exception:
+                candidate = None
+            if isinstance(candidate, dict):
+                thesis_context = candidate
+        if not isinstance(thesis_context, dict):
+            return requested
+        multiplier = self.to_float(thesis_context.get("thesis_exposure_size_multiplier"), 1.0) or 1.0
+        if multiplier >= 0.999:
+            return requested
+        adjusted = max(1, min(int(MAX_LIVE_ORDER_SIZE or requested), int(round(requested * max(0.25, float(multiplier))))))
+        payload = {
+            **thesis_context,
+            "source": source,
+            "requested_size": requested,
+            "adjusted_size": adjusted,
+            "applied_multiplier": round(float(multiplier), 4),
+            "reason": "same_event_thesis_exposure_compression" if adjusted != requested else "same_event_thesis_min_size_preserved",
+            "no_hard_block": True,
+        }
+        self._emit_aion_profit_engine_log(
+            "AION-EXPOSURE-COMPRESS",
+            payload,
+            cooldown_key=f"thesis-size-final:{source}:{thesis_context.get('ticker')}:{thesis_context.get('thesis_key')}:{requested}:{adjusted}",
+            cooldown_seconds=5.0,
+        )
+        self._emit_aion_profit_engine_log(
+            "AION-CONFIDENCE-SIZING",
+            payload,
+            cooldown_key=f"thesis-confidence-final:{source}:{thesis_context.get('ticker')}:{thesis_context.get('thesis_key')}",
+            cooldown_seconds=30.0,
+        )
+        self._emit_aion_profit_engine_log(
+            "AION-CAPITAL-ROUTING",
+            {**payload, "routing_preference": "prefer_independent_thesis_when_available"},
+            cooldown_key=f"thesis-capital-final:{source}:{thesis_context.get('ticker')}:{thesis_context.get('thesis_key')}",
+            cooldown_seconds=30.0,
+        )
+        return adjusted
 
     def _aion_family_learning_summary(self, *, family=None, side=None, selected_price=None):
         state = self._load_aion_profit_engine_state()
@@ -49019,7 +49443,7 @@ class KalshiSniperBot:
             )
         return adaptive
 
-    def _aion_entry_profit_signal(self, *, ticker=None, family=None, side=None, selected_price=None, edge=None, ev=None, confidence=None, spread=None, liquidity=None, market_quality=None, unified_score=None, q=None, source="entry"):
+    def _aion_entry_profit_signal(self, *, ticker=None, family=None, side=None, selected_price=None, edge=None, ev=None, confidence=None, spread=None, liquidity=None, market_quality=None, unified_score=None, q=None, market=None, context=None, source="entry"):
         ticker = str(ticker or getattr(q, "ticker", None) or "").strip()
         family_key = self._normalize_family_for_profit_memory(family, ticker=ticker, q=q) if family or q is not None or ticker else "UNKNOWN"
         side = self._normalize_live_side(side or getattr(q, "selected_side", None) or getattr(q, "side", None))
@@ -49038,6 +49462,19 @@ class KalshiSniperBot:
             source=source,
             emit=True,
         )
+        thesis_exposure = self._aion_thesis_exposure_context(
+            ticker=ticker,
+            family=family_key,
+            side=side,
+            selected_price=selected_price,
+            q=q,
+            market=market,
+            context=context,
+            source=source,
+            emit=True,
+        )
+        thesis_size_multiplier = self.to_float(thesis_exposure.get("thesis_exposure_size_multiplier"), 1.0) or 1.0
+        thesis_rank_adjustment = self.to_float(thesis_exposure.get("thesis_exposure_rank_adjustment"), 0.0) or 0.0
         base_multiplier = 1.0
         reasons = []
         strongest_edge = max(value for value in (edge or 0.0, ev or 0.0, 0.0))
@@ -49090,12 +49527,18 @@ class KalshiSniperBot:
             reasons.append("thin_liquidity_size_down")
         profile_multiplier = self.to_float(profile.get("entry_size_multiplier"), 1.0) or 1.0
         base_multiplier *= profile_multiplier
+        if thesis_size_multiplier < 0.999:
+            reasons.append("same_event_thesis_exposure_size_down")
         multiplier = self._family_profitability_clamp(
             base_multiplier,
             AION_PROFIT_ENGINE_MIN_SIZE_MULTIPLIER,
             AION_PROFIT_ENGINE_MAX_SIZE_MULTIPLIER,
         )
-        rank_adjustment = self._family_profitability_clamp((multiplier - 1.0) * 10.0, -5.0, 7.0)
+        profit_rank_adjustment = self._family_profitability_clamp((multiplier - 1.0) * 10.0, -5.0, 7.0)
+        rank_adjustment = self._family_profitability_clamp(profit_rank_adjustment + thesis_rank_adjustment, -5.0, 7.0)
+        capital_preference = "size_up" if multiplier > 1.08 else "size_down" if multiplier < 0.94 else "normal"
+        if thesis_size_multiplier < 0.999:
+            capital_preference = "size_down"
         signal = {
             "source": source,
             "ticker": ticker or getattr(q, "ticker", None),
@@ -49111,11 +49554,21 @@ class KalshiSniperBot:
             "unified_score": self._safe_round(unified_score, 4, None),
             "profit_engine_size_multiplier": round(multiplier, 4),
             "profit_engine_rank_adjustment": round(rank_adjustment, 4),
+            "profit_engine_rank_adjustment_before_thesis": round(profit_rank_adjustment, 4),
             "profile_entry_size_multiplier": profile.get("entry_size_multiplier"),
+            "thesis_exposure": thesis_exposure,
+            "thesis_exposure_score": thesis_exposure.get("thesis_exposure_score"),
+            "THESIS_EXPOSURE_SCORE": thesis_exposure.get("THESIS_EXPOSURE_SCORE"),
+            "thesis_exposure_size_multiplier": round(float(thesis_size_multiplier), 4),
+            "thesis_exposure_rank_adjustment": round(float(thesis_rank_adjustment), 4),
+            "thesis_key": thesis_exposure.get("thesis_key"),
+            "thesis": thesis_exposure.get("thesis"),
+            "thesis_position_count": thesis_exposure.get("position_count"),
+            "related_position_count": thesis_exposure.get("related_position_count"),
             "exit_quality_score": profile.get("exit_quality_score"),
             "family_pnl": profile.get("family_pnl"),
             "family_win_rate": profile.get("family_win_rate"),
-            "capital_preference": "size_up" if multiplier > 1.08 else "size_down" if multiplier < 0.94 else "normal",
+            "capital_preference": capital_preference,
             "reasons": reasons or ["neutral_profit_engine"],
             "no_hard_block": True,
         }
@@ -49142,6 +49595,20 @@ class KalshiSniperBot:
     def _aion_apply_entry_profit_signal_to_target(self, target, signal):
         if not isinstance(target, dict) or not isinstance(signal, dict):
             return target
+        if isinstance(signal.get("thesis_exposure"), dict):
+            target["thesis_exposure"] = signal.get("thesis_exposure")
+        for field in (
+            "thesis_exposure_score",
+            "THESIS_EXPOSURE_SCORE",
+            "thesis_exposure_size_multiplier",
+            "thesis_exposure_rank_adjustment",
+            "thesis_key",
+            "thesis",
+            "thesis_position_count",
+            "related_position_count",
+        ):
+            if signal.get(field) is not None:
+                target[field] = signal.get(field)
         if target.get("profit_engine_size_multiplier_applied"):
             return target
         multiplier = self.to_float(signal.get("profit_engine_size_multiplier"), 1.0) or 1.0
@@ -49179,6 +49646,7 @@ class KalshiSniperBot:
         selected_side = context.get("selected_side") or allocation.get("selected_side") or item.get("selected_side") or getattr(q, "selected_side", None) or getattr(q, "side", None)
         selected_price = self._family_profitability_selected_price(context, allocation, item, market)
         signal = self._aion_entry_profit_signal(
+            ticker=ticker,
             family=family,
             side=selected_side,
             selected_price=selected_price,
@@ -49190,6 +49658,8 @@ class KalshiSniperBot:
             market_quality=context.get("sports_execution_quality_score") or context.get("market_quality") or allocation.get("sports_execution_quality_score"),
             unified_score=context.get("unified_score"),
             q=q,
+            market=market,
+            context=context,
             source=source,
         )
         score_adjustment = self.to_float(signal.get("profit_engine_rank_adjustment"), 0.0) or 0.0
@@ -49212,6 +49682,15 @@ class KalshiSniperBot:
         context["profit_engine_size_multiplier"] = signal.get("profit_engine_size_multiplier")
         context["profit_engine_capital_preference"] = signal.get("capital_preference")
         context["profit_engine_exit_quality_score"] = signal.get("exit_quality_score")
+        context["thesis_exposure"] = signal.get("thesis_exposure")
+        context["thesis_exposure_score"] = signal.get("thesis_exposure_score")
+        context["THESIS_EXPOSURE_SCORE"] = signal.get("THESIS_EXPOSURE_SCORE")
+        context["thesis_exposure_size_multiplier"] = signal.get("thesis_exposure_size_multiplier")
+        context["thesis_exposure_rank_adjustment"] = signal.get("thesis_exposure_rank_adjustment")
+        context["thesis_key"] = signal.get("thesis_key")
+        context["thesis"] = signal.get("thesis")
+        context["thesis_position_count"] = signal.get("thesis_position_count")
+        context["related_position_count"] = signal.get("related_position_count")
         context["profit_engine_size_multiplier_applied"] = True
         reason = str(context.get("reason") or "").strip()
         context["reason"] = "+".join([part for part in (reason, f"profit_engine_{signal.get('capital_preference', 'normal')}") if part])
@@ -49223,6 +49702,10 @@ class KalshiSniperBot:
                 ("profit_engine_size_multiplier", signal.get("profit_engine_size_multiplier")),
                 ("profit_engine_size_multiplier_applied", True),
                 ("profit_engine_capital_preference", signal.get("capital_preference")),
+                ("thesis_exposure_context", signal.get("thesis_exposure")),
+                ("thesis_exposure_size_multiplier", signal.get("thesis_exposure_size_multiplier")),
+                ("thesis_exposure_score", signal.get("thesis_exposure_score")),
+                ("thesis_key", signal.get("thesis_key")),
             ):
                 try:
                     setattr(q, attr_name, attr_value)
@@ -49263,6 +49746,9 @@ class KalshiSniperBot:
         mae_loss = self.to_float(decision.get("mae_loss"), self.to_float(context.get("mae_loss"), None))
         spread_at_exit = self.to_float(decision.get("spread"), self.to_float(context.get("spread"), None))
         liquidity_at_exit = self.to_float(context.get("side_liquidity"), None)
+        entry_context = context.get("entry_context") if isinstance(context.get("entry_context"), dict) else {}
+        thesis_profile = position.get("thesis_profile") if isinstance(position.get("thesis_profile"), dict) else entry_context.get("thesis_profile") if isinstance(entry_context.get("thesis_profile"), dict) else None
+        thesis_exposure = position.get("thesis_exposure") if isinstance(position.get("thesis_exposure"), dict) else entry_context.get("thesis_exposure") if isinstance(entry_context.get("thesis_exposure"), dict) else None
         pending[key] = {
             "key": key,
             "order_id": order_id or None,
@@ -49299,6 +49785,10 @@ class KalshiSniperBot:
             "spread_at_exit": spread_at_exit,
             "liquidity_at_exit": liquidity_at_exit,
             "drift_at_exit": drift_context.get("probability_drift"),
+            "thesis_profile": thesis_profile,
+            "thesis_exposure": thesis_exposure,
+            "thesis_key": position.get("thesis_key") or entry_context.get("thesis_key") or (thesis_profile or {}).get("thesis_key"),
+            "thesis_exposure_score": (thesis_exposure or {}).get("thesis_exposure_score") if isinstance(thesis_exposure, dict) else None,
             "better_candidate_available": bool((decision.get("better_candidate") or {}).get("available")) if isinstance(decision.get("better_candidate"), dict) else False,
             "market_title": context.get("market_title"),
             "drift_context": drift_context,
@@ -51260,6 +51750,32 @@ class KalshiSniperBot:
             "elite_signal_used": bool(elite_context.get("matched") or getattr(q, "elite_signal_used", False)),
             "elite_trader_handle": getattr(q, "elite_trader_handle", None) or ((elite_context.get("signal") or {}).get("trader_handle") if isinstance(elite_context.get("signal"), dict) else None),
         }
+        thesis_exposure = getattr(q, "thesis_exposure_context", None) if q is not None else None
+        if not isinstance(thesis_exposure, dict):
+            thesis_exposure = self._aion_thesis_exposure_context(
+                ticker=ticker,
+                family=family,
+                side=side,
+                selected_price=price,
+                q=q,
+                context=entry_context,
+                source="record_live_position",
+                emit=False,
+            )
+        thesis_profile = {
+            "event": thesis_exposure.get("event") if isinstance(thesis_exposure, dict) else None,
+            "event_key": thesis_exposure.get("event_key") if isinstance(thesis_exposure, dict) else None,
+            "thesis": thesis_exposure.get("thesis") if isinstance(thesis_exposure, dict) else None,
+            "thesis_key": thesis_exposure.get("thesis_key") if isinstance(thesis_exposure, dict) else None,
+            "outcome_slot": thesis_exposure.get("outcome_slot") if isinstance(thesis_exposure, dict) else None,
+            "paired_outcome_slot": thesis_exposure.get("paired_outcome_slot") if isinstance(thesis_exposure, dict) else None,
+            "side": side,
+        }
+        if isinstance(thesis_exposure, dict) and thesis_exposure.get("enabled", True):
+            entry_context["thesis_exposure"] = thesis_exposure
+            entry_context["thesis_profile"] = thesis_profile
+            entry_context["thesis_key"] = thesis_exposure.get("thesis_key")
+            entry_context["thesis_exposure_score"] = thesis_exposure.get("thesis_exposure_score")
         row = {
             "ticker": ticker,
             "family": family,
@@ -51270,6 +51786,9 @@ class KalshiSniperBot:
             "entry_ts": time.time(),
             "order_id": order_id,
             "entry_context": entry_context,
+            "thesis_profile": thesis_profile if thesis_profile.get("thesis_key") else None,
+            "thesis_exposure": thesis_exposure if isinstance(thesis_exposure, dict) and thesis_exposure.get("enabled", True) else None,
+            "thesis_key": thesis_exposure.get("thesis_key") if isinstance(thesis_exposure, dict) else None,
         }
         self.live_positions = [
             position for position in (self.live_positions or [])
@@ -61362,6 +61881,39 @@ class KalshiSniperBot:
                 source="build_live_order_payload",
             ),
         }
+        thesis_exposure = getattr(q, "thesis_exposure_context", None) if q is not None else None
+        if not isinstance(thesis_exposure, dict):
+            thesis_exposure = self._aion_thesis_exposure_context(
+                ticker=ticker,
+                family=family,
+                side=intended_side,
+                selected_price=sizing_context.get("selected_price") or sizing_context.get("selected_price_dollars"),
+                q=q,
+                market=market,
+                context=sizing_context,
+                source=selection_stage or "build_live_order_payload",
+                emit=False,
+            )
+        if isinstance(thesis_exposure, dict) and thesis_exposure.get("enabled", True):
+            thesis_profile = {
+                "event": thesis_exposure.get("event"),
+                "event_key": thesis_exposure.get("event_key"),
+                "thesis": thesis_exposure.get("thesis"),
+                "thesis_key": thesis_exposure.get("thesis_key"),
+                "outcome_slot": thesis_exposure.get("outcome_slot"),
+                "paired_outcome_slot": thesis_exposure.get("paired_outcome_slot"),
+                "side": intended_side,
+            }
+            payload["thesis_exposure"] = thesis_exposure
+            payload["thesis_profile"] = thesis_profile
+            payload["thesis_key"] = thesis_exposure.get("thesis_key")
+            payload["thesis_exposure_score"] = thesis_exposure.get("thesis_exposure_score")
+            payload["thesis_exposure_size_multiplier"] = thesis_exposure.get("thesis_exposure_size_multiplier")
+            if isinstance(payload.get("entry_context"), dict):
+                payload["entry_context"]["thesis_exposure"] = thesis_exposure
+                payload["entry_context"]["thesis_profile"] = thesis_profile
+                payload["entry_context"]["thesis_key"] = thesis_exposure.get("thesis_key")
+                payload["entry_context"]["thesis_exposure_score"] = thesis_exposure.get("thesis_exposure_score")
         if post_only is not None:
             payload["post_only"] = bool(post_only)
         if rest_remainder is not None:
