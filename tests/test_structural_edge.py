@@ -72,7 +72,6 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.live_loss_exit_confirmation_counts = {}
         bot.position_flip_cooldowns = {}
         bot.position_flip_log_markers = {}
-        bot.live_exit_cooldowns = {}
         bot.live_exit_pending_tickers = set()
         bot.get_live_entry_metadata = lambda _ticker: {}
         bot.get_live_market_detail = lambda _ticker: {}
@@ -152,7 +151,6 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.live_loss_exit_confirmation_counts = {}
         bot.position_flip_cooldowns = {}
         bot.position_flip_log_markers = {}
-        bot.live_exit_cooldowns = {}
         bot.live_exit_pending_tickers = set()
         bot.winner_scale_state = {}
         bot._live_order_timestamps = []
@@ -5951,6 +5949,71 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["submitted"])
         self.assertIn("[EXIT_SUBMITTED]", out.getvalue())
         self.assertIn("PROFIT_PROTECT", out.getvalue())
+
+    def test_submit_live_exit_order_keeps_inflight_duplicate_guard(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-EXIT-PENDING"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 1, "entry_ts": time.time() - 90}
+        bot.live_exit_pending_tickers = {ticker}
+        submitted_payloads = []
+        bot.place_live_order = lambda payload: submitted_payloads.append(dict(payload)) or {"submitted": True, "reason": "submitted"}
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "exit",
+            "reason": "position_intelligence_profit_protect",
+            "exit_price": 0.55,
+            "count": 1,
+            "unrealized_pnl": 0.05,
+            "is_sports_position": True,
+            "position_intelligence_label": "PROFIT_PROTECT",
+        }
+
+        result = bot.submit_live_exit_order(position, decision)
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "exit_already_pending")
+        self.assertEqual(submitted_payloads, [])
+
+    def test_submit_live_exit_order_marks_exit_pending_without_recent_order_delay(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-EXIT-NO-COOLDOWN"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 1, "entry_ts": time.time() - 90}
+        bot.live_positions = [position]
+        bot.get_live_submit_authorization = lambda payload: {"ok": True}
+        bot.can_build_live_auth = lambda: True
+        bot._active_live_order_timestamps = lambda: []
+        bot.extract_order_execution_summary = lambda response: {"order_id": "exit-1"}
+        submitted_payloads = []
+        bot.place_live_order = lambda payload: submitted_payloads.append(dict(payload)) or {"submitted": True, "reason": "submitted", "status_code": 201, "response": {"order": {"order_id": "exit-1"}}}
+
+        def recent_order_time_gate(*args, **kwargs):
+            raise AssertionError("exit path should not use recent-order time gate")
+
+        bot.recent_submitted_order_for_ticker = recent_order_time_gate
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "exit",
+            "reason": "position_intelligence_profit_protect",
+            "exit_price": 0.55,
+            "count": 1,
+            "unrealized_pnl": 0.05,
+            "is_sports_position": True,
+            "position_intelligence_label": "PROFIT_PROTECT",
+        }
+
+        result = bot.submit_live_exit_order(position, decision)
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(len(submitted_payloads), 1)
+        self.assertTrue(submitted_payloads[0]["reduce_only"])
+        self.assertEqual(position["status"], "exit_pending")
+        self.assertEqual(bot._get_open_live_positions(), [])
 
     def test_winner_scaling_respects_twenty_dollar_ticker_cap(self):
         self._set_position_management_config(winner_min_hold=0.0, winner_cap=20.0)

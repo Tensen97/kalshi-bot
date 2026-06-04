@@ -1851,7 +1851,6 @@ ENTRY_ATTEMPT_FAMILY_LAST_TICKER = {}
 MAX_EXIT_SPREAD = 0.12
 LIVE_POSITION_POLL_SECONDS = 15
 ALLOW_CONTINUOUS_LIVE_EXITS = False
-LIVE_EXIT_COOLDOWN_SECONDS = 60
 KALSHI_DYNAMIC_EXIT_ENABLED = (os.environ.get("KALSHI_DYNAMIC_EXIT_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 KALSHI_DYNAMIC_EXIT_MIN_PROFIT = _env_float("KALSHI_DYNAMIC_EXIT_MIN_PROFIT", 0.018)
 KALSHI_DYNAMIC_EXIT_WEAK_PROFIT_MULTIPLIER = _env_float("KALSHI_DYNAMIC_EXIT_WEAK_PROFIT_MULTIPLIER", 0.60)
@@ -2630,7 +2629,6 @@ class KalshiSniperBot:
         self.live_canary_selected_ticker = None
         self.live_canary_authorized_ticker = None
         self.live_pending_entry_ticker = None
-        self.live_exit_cooldowns = {}
         self.live_exit_pending_tickers = set()
         self.live_exit_price_history = {}
         self.live_exit_peak_values = {}
@@ -49375,15 +49373,8 @@ class KalshiSniperBot:
         ticker = str(decision.get("ticker") or position.get("ticker") or "").strip()
         if not ticker:
             return {"submitted": False, "reason": "missing_ticker"}
-        now_ts = time.time()
         if ticker in getattr(self, "live_exit_pending_tickers", set()):
             return {"submitted": False, "reason": "exit_already_pending"}
-        cooldown_until = self.to_float((self.live_exit_cooldowns or {}).get(ticker), 0.0) or 0.0
-        if now_ts < cooldown_until:
-            return {"submitted": False, "reason": "exit_cooldown_active", "cooldown_remaining": round(cooldown_until - now_ts, 3)}
-        recent_order = self.recent_submitted_order_for_ticker(ticker, window_seconds=LIVE_EXIT_COOLDOWN_SECONDS)
-        if recent_order:
-            return {"submitted": False, "reason": "recent_order_pending_confirmation", "recent_order": recent_order}
         payload = self._build_live_exit_order_payload(position, decision)
         if not payload:
             return {"submitted": False, "reason": "invalid_exit_payload"}
@@ -49421,7 +49412,6 @@ class KalshiSniperBot:
             order_id = order_summary.get("order_id")
             if result.get("submitted"):
                 self._live_order_timestamps.append(time.time())
-                self.live_exit_cooldowns[ticker] = time.time() + float(LIVE_EXIT_COOLDOWN_SECONDS or 60)
                 self._mark_live_exit_pending(
                     ticker,
                     order_id=order_id,
@@ -49487,7 +49477,6 @@ class KalshiSniperBot:
                     )
                 )
             else:
-                self.live_exit_cooldowns[ticker] = time.time() + min(float(LIVE_EXIT_COOLDOWN_SECONDS or 60), 20.0)
                 self.append_live_audit_log(
                     "live_exit_failed",
                     ticker=ticker,
