@@ -685,7 +685,6 @@ def evaluate_opposite_side_pre_submit_guard(bot, payload, q=None, *, source="pre
             "source": source,
         }
         _emit_opposite_side_log("AION-OPPOSITE-SIDE-AUDIT", result)
-        _emit_opposite_side_log("AION-OPPOSITE-SIDE-BLOCK", result)
         return result
     return {
         "ok": True,
@@ -712,6 +711,7 @@ def evaluate_live_order_risk_governor(
     payload = dict(payload or {})
     warnings = []
     cap_reasons = []
+    opposite_side_warning = None
     kill_enabled, kill_env = _env_flag_enabled(
         "AION_RISK_EMERGENCY_KILL_SWITCH",
         "AION_EMERGENCY_KILL_SWITCH",
@@ -802,9 +802,27 @@ def evaluate_live_order_risk_governor(
         live_state=live_state,
     )
     if not opposite_guard.get("ok"):
-        blocked = _block(opposite_guard.get("reason") or "opposite_side_conflict")
-        blocked["opposite_side_guard"] = opposite_guard
-        return blocked
+        conflicts = opposite_guard.get("conflicts") if isinstance(opposite_guard.get("conflicts"), list) else []
+        exact_ticker_conflict = any(
+            isinstance(conflict, dict)
+            and (
+                str(conflict.get("reason") or "").strip().lower() == "exact_ticker_opposite_side"
+                or str(conflict.get("ticker") or "").strip() == ticker
+            )
+            for conflict in conflicts
+        )
+        if exact_ticker_conflict:
+            _emit_opposite_side_log("AION-OPPOSITE-SIDE-BLOCK", opposite_guard)
+            blocked = _block(opposite_guard.get("reason") or "opposite_side_conflict")
+            blocked["opposite_side_guard"] = opposite_guard
+            return blocked
+        opposite_side_warning = opposite_guard
+        warnings.append("opposite_side_conflict_warning")
+        payload["opposite_side_warning"] = opposite_guard
+        _emit_opposite_side_log(
+            "AION-OPPOSITE-SIDE-WARNING",
+            dict(opposite_guard, decision="CONTINUE", reason="opposite_side_conflict_softened"),
+        )
     if bot.already_holding(ticker):
         try:
             print(
@@ -893,4 +911,5 @@ def evaluate_live_order_risk_governor(
         "max_family_exposure_dollars": round(max_family, 4),
         "max_dollars_per_trade": round(max_dollars, 4),
         "max_contracts_per_trade": int(max_contracts),
+        "opposite_side_warning": opposite_side_warning,
     }

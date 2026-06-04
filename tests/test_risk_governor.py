@@ -159,7 +159,7 @@ class RiskGovernorTests(unittest.TestCase):
         self.assertEqual(result["reason"], "opposite_side_conflict")
         self.assertEqual(result["opposite_side_guard"]["conflicts"][0]["side"], "no")
 
-    def test_same_match_competing_player_yes_buy_is_blocked(self):
+    def test_same_match_competing_player_yes_buy_warns_and_continues(self):
         bot = RiskBotStub()
         bot.live_positions.append(
             {"ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-MIL", "family": "KXATPCHALLENGERMATCH", "side": "yes", "count": 2, "entry_price": 0.60}
@@ -173,11 +173,11 @@ class RiskGovernorTests(unittest.TestCase):
                 selected_price=0.46,
             ),
         )
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "opposite_side_conflict")
-        self.assertEqual(result["opposite_side_guard"]["conflicts"][0]["reason"], "same_event_competing_outcome")
+        self.assertTrue(result["ok"])
+        self.assertIn("opposite_side_conflict_warning", result["warnings"])
+        self.assertEqual(result["opposite_side_warning"]["conflicts"][0]["reason"], "same_event_competing_outcome")
 
-    def test_same_game_competing_team_yes_buy_is_blocked(self):
+    def test_same_game_competing_team_yes_buy_warns_and_continues(self):
         bot = RiskBotStub()
         bot.live_positions.append(
             {"ticker": "KXMLBMONEYLINE-26JUN01NYYBOS-NYY", "family": "KXMLBMONEYLINE", "side": "yes", "count": 1, "entry_price": 0.52}
@@ -191,10 +191,11 @@ class RiskGovernorTests(unittest.TestCase):
                 selected_price=0.49,
             ),
         )
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "opposite_side_conflict")
+        self.assertTrue(result["ok"])
+        self.assertIn("opposite_side_conflict_warning", result["warnings"])
+        self.assertEqual(result["opposite_side_warning"]["conflicts"][0]["reason"], "same_event_competing_outcome")
 
-    def test_game_family_competing_team_yes_buy_is_blocked(self):
+    def test_game_family_competing_team_yes_buy_warns_and_continues(self):
         bot = RiskBotStub()
         bot.live_positions.append(
             {"ticker": "KXNCAASBGAME-26JUN012200ALATTUG2-TTU", "family": "KXNCAASBGAME", "side": "yes", "count": 2, "entry_price": 0.57}
@@ -208,9 +209,9 @@ class RiskGovernorTests(unittest.TestCase):
                 selected_price=0.48,
             ),
         )
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "opposite_side_conflict")
-        self.assertEqual(result["opposite_side_guard"]["conflicts"][0]["reason"], "same_event_competing_outcome")
+        self.assertTrue(result["ok"])
+        self.assertIn("opposite_side_conflict_warning", result["warnings"])
+        self.assertEqual(result["opposite_side_warning"]["conflicts"][0]["reason"], "same_event_competing_outcome")
 
     def test_live_api_opposite_side_truth_overrides_empty_local_state(self):
         bot = RiskBotStub()
@@ -228,8 +229,9 @@ class RiskGovernorTests(unittest.TestCase):
             ),
         )
         self.assertEqual(bot.reconcile_calls, 1)
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "opposite_side_conflict")
+        self.assertTrue(result["ok"])
+        self.assertIn("opposite_side_conflict_warning", result["warnings"])
+        self.assertEqual(result["opposite_side_warning"]["conflicts"][0]["reason"], "same_event_competing_outcome")
 
     def test_reduce_only_exit_allowed_despite_opposite_side_exposure(self):
         bot = RiskBotStub()

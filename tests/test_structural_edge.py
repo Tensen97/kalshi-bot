@@ -1194,7 +1194,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(captured_payloads[0]["count"], 1)
         self.assertEqual(captured_payloads[0]["yes_price"], 54)
 
-    def test_canonical_place_order_blocks_opposite_side_before_post(self):
+    def test_canonical_place_order_warns_on_competing_outcome_and_posts(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         posted = []
@@ -1217,7 +1217,7 @@ class StructuralEdgeTests(unittest.TestCase):
             return {
                 "ok": True,
                 "status_code": 201,
-                "body": {"order": {"order_id": "should-not-post"}},
+                "body": {"order": {"order_id": "soft-conflict-posted"}},
             }
 
         bot._live_request_json = fake_live_request
@@ -1235,9 +1235,9 @@ class StructuralEdgeTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(result["submitted"])
-        self.assertEqual(result["reason"], "opposite_side_conflict")
-        self.assertEqual(posted, [])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["ticker"], "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN")
 
     def test_canonical_place_order_allows_reduce_only_exit_with_conflict(self):
         self._set_sports_only_mode(True)
@@ -3986,7 +3986,7 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertEqual(ranked[0]["ticker"], "KXNCAASB-GAMEA-YES")
 
-    def test_tennis_exposure_cap_blocks_weak_tennis_after_two_open(self):
+    def test_tennis_exposure_cap_softens_weak_tennis_after_two_open(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         self._configure_multi_submit_bot(bot, [])
@@ -3999,8 +3999,9 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as logs:
             result = bot._evaluate_aion_concurrency_candidate(candidate, submitted_entries=[], source="unit_tennis_cap")
 
-        self.assertFalse(result["allowed"])
-        self.assertEqual(result["reason"], "tennis_exposure_cap")
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["reason"], "concurrency_capacity_available")
+        self.assertEqual(result["audit"]["tennis_cap"]["reason"], "tennis_exposure_pressure")
         self.assertIn("[AION-TENNIS-CAP]", logs.getvalue())
 
     def test_elite_tennis_can_exceed_exposure_cap(self):
@@ -4066,7 +4067,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["submitted"])
         self.assertEqual(result["submitted_count"], 8)
         self.assertEqual(len(submitted), 8)
-        self.assertLessEqual(len(tennis_submits), kw.AION_TENNIS_EXPOSURE_CAP)
+        self.assertGreaterEqual(len(tennis_submits), kw.AION_TENNIS_EXPOSURE_CAP)
         self.assertGreaterEqual(result["submitted_family_counts"].get("KXNCAASB", 0), 1)
         self.assertIn("[AION-SLOT-ALLOCATION]", logs.getvalue())
 
@@ -6880,7 +6881,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertAlmostEqual(result["selected_price"], 0.42)
         self.assertIn("[AION-ADMISSION-RELAXED]", logs)
 
-    def test_realm_vv_negative_ev_still_rejected_under_confidence_restore(self):
+    def test_realm_vv_negative_ev_positive_edge_gets_size_penalty(self):
         bot = self._make_bot()
         tradeability = self._realm_confidence_tradeability(ev_edge=-0.01)
 
@@ -6892,10 +6893,15 @@ class StructuralEdgeTests(unittest.TestCase):
             confidence=0.54,
         )
 
-        self.assertFalse(result["tradeable"])
-        self.assertEqual(result["blocker"], "negative_ev")
-        self.assertEqual(result["edge_audit_action"], "block")
-        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+        self.assertTrue(result["tradeable"])
+        self.assertEqual(result["decision"], "BUY")
+        self.assertTrue(result["negative_ev_penalty_applied"])
+        self.assertEqual(result["edge_audit_action"], "warn")
+        self.assertLess(result["negative_ev_size_multiplier"], 1.0)
+        self.assertEqual(
+            result["canonical_tradeability"]["negative_ev_penalty_reason"],
+            "negative_ev_softened_to_size_penalty",
+        )
 
     def test_realm_vv_moderate_wide_spread_penalizes_positive_ev_instead_of_hard_block(self):
         bot = self._make_bot()
@@ -6975,7 +6981,7 @@ class StructuralEdgeTests(unittest.TestCase):
         )
 
         self.assertFalse(result["tradeable"])
-        self.assertEqual(result["blocker"], "negative_ev")
+        self.assertEqual(result["blocker"], "nonpositive_edge")
         self.assertEqual(result["edge_audit_action"], "block")
         self.assertNotIn("[SPORTS-PROBABILITY-OVERRIDE]", logs)
 

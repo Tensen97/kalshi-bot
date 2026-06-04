@@ -284,7 +284,7 @@ class ExpectancyActivationTests(unittest.TestCase):
         self.assertEqual(summary["skipped"].get("record_hard_block", 0), 0)
         self.assertEqual(q.selected_side, "no")
 
-    def test_entry_ready_seed_preserves_atp_challenger_leak_block(self):
+    def test_entry_ready_seed_keeps_atp_challenger_participation(self):
         bot = self._make_bot()
         q = SimpleNamespace(
             ticker="KXATPCHALLENGERMATCH-UNIT",
@@ -322,8 +322,8 @@ class ExpectancyActivationTests(unittest.TestCase):
                 }
             },
         )
-        self.assertEqual(summary["seeded_count"], 0)
-        self.assertEqual(summary["skipped"].get("recent_pnl_leak_kxatpchallenger"), 1)
+        self.assertEqual(summary["seeded_count"], 1)
+        self.assertEqual(summary["skipped"].get("recent_pnl_leak_kxatpchallenger", 0), 0)
 
     def test_expectancy_state_round_trip(self):
         bot = self._make_bot()

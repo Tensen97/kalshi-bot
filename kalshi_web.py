@@ -2077,12 +2077,12 @@ AION_SPORTS_MEMORY_MAX_SIZE_MULTIPLIER = get_env_float("AION_SPORTS_MEMORY_MAX_S
 AION_FAMILY_PROFITABILITY_ENABLED = get_env_bool("AION_FAMILY_PROFITABILITY_ENABLED", 1)
 AION_FAMILY_PROFITABILITY_MIN_TRADES = get_env_int("AION_FAMILY_PROFITABILITY_MIN_TRADES", 2)
 AION_FAMILY_PROFITABILITY_MAX_RANK_BOOST = get_env_float("AION_FAMILY_PROFITABILITY_MAX_RANK_BOOST", 24.0)
-AION_FAMILY_PROFITABILITY_MAX_RANK_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_MAX_RANK_PENALTY", 55.0)
+AION_FAMILY_PROFITABILITY_MAX_RANK_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_MAX_RANK_PENALTY", 12.0)
 AION_FAMILY_PROFITABILITY_MAX_UNIFIED_BOOST = get_env_float("AION_FAMILY_PROFITABILITY_MAX_UNIFIED_BOOST", 14.0)
-AION_FAMILY_PROFITABILITY_MAX_UNIFIED_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_MAX_UNIFIED_PENALTY", 28.0)
-AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER = get_env_float("AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER", 0.30)
+AION_FAMILY_PROFITABILITY_MAX_UNIFIED_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_MAX_UNIFIED_PENALTY", 8.0)
+AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER = get_env_float("AION_FAMILY_PROFITABILITY_MIN_SIZE_MULTIPLIER", 0.70)
 AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER = get_env_float("AION_FAMILY_PROFITABILITY_MAX_SIZE_MULTIPLIER", 1.85)
-AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY", 12.0)
+AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY = get_env_float("AION_FAMILY_PROFITABILITY_LONGSHOT_PENALTY", 3.0)
 AION_FAMILY_PROFITABILITY_PRIORS = {
     "MLB": {"family_pnl": 0.75, "wins": 7, "losses": 1, "trade_count": 8},
     "KXMLB": {"family_pnl": 0.75, "wins": 7, "losses": 1, "trade_count": 8},
@@ -5254,9 +5254,6 @@ class KalshiSniperBot:
                 or self.get_market_family(market or {"ticker": ticker})
                 or "UNKNOWN"
             ).strip().upper() or "UNKNOWN"
-            if str(family).startswith("KXATPCHALLENGERMATCH"):
-                skipped["recent_pnl_leak_kxatpchallenger"] += 1
-                continue
             if self._sports_only_mode_enabled() and not (
                 self._is_sports_market_or_family(family)
                 or self._is_priority_sports_family(family)
@@ -25820,8 +25817,8 @@ class KalshiSniperBot:
         if weak_tennis:
             return {
                 "family": family,
-                "priority_bucket": 6,
-                "priority_label": "losing_tennis",
+                "priority_bucket": 5,
+                "priority_label": "weak_tennis_soft_pressure",
                 "weak_tennis": True,
                 "profitable_family": False,
             }
@@ -25982,13 +25979,13 @@ class KalshiSniperBot:
         failed_checks = [name for name, passed in checks.items() if not passed]
         pressure = max(0.55, min(0.75, 0.65 if checks["EV_elite"] else 0.6))
         payload.update({
-            "decision": "BLOCK",
-            "reason": "tennis_exposure_cap",
+            "decision": "SOFT_LIMIT",
+            "reason": "tennis_exposure_pressure",
             "failed_checks": failed_checks,
             "pressure_factor": pressure,
         })
         self._emit_aion_concurrency_log("AION-TENNIS-CAP", payload)
-        return {"allowed": False, "reason": "tennis_exposure_cap", "audit": payload}
+        return {"allowed": True, "reason": "tennis_exposure_pressure", "audit": payload}
 
     def _slot_allocation_candidate_sort_key(self, candidate, *, snapshot=None):
         meta = self._aion_concurrency_candidate_meta(candidate)
@@ -31953,48 +31950,23 @@ class KalshiSniperBot:
                 selected_price = self.to_float(getattr(q, "no_ask", None), None)
             if selected_price is None:
                 selected_price = self.to_float(getattr(q, "yes_ask", None), None)
-            yes_bid_for_reject = self.to_float(getattr(q, "yes_bid", None), None)
-            yes_ask_for_reject = self.to_float(getattr(q, "yes_ask", None), None)
-            spread_for_reject = self.to_float(getattr(q, "spread", None), None)
-            if spread_for_reject is None and yes_bid_for_reject is not None and yes_ask_for_reject is not None:
-                spread_for_reject = round(float(yes_ask_for_reject) - float(yes_bid_for_reject), 4)
-            liquidity_for_reject = self.to_float(getattr(q, "liquidity", None), None)
-            volume_for_reject = self.to_float(getattr(q, "volume", None), None)
-            self._record_live_reject_telemetry(
-                reason="recent_pnl_leak_kxatpchallenger",
-                ticker=ticker,
-                family=family,
-                spread=spread_for_reject,
-                stage="prefilter",
-                category="sports",
-                details={
-                    "subsystem": "kalshi_web._filter_live_entry_candidate",
-                    "side": selected_side,
-                    "selected_price": selected_price,
-                    "liquidity": liquidity_for_reject,
-                    "volume": volume_for_reject,
-                },
-                subsystem="kalshi_web._filter_live_entry_candidate",
-            )
             builtins.print(
-                "[AION-FINAL-REJECT] "
+                "[AION-ADMISSION-RELAXED] "
                 + json.dumps(
                     {
                         "ticker": ticker,
                         "family": family,
                         "side": selected_side,
                         "selected_price": selected_price,
-                        "spread": spread_for_reject,
-                        "liquidity": liquidity_for_reject,
-                        "volume": volume_for_reject,
-                        "reason": "recent_pnl_leak_kxatpchallenger",
+                        "old_reason": "recent_pnl_leak_kxatpchallenger",
+                        "reason": "recent_pnl_leak_kxatpchallenger_softened",
                         "responsible_subsystem": "kalshi_web._filter_live_entry_candidate",
+                        "decision": "CONTINUE",
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
-            return False, "recent_pnl_leak_kxatpchallenger"
         yes_bid = getattr(q, "yes_bid", 0.0) or 0.0
         yes_ask = getattr(q, "yes_ask", 0.0) or 0.0
         if yes_bid <= 0 or yes_ask <= 0:
@@ -58744,7 +58716,7 @@ class KalshiSniperBot:
         positive_edge = bool(edge is not None and edge > 0.0)
         positive_ev = bool(ev_value is not None and ev_value > 0.0)
         explicit_negative_ev = bool(ev_value is not None and ev_value <= 0.0)
-        positive_value_signal = bool(positive_edge and not explicit_negative_ev)
+        positive_value_signal = bool(positive_edge)
         live_market = bool(
             decision_context.get("live_market")
             or decision_context.get("market_live")
@@ -58806,6 +58778,51 @@ class KalshiSniperBot:
         spread_penalty_applied = False
         spread_rank_adjustment = 0.0
         spread_size_multiplier = 1.0
+        negative_ev_penalty_applied = False
+        negative_ev_size_multiplier = 1.0
+        if explicit_negative_ev and positive_edge and self.is_sports_family(family, ticker=ticker):
+            negative_ev_penalty_applied = True
+            negative_ev_size_multiplier = 0.75
+            edge_audit_action = "warn"
+            tradeability["negative_ev_penalty_applied"] = True
+            tradeability["negative_ev_penalty_reason"] = "negative_ev_softened_to_size_penalty"
+            tradeability["negative_ev_size_multiplier"] = negative_ev_size_multiplier
+            existing_size_multiplier = self.to_float(tradeability.get("suggested_size_multiplier"), None)
+            if existing_size_multiplier is None:
+                tradeability["suggested_size_multiplier"] = negative_ev_size_multiplier
+            else:
+                tradeability["suggested_size_multiplier"] = max(0.10, existing_size_multiplier * negative_ev_size_multiplier)
+            if quote_payload is not None:
+                for attr_name, attr_value in (
+                    ("negative_ev_penalty_applied", True),
+                    ("negative_ev_penalty_reason", "negative_ev_softened_to_size_penalty"),
+                    ("negative_ev_size_multiplier", negative_ev_size_multiplier),
+                ):
+                    try:
+                        setattr(quote_payload, attr_name, attr_value)
+                    except Exception:
+                        pass
+            print(
+                "[AION-EDGE-AUDIT] "
+                + json.dumps(
+                    {
+                        "ticker": selected_ticker,
+                        "family": family,
+                        "side": selected_side,
+                        "selected_price": selected_price,
+                        "edge_after_cost": edge,
+                        "EV": ev_value,
+                        "decision": "WARN",
+                        "reason": "negative_ev_softened_to_size_penalty",
+                        "size_multiplier": negative_ev_size_multiplier,
+                        "quote_ready": bool(quote_ready),
+                        "orderbook_ready": bool(orderbook_ready),
+                        "price_bounds_pass": bool(price_bounds_pass),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         adaptive_confidence_allow = bool(
             self.is_sports_family(family, ticker=ticker)
             and live_market
@@ -58875,13 +58892,13 @@ class KalshiSniperBot:
             blocker_detail = blocker
         elif blocker in {"both_sides_unexecutable", "unexecutable_price"}:
             decision = "SKIP"
-        elif explicit_negative_ev or edge <= 0.0:
+        elif edge is None or edge <= 0.0:
             decision = "SKIP"
-            blocker = "negative_ev" if explicit_negative_ev else "nonpositive_edge"
+            blocker = "nonpositive_edge"
             blocker_detail = (
-                f"EV={ev_value:.6f}"
-                if explicit_negative_ev and ev_value is not None
-                else f"edge_after_cost={edge:.6f}"
+                f"edge_after_cost={edge:.6f}"
+                if edge is not None
+                else "edge_after_cost=missing"
             )
             edge_audit_action = "block"
             print(
@@ -59176,9 +59193,7 @@ class KalshiSniperBot:
                 blocker_detail = f"confidence={confidence:.4f}<floor={confidence_floor:.4f}"
                 confidence_gate_action = "block"
                 confidence_gate_reason = (
-                    "negative_ev"
-                    if explicit_negative_ev
-                    else "extreme_spread"
+                    "extreme_spread"
                     if truly_extreme_spread
                     else "missing_executable_quote"
                     if not quote_ready or not orderbook_ready
@@ -59254,7 +59269,7 @@ class KalshiSniperBot:
                 blocker_detail = blocker_detail or blocker
         if decision == "WAIT" and wait_reason is None:
             wait_reason = "wait_for_better_fill"
-        if decision == "BUY" and moderate_wide_spread and positive_edge and not explicit_negative_ev:
+        if decision == "BUY" and moderate_wide_spread and positive_edge:
             spread_basis = self.to_float(spread_width_value, 0.0) or 0.0
             spread_size_multiplier = round(max(0.35, min(0.9, 1.0 - min(0.55, spread_basis * 2.0))), 4)
             spread_rank_adjustment = round(-max(0.25, min(8.0, spread_basis * 24.0)), 4)
@@ -59361,6 +59376,8 @@ class KalshiSniperBot:
             "confidence_rank_adjustment": confidence_rank_adjustment,
             "confidence_size_multiplier": confidence_size_multiplier,
             "edge_audit_action": edge_audit_action,
+            "negative_ev_penalty_applied": bool(negative_ev_penalty_applied),
+            "negative_ev_size_multiplier": negative_ev_size_multiplier,
             "spread_penalty_applied": bool(spread_penalty_applied),
             "spread_rank_adjustment": spread_rank_adjustment,
             "spread_size_multiplier": spread_size_multiplier,
@@ -59418,6 +59435,9 @@ class KalshiSniperBot:
                 "EV": ev_value,
                 "positive_edge": bool(positive_edge),
                 "positive_ev": bool(positive_ev),
+                "explicit_negative_ev": bool(explicit_negative_ev),
+                "negative_ev_penalty_applied": bool(negative_ev_penalty_applied),
+                "negative_ev_size_multiplier": negative_ev_size_multiplier,
                 "spread": spread_value,
                 "spread_cents": tradeability.get("spread_cents"),
                 "spread_bucket": spread_bucket or None,

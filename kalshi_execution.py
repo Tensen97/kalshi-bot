@@ -667,6 +667,7 @@ def place_live_order(bot, payload):
     selected_price_key = validation.get("price_key")
     selected_price = request_payload.get(selected_price_key)
     sports_live_guard_result = None
+    opposite_side_guard_result = None
     sports_live_guard = getattr(bot, "evaluate_sports_live_state_pre_submit_guard", None)
     if callable(sports_live_guard):
         guard_payload = dict(payload)
@@ -698,16 +699,50 @@ def place_live_order(bot, payload):
             source="canonical_place_live_order",
             refresh=True,
         )
+        opposite_side_guard_result = guard_result if isinstance(guard_result, dict) else None
         if not guard_result.get("ok"):
-            return {
-                "submitted": False,
-                "reason": guard_result.get("reason") or "opposite_side_conflict",
-                "payload": legacy_payload,
-                "request_payload": request_payload,
-                "endpoint": path,
-                "endpoint_kind": endpoint_kind,
-                "opposite_side_guard": guard_result,
-            }
+            conflicts = guard_result.get("conflicts") if isinstance(guard_result.get("conflicts"), list) else []
+            ticker = str(request_payload.get("ticker") or legacy_payload.get("ticker") or "").strip()
+            exact_ticker_conflict = any(
+                isinstance(conflict, dict)
+                and (
+                    str(conflict.get("reason") or "").strip().lower() == "exact_ticker_opposite_side"
+                    or str(conflict.get("ticker") or "").strip() == ticker
+                )
+                for conflict in conflicts
+            )
+            if not exact_ticker_conflict:
+                print(
+                    "[AION-OPPOSITE-SIDE-WARNING] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker or None,
+                            "selected_side": request_payload.get("side") or legacy_payload.get("side"),
+                            "old_reason": guard_result.get("reason") or "opposite_side_conflict",
+                            "reason": "opposite_side_conflict_softened",
+                            "conflict_count": guard_result.get("conflict_count"),
+                            "conflicts": guard_result.get("conflicts"),
+                            "source": "kalshi_execution.place_live_order",
+                            "decision": "CONTINUE",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            else:
+                print(
+                    "[AION-OPPOSITE-SIDE-BLOCK] "
+                    + json.dumps(guard_result, sort_keys=True, default=str)
+                )
+                return {
+                    "submitted": False,
+                    "reason": guard_result.get("reason") or "opposite_side_conflict",
+                    "payload": legacy_payload,
+                    "request_payload": request_payload,
+                    "endpoint": path,
+                    "endpoint_kind": endpoint_kind,
+                    "opposite_side_guard": guard_result,
+                }
     print(
         "[AION-EXECUTION-RECOVERY-SUBMIT] "
         + json.dumps(
@@ -723,6 +758,8 @@ def place_live_order(bot, payload):
                 "sports_live_guard_ok": None if sports_live_guard_result is None else bool(sports_live_guard_result.get("ok")),
                 "sports_live_guard_reason": None if sports_live_guard_result is None else sports_live_guard_result.get("reason"),
                 "sports_live_guard_block_reason": None if sports_live_guard_result is None else sports_live_guard_result.get("block_reason"),
+                "opposite_side_guard_ok": None if opposite_side_guard_result is None else bool(opposite_side_guard_result.get("ok")),
+                "opposite_side_guard_reason": None if opposite_side_guard_result is None else opposite_side_guard_result.get("reason"),
                 "orderbook_ready": payload.get("orderbook_ready"),
                 "subsystem": "kalshi_execution.place_live_order",
             },

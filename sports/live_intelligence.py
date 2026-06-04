@@ -15780,7 +15780,7 @@ def find_best_live_ticker(self, markets=None):
     final_family_counts = {}
     strict_reject_reason_counts = {}
     if prefilter_pool or family_adaptive_probe_pool:
-        def _blocked_recent_pnl_leak_candidate(item):
+        def _recent_pnl_leak_candidate(item):
             try:
                 prescore, market = item
             except (TypeError, ValueError):
@@ -15792,34 +15792,24 @@ def find_best_live_ticker(self, markets=None):
             ).strip().upper()
             return family.startswith("KXATPCHALLENGERMATCH")
 
-        prefilter_before_pnl_leak_filter = len(prefilter_pool)
-        adaptive_before_pnl_leak_filter = len(family_adaptive_probe_pool)
-        prefilter_pool = [
-            item for item in prefilter_pool
-            if not _blocked_recent_pnl_leak_candidate(item)
-        ]
-        family_adaptive_probe_pool = [
-            item for item in family_adaptive_probe_pool
-            if not _blocked_recent_pnl_leak_candidate(item)
-        ]
-        removed_recent_pnl_leak = (
-            prefilter_before_pnl_leak_filter
-            + adaptive_before_pnl_leak_filter
-            - len(prefilter_pool)
-            - len(family_adaptive_probe_pool)
+        recent_pnl_leak_candidates = sum(
+            1 for item in prefilter_pool
+            if _recent_pnl_leak_candidate(item)
+        ) + sum(
+            1 for item in family_adaptive_probe_pool
+            if _recent_pnl_leak_candidate(item)
         )
-        if removed_recent_pnl_leak > 0:
+        if recent_pnl_leak_candidates > 0:
             print(
                 "[LIVE-SELECT-STRICT-PREFILTER] "
                 + json.dumps(
                     {
-                        "reason": "recent_pnl_leak_kxatpchallenger",
-                        "removed": int(removed_recent_pnl_leak),
-                        "prefilter_before": int(prefilter_before_pnl_leak_filter),
-                        "prefilter_after": int(len(prefilter_pool)),
-                        "adaptive_before": int(adaptive_before_pnl_leak_filter),
-                        "adaptive_after": int(len(family_adaptive_probe_pool)),
-                        "next_action": "fill_strict_pool_from_remaining_candidates",
+                        "reason": "recent_pnl_leak_kxatpchallenger_softened",
+                        "removed": 0,
+                        "retained": int(recent_pnl_leak_candidates),
+                        "prefilter_count": int(len(prefilter_pool)),
+                        "adaptive_count": int(len(family_adaptive_probe_pool)),
+                        "next_action": "keep_candidates_in_strict_pool",
                     },
                     sort_keys=True,
                     default=str,
