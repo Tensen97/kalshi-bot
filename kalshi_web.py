@@ -442,10 +442,18 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-MOMENTUM-PRESS-ADD",
     "AION-REVERSAL-EXIT-CHECK",
     "AION-REVERSAL-EXIT",
+    "AION-POSITION-INTELLIGENCE",
+    "PROFIT_RUN",
+    "PROFIT_PROTECT",
+    "TRAILING_LOCK",
+    "FAST_CUT",
+    "CAPITAL_RECYCLE",
+    "SETTLEMENT_HOLD",
     "SPORTS-PROFIT-LOCK-EXIT",
     "AION-PEAK-VALUE-UPDATE",
     "AION-EXIT-SKIP",
     "LIVE-EXIT",
+    "EXIT_SUBMITTED",
     "ORDER-SUBMITTED",
     "ORDER-SUBMIT",
     "POSITION-OPEN",
@@ -2292,6 +2300,20 @@ AION_REVERSAL_EXIT_MAX_SPREAD = max(0.01, get_env_float("AION_REVERSAL_EXIT_MAX_
 AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT = max(0.05, min(0.90, get_env_float("AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT", 0.30)))
 AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT = max(0.05, min(AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT, get_env_float("AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT", 0.25)))
 AION_REVERSAL_EXIT_SHARP_OPPONENT_DELTA = max(0.006, get_env_float("AION_REVERSAL_EXIT_SHARP_OPPONENT_DELTA", 0.018))
+AION_POSITION_INTELLIGENCE_ENABLED = get_env_bool("AION_POSITION_INTELLIGENCE_ENABLED", 1)
+AION_PI_MIN_GREEN_PNL_PER_CONTRACT = max(0.005, get_env_float("AION_PI_MIN_GREEN_PNL_PER_CONTRACT", 0.01))
+AION_PI_MIN_GREEN_DOLLARS = max(0.01, get_env_float("AION_PI_MIN_GREEN_DOLLARS", 0.02))
+AION_PI_PEAK_PROFIT_FLOOR = max(0.01, get_env_float("AION_PI_PEAK_PROFIT_FLOOR", 0.03))
+AION_PI_TRAIL_GIVEBACK_PCT = max(0.05, min(0.90, get_env_float("AION_PI_TRAIL_GIVEBACK_PCT", 0.22)))
+AION_PI_SMALL_ACCOUNT_TRAIL_GIVEBACK_PCT = max(0.05, min(AION_PI_TRAIL_GIVEBACK_PCT, get_env_float("AION_PI_SMALL_ACCOUNT_TRAIL_GIVEBACK_PCT", 0.18)))
+AION_PI_FAST_CUT_MIN_HOLD_SECONDS = max(15.0, get_env_float("AION_PI_FAST_CUT_MIN_HOLD_SECONDS", 30.0))
+AION_PI_FAST_CUT_LOSS_PER_CONTRACT = max(0.005, get_env_float("AION_PI_FAST_CUT_LOSS_PER_CONTRACT", 0.025))
+AION_PI_RECYCLE_MIN_HOLD_SECONDS = max(60.0, get_env_float("AION_PI_RECYCLE_MIN_HOLD_SECONDS", 180.0))
+AION_PI_STALL_DELTA = max(0.0005, get_env_float("AION_PI_STALL_DELTA", 0.002))
+AION_PI_RUN_MIN_DELTA = max(0.0005, get_env_float("AION_PI_RUN_MIN_DELTA", KALSHI_DYNAMIC_EXIT_MOMENTUM_EPSILON))
+AION_PI_MAX_EXIT_SPREAD = max(0.01, get_env_float("AION_PI_MAX_EXIT_SPREAD", max(MAX_EXIT_SPREAD, 0.18)))
+AION_PI_SETTLEMENT_HOLD_PRICE = max(0.50, min(0.99, get_env_float("AION_PI_SETTLEMENT_HOLD_PRICE", 0.88)))
+AION_PI_BETTER_CANDIDATE_SCORE_DELTA = max(0.0, get_env_float("AION_PI_BETTER_CANDIDATE_SCORE_DELTA", 8.0))
 LIVE_ORDER_RATE_LIMIT = max(1, get_env_int("LIVE_ORDER_RATE_LIMIT", get_env_int("AION_LIVE_ORDER_RATE_LIMIT", 5)))
 LIVE_ORDER_RATE_WINDOW_SEC = max(1, get_env_int("LIVE_ORDER_RATE_WINDOW_SEC", 60))
 LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS = 30
@@ -47592,6 +47614,395 @@ class KalshiSniperBot:
         self._emit_position_management_log("AION-DEAD-POSITION-EXIT", {**payload, "reason": "dead_position_no_improvement"})
         return exit_decision
 
+    def _position_intelligence_candidate_strength(self, candidate):
+        q = candidate
+        candidate_dict = candidate if isinstance(candidate, dict) else {}
+        if isinstance(candidate, dict):
+            q = (
+                candidate.get("q")
+                or candidate.get("quote")
+                or candidate.get("quote_obj")
+                or candidate.get("candidate")
+                or candidate.get("selected_quote")
+                or candidate
+            )
+        values = []
+        for key in (
+            "sports_execution_quality_score",
+            "unified_opportunity_score",
+            "market_quality",
+            "conviction_score",
+            "confidence",
+            "score",
+            "rank_score",
+        ):
+            values.append(self.to_float(candidate_dict.get(key), None))
+            values.append(self.to_float(getattr(q, key, None), None))
+        score = max([float(value) for value in values if value is not None] or [0.0])
+        edge_values = []
+        for key in (
+            "selected_edge_after_cost",
+            "edge_after_cost",
+            "EV",
+            "edge",
+            "yes_edge_after_cost",
+            "no_edge_after_cost",
+        ):
+            edge_values.append(self.to_float(candidate_dict.get(key), None))
+            edge_values.append(self.to_float(getattr(q, key, None), None))
+        edge = max([float(value) for value in edge_values if value is not None] or [0.0])
+        if edge > 0.0 and score < 100.0:
+            score += min(20.0, edge * 100.0)
+        ticker = str(
+            candidate_dict.get("ticker")
+            or getattr(q, "ticker", "")
+            or ""
+        ).strip()
+        family = str(candidate_dict.get("family") or getattr(q, "family", "") or "").strip().upper()
+        if not family and ticker:
+            family = str(self.get_market_family({"ticker": ticker}) or "").strip().upper()
+        side = self._normalize_live_side(
+            candidate_dict.get("selected_side")
+            or candidate_dict.get("side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        return {
+            "ticker": ticker,
+            "family": family,
+            "side": side,
+            "score": round(float(score), 4),
+            "edge": round(float(edge), 6),
+            "source": candidate_dict.get("source") or getattr(q, "source", None),
+        }
+
+    def _position_intelligence_best_live_candidate(self, current_context=None):
+        current_context = current_context if isinstance(current_context, dict) else {}
+        current_ticker = str(current_context.get("ticker") or "").strip()
+        candidates = []
+        selected = getattr(self, "last_auto_live_selected_quote", None)
+        if selected is not None:
+            candidates.append({"q": selected, "source": "last_auto_live_selected_quote"})
+        for raw in list(getattr(self, "last_dual_lane_buy_candidates", []) or []):
+            if isinstance(raw, dict):
+                candidates.append({**raw, "source": raw.get("source") or "last_dual_lane_buy_candidates"})
+            elif isinstance(raw, (list, tuple)) and raw:
+                candidates.append({"q": raw[-1], "source": "last_dual_lane_buy_candidates"})
+        summary = getattr(self, "last_live_select_summary", {}) or {}
+        if isinstance(summary, dict) and (summary.get("selected_ticker") or summary.get("best_candidate_ticker")):
+            candidates.append(
+                {
+                    "ticker": summary.get("selected_ticker") or summary.get("best_candidate_ticker"),
+                    "family": summary.get("selected_family") or summary.get("family"),
+                    "selected_side": summary.get("selected_side") or summary.get("side"),
+                    "sports_execution_quality_score": summary.get("selected_score") or summary.get("best_candidate_score"),
+                    "edge_after_cost": summary.get("selected_edge_after_cost") or summary.get("edge_after_cost"),
+                    "source": "last_live_select_summary",
+                }
+            )
+        best = None
+        for candidate in candidates:
+            strength = self._position_intelligence_candidate_strength(candidate)
+            ticker = str(strength.get("ticker") or "").strip()
+            if not ticker or ticker == current_ticker:
+                continue
+            if not self.is_sports_family(strength.get("family"), ticker=ticker):
+                continue
+            if best is None or float(strength.get("score") or 0.0) > float(best.get("score") or 0.0):
+                best = strength
+        if best is None:
+            return {"available": False, "reason": "no_better_live_candidate"}
+        current_quality = self.to_float(current_context.get("market_quality"), 0.0) or 0.0
+        current_edge = self.to_float(current_context.get("explicit_edge_after_cost"), 0.0) or 0.0
+        current_score = max(float(current_quality), max(0.0, float(current_edge)) * 100.0)
+        score_delta = float(best.get("score") or 0.0) - float(current_score)
+        return {
+            **best,
+            "available": bool(score_delta >= float(AION_PI_BETTER_CANDIDATE_SCORE_DELTA or 0.0)),
+            "score_delta": round(score_delta, 4),
+            "current_score": round(current_score, 4),
+            "required_score_delta": float(AION_PI_BETTER_CANDIDATE_SCORE_DELTA or 0.0),
+            "reason": "better_live_candidate" if score_delta >= float(AION_PI_BETTER_CANDIDATE_SCORE_DELTA or 0.0) else "candidate_not_better_enough",
+        }
+
+    def _position_intelligence_existing_exit_label(self, decision):
+        reason = str((decision or {}).get("reason") or "").strip().lower()
+        if reason in {"trailing_profit_giveback", "green_to_red_peak_giveback"}:
+            return "TRAILING_LOCK"
+        if reason in {"defensive_exit", "adverse_fast_cut", "severe_stop_loss", "stop_loss", "dead_prop_exit", "late_game_decay_exit", "stale_sports_exit"}:
+            return "FAST_CUT"
+        if reason in {"capital_rotation_harvest", "dead_position_no_improvement"}:
+            return "CAPITAL_RECYCLE"
+        if reason in {"max_payout_profit_lock", "near_lock_harvest", "near_expiry_profit_lock"}:
+            return "SETTLEMENT_HOLD"
+        if reason in {"fast_green_harvest", "fast_profit_pct_lock", "fast_profit_dollar_lock", "green_momentum_flip", "harvest_profit", "protect_profit", "profit_momentum_weakened", "take_profit"}:
+            return "PROFIT_PROTECT"
+        return "POSITION_EXIT"
+
+    def _position_intelligence_exit_decision(self, decision, context, *, reason, label, extra=None):
+        extra = extra if isinstance(extra, dict) else {}
+        exit_decision = dict(decision or {})
+        count = self.to_float(context.get("count"), 0.0) or 0.0
+        entry_cost = self.to_float(context.get("entry_cost"), 0.0) or 0.0
+        cashout_value = self.to_float(context.get("cashout_value"), None)
+        current_profit = round(float(cashout_value or 0.0) - float(entry_cost or 0.0), 4) if cashout_value is not None else context.get("unrealized_pnl")
+        exit_decision.update(
+            {
+                "ticker": context.get("ticker"),
+                "family": context.get("family"),
+                "side": context.get("side"),
+                "action": "exit",
+                "reason": reason,
+                "entry_price": context.get("entry_price"),
+                "current_price": context.get("current_price"),
+                "exit_price": context.get("exit_price"),
+                "spread": context.get("spread"),
+                "count": count,
+                "hold_seconds": context.get("hold_seconds"),
+                "pnl_per_contract": context.get("pnl_per_contract"),
+                "unrealized_pnl": current_profit,
+                "cashout_value": context.get("cashout_value"),
+                "entry_cost": context.get("entry_cost"),
+                "is_sports_position": True,
+                "position_intelligence_label": label,
+                "position_intelligence_exit": True,
+            }
+        )
+        exit_decision.update(extra)
+        return exit_decision
+
+    def _evaluate_aggressive_position_intelligence(self, position, decision, *, quotes_by_ticker=None):
+        decision = decision if isinstance(decision, dict) else {}
+        if not AION_POSITION_INTELLIGENCE_ENABLED:
+            return decision
+        context = self._build_position_monitor_context(position, decision=decision, quotes_by_ticker=quotes_by_ticker)
+        ticker = str(context.get("ticker") or "").strip()
+        family = str(context.get("family") or "").strip().upper()
+        if not ticker or not self.is_sports_family(family, ticker=ticker):
+            return decision
+        q = context.get("q")
+        book_source = str(self._read_field(q, "orderbook_source", "book_source", default="") or "").strip().lower() if q is not None else ""
+        fake_book = bool(
+            self._read_field(q, "synthetic_used", default=False) if q is not None else False
+        ) or book_source in {"synthetic", "fake", "fake_book"}
+        spread = self.to_float(context.get("spread"), None)
+        exit_price = self._position_flip_price_value(context.get("exit_price"))
+        executable_exit = bool(
+            not fake_book
+            and exit_price is not None
+            and 0.0 < float(exit_price) < 1.0
+            and (spread is None or spread <= float(AION_PI_MAX_EXIT_SPREAD or MAX_EXIT_SPREAD))
+        )
+        press_state = self._momentum_press_state(context)
+        entry_cost = self.to_float(context.get("entry_cost"), 0.0) or 0.0
+        cashout_value = self.to_float(context.get("cashout_value"), None)
+        current_value = self.to_float(context.get("current_value"), cashout_value)
+        max_payout = self.to_float(context.get("count"), 0.0) or 0.0
+        peak_context = kalshi_exits_module.update_live_exit_peak_value(
+            self,
+            ticker=ticker,
+            side=context.get("side"),
+            entry_cost=entry_cost,
+            current_value=current_value,
+            cashout_value=cashout_value,
+            max_payout=max_payout,
+        )
+        peak_profit = self.to_float(decision.get("peak_profit"), self.to_float(peak_context.get("peak_profit"), 0.0)) or 0.0
+        peak_value = self.to_float(decision.get("peak_value"), self.to_float(peak_context.get("peak_value"), None))
+        peak_giveback_pct = self.to_float(decision.get("peak_giveback_pct"), self.to_float(peak_context.get("peak_giveback_pct"), 0.0)) or 0.0
+        current_profit = round(float(cashout_value or 0.0) - float(entry_cost or 0.0), 4) if cashout_value is not None else self.to_float(context.get("unrealized_pnl"), 0.0) or 0.0
+        pnl_per_contract = self.to_float(context.get("pnl_per_contract"), 0.0) or 0.0
+        hold_seconds = self.to_float(context.get("hold_seconds"), 0.0) or 0.0
+        recent_delta = self.to_float(context.get("recent_delta"), 0.0) or 0.0
+        last_step_delta = self.to_float(context.get("last_step_delta"), 0.0) or 0.0
+        side_support = self.to_float(context.get("side_support"), 0.0) or 0.0
+        neutral_band = max(0.0, float(KALSHI_ORDERBOOK_IMBALANCE_NEUTRAL_BAND or 0.0))
+        run_eps = max(0.0005, float(AION_PI_RUN_MIN_DELTA or KALSHI_DYNAMIC_EXIT_MOMENTUM_EPSILON or 0.004))
+        stall_delta = max(0.0005, float(AION_PI_STALL_DELTA or 0.002))
+        opponent_recovering = bool((press_state or {}).get("opponent_recovering") or (press_state or {}).get("opponent_sharp_recovery"))
+        strengthening = bool(
+            press_state.get("allowed")
+            or (
+                recent_delta >= run_eps
+                and last_step_delta >= -stall_delta
+                and side_support >= -neutral_band
+                and not opponent_recovering
+            )
+        )
+        stalling = bool(
+            hold_seconds >= 30.0
+            and abs(recent_delta) <= stall_delta
+            and last_step_delta <= stall_delta
+            and side_support <= neutral_band
+        )
+        weakening = bool(
+            recent_delta <= -run_eps
+            or last_step_delta <= -stall_delta
+            or side_support < -neutral_band
+            or opponent_recovering
+            or str(context.get("thesis_status") or "").strip().lower() == "weakening"
+        )
+        green_floor = max(
+            float(AION_PI_MIN_GREEN_DOLLARS or 0.02),
+            min(0.25, float(entry_cost or 0.0) * 0.02),
+        )
+        green_contract_floor = float(AION_PI_MIN_GREEN_PNL_PER_CONTRACT or 0.01)
+        protectable_green = bool(current_profit >= green_floor or pnl_per_contract >= green_contract_floor)
+        small_account = bool(entry_cost <= float(AION_WINNER_SCALE_MAX_TICKER_EXPOSURE or 20.0))
+        peak_floor = max(float(AION_PI_PEAK_PROFIT_FLOOR or 0.03), min(0.25, float(entry_cost or 0.0) * 0.03))
+        trail_threshold = float(AION_PI_SMALL_ACCOUNT_TRAIL_GIVEBACK_PCT if small_account else AION_PI_TRAIL_GIVEBACK_PCT)
+        trailing_lock = bool(
+            executable_exit
+            and current_profit > 0.0
+            and peak_profit >= peak_floor
+            and peak_giveback_pct >= trail_threshold
+        )
+        fast_cut = bool(
+            executable_exit
+            and hold_seconds >= float(AION_PI_FAST_CUT_MIN_HOLD_SECONDS or 30.0)
+            and pnl_per_contract <= -float(AION_PI_FAST_CUT_LOSS_PER_CONTRACT or 0.025)
+            and weakening
+        )
+        profit_protect = bool(
+            executable_exit
+            and protectable_green
+            and current_profit > 0.0
+            and (weakening or stalling)
+        )
+        current_price = self._position_flip_price_value(context.get("current_price"))
+        high_probability = bool(current_price is not None and current_price >= float(AION_PI_SETTLEMENT_HOLD_PRICE or 0.88))
+        settlement_hold = bool(
+            high_probability
+            and current_profit >= 0.0
+            and strengthening
+            and not opponent_recovering
+            and not trailing_lock
+        )
+        better_candidate = self._position_intelligence_best_live_candidate(context)
+        stagnant_quality = bool(
+            executable_exit
+            and hold_seconds >= float(AION_PI_RECYCLE_MIN_HOLD_SECONDS or 180.0)
+            and current_profit >= -green_floor
+            and not strengthening
+            and (stalling or weakening or str(context.get("thesis_status") or "").strip().lower() in {"flat", "weakening"})
+            and bool(better_candidate.get("available"))
+        )
+        existing_action = str(decision.get("action") or "hold").strip().lower()
+        existing_reason = str(decision.get("reason") or "").strip().lower()
+        payload = {
+            **{key: value for key, value in context.items() if key not in {"q", "market"}},
+            "existing_action": existing_action,
+            "existing_reason": existing_reason,
+            "current_profit": current_profit,
+            "peak_value": peak_value,
+            "peak_profit": round(float(peak_profit), 4),
+            "peak_giveback_pct": round(float(peak_giveback_pct), 4),
+            "green_floor": round(float(green_floor), 4),
+            "green_contract_floor": round(float(green_contract_floor), 4),
+            "peak_profit_floor": round(float(peak_floor), 4),
+            "trail_threshold": round(float(trail_threshold), 4),
+            "fast_cut_loss_per_contract": float(AION_PI_FAST_CUT_LOSS_PER_CONTRACT or 0.025),
+            "run_min_delta": round(float(run_eps), 6),
+            "stall_delta": round(float(stall_delta), 6),
+            "strengthening": strengthening,
+            "stalling": stalling,
+            "weakening": weakening,
+            "opponent_recovering": opponent_recovering,
+            "protectable_green": protectable_green,
+            "exit_executable": executable_exit,
+            "fake_book": fake_book,
+            "better_candidate": better_candidate,
+        }
+
+        decision_label = None
+        updated = dict(decision)
+        if fake_book:
+            decision_label = "POSITION_HOLD"
+            updated.update({"action": "hold", "reason": "position_intelligence_invalid_book", "position_intelligence_label": decision_label})
+        elif settlement_hold and existing_action == "exit" and existing_reason in {
+            "max_payout_profit_lock",
+            "near_lock_harvest",
+            "near_expiry_profit_lock",
+            "fast_green_harvest",
+            "fast_profit_pct_lock",
+            "fast_profit_dollar_lock",
+            "capital_rotation_harvest",
+            "harvest_profit",
+            "take_profit",
+            "runner_profit_target",
+        }:
+            decision_label = "SETTLEMENT_HOLD"
+            updated.update(
+                {
+                    "action": "hold",
+                    "reason": "position_intelligence_settlement_hold",
+                    "position_intelligence_label": decision_label,
+                    "position_intelligence_override": True,
+                    "deferred_exit_reason": existing_reason,
+                }
+            )
+        elif existing_action == "exit":
+            decision_label = self._position_intelligence_existing_exit_label(decision)
+            updated.update({"position_intelligence_label": decision_label})
+        elif settlement_hold:
+            decision_label = "SETTLEMENT_HOLD"
+            updated.update({"action": "hold", "reason": "position_intelligence_settlement_hold", "position_intelligence_label": decision_label})
+        elif trailing_lock:
+            decision_label = "TRAILING_LOCK"
+            updated = self._position_intelligence_exit_decision(
+                decision,
+                context,
+                reason="position_intelligence_trailing_lock",
+                label=decision_label,
+                extra={
+                    "peak_value": peak_value,
+                    "peak_profit": round(float(peak_profit), 4),
+                    "peak_giveback_pct": round(float(peak_giveback_pct), 4),
+                    "trailing_profit_exit": True,
+                },
+            )
+        elif fast_cut:
+            decision_label = "FAST_CUT"
+            updated = self._position_intelligence_exit_decision(
+                decision,
+                context,
+                reason="position_intelligence_fast_cut",
+                label=decision_label,
+                extra={"fast_cut_exit": True},
+            )
+        elif profit_protect:
+            decision_label = "PROFIT_PROTECT"
+            updated = self._position_intelligence_exit_decision(
+                decision,
+                context,
+                reason="position_intelligence_profit_protect",
+                label=decision_label,
+                extra={"profit_protect_exit": True},
+            )
+        elif stagnant_quality:
+            decision_label = "CAPITAL_RECYCLE"
+            updated = self._position_intelligence_exit_decision(
+                decision,
+                context,
+                reason="position_intelligence_capital_recycle",
+                label=decision_label,
+                extra={"capital_recycle_exit": True, "better_candidate": better_candidate},
+            )
+        elif current_profit > 0.0 and strengthening:
+            decision_label = "PROFIT_RUN"
+            updated.update({"action": "hold", "reason": "position_intelligence_profit_run", "position_intelligence_label": decision_label})
+        else:
+            decision_label = "POSITION_HOLD"
+            updated.update({"position_intelligence_label": decision_label})
+
+        payload["decision_label"] = decision_label
+        payload["final_action"] = updated.get("action")
+        payload["final_reason"] = updated.get("reason")
+        self._emit_position_management_log("AION-POSITION-INTELLIGENCE", payload)
+        if decision_label in {"PROFIT_RUN", "PROFIT_PROTECT", "TRAILING_LOCK", "FAST_CUT", "CAPITAL_RECYCLE", "SETTLEMENT_HOLD"}:
+            self._emit_position_management_log(decision_label, payload)
+        return updated
+
     def _is_protective_position_exit_decision(self, decision):
         decision = decision if isinstance(decision, dict) else {}
         if str(decision.get("action") or "").strip().lower() != "exit":
@@ -47613,6 +48024,10 @@ class KalshiSniperBot:
             "near_expiry_profit_lock",
             "dead_position_no_improvement",
             "momentum_reversal_profit_protect",
+            "position_intelligence_trailing_lock",
+            "position_intelligence_profit_protect",
+            "position_intelligence_fast_cut",
+            "position_intelligence_capital_recycle",
         }
         if reason in protective_reasons:
             return True
@@ -47630,6 +48045,10 @@ class KalshiSniperBot:
             "dead_prop_exit",
             "dead_position_exit",
             "momentum_reversal_exit",
+            "position_intelligence_exit",
+            "profit_protect_exit",
+            "fast_cut_exit",
+            "capital_recycle_exit",
         )
         return any(bool(decision.get(flag)) for flag in protective_flags)
 
@@ -48045,6 +48464,24 @@ class KalshiSniperBot:
                             "ticker": ticker,
                             "submitted": True,
                             "reason": decision.get("reason"),
+                            "pnl": decision.get("unrealized_pnl"),
+                            "order_id": order_id,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+                print(
+                    "[EXIT_SUBMITTED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": decision.get("family"),
+                            "side": payload.get("side"),
+                            "count": payload.get("count"),
+                            "price": payload.get("price"),
+                            "reason": decision.get("reason"),
+                            "position_intelligence_label": decision.get("position_intelligence_label"),
                             "pnl": decision.get("unrealized_pnl"),
                             "order_id": order_id,
                         },
@@ -48469,7 +48906,12 @@ class KalshiSniperBot:
                 market=payload_override if isinstance(payload_override, dict) else {"ticker": ticker, "series_ticker": family},
                 q=q,
             )
-        if self._sports_only_execution_blocked(
+        submit_action_hint = str((payload_override or {}).get("action") or "").strip().lower() if isinstance(payload_override, dict) else ""
+        reduce_only_submit = bool(
+            submit_action_hint in {"sell", "exit", "close"}
+            or (isinstance(payload_override, dict) and (payload_override.get("reduce_only") or payload_override.get("exit_reason") or payload_override.get("exit_order")))
+        )
+        if (not reduce_only_submit) and self._sports_only_execution_blocked(
             family=family,
             ticker=ticker,
             market=payload_override if isinstance(payload_override, dict) else {"ticker": ticker, "series_ticker": family},
@@ -48483,7 +48925,7 @@ class KalshiSniperBot:
                 "reason": self._sports_only_block_reason(family=family, ticker=ticker, q=q, lane=resolved_lane),
                 "payload": payload_override if isinstance(payload_override, dict) else None,
             }
-        if self._sports_only_mode_enabled():
+        if self._sports_only_mode_enabled() and not reduce_only_submit:
             self._emit_sports_only_execution_log(
                 "AION-SPORTS-ONLY-SUBMIT",
                 ticker=ticker,
@@ -48616,6 +49058,13 @@ class KalshiSniperBot:
             )
             if reversal_decision.get("action") == "exit":
                 decision = reversal_decision
+            intelligence_decision = self._evaluate_aggressive_position_intelligence(
+                position,
+                decision,
+                quotes_by_ticker=quotes_by_ticker,
+            )
+            if isinstance(intelligence_decision, dict):
+                decision = intelligence_decision
             scale_result = {"submitted": False, "reason": "not_attempted"}
             if not self._is_protective_position_exit_decision(decision):
                 winner_scale_attempts += 1
@@ -48699,6 +49148,8 @@ class KalshiSniperBot:
                     "dead_position_exit": bool(decision.get("dead_position_exit")),
                     "momentum_reversal_exit": bool(decision.get("momentum_reversal_exit")),
                     "trailing_profit_exit": bool(decision.get("trailing_profit_exit")),
+                    "position_intelligence_label": decision.get("position_intelligence_label"),
+                    "position_intelligence_exit": bool(decision.get("position_intelligence_exit")),
                 }
             )
         post_exit_reconcile = None

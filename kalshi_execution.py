@@ -539,6 +539,13 @@ def place_live_order(bot, payload):
     payload = payload if isinstance(payload, dict) else {}
     ticker_hint = str(payload.get("ticker") or "").strip()
     family_hint = str(payload.get("family") or "").strip().upper()
+    action_hint = str(payload.get("action") or "").strip().lower()
+    exit_hint = bool(
+        action_hint in {"sell", "exit", "close"}
+        or payload.get("reduce_only")
+        or payload.get("exit_reason")
+        or payload.get("exit_order")
+    )
     if not family_hint and ticker_hint:
         family_resolver = getattr(bot, "get_market_family", None)
         if callable(family_resolver):
@@ -547,7 +554,7 @@ def place_live_order(bot, payload):
             except Exception:
                 family_hint = ""
     sports_only_blocker = getattr(bot, "_sports_only_execution_blocked", None)
-    if callable(sports_only_blocker) and (ticker_hint or family_hint):
+    if callable(sports_only_blocker) and (ticker_hint or family_hint) and not exit_hint:
         lane_hint = ""
         lane_resolver = getattr(bot, "_candidate_execution_lane", None)
         if callable(lane_resolver):
@@ -580,13 +587,6 @@ def place_live_order(bot, payload):
                 }
         except Exception:
             pass
-    action_hint = str(payload.get("action") or "").strip().lower()
-    exit_hint = bool(
-        action_hint in {"sell", "exit", "close"}
-        or payload.get("reduce_only")
-        or payload.get("exit_reason")
-        or payload.get("exit_order")
-    )
     if not exit_hint and action_hint in {"", "buy"} and not bool(payload.get("_risk_governor_checked")):
         risk_governor = getattr(bot, "evaluate_live_order_risk_governor", None)
         if callable(risk_governor):
@@ -1386,8 +1386,15 @@ def submit_live_order(
                 family_hint = str(family_resolver(payload_hint or {"ticker": ticker_hint}) or "").strip().upper()
             except Exception:
                 family_hint = ""
+    action_hint = str(payload_hint.get("action") or "").strip().lower()
+    exit_hint = bool(
+        action_hint in {"sell", "exit", "close"}
+        or payload_hint.get("reduce_only")
+        or payload_hint.get("exit_reason")
+        or payload_hint.get("exit_order")
+    )
     sports_only_blocker = getattr(bot, "_sports_only_execution_blocked", None)
-    if callable(sports_only_blocker) and (ticker_hint or family_hint):
+    if callable(sports_only_blocker) and (ticker_hint or family_hint) and not exit_hint:
         market_hint = payload_hint or {"ticker": ticker_hint, "series_ticker": family_hint}
         lane_hint = str(lane or "").strip().upper()
         lane_resolver = getattr(bot, "_candidate_execution_lane", None)

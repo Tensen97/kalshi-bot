@@ -98,6 +98,20 @@ class StructuralEdgeTests(unittest.TestCase):
             "AION_REVERSAL_EXIT_ENABLED": kw.AION_REVERSAL_EXIT_ENABLED,
             "AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT": kw.AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT,
             "AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT": kw.AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT,
+            "AION_POSITION_INTELLIGENCE_ENABLED": kw.AION_POSITION_INTELLIGENCE_ENABLED,
+            "AION_PI_MIN_GREEN_PNL_PER_CONTRACT": kw.AION_PI_MIN_GREEN_PNL_PER_CONTRACT,
+            "AION_PI_MIN_GREEN_DOLLARS": kw.AION_PI_MIN_GREEN_DOLLARS,
+            "AION_PI_PEAK_PROFIT_FLOOR": kw.AION_PI_PEAK_PROFIT_FLOOR,
+            "AION_PI_TRAIL_GIVEBACK_PCT": kw.AION_PI_TRAIL_GIVEBACK_PCT,
+            "AION_PI_SMALL_ACCOUNT_TRAIL_GIVEBACK_PCT": kw.AION_PI_SMALL_ACCOUNT_TRAIL_GIVEBACK_PCT,
+            "AION_PI_FAST_CUT_MIN_HOLD_SECONDS": kw.AION_PI_FAST_CUT_MIN_HOLD_SECONDS,
+            "AION_PI_FAST_CUT_LOSS_PER_CONTRACT": kw.AION_PI_FAST_CUT_LOSS_PER_CONTRACT,
+            "AION_PI_RECYCLE_MIN_HOLD_SECONDS": kw.AION_PI_RECYCLE_MIN_HOLD_SECONDS,
+            "AION_PI_STALL_DELTA": kw.AION_PI_STALL_DELTA,
+            "AION_PI_RUN_MIN_DELTA": kw.AION_PI_RUN_MIN_DELTA,
+            "AION_PI_MAX_EXIT_SPREAD": kw.AION_PI_MAX_EXIT_SPREAD,
+            "AION_PI_SETTLEMENT_HOLD_PRICE": kw.AION_PI_SETTLEMENT_HOLD_PRICE,
+            "AION_PI_BETTER_CANDIDATE_SCORE_DELTA": kw.AION_PI_BETTER_CANDIDATE_SCORE_DELTA,
         }
         kw.AION_WINNER_SCALE_ENABLED = bool(winner_enabled)
         kw.AION_WINNER_SCALE_MAX_TICKER_EXPOSURE = float(winner_cap)
@@ -109,6 +123,20 @@ class StructuralEdgeTests(unittest.TestCase):
         kw.AION_REVERSAL_EXIT_ENABLED = True
         kw.AION_REVERSAL_EXIT_TRAIL_GIVEBACK_PCT = 0.30
         kw.AION_REVERSAL_EXIT_SMALL_ACCOUNT_GIVEBACK_PCT = 0.25
+        kw.AION_POSITION_INTELLIGENCE_ENABLED = True
+        kw.AION_PI_MIN_GREEN_PNL_PER_CONTRACT = 0.01
+        kw.AION_PI_MIN_GREEN_DOLLARS = 0.02
+        kw.AION_PI_PEAK_PROFIT_FLOOR = 0.03
+        kw.AION_PI_TRAIL_GIVEBACK_PCT = 0.22
+        kw.AION_PI_SMALL_ACCOUNT_TRAIL_GIVEBACK_PCT = 0.18
+        kw.AION_PI_FAST_CUT_MIN_HOLD_SECONDS = 30.0
+        kw.AION_PI_FAST_CUT_LOSS_PER_CONTRACT = 0.025
+        kw.AION_PI_RECYCLE_MIN_HOLD_SECONDS = 180.0
+        kw.AION_PI_STALL_DELTA = 0.002
+        kw.AION_PI_RUN_MIN_DELTA = 0.004
+        kw.AION_PI_MAX_EXIT_SPREAD = 0.18
+        kw.AION_PI_SETTLEMENT_HOLD_PRICE = 0.88
+        kw.AION_PI_BETTER_CANDIDATE_SCORE_DELTA = 8.0
         for name, value in old_values.items():
             self.addCleanup(setattr, kw, name, value)
 
@@ -1065,6 +1093,35 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertFalse(result["submitted"])
         self.assertIn(result["reason"], {"sports_only_weather_execution_disabled", "sports_only_non_sports_execution_disabled"})
+
+    def test_sports_only_submit_live_order_allows_reduce_only_non_sports_exit_to_auth(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        q = SimpleNamespace(ticker="KXTEMPCHI-26MAY-HIGH", family="KXTEMP", selected_side="yes", selected_price=0.42)
+        bot.recent_submitted_order_for_ticker = lambda ticker: None
+        bot.recent_submitted_order_count_for_family = lambda family: 0
+        bot.recent_submitted_order_count_total = lambda: 0
+        bot.evaluate_live_order_risk_governor = lambda payload, q=None: {"ok": True, "payload": dict(payload)}
+        bot.get_live_submit_authorization = lambda payload: {"ok": False, "reason": "unit_auth_block"}
+
+        result = bot.submit_live_order(
+            q,
+            payload_override={
+                "ticker": q.ticker,
+                "family": q.family,
+                "side": "yes",
+                "selected_side": "yes",
+                "action": "sell",
+                "reduce_only": True,
+                "price": 0.42,
+                "selected_price": 0.42,
+                "count": 1,
+                "_aion_sizing_resolved": True,
+            },
+        )
+
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "unit_auth_block")
 
     def test_sports_only_submit_live_order_allows_sports_yes_and_no(self):
         self._set_sports_only_mode(True)
@@ -5509,6 +5566,281 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertLess(result["peak_giveback_pct"], 0.25)
         self.assertTrue(any(tag == "AION-REVERSAL-EXIT-CHECK" for tag, _payload in bot.position_management_test_logs))
         self.assertTrue(any(tag == "AION-REVERSAL-EXIT" for tag, _payload in bot.position_management_test_logs))
+
+    def test_position_intelligence_profit_run_holds_strengthening_winner(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-PI-PROFIT-RUN"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 90}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.57, yes_ask=0.58, no_bid=0.42, no_ask=0.43, yes_top_size=20, no_top_size=20)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "reason": "unit_hold",
+            "entry_price": 0.50,
+            "current_price": 0.57,
+            "exit_price": 0.57,
+            "count": 2,
+            "hold_seconds": 90,
+            "pnl_per_contract": 0.07,
+            "unrealized_pnl": 0.14,
+            "spread": 0.01,
+            "recent_delta": 0.008,
+            "last_step_delta": 0.004,
+            "side_support": 0.12,
+        }
+
+        result = bot._evaluate_aggressive_position_intelligence(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(result["reason"], "position_intelligence_profit_run")
+        self.assertEqual(result["position_intelligence_label"], "PROFIT_RUN")
+        self.assertTrue(any(tag == "AION-POSITION-INTELLIGENCE" for tag, _payload in bot.position_management_test_logs))
+        self.assertTrue(any(tag == "PROFIT_RUN" for tag, _payload in bot.position_management_test_logs))
+
+    def test_position_intelligence_profit_protect_exits_small_green_reversal(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-PI-PROTECT"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 120}
+        bot.live_opponent_price_history = {f"{ticker}|yes|opponent": [{"ts": time.time() - 20, "price": 0.36}]}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.53, yes_ask=0.55, no_bid=0.43, no_ask=0.45, yes_top_size=20, no_top_size=20)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "reason": "unit_hold",
+            "entry_price": 0.50,
+            "current_price": 0.53,
+            "exit_price": 0.53,
+            "count": 2,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.03,
+            "unrealized_pnl": 0.06,
+            "spread": 0.02,
+            "recent_delta": -0.006,
+            "last_step_delta": -0.004,
+            "side_support": -0.04,
+        }
+
+        result = bot._evaluate_aggressive_position_intelligence(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "position_intelligence_profit_protect")
+        self.assertEqual(result["position_intelligence_label"], "PROFIT_PROTECT")
+        self.assertTrue(result["profit_protect_exit"])
+        self.assertGreater(result["unrealized_pnl"], 0.0)
+        self.assertTrue(any(tag == "PROFIT_PROTECT" for tag, _payload in bot.position_management_test_logs))
+
+    def test_position_intelligence_trailing_lock_exits_after_high_water_pullback(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-PI-TRAIL"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 180}
+        bot.live_exit_peak_values = {
+            f"{ticker}|yes": {"ticker": ticker, "side": "yes", "peak_value": 1.40, "entry_cost": 1.00, "max_payout": 2.0}
+        }
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.58, yes_ask=0.60, no_bid=0.40, no_ask=0.42, yes_top_size=20, no_top_size=20)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "reason": "unit_hold",
+            "entry_price": 0.50,
+            "current_price": 0.58,
+            "exit_price": 0.58,
+            "count": 2,
+            "hold_seconds": 180,
+            "pnl_per_contract": 0.08,
+            "unrealized_pnl": 0.16,
+            "spread": 0.02,
+            "recent_delta": -0.02,
+            "last_step_delta": -0.01,
+            "side_support": 0.0,
+        }
+
+        result = bot._evaluate_aggressive_position_intelligence(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "position_intelligence_trailing_lock")
+        self.assertEqual(result["position_intelligence_label"], "TRAILING_LOCK")
+        self.assertTrue(result["trailing_profit_exit"])
+        self.assertTrue(any(tag == "TRAILING_LOCK" for tag, _payload in bot.position_management_test_logs))
+
+    def test_position_intelligence_fast_cut_exits_weakening_loser(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-PI-FAST-CUT"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 45}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.46, yes_ask=0.48, no_bid=0.52, no_ask=0.54, yes_top_size=20, no_top_size=20)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "reason": "unit_hold",
+            "entry_price": 0.50,
+            "current_price": 0.46,
+            "exit_price": 0.46,
+            "count": 2,
+            "hold_seconds": 45,
+            "pnl_per_contract": -0.04,
+            "unrealized_pnl": -0.08,
+            "spread": 0.02,
+            "recent_delta": -0.012,
+            "last_step_delta": -0.006,
+            "side_support": -0.10,
+        }
+
+        result = bot._evaluate_aggressive_position_intelligence(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "position_intelligence_fast_cut")
+        self.assertEqual(result["position_intelligence_label"], "FAST_CUT")
+        self.assertTrue(result["fast_cut_exit"])
+        self.assertTrue(any(tag == "FAST_CUT" for tag, _payload in bot.position_management_test_logs))
+
+    def test_position_intelligence_capital_recycle_exits_stagnant_position_for_better_candidate(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-PI-RECYCLE"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 2, "entry_ts": time.time() - 240}
+        bot.last_auto_live_selected_quote = SimpleNamespace(
+            ticker="KXMLBTOTAL-PI-BETTER",
+            family="KXMLBTOTAL",
+            selected_side="yes",
+            selected_price=0.42,
+            sports_execution_quality_score=98,
+            edge_after_cost=0.12,
+        )
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.50, yes_ask=0.52, no_bid=0.48, no_ask=0.50, yes_top_size=20, no_top_size=20)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "hold",
+            "reason": "unit_hold",
+            "entry_price": 0.50,
+            "current_price": 0.50,
+            "exit_price": 0.50,
+            "count": 2,
+            "hold_seconds": 240,
+            "pnl_per_contract": 0.0,
+            "unrealized_pnl": 0.0,
+            "spread": 0.02,
+            "recent_delta": 0.0,
+            "last_step_delta": 0.0,
+            "side_support": 0.0,
+        }
+
+        result = bot._evaluate_aggressive_position_intelligence(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "position_intelligence_capital_recycle")
+        self.assertEqual(result["position_intelligence_label"], "CAPITAL_RECYCLE")
+        self.assertTrue(result["capital_recycle_exit"])
+        self.assertEqual(result["better_candidate"]["ticker"], "KXMLBTOTAL-PI-BETTER")
+        self.assertTrue(any(tag == "CAPITAL_RECYCLE" for tag, _payload in bot.position_management_test_logs))
+
+    def test_position_intelligence_settlement_hold_overrides_profit_lock_when_strengthening(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-PI-SETTLEMENT-HOLD"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.80, "count": 2, "entry_ts": time.time() - 120}
+        q = SimpleNamespace(ticker=ticker, family="KXMLBSPREAD", yes_bid=0.91, yes_ask=0.92, no_bid=0.08, no_ask=0.09, yes_top_size=20, no_top_size=20)
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "exit",
+            "reason": "max_payout_profit_lock",
+            "entry_price": 0.80,
+            "current_price": 0.91,
+            "exit_price": 0.91,
+            "count": 2,
+            "hold_seconds": 120,
+            "pnl_per_contract": 0.11,
+            "unrealized_pnl": 0.22,
+            "spread": 0.01,
+            "recent_delta": 0.012,
+            "last_step_delta": 0.005,
+            "side_support": 0.14,
+        }
+
+        result = bot._evaluate_aggressive_position_intelligence(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "hold")
+        self.assertEqual(result["reason"], "position_intelligence_settlement_hold")
+        self.assertEqual(result["position_intelligence_label"], "SETTLEMENT_HOLD")
+        self.assertTrue(result["position_intelligence_override"])
+        self.assertTrue(any(tag == "SETTLEMENT_HOLD" for tag, _payload in bot.position_management_test_logs))
+
+    def test_position_intelligence_profit_protect_supports_no_side(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXATPMATCH")
+        ticker = "KXATPMATCH-PI-NO-SIDE"
+        position = {"ticker": ticker, "family": "KXATPMATCH", "side": "no", "entry_price": 0.20, "count": 1, "entry_ts": time.time() - 90}
+        q = SimpleNamespace(ticker=ticker, family="KXATPMATCH", yes_bid=0.72, yes_ask=0.74, no_bid=0.26, no_ask=0.28, yes_top_size=20, no_top_size=20)
+        decision = {
+            "ticker": ticker,
+            "family": "KXATPMATCH",
+            "side": "no",
+            "action": "hold",
+            "reason": "unit_hold",
+            "entry_price": 0.20,
+            "current_price": 0.26,
+            "exit_price": 0.26,
+            "count": 1,
+            "hold_seconds": 90,
+            "pnl_per_contract": 0.06,
+            "unrealized_pnl": 0.06,
+            "spread": 0.02,
+            "recent_delta": -0.008,
+            "last_step_delta": -0.005,
+            "side_support": -0.08,
+        }
+
+        result = bot._evaluate_aggressive_position_intelligence(position, decision, quotes_by_ticker={ticker: q})
+
+        self.assertEqual(result["action"], "exit")
+        self.assertEqual(result["reason"], "position_intelligence_profit_protect")
+        self.assertEqual(result["side"], "no")
+        self.assertEqual(result["position_intelligence_label"], "PROFIT_PROTECT")
+
+    def test_submit_live_exit_order_emits_exit_submitted_log(self):
+        self._set_position_management_config(winner_min_hold=0.0)
+        bot = self._configure_position_management_bot(self._make_bot(), family="KXMLBSPREAD")
+        ticker = "KXMLBSPREAD-EXIT-LOG"
+        position = {"ticker": ticker, "family": "KXMLBSPREAD", "side": "yes", "entry_price": 0.50, "count": 1, "entry_ts": time.time() - 90}
+        bot.get_live_submit_authorization = lambda payload: {"ok": True}
+        bot.can_build_live_auth = lambda: True
+        bot._active_live_order_timestamps = lambda: []
+        bot.extract_order_execution_summary = lambda response: {"order_id": "exit-1"}
+        bot.place_live_order = lambda payload: {"submitted": True, "reason": "submitted", "status_code": 201, "response": {"order": {"order_id": "exit-1"}}}
+        decision = {
+            "ticker": ticker,
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "action": "exit",
+            "reason": "position_intelligence_profit_protect",
+            "exit_price": 0.55,
+            "count": 1,
+            "unrealized_pnl": 0.05,
+            "is_sports_position": True,
+            "position_intelligence_label": "PROFIT_PROTECT",
+        }
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = bot.submit_live_exit_order(position, decision)
+
+        self.assertTrue(result["submitted"])
+        self.assertIn("[EXIT_SUBMITTED]", out.getvalue())
+        self.assertIn("PROFIT_PROTECT", out.getvalue())
 
     def test_winner_scaling_respects_twenty_dollar_ticker_cap(self):
         self._set_position_management_config(winner_min_hold=0.0, winner_cap=20.0)
