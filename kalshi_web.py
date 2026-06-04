@@ -1851,6 +1851,9 @@ ENTRY_ATTEMPT_FAMILY_LAST_TICKER = {}
 MAX_EXIT_SPREAD = 0.12
 LIVE_POSITION_POLL_SECONDS = 15
 ALLOW_CONTINUOUS_LIVE_EXITS = False
+AION_MOMENTUM_ENTRY_CONFIRM_SECONDS = _env_float("AION_MOMENTUM_ENTRY_CONFIRM_SECONDS", 5.0)
+AION_MOMENTUM_ENTRY_MIN_DRIFT = _env_float("AION_MOMENTUM_ENTRY_MIN_DRIFT", 0.003)
+AION_MOMENTUM_ENTRY_MATERIAL_OPPONENT_RECOVERY = _env_float("AION_MOMENTUM_ENTRY_MATERIAL_OPPONENT_RECOVERY", 0.006)
 KALSHI_DYNAMIC_EXIT_ENABLED = (os.environ.get("KALSHI_DYNAMIC_EXIT_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 KALSHI_DYNAMIC_EXIT_MIN_PROFIT = _env_float("KALSHI_DYNAMIC_EXIT_MIN_PROFIT", 0.018)
 KALSHI_DYNAMIC_EXIT_WEAK_PROFIT_MULTIPLIER = _env_float("KALSHI_DYNAMIC_EXIT_WEAK_PROFIT_MULTIPLIER", 0.60)
@@ -2633,6 +2636,8 @@ class KalshiSniperBot:
         self.live_exit_price_history = {}
         self.live_exit_peak_values = {}
         self.live_opponent_price_history = {}
+        self.aion_entry_side_history = {}
+        self.aion_recent_exit_reentry_context = {}
         self.position_flip_cooldowns = {}
         self.position_flip_log_markers = {}
         self.aion_profit_engine_state = None
@@ -7700,6 +7705,674 @@ class KalshiSniperBot:
         side = str(side or "").strip().lower()
         return side if side in {"yes", "no"} else None
 
+    def _aion_entry_mid_price(self, bid=None, ask=None):
+        bid_value = self._aion_quote_price_to_dollars(bid, allow_zero=True)
+        ask_value = self._aion_quote_price_to_dollars(ask)
+        if bid_value is not None and ask_value is not None:
+            return round((float(bid_value) + float(ask_value)) / 2.0, 4)
+        if ask_value is not None:
+            return ask_value
+        if bid_value is not None:
+            return bid_value
+        return None
+
+    def _record_aion_entry_side_observation(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        side=None,
+        bid=None,
+        ask=None,
+        opponent_bid=None,
+        opponent_ask=None,
+        top_size=None,
+        opponent_top_size=None,
+        edge_after_cost=None,
+        source="entry_side",
+    ):
+        ticker = str(ticker or "").strip()
+        family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
+        side = self._aion_normalize_live_side(side)
+        price = self._aion_entry_mid_price(bid, ask)
+        opponent_price = self._aion_entry_mid_price(opponent_bid, opponent_ask)
+        ask_value = self._aion_quote_price_to_dollars(ask)
+        bid_value = self._aion_quote_price_to_dollars(bid, allow_zero=True)
+        top_size_value = self.to_float(top_size, 0.0) or 0.0
+        opponent_top_size_value = self.to_float(opponent_top_size, 0.0) or 0.0
+        spread = None
+        if ask_value is not None and bid_value is not None and ask_value >= bid_value:
+            spread = round(float(ask_value) - float(bid_value), 4)
+        executable = bool(
+            side in {"yes", "no"}
+            and ask_value is not None
+            and KALSHI_CONTRACT_MIN_PRICE <= ask_value <= KALSHI_CONTRACT_MAX_PRICE
+            and (top_size_value > 0.0 or bid_value is not None)
+        )
+        if not ticker or side not in {"yes", "no"} or price is None:
+            return {
+                "side": side,
+                "direction": "unknown",
+                "score": -999.0,
+                "executable": False,
+                "reason": "missing_entry_side_observation",
+            }
+        now_ts = time.time()
+        history_map = getattr(self, "aion_entry_side_history", None)
+        if not isinstance(history_map, dict):
+            history_map = {}
+        key = f"{ticker}|{side}"
+        history = [
+            item for item in list(history_map.get(key, []) or [])
+            if isinstance(item, dict) and now_ts - self.to_float(item.get("ts"), 0.0) <= 180.0
+        ]
+        history.append({"ts": now_ts, "price": price, "opponent_price": opponent_price})
+        history = history[-10:]
+        history_map[key] = history
+        self.aion_entry_side_history = history_map
+        first_price = self.to_float(history[0].get("price"), price) if history else price
+        previous_price = self.to_float(history[-2].get("price"), price) if len(history) >= 2 else price
+        first_opponent = self.to_float(history[0].get("opponent_price"), opponent_price) if history else opponent_price
+        previous_opponent = self.to_float(history[-2].get("opponent_price"), opponent_price) if len(history) >= 2 else opponent_price
+        recent_delta = round(float(price) - float(first_price if first_price is not None else price), 4)
+        last_step_delta = round(float(price) - float(previous_price if previous_price is not None else price), 4)
+        opponent_recent_delta = 0.0
+        opponent_last_step_delta = 0.0
+        if opponent_price is not None and first_opponent is not None:
+            opponent_recent_delta = round(float(opponent_price) - float(first_opponent), 4)
+        if opponent_price is not None and previous_opponent is not None:
+            opponent_last_step_delta = round(float(opponent_price) - float(previous_opponent), 4)
+        eps = max(0.0015, float(AION_MOMENTUM_ENTRY_MIN_DRIFT or 0.003))
+        recovery_eps = max(eps * 1.5, float(AION_MOMENTUM_ENTRY_MATERIAL_OPPONENT_RECOVERY or 0.006))
+        edge = self.to_float(edge_after_cost, 0.0) or 0.0
+        liquidity_total = max(0.0, top_size_value) + max(0.0, opponent_top_size_value)
+        side_pressure = (top_size_value + 1.0) / max(liquidity_total + 2.0, 2.0)
+        opponent_recovery = bool(opponent_recent_delta >= recovery_eps or opponent_last_step_delta >= eps)
+        side_strengthening = bool(
+            recent_delta >= eps
+            or last_step_delta >= eps
+            or (opponent_recent_delta <= -eps and recent_delta >= -eps)
+            or (edge > 0.0 and recent_delta >= 0.0 and not opponent_recovery)
+        )
+        side_weakening = bool(recent_delta <= -eps or last_step_delta <= -eps or opponent_recovery)
+        if side_strengthening and not side_weakening:
+            direction = "strengthening"
+        elif side_weakening and not side_strengthening:
+            direction = "weakening"
+        elif abs(recent_delta) <= eps and abs(last_step_delta) <= eps:
+            direction = "flat"
+        else:
+            direction = "mixed"
+        spread_penalty = max(0.0, spread or 0.08) * 16.0
+        liquidity_score = min(4.0, math.log10(max(0.0, top_size_value) + 1.0) * 1.25) if top_size_value > 0.0 else 0.0
+        drift_score = (recent_delta * 180.0) + (last_step_delta * 110.0) - (max(0.0, opponent_recent_delta) * 140.0)
+        edge_score = edge * 90.0
+        pressure_score = (side_pressure - 0.50) * 4.0
+        score = drift_score + edge_score + liquidity_score + pressure_score - spread_penalty
+        if side_strengthening:
+            score += 5.0
+        if side_weakening:
+            score -= 5.0
+        flat_no_edge = bool(
+            len(history) >= 2
+            and abs(recent_delta) <= eps
+            and abs(last_step_delta) <= eps
+            and abs(opponent_recent_delta) <= recovery_eps
+            and edge <= 0.0
+        )
+        return {
+            "ticker": ticker,
+            "family": family,
+            "side": side,
+            "source": source,
+            "price": price,
+            "bid": bid_value,
+            "ask": ask_value,
+            "spread": spread,
+            "top_size": top_size_value,
+            "opponent_top_size": opponent_top_size_value,
+            "side_pressure": round(side_pressure, 4),
+            "edge_after_cost": round(edge, 6),
+            "recent_delta": recent_delta,
+            "last_step_delta": last_step_delta,
+            "opponent_recent_delta": opponent_recent_delta,
+            "opponent_last_step_delta": opponent_last_step_delta,
+            "opponent_recovery": opponent_recovery,
+            "side_strengthening": side_strengthening,
+            "side_weakening": side_weakening,
+            "flat_no_edge": flat_no_edge,
+            "direction": direction,
+            "samples": len(history),
+            "history_span_seconds": round(max(0.0, now_ts - self.to_float(history[0].get("ts"), now_ts)), 3) if history else 0.0,
+            "executable": executable,
+            "score": round(score, 6),
+        }
+
+    def _aion_detect_winning_side(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        market=None,
+        q=None,
+        quote_diag=None,
+        orderbook_resolution=None,
+        preferred_side=None,
+        source="entry_side",
+        emit=False,
+    ):
+        market = market if isinstance(market, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        orderbook_resolution = orderbook_resolution if isinstance(orderbook_resolution, dict) else {}
+        ticker = str(
+            ticker
+            or orderbook_resolution.get("ticker")
+            or market.get("ticker")
+            or quote_diag.get("ticker")
+            or getattr(q, "ticker", "")
+            or ""
+        ).strip()
+        family = str(
+            family
+            or orderbook_resolution.get("family")
+            or market.get("family")
+            or market.get("series_ticker")
+            or quote_diag.get("family")
+            or getattr(q, "family", None)
+            or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN")
+            or "UNKNOWN"
+        ).strip().upper()
+        preferred_side = self._aion_normalize_live_side(
+            preferred_side
+            or orderbook_resolution.get("selected_side")
+            or orderbook_resolution.get("chosen_side")
+            or quote_diag.get("selected_side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        def _field(*names):
+            for name in names:
+                for source_obj in (orderbook_resolution, quote_diag, market):
+                    value = source_obj.get(name) if isinstance(source_obj, dict) else None
+                    if value not in (None, "", [], {}):
+                        return value
+                try:
+                    value = getattr(q, name, None)
+                except Exception:
+                    value = None
+                if value not in (None, "", [], {}):
+                    return value
+            return None
+
+        yes_bid = self._aion_quote_price_to_dollars(_field("yes_bid_dollars", "yes_bid"), allow_zero=True)
+        yes_ask = self._aion_quote_price_to_dollars(_field("yes_ask_dollars", "yes_ask"))
+        no_bid = self._aion_quote_price_to_dollars(_field("no_bid_dollars", "no_bid"), allow_zero=True)
+        no_ask = self._aion_quote_price_to_dollars(_field("no_ask_dollars", "no_ask"))
+        try:
+            yes_bid, yes_ask, no_bid, no_ask = self._infer_missing_binary_quotes(yes_bid, yes_ask, no_bid, no_ask)
+        except Exception:
+            pass
+        yes_top_size = self.to_float(_field("yes_top_size", "yes_ask_size"), 0.0) or 0.0
+        no_top_size = self.to_float(_field("no_top_size", "no_ask_size"), 0.0) or 0.0
+        yes_edge = self.to_float(_field("yes_edge_after_cost", "yes_final_edge", "yes_edge"), 0.0) or 0.0
+        no_edge = self.to_float(_field("no_edge_after_cost", "no_final_edge", "no_edge"), 0.0) or 0.0
+        generic_edge = self.to_float(_field("selected_edge_after_cost", "edge_after_cost", "final_edge", "EV", "edge"), None)
+        if generic_edge is not None and preferred_side == "yes" and yes_edge == 0.0:
+            yes_edge = generic_edge
+        if generic_edge is not None and preferred_side == "no" and no_edge == 0.0:
+            no_edge = generic_edge
+        yes_context = self._record_aion_entry_side_observation(
+            ticker=ticker,
+            family=family,
+            side="yes",
+            bid=yes_bid,
+            ask=yes_ask,
+            opponent_bid=no_bid,
+            opponent_ask=no_ask,
+            top_size=yes_top_size,
+            opponent_top_size=no_top_size,
+            edge_after_cost=yes_edge,
+            source=source,
+        )
+        no_context = self._record_aion_entry_side_observation(
+            ticker=ticker,
+            family=family,
+            side="no",
+            bid=no_bid,
+            ask=no_ask,
+            opponent_bid=yes_bid,
+            opponent_ask=yes_ask,
+            top_size=no_top_size,
+            opponent_top_size=yes_top_size,
+            edge_after_cost=no_edge,
+            source=source,
+        )
+        executable = [ctx for ctx in (yes_context, no_context) if bool(ctx.get("executable"))]
+        winner = max(executable, key=lambda ctx: self.to_float(ctx.get("score"), -999.0)) if executable else None
+        winning_side = winner.get("side") if isinstance(winner, dict) else None
+        selected_context = yes_context if preferred_side == "yes" else no_context if preferred_side == "no" else winner or {}
+        active_positive_drift = bool(winner and (winner.get("side_strengthening") or self.to_float(winner.get("recent_delta"), 0.0) > 0.0))
+        flat_no_edge = bool(all(bool(ctx.get("flat_no_edge")) for ctx in (yes_context, no_context)))
+        payload = {
+            "ticker": ticker,
+            "family": family,
+            "source": source,
+            "preferred_side": preferred_side,
+            "winning_side": winning_side,
+            "winning_score": winner.get("score") if isinstance(winner, dict) else None,
+            "winning_direction": winner.get("direction") if isinstance(winner, dict) else None,
+            "active_positive_drift": active_positive_drift,
+            "flat_no_edge": flat_no_edge,
+            "selected_side_direction": selected_context.get("direction"),
+            "selected_side_strengthening": bool(selected_context.get("side_strengthening")),
+            "selected_side_weakening": bool(selected_context.get("side_weakening")),
+            "opponent_recovery": bool(selected_context.get("opponent_recovery")),
+            "yes": yes_context,
+            "no": no_context,
+            "reason": "active_positive_drift" if active_positive_drift else "flat_no_edge" if flat_no_edge else "best_executable_side_score",
+        }
+        if self._is_sports_market_or_family(family):
+            try:
+                markers = getattr(self, "aion_entry_side_log_markers", None)
+                if not isinstance(markers, dict):
+                    markers = {}
+                log_key = f"winning-side:{source}:{ticker}"
+                now_ts = time.time()
+                last_ts = float(markers.get(log_key) or 0.0)
+                if now_ts - last_ts >= 2.0:
+                    markers[log_key] = now_ts
+                    self.aion_entry_side_log_markers = markers
+                    builtins.print("[AION-WINNING-SIDE-DETECTED] " + json.dumps(payload, sort_keys=True, default=str))
+            except Exception:
+                try:
+                    builtins.print(
+                        "[AION-WINNING-SIDE-DETECTED] "
+                        + json.dumps(
+                            {
+                                "ticker": ticker,
+                                "family": family,
+                                "source": source,
+                                "preferred_side": preferred_side,
+                                "winning_side": winning_side,
+                                "active_positive_drift": active_positive_drift,
+                                "flat_no_edge": flat_no_edge,
+                                "reason": payload.get("reason"),
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                except Exception:
+                    pass
+        return payload
+
+    def _aion_recent_reentry_context(self, ticker=None, family=None, max_age_seconds=180.0):
+        context_map = getattr(self, "aion_recent_exit_reentry_context", None)
+        if not isinstance(context_map, dict):
+            return {}
+        now_ts = time.time()
+        ticker_key = str(ticker or "").strip()
+        family_key = str(family or "").strip().upper()
+        candidates = []
+        if ticker_key and isinstance(context_map.get(ticker_key), dict):
+            candidates.append(context_map.get(ticker_key))
+        if family_key and isinstance(context_map.get(f"family:{family_key}"), dict):
+            candidates.append(context_map.get(f"family:{family_key}"))
+        for item in candidates:
+            age = now_ts - self.to_float(item.get("ts"), 0.0)
+            if age <= float(max_age_seconds or 180.0):
+                return {**item, "age_seconds": round(age, 3)}
+        return {}
+
+    def _mark_aion_recent_exit_for_reentry(self, position=None, decision=None, result=None, payload=None):
+        position = position if isinstance(position, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        ticker = str(decision.get("ticker") or position.get("ticker") or payload.get("ticker") or "").strip()
+        if not ticker:
+            return
+        family = str(decision.get("family") or position.get("family") or self.get_market_family({"ticker": ticker}) or "UNKNOWN").strip().upper()
+        side = self._aion_normalize_live_side(decision.get("side") or position.get("side") or payload.get("side"))
+        entry = {
+            "ticker": ticker,
+            "family": family,
+            "side": side,
+            "exit_reason": decision.get("reason"),
+            "position_intelligence_label": decision.get("position_intelligence_label"),
+            "unrealized_pnl": decision.get("unrealized_pnl"),
+            "exit_price": payload.get("price") or decision.get("exit_price"),
+            "order_id": ((result or {}).get("response") or {}).get("order_id") if isinstance((result or {}).get("response"), dict) else None,
+            "ts": time.time(),
+        }
+        context_map = getattr(self, "aion_recent_exit_reentry_context", None)
+        if not isinstance(context_map, dict):
+            context_map = {}
+        context_map[ticker] = entry
+        context_map[f"family:{family}"] = entry
+        self.aion_recent_exit_reentry_context = context_map
+
+    def _aion_payload_side_and_price(self, payload):
+        payload = payload if isinstance(payload, dict) else {}
+        side = self._aion_normalize_live_side(payload.get("selected_side") or payload.get("side"))
+        price = payload.get("selected_price")
+        if price in (None, "", 0, 0.0):
+            price = payload.get("yes_price") if side == "yes" else payload.get("no_price") if side == "no" else payload.get("price")
+        price = self.to_float(price, None)
+        if price is not None and price > 1.0 and price <= 99.0:
+            price = round(price / 100.0, 4)
+        return side, price
+
+    def _aion_build_payload_for_side_from_resolution(self, resolution, side):
+        resolution = dict(resolution or {})
+        side = self._aion_normalize_live_side(side)
+        if side not in {"yes", "no"}:
+            return None
+        selected_price = self.to_float(resolution.get(f"{side}_ask"), None)
+        if selected_price is None:
+            selected_price = self.to_float(resolution.get(f"{side}_ask_dollars"), None)
+        if selected_price is None:
+            executable = self._aion_selected_executable_price_from_book(
+                selected_side=side,
+                yes_bid=resolution.get("yes_bid_dollars", resolution.get("yes_bid")),
+                yes_ask=resolution.get("yes_ask_dollars", resolution.get("yes_ask")),
+                no_bid=resolution.get("no_bid_dollars", resolution.get("no_bid")),
+                no_ask=resolution.get("no_ask_dollars", resolution.get("no_ask")),
+                preferred_source="ask",
+            )
+            selected_price = executable.get("price") if executable else None
+        selected_price = self._aion_quote_price_to_dollars(selected_price)
+        if selected_price is None:
+            return None
+        resolution["selected_side"] = side
+        resolution["chosen_side"] = side
+        resolution["selected_price"] = selected_price
+        resolution["selected_price_dollars"] = selected_price
+        resolution["chosen_price"] = selected_price
+        resolution["chosen_price_dollars"] = selected_price
+        resolution["selected_price_cents"] = int(round(selected_price * 100.0))
+        resolution["chosen_price_cents"] = int(round(selected_price * 100.0))
+        resolution["selected_price_source"] = "winning_side_momentum"
+        resolution["selected_price_source_used"] = "winning_side_momentum"
+        resolution["side_switch_success"] = True
+        resolution["side_switch_reason"] = "winning_side_momentum"
+        return resolution
+
+    def _aion_confirm_momentum_entry(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        q=None,
+        market=None,
+        quote_diag=None,
+        payload=None,
+        size=None,
+        source="final_submit_preflight",
+    ):
+        payload = dict(payload or {})
+        market = market if isinstance(market, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        ticker = str(ticker or payload.get("ticker") or market.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        family = str(family or payload.get("family") or self.get_market_family({"ticker": ticker}) or "UNKNOWN").strip().upper()
+        if not payload or not ticker or not self._is_sports_market_or_family(family):
+            return {"allowed": True, "payload": payload, "reason": "non_sports_or_missing_payload", "wait_seconds": 0.0}
+        initial = self._aion_detect_winning_side(
+            ticker=ticker,
+            family=family,
+            market=market,
+            q=q,
+            quote_diag=quote_diag,
+            orderbook_resolution=payload,
+            preferred_side=payload.get("selected_side") or payload.get("side"),
+            source=f"{source}:initial",
+            emit=True,
+        )
+        side_contexts = [ctx for ctx in (initial.get("yes"), initial.get("no")) if isinstance(ctx, dict)]
+        observed_span = max([self.to_float(ctx.get("history_span_seconds"), 0.0) or 0.0 for ctx in side_contexts] or [0.0])
+        wait_seconds = max(0.0, min(float(AION_MOMENTUM_ENTRY_CONFIRM_SECONDS or 0.0), float(AION_MOMENTUM_ENTRY_CONFIRM_SECONDS or 0.0) - observed_span))
+        if wait_seconds >= 0.75:
+            try:
+                builtins.print(
+                    "[AION-FIVE-SECOND-CONFIRM] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "phase": "observe",
+                            "wait_seconds": round(wait_seconds, 3),
+                            "observed_span_seconds": round(observed_span, 3),
+                            "initial_winning_side": initial.get("winning_side"),
+                            "initial_reason": initial.get("reason"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+            time.sleep(wait_seconds)
+        selected_side, _selected_price = self._aion_payload_side_and_price(payload)
+        refreshed_resolution = self.resolve_aion_orderbook_for_payload(
+            ticker,
+            candidate=q,
+            market=market,
+            quote_diag=quote_diag,
+            price_source="ask",
+            selected_side=selected_side,
+            selection_stage="five_second_momentum_confirm",
+            allow_refresh=True,
+        )
+        confirmed = self._aion_detect_winning_side(
+            ticker=ticker,
+            family=family,
+            market=market,
+            q=q,
+            quote_diag=quote_diag,
+            orderbook_resolution=refreshed_resolution,
+            preferred_side=selected_side,
+            source=f"{source}:confirmed",
+            emit=True,
+        )
+        winning_side = self._aion_normalize_live_side(confirmed.get("winning_side"))
+        final_resolution = refreshed_resolution if isinstance(refreshed_resolution, dict) else {}
+        side_flip_guard = None
+        side_flip_decision = "not_applicable"
+        if winning_side in {"yes", "no"} and selected_side in {"yes", "no"} and winning_side != selected_side:
+            flipped_resolution = self._aion_build_payload_for_side_from_resolution(final_resolution, winning_side)
+            flipped_payload = None
+            if flipped_resolution:
+                flipped_payload = self.build_live_order_payload(
+                    q,
+                    size=size or payload.get("count") or 1,
+                    price_source="ask",
+                    post_only=payload.get("post_only", False),
+                    rest_remainder=payload.get("rest_remainder", True),
+                    market=market,
+                    quote_diag=quote_diag,
+                    selected_ticker=ticker,
+                    orderbook_resolution=flipped_resolution,
+                    selection_stage="five_second_momentum_side_flip",
+                    allow_orderbook_refresh=False,
+                )
+            if flipped_payload:
+                try:
+                    side_flip_guard = self.evaluate_opposite_side_pre_submit_guard(
+                        flipped_payload,
+                        q=q,
+                        source="winning_side_momentum_flip",
+                        refresh=True,
+                    )
+                except Exception as exc:
+                    side_flip_guard = {"ok": False, "reason": f"opposite_guard_{exc.__class__.__name__}"}
+                if bool((side_flip_guard or {}).get("ok")):
+                    payload = dict(flipped_payload)
+                    final_resolution = flipped_resolution
+                    selected_side = winning_side
+                    side_flip_decision = "switch_payload"
+                else:
+                    side_flip_decision = "guard_not_clear"
+            try:
+                builtins.print(
+                    "[AION-SIDE-FLIP-CANDIDATE] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "from_side": self._aion_payload_side_and_price(payload)[0],
+                            "winning_side": winning_side,
+                            "decision": side_flip_decision,
+                            "opposite_side_guard": side_flip_guard,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+        if side_flip_decision != "switch_payload":
+            rebuilt_payload = self.build_live_order_payload(
+                q,
+                size=size or payload.get("count") or 1,
+                price_source="ask",
+                post_only=payload.get("post_only", False),
+                rest_remainder=payload.get("rest_remainder", True),
+                market=market,
+                quote_diag=quote_diag,
+                selected_ticker=ticker,
+                orderbook_resolution=final_resolution,
+                selection_stage="five_second_momentum_confirm",
+                allow_orderbook_refresh=False,
+            )
+            if rebuilt_payload:
+                payload = dict(rebuilt_payload)
+        final_side, final_price = self._aion_payload_side_and_price(payload)
+        final_context = confirmed.get(final_side) if isinstance(confirmed, dict) and final_side in {"yes", "no"} else {}
+        final_context = final_context if isinstance(final_context, dict) else {}
+        flat_no_edge = bool(final_context.get("flat_no_edge") or confirmed.get("flat_no_edge"))
+        opponent_recovery = bool(final_context.get("opponent_recovery"))
+        side_weakening = bool(final_context.get("side_weakening"))
+        side_strengthening = bool(final_context.get("side_strengthening"))
+        decision = "ENTER"
+        reason = "momentum_confirmed"
+        if flat_no_edge:
+            payload["count"] = max(1, min(int(payload.get("count") or size or 1), 1))
+            decision = "SIZE_DOWN"
+            reason = "flat_no_edge_sized_down"
+            builtins.print(
+                "[AION-SIZE-DOWN] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "side": final_side,
+                        "selected_price": final_price,
+                        "reason": reason,
+                        "adjusted_size": payload.get("count"),
+                        "no_hard_block": True,
+                        "responsible_subsystem": "winning_side_momentum_confirm",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        elif side_weakening and not side_strengthening:
+            payload["count"] = max(1, min(int(payload.get("count") or size or 1), 1))
+            decision = "SIZE_DOWN"
+            reason = "selected_side_weakening_sized_down"
+        elif opponent_recovery and not side_strengthening:
+            payload["count"] = max(1, min(int(payload.get("count") or size or 1), 1))
+            decision = "SIZE_DOWN"
+            reason = "opponent_recovery_sized_down"
+        reentry_context = self._aion_recent_reentry_context(ticker=ticker, family=family)
+        if reentry_context:
+            reentry_tag = "AION-CAPITAL-RECYCLE-REENTRY" if str(reentry_context.get("position_intelligence_label") or "").upper() == "CAPITAL_RECYCLE" else "AION-FAST-REENTRY"
+            try:
+                builtins.print(
+                    f"[{reentry_tag}] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": final_side,
+                            "selected_price": final_price,
+                            "prior_exit_side": reentry_context.get("side"),
+                            "prior_exit_reason": reentry_context.get("exit_reason"),
+                            "prior_exit_label": reentry_context.get("position_intelligence_label"),
+                            "age_seconds": reentry_context.get("age_seconds"),
+                            "decision": decision,
+                            "reason": reason,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+        try:
+            builtins.print(
+                "[AION-FIVE-SECOND-CONFIRM] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "phase": "confirmed",
+                        "wait_seconds": round(wait_seconds, 3),
+                        "side": final_side,
+                        "selected_price": final_price,
+                        "winning_side": winning_side,
+                        "direction": final_context.get("direction"),
+                        "recent_delta": final_context.get("recent_delta"),
+                        "last_step_delta": final_context.get("last_step_delta"),
+                        "opponent_recovery": opponent_recovery,
+                        "decision": decision,
+                        "reason": reason,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            builtins.print(
+                "[AION-MOMENTUM-ENTRY] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "side": final_side,
+                        "selected_price": final_price,
+                        "count": payload.get("count"),
+                        "winning_side": winning_side,
+                        "direction": final_context.get("direction"),
+                        "side_strengthening": side_strengthening,
+                        "side_weakening": side_weakening,
+                        "decision": decision,
+                        "reason": reason,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+        payload["aion_momentum_entry"] = {
+            "decision": decision,
+            "reason": reason,
+            "winning_side": winning_side,
+            "confirmed_side": final_side,
+            "confirmed_direction": final_context.get("direction"),
+            "wait_seconds": round(wait_seconds, 3),
+        }
+        return {
+            "allowed": True,
+            "payload": payload,
+            "reason": reason,
+            "decision": decision,
+            "wait_seconds": round(wait_seconds, 3),
+            "winning_side": winning_side,
+            "selected_side": final_side,
+            "selected_price": final_price,
+            "confirmation": confirmed,
+        }
+
     def _aion_select_bidirectional_side(
         self,
         *,
@@ -7991,6 +8664,54 @@ class KalshiSniperBot:
 
         yes_snapshot = _side_snapshot("yes", yes_bid, yes_ask, yes_top_size)
         no_snapshot = _side_snapshot("no", no_bid, no_ask, no_top_size)
+        winning_side_context = {}
+        if is_sports:
+            winning_side_context = self._aion_detect_winning_side(
+                ticker=ticker,
+                family=family,
+                market=market,
+                q=q,
+                quote_diag=quote_diag,
+                orderbook_resolution={
+                    "ticker": ticker,
+                    "family": family,
+                    "selected_side": preferred_side,
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                    "no_bid": no_bid,
+                    "no_ask": no_ask,
+                    "yes_top_size": yes_top_size,
+                    "no_top_size": no_top_size,
+                    "yes_edge_after_cost": yes_snapshot["edge_after_cost"],
+                    "no_edge_after_cost": no_snapshot["edge_after_cost"],
+                },
+                preferred_side=preferred_side,
+                source=source,
+                emit=True,
+            )
+            winning_side = self._aion_normalize_live_side(winning_side_context.get("winning_side"))
+            for snapshot in (yes_snapshot, no_snapshot):
+                side_context = winning_side_context.get(snapshot["side"]) if isinstance(winning_side_context, dict) else {}
+                side_context = side_context if isinstance(side_context, dict) else {}
+                adjustment = 0.0
+                if snapshot["side"] == winning_side:
+                    adjustment += 9.0
+                    adjustment += max(0.0, self.to_float(side_context.get("recent_delta"), 0.0) or 0.0) * 220.0
+                    adjustment += max(0.0, self.to_float(side_context.get("last_step_delta"), 0.0) or 0.0) * 130.0
+                if bool(side_context.get("side_strengthening")):
+                    adjustment += 4.0
+                if bool(side_context.get("side_weakening")):
+                    adjustment -= 8.0
+                if bool(side_context.get("opponent_recovery")):
+                    adjustment -= 6.0
+                if bool(side_context.get("flat_no_edge")):
+                    adjustment -= 3.0
+                snapshot["momentum_entry_adjustment"] = round(adjustment, 4)
+                snapshot["momentum_entry_direction"] = side_context.get("direction")
+                snapshot["momentum_entry_recent_delta"] = side_context.get("recent_delta")
+                snapshot["momentum_entry_last_step_delta"] = side_context.get("last_step_delta")
+                snapshot["momentum_entry_opponent_recovery"] = bool(side_context.get("opponent_recovery"))
+                snapshot["final_score"] = round(self.to_float(snapshot.get("final_score"), 0.0) + adjustment, 6)
         two_sided_quote_ready = bool(yes_snapshot["selected_price"] is not None and no_snapshot["selected_price"] is not None)
         reason = "selected_by_two_sided_score"
         selected = None
@@ -8052,6 +8773,13 @@ class KalshiSniperBot:
             "selected_final_score": selected["final_score"] if selected else None,
             "selected_fill_probability": selected["fill_probability"] if selected else None,
             "selected_side_pressure": selected["side_pressure"] if selected else None,
+            "winning_side": winning_side_context.get("winning_side") if isinstance(winning_side_context, dict) else None,
+            "winning_side_reason": winning_side_context.get("reason") if isinstance(winning_side_context, dict) else None,
+            "winning_side_direction": winning_side_context.get("winning_direction") if isinstance(winning_side_context, dict) else None,
+            "active_positive_drift": bool(winning_side_context.get("active_positive_drift")) if isinstance(winning_side_context, dict) else False,
+            "flat_no_edge": bool(winning_side_context.get("flat_no_edge")) if isinstance(winning_side_context, dict) else False,
+            "yes_momentum_entry_adjustment": yes_snapshot.get("momentum_entry_adjustment"),
+            "no_momentum_entry_adjustment": no_snapshot.get("momentum_entry_adjustment"),
             "momentum_direction": momentum_direction,
             "momentum_strength": momentum_strength,
             "two_sided_quote_ready": bool(two_sided_quote_ready),
@@ -48982,6 +49710,10 @@ class KalshiSniperBot:
         self._emit_position_management_log("AION-POSITION-INTELLIGENCE", payload)
         if decision_label in {"PROFIT_RUN", "PROFIT_PROTECT", "TRAILING_LOCK", "FAST_CUT", "CAPITAL_RECYCLE", "SETTLEMENT_HOLD"}:
             self._emit_position_management_log(decision_label, payload)
+        if decision_label == "PROFIT_RUN":
+            self._emit_position_management_log("AION-WINNER-RUN", payload)
+        if str(updated.get("action") or "").strip().lower() == "exit" and decision_label in {"PROFIT_PROTECT", "TRAILING_LOCK", "FAST_CUT", "CAPITAL_RECYCLE"}:
+            self._emit_position_management_log("AION-EDGE-DECLINE-EXIT", payload)
         return updated
 
     def _is_protective_position_exit_decision(self, decision):
@@ -49419,6 +50151,7 @@ class KalshiSniperBot:
                     exit_reason=decision.get("reason"),
                     unrealized_pnl=decision.get("unrealized_pnl"),
                 )
+                self._mark_aion_recent_exit_for_reentry(position=position, decision=decision, result=result, payload=payload)
                 self.append_live_audit_log(
                     "live_exit_submitted",
                     ticker=ticker,
@@ -56494,6 +57227,56 @@ class KalshiSniperBot:
                         source="final_submit_primary_preflight_block",
                     )
                     return
+            momentum_confirmation = self._aion_confirm_momentum_entry(
+                ticker=auto_live_ticker,
+                family=selected_family,
+                q=selected_quote_for_submission,
+                market=selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
+                quote_diag=quote_readiness_diagnostic,
+                payload=aggressive_fastpath_payload_override or payload_preview,
+                size=ev_contract_size,
+                source="final_submit_preflight",
+            )
+            if isinstance(momentum_confirmation, dict) and isinstance(momentum_confirmation.get("payload"), dict):
+                payload_preview = dict(momentum_confirmation.get("payload"))
+                if aggressive_fastpath_payload_override is not None:
+                    aggressive_fastpath_payload_override = dict(payload_preview)
+                confirmed_count = self.to_float(payload_preview.get("count"), None)
+                if confirmed_count is not None and confirmed_count > 0:
+                    ev_contract_size = int(min(int(MAX_LIVE_ORDER_SIZE or confirmed_count), max(1, int(confirmed_count))))
+                    payload_preview["count"] = int(ev_contract_size)
+                    if isinstance(aggressive_fastpath_payload_override, dict):
+                        aggressive_fastpath_payload_override["count"] = int(ev_contract_size)
+                confirmed_side, confirmed_price = self._aion_payload_side_and_price(payload_preview)
+                if confirmed_side in {"yes", "no"}:
+                    submission_side = confirmed_side
+                    final_lane_expectancy["selected_side"] = confirmed_side
+                    final_lane_quality["selected_side"] = confirmed_side
+                    final_lane_allocation["selected_side"] = confirmed_side
+                    try:
+                        setattr(selected_quote_for_submission, "selected_side", confirmed_side)
+                        setattr(selected_quote_for_submission, "side", confirmed_side)
+                    except Exception:
+                        pass
+                if confirmed_price is not None:
+                    submission_price = confirmed_price
+                    final_lane_expectancy["selected_price"] = confirmed_price
+                    final_lane_expectancy["selected_price_dollars"] = confirmed_price
+                    final_lane_quality["selected_price"] = confirmed_price
+                    final_lane_quality["selected_price_dollars"] = confirmed_price
+                    final_lane_allocation["selected_price"] = confirmed_price
+                    try:
+                        setattr(selected_quote_for_submission, "selected_price", confirmed_price)
+                    except Exception:
+                        pass
+                final_lane_allocation["momentum_entry_confirmation"] = {
+                    "decision": momentum_confirmation.get("decision"),
+                    "reason": momentum_confirmation.get("reason"),
+                    "winning_side": momentum_confirmation.get("winning_side"),
+                    "selected_side": momentum_confirmation.get("selected_side"),
+                    "selected_price": momentum_confirmation.get("selected_price"),
+                    "wait_seconds": momentum_confirmation.get("wait_seconds"),
+                }
             print(
                 "[AION-QUALIFIED] "
                 + json.dumps(
