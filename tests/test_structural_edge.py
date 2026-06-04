@@ -33,6 +33,8 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.family_profit_memory_cache = {"loaded_at": 0.0, "stats": {}}
         bot.family_profit_memory_log_markers = {}
         bot.live_family_perf_stats = {}
+        bot.aion_profit_engine_state = None
+        bot.aion_profit_engine_log_markers = {}
         bot.last_lane_allocation_summary = {}
         bot.last_dual_lane_buy_candidates = []
         bot.last_dual_lane_execution_summary = {}
@@ -1250,6 +1252,114 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["submitted"])
         self.assertEqual(captured_payloads[0]["count"], 1)
         self.assertEqual(captured_payloads[0]["yes_price"], 54)
+
+    def test_valid_sports_payload_softens_kelly_zero_to_minimum_size(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        bot._resolve_dynamic_live_entry_size = lambda *args, **kwargs: 0
+        bot.last_fractional_kelly_result = {
+            "final_contract_size": 0,
+            "reason": "nonpositive_edge",
+        }
+        q = SimpleNamespace(
+            ticker="KXNCAABTOTAL-PURMICH-YES",
+            family="KXNCAABTOTAL",
+            selected_side="yes",
+            selected_price=0.54,
+            yes_bid=0.53,
+            yes_ask=0.54,
+            no_bid=0.45,
+            no_ask=0.46,
+        )
+
+        payload = bot.build_live_order_payload(
+            q,
+            size=1,
+            market={"ticker": q.ticker, "series_ticker": q.family, "status": "open"},
+            orderbook_resolution={
+                "ticker": q.ticker,
+                "selected_side": "yes",
+                "selected_price": 0.54,
+                "selected_price_dollars": 0.54,
+                "selected_price_cents": 54,
+                "orderbook_ready": True,
+                "yes_bid": 0.53,
+                "yes_ask": 0.54,
+                "no_bid": 0.45,
+                "no_ask": 0.46,
+            },
+            selection_stage="unit_kelly_zero_soften",
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["side"], "yes")
+        self.assertEqual(payload["yes_price"], 54)
+
+    def test_payload_preflight_softens_kelly_zero_cents_price(self):
+        self._set_sports_only_mode(True)
+        bot = self._make_bot()
+        bot._resolve_dynamic_live_entry_size = lambda *args, **kwargs: 0
+        bot.last_fractional_kelly_result = {
+            "final_contract_size": 0,
+            "contracts": 0,
+            "reason": "nonpositive_edge",
+        }
+        bot._get_phase55_live_execution_gate_record = lambda *args, **kwargs: {}
+        bot._build_entry_context = lambda *args, **kwargs: {"source": "unit_preflight"}
+        q = SimpleNamespace(
+            ticker="KXATPCHALLENGERMATCH-26JUN04BASFOR-BAS",
+            family="KXATPCHALLENGERMATCH",
+            selected_side="yes",
+            selected_price=54,
+            yes_bid=53,
+            yes_ask=54,
+            no_bid=45,
+            no_ask=46,
+        )
+        bot.resolve_aion_quote_orderbook_snapshot = lambda *args, **kwargs: {
+            "ticker": q.ticker,
+            "normalized_ticker": q.ticker,
+            "selected_side": "yes",
+            "selected_price": 54,
+            "selected_price_cents": 54,
+            "best_action": "buy",
+            "orderbook_ready": True,
+            "orderbook_source": "unit",
+            "orderbook_missing_reason": None,
+            "orderbook_keys": ["yes_bid", "yes_ask", "no_bid", "no_ask"],
+            "orderbook_fetch_called": False,
+            "orderbook_fetch_success": True,
+            "cache_hit": True,
+            "cache_age_seconds": 0.0,
+            "yes_bid": 0.53,
+            "yes_ask": 0.54,
+            "no_bid": 0.45,
+            "no_ask": 0.46,
+            "yes_bid_dollars": 0.53,
+            "yes_ask_dollars": 0.54,
+            "no_bid_dollars": 0.45,
+            "no_ask_dollars": 0.46,
+            "quote_ready": True,
+            "quote_complete": True,
+            "quote_missing_fields": [],
+            "quote_source": "unit",
+        }
+
+        result = bot._diagnose_live_order_payload_context(
+            q,
+            size=1,
+            price_source="ask",
+            selected_ticker=q.ticker,
+            selection_stage="unit_payload_preflight",
+            market={"ticker": q.ticker, "series_ticker": q.family, "status": "open"},
+            quote_diag={"ticker": q.ticker, "selected_side": "yes", "quote_ready": True},
+        )
+
+        self.assertTrue(result["payload_ready"])
+        self.assertIsNone(result["payload_missing_reason"])
+        self.assertEqual(result["payload"]["count"], 1)
+        self.assertEqual(result["payload"]["yes_price"], 54)
 
     def test_canonical_place_order_warns_on_competing_outcome_and_posts(self):
         self._set_sports_only_mode(True)
@@ -8545,6 +8655,141 @@ class StructuralEdgeTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("[AION-FUNNEL-ACCOUNTING]", output)
         self.assertIn("[AION-FUNNEL-ACCOUNTING-FAIL]", output)
+
+    def test_aion_probability_drift_detects_strengthening(self):
+        bot = self._make_bot()
+        context = {
+            "ticker": "KXMLBSPREAD-TEST",
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "entry_price": 0.42,
+            "current_price": 0.50,
+            "exit_price": 0.49,
+            "recent_delta": 0.05,
+            "last_step_delta": 0.02,
+            "opponent_recent_delta": -0.02,
+            "opponent_last_step_delta": -0.01,
+            "side_support": 0.12,
+        }
+
+        drift = bot._aion_probability_drift_context(context)
+
+        self.assertEqual(drift["direction"], "strengthening")
+        self.assertTrue(drift["side_strengthening"])
+        self.assertFalse(drift["opponent_recovery"])
+
+    def test_aion_exit_learning_tightens_after_giveback(self):
+        bot = self._make_bot()
+        bot._get_family_profitability_profile = lambda *args, **kwargs: {
+            "trade_count": 5,
+            "family_pnl": 0.15,
+            "win_rate": 0.6,
+            "profitability_signal": 0.2,
+            "capital_preference": "increase",
+        }
+        bot.aion_profit_engine_state = {
+            "pending": {},
+            "completed": [
+                {
+                    "family": "KXMLBSPREAD",
+                    "side": "yes",
+                    "grade_labels": ["exited_too_late", "would_have_decayed_to_zero"],
+                    "exit_pnl": 0.0,
+                    "hold_seconds": 240,
+                },
+                {
+                    "family": "KXMLBSPREAD",
+                    "side": "yes",
+                    "grade_labels": ["protected_profit"],
+                    "exit_pnl": 0.05,
+                    "hold_seconds": 120,
+                },
+            ],
+            "summary": {},
+        }
+
+        profile = bot._aion_exit_learning_profile(family="KXMLBSPREAD", side="yes")
+
+        self.assertLess(profile["trail_multiplier"], 1.0)
+        self.assertLess(profile["profit_protect_multiplier"], 1.0)
+        self.assertGreaterEqual(profile["entry_size_multiplier"], 1.0)
+
+    def test_aion_confidence_sizing_sizes_up_strong_clean_edge(self):
+        bot = self._make_bot()
+        bot._get_family_profitability_profile = lambda *args, **kwargs: {
+            "trade_count": 8,
+            "family_pnl": 0.75,
+            "win_rate": 0.75,
+            "profitability_signal": 0.55,
+            "capital_preference": "increase",
+        }
+        bot.aion_profit_engine_state = {
+            "pending": {},
+            "completed": [
+                {
+                    "family": "KXMLBSPREAD",
+                    "side": "yes",
+                    "grade_labels": ["protected_profit"],
+                    "exit_pnl": 0.08,
+                    "hold_seconds": 90,
+                }
+            ],
+            "summary": {},
+        }
+
+        signal = bot._aion_entry_profit_signal(
+            ticker="KXMLBSPREAD-TEST",
+            family="KXMLBSPREAD",
+            side="yes",
+            selected_price=0.44,
+            edge=0.07,
+            ev=0.07,
+            confidence=0.72,
+            spread=0.02,
+            liquidity=300,
+            market_quality=88,
+            source="unit_test",
+        )
+
+        self.assertEqual(signal["capital_preference"], "size_up")
+        self.assertGreater(signal["profit_engine_size_multiplier"], 1.0)
+        self.assertTrue(signal["no_hard_block"])
+
+    def test_aion_exit_outcome_grades_protected_profit(self):
+        bot = self._make_bot()
+        bot._save_json_file = lambda *args, **kwargs: True
+        old_ts = time.time() - 1000
+        bot.aion_profit_engine_state = {
+            "pending": {
+                "order-1": {
+                    "ticker": "KXMLBSPREAD-TEST",
+                    "family": "KXMLBSPREAD",
+                    "side": "yes",
+                    "exit_price": 0.60,
+                    "exit_pnl": 0.08,
+                    "exit_ts": old_ts,
+                    "hold_seconds": 150,
+                }
+            },
+            "completed": [],
+            "summary": {},
+        }
+        bot._build_position_monitor_context = lambda *args, **kwargs: {
+            "ticker": "KXMLBSPREAD-TEST",
+            "family": "KXMLBSPREAD",
+            "side": "yes",
+            "exit_price": 0.54,
+            "current_cashout_price": 0.54,
+            "spread": 0.02,
+        }
+
+        result = bot._grade_aion_exit_outcomes(force=True)
+        completed = bot.aion_profit_engine_state["completed"]
+
+        self.assertEqual(result["graded"], 1)
+        self.assertEqual(bot.aion_profit_engine_state["pending"], {})
+        self.assertIn("protected_profit", completed[0]["grade_labels"])
+        self.assertIn("would_have_decayed_to_zero", completed[0]["grade_labels"])
 
 
 if __name__ == "__main__":
