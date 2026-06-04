@@ -666,6 +666,108 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "SIZE_DOWN")
         self.assertEqual(result["payload"]["count"], 1)
 
+    def test_adaptive_momentum_confirmation_strong_drift_avoids_fixed_wait(self):
+        old_confirm = kw.AION_MOMENTUM_ENTRY_CONFIRM_SECONDS
+        old_sleep = kw.time.sleep
+        sleeps = []
+        kw.AION_MOMENTUM_ENTRY_CONFIRM_SECONDS = 5.0
+        kw.time.sleep = lambda seconds: sleeps.append(seconds)
+        self.addCleanup(setattr, kw, "AION_MOMENTUM_ENTRY_CONFIRM_SECONDS", old_confirm)
+        self.addCleanup(setattr, kw.time, "sleep", old_sleep)
+        bot = self._make_bot()
+        ticker = "KXATPCHALLENGERMATCH-STRONG"
+        q = SimpleNamespace(ticker=ticker, family="KXATPCHALLENGERMATCH", selected_side="no")
+        strong_book = {
+            "ticker": ticker,
+            "family": "KXATPCHALLENGERMATCH",
+            "selected_side": "no",
+            "yes_bid": 0.78,
+            "yes_ask": 0.79,
+            "no_bid": 0.21,
+            "no_ask": 0.22,
+            "yes_top_size": 80,
+            "no_top_size": 120,
+            "no_edge_after_cost": 0.04,
+            "orderbook_ready": True,
+        }
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: dict(strong_book)
+        bot.build_live_order_payload = lambda q_obj, **kwargs: {
+            "ticker": q_obj.ticker,
+            "side": "no",
+            "selected_side": "no",
+            "selected_price": 0.22,
+            "count": kwargs.get("size") or 4,
+            "post_only": False,
+            "rest_remainder": True,
+        }
+
+        result = bot._aion_confirm_momentum_entry(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            q=q,
+            market={"ticker": ticker, "title": "Tennis live winner"},
+            payload={**strong_book, "side": "no", "selected_price": 0.22, "count": 4},
+            size=4,
+            source="unit_test",
+        )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["payload"]["selected_side"], "no")
+        self.assertLessEqual(result["wait_seconds"], 0.5)
+        self.assertTrue(all(seconds <= 0.5 for seconds in sleeps))
+        self.assertEqual(result["payload"]["aion_momentum_entry"]["adaptive_mode"], "strong_drift_instant")
+
+    def test_adaptive_momentum_confirmation_flat_no_edge_does_not_sleep(self):
+        old_confirm = kw.AION_MOMENTUM_ENTRY_CONFIRM_SECONDS
+        old_sleep = kw.time.sleep
+        sleeps = []
+        kw.AION_MOMENTUM_ENTRY_CONFIRM_SECONDS = 5.0
+        kw.time.sleep = lambda seconds: sleeps.append(seconds)
+        self.addCleanup(setattr, kw, "AION_MOMENTUM_ENTRY_CONFIRM_SECONDS", old_confirm)
+        self.addCleanup(setattr, kw.time, "sleep", old_sleep)
+        bot = self._make_bot()
+        ticker = "KXATPCHALLENGERMATCH-ADAPTIVE-FLAT"
+        q = SimpleNamespace(ticker=ticker, family="KXATPCHALLENGERMATCH", selected_side="yes")
+        flat_book = {
+            "ticker": ticker,
+            "family": "KXATPCHALLENGERMATCH",
+            "selected_side": "yes",
+            "yes_bid": 0.49,
+            "yes_ask": 0.51,
+            "no_bid": 0.49,
+            "no_ask": 0.51,
+            "yes_top_size": 20,
+            "no_top_size": 20,
+            "orderbook_ready": True,
+        }
+        bot._aion_detect_winning_side(ticker=ticker, family="KXATPCHALLENGERMATCH", q=q, orderbook_resolution=flat_book, source="unit_test_flat_seed")
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: dict(flat_book)
+        bot.build_live_order_payload = lambda q_obj, **kwargs: {
+            "ticker": q_obj.ticker,
+            "side": "yes",
+            "selected_side": "yes",
+            "selected_price": 0.51,
+            "count": kwargs.get("size") or 5,
+            "post_only": False,
+            "rest_remainder": True,
+        }
+
+        result = bot._aion_confirm_momentum_entry(
+            ticker=ticker,
+            family="KXATPCHALLENGERMATCH",
+            q=q,
+            market={"ticker": ticker},
+            payload={"ticker": ticker, "side": "yes", "selected_side": "yes", "selected_price": 0.51, "count": 5},
+            size=5,
+            source="unit_test",
+        )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["decision"], "SIZE_DOWN")
+        self.assertEqual(result["payload"]["count"], 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(result["payload"]["aion_momentum_entry"]["adaptive_mode"], "noisy_size_down")
+
     def test_sports_side_selection_fake_missing_no_quote_blocks_no(self):
         bot = self._make_bot()
         decision = bot._aion_select_bidirectional_side(

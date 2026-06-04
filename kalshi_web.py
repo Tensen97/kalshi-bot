@@ -1854,6 +1854,14 @@ ALLOW_CONTINUOUS_LIVE_EXITS = False
 AION_MOMENTUM_ENTRY_CONFIRM_SECONDS = _env_float("AION_MOMENTUM_ENTRY_CONFIRM_SECONDS", 5.0)
 AION_MOMENTUM_ENTRY_MIN_DRIFT = _env_float("AION_MOMENTUM_ENTRY_MIN_DRIFT", 0.003)
 AION_MOMENTUM_ENTRY_MATERIAL_OPPONENT_RECOVERY = _env_float("AION_MOMENTUM_ENTRY_MATERIAL_OPPONENT_RECOVERY", 0.006)
+AION_MOMENTUM_ENTRY_STRONG_CONFIRM_SECONDS = _env_float("AION_MOMENTUM_ENTRY_STRONG_CONFIRM_SECONDS", 0.5)
+AION_MOMENTUM_ENTRY_MODERATE_CONFIRM_SECONDS = _env_float("AION_MOMENTUM_ENTRY_MODERATE_CONFIRM_SECONDS", 1.5)
+AION_MOMENTUM_ENTRY_TENNIS_MAX_CONFIRM_SECONDS = _env_float("AION_MOMENTUM_ENTRY_TENNIS_MAX_CONFIRM_SECONDS", 2.0)
+AION_MOMENTUM_ENTRY_SPORTS_MAX_CONFIRM_SECONDS = _env_float("AION_MOMENTUM_ENTRY_SPORTS_MAX_CONFIRM_SECONDS", 3.0)
+AION_MOMENTUM_ENTRY_STRONG_EDGE = _env_float("AION_MOMENTUM_ENTRY_STRONG_EDGE", 0.025)
+AION_MOMENTUM_ENTRY_TIGHT_SPREAD = _env_float("AION_MOMENTUM_ENTRY_TIGHT_SPREAD", 0.03)
+AION_MOMENTUM_ENTRY_STRONG_DRIFT_MULTIPLIER = _env_float("AION_MOMENTUM_ENTRY_STRONG_DRIFT_MULTIPLIER", 2.0)
+AION_MOMENTUM_ENTRY_HIGH_SCORE = _env_float("AION_MOMENTUM_ENTRY_HIGH_SCORE", 12.0)
 KALSHI_DYNAMIC_EXIT_ENABLED = (os.environ.get("KALSHI_DYNAMIC_EXIT_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
 KALSHI_DYNAMIC_EXIT_MIN_PROFIT = _env_float("KALSHI_DYNAMIC_EXIT_MIN_PROFIT", 0.018)
 KALSHI_DYNAMIC_EXIT_WEAK_PROFIT_MULTIPLIER = _env_float("KALSHI_DYNAMIC_EXIT_WEAK_PROFIT_MULTIPLIER", 0.60)
@@ -8097,6 +8105,146 @@ class KalshiSniperBot:
         resolution["side_switch_reason"] = "winning_side_momentum"
         return resolution
 
+    def _aion_adaptive_momentum_confirm_plan(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        market=None,
+        initial=None,
+        selected_side=None,
+        observed_span=0.0,
+    ):
+        initial = initial if isinstance(initial, dict) else {}
+        market = market if isinstance(market, dict) else {}
+        family = str(family or initial.get("family") or "UNKNOWN").strip().upper()
+        ticker = str(ticker or initial.get("ticker") or "").strip()
+        selected_side = self._aion_normalize_live_side(selected_side or initial.get("preferred_side"))
+        winning_side = self._aion_normalize_live_side(initial.get("winning_side"))
+        selected_context = initial.get(selected_side) if selected_side in {"yes", "no"} else None
+        winning_context = initial.get(winning_side) if winning_side in {"yes", "no"} else None
+        selected_context = selected_context if isinstance(selected_context, dict) else {}
+        winning_context = winning_context if isinstance(winning_context, dict) else selected_context
+        eps = max(0.0015, float(AION_MOMENTUM_ENTRY_MIN_DRIFT or 0.003))
+        strong_delta = max(eps * float(AION_MOMENTUM_ENTRY_STRONG_DRIFT_MULTIPLIER or 2.0), eps)
+        edge = max(
+            self.to_float(selected_context.get("edge_after_cost"), 0.0) or 0.0,
+            self.to_float(winning_context.get("edge_after_cost"), 0.0) or 0.0,
+        )
+        recent_delta = max(
+            self.to_float(selected_context.get("recent_delta"), 0.0) or 0.0,
+            self.to_float(winning_context.get("recent_delta"), 0.0) or 0.0,
+        )
+        last_step_delta = max(
+            self.to_float(selected_context.get("last_step_delta"), 0.0) or 0.0,
+            self.to_float(winning_context.get("last_step_delta"), 0.0) or 0.0,
+        )
+        spread = self.to_float(selected_context.get("spread"), None)
+        if spread is None:
+            spread = self.to_float(winning_context.get("spread"), None)
+        winner_score = self.to_float(winning_context.get("score"), 0.0) or 0.0
+        active_positive_drift = bool(initial.get("active_positive_drift"))
+        opponent_recovery = bool(selected_context.get("opponent_recovery") or winning_context.get("opponent_recovery"))
+        side_weakening = bool(selected_context.get("side_weakening"))
+        side_strengthening = bool(selected_context.get("side_strengthening") or winning_context.get("side_strengthening"))
+        tight_book = bool(
+            selected_context.get("executable")
+            and winning_context.get("executable")
+            and spread is not None
+            and spread <= float(AION_MOMENTUM_ENTRY_TIGHT_SPREAD or 0.03)
+        )
+        high_confidence = bool(
+            edge >= float(AION_MOMENTUM_ENTRY_STRONG_EDGE or 0.025)
+            or winner_score >= float(AION_MOMENTUM_ENTRY_HIGH_SCORE or 12.0)
+        )
+        strong_drift = bool(
+            active_positive_drift
+            and side_strengthening
+            and tight_book
+            and not opponent_recovery
+            and not side_weakening
+            and high_confidence
+            and (
+                recent_delta >= strong_delta
+                or last_step_delta >= strong_delta
+                or edge >= float(AION_MOMENTUM_ENTRY_STRONG_EDGE or 0.025)
+                or winner_score >= float(AION_MOMENTUM_ENTRY_HIGH_SCORE or 12.0)
+            )
+        )
+        moderate_drift = bool(
+            not strong_drift
+            and active_positive_drift
+            and side_strengthening
+            and not opponent_recovery
+            and not side_weakening
+            and (recent_delta >= eps or last_step_delta >= eps or edge > 0.0 or winner_score > 0.0)
+        )
+        noisy_or_flat = bool(
+            initial.get("flat_no_edge")
+            or selected_context.get("flat_no_edge")
+            or winning_context.get("flat_no_edge")
+            or not active_positive_drift
+            or selected_context.get("direction") in {"flat", "mixed", "unknown"}
+        )
+        market_type = self._classify_sports_liquidity_market_type(
+            family=family,
+            ticker=ticker,
+            title=market.get("title") or market.get("name") or market.get("subtitle"),
+        )
+        sport_max = float(AION_MOMENTUM_ENTRY_SPORTS_MAX_CONFIRM_SECONDS or 3.0)
+        if market_type == "tennis_atp" or family.startswith(("KXATP", "KXWTA", "KXITF", "KXTENNIS")):
+            sport_max = min(sport_max, float(AION_MOMENTUM_ENTRY_TENNIS_MAX_CONFIRM_SECONDS or 2.0))
+            sport = "tennis"
+        elif family.startswith("KXMLB") or market_type.startswith("mlb_"):
+            sport = "mlb"
+        elif family.startswith(("KXNBA", "KXWNBA")):
+            sport = "basketball"
+        else:
+            sport = market_type or "sports"
+        emergency_cap = max(0.0, float(AION_MOMENTUM_ENTRY_CONFIRM_SECONDS or 0.0))
+        if strong_drift:
+            mode = "strong_drift_instant"
+            target_wait = max(0.0, float(AION_MOMENTUM_ENTRY_STRONG_CONFIRM_SECONDS or 0.5))
+        elif opponent_recovery or side_weakening:
+            mode = "opponent_recovery_no_wait" if opponent_recovery else "selected_side_weakening_no_wait"
+            target_wait = 0.0
+        elif moderate_drift:
+            mode = "moderate_drift_confirm"
+            target_wait = max(0.0, float(AION_MOMENTUM_ENTRY_MODERATE_CONFIRM_SECONDS or 1.5))
+        else:
+            mode = "noisy_size_down"
+            target_wait = 0.0
+        max_confirm = min(sport_max, emergency_cap) if emergency_cap > 0.0 else 0.0
+        target_wait = min(target_wait, max_confirm)
+        wait_seconds = max(0.0, target_wait - max(0.0, float(observed_span or 0.0)))
+        return {
+            "mode": mode,
+            "sport": sport,
+            "market_type": market_type,
+            "wait_seconds": round(wait_seconds, 3),
+            "target_wait_seconds": round(target_wait, 3),
+            "observed_span_seconds": round(max(0.0, float(observed_span or 0.0)), 3),
+            "sport_max_seconds": round(sport_max, 3),
+            "emergency_cap_seconds": round(emergency_cap, 3),
+            "strong_drift": strong_drift,
+            "moderate_drift": moderate_drift,
+            "noisy_or_flat": noisy_or_flat,
+            "tight_book": tight_book,
+            "high_confidence": high_confidence,
+            "opponent_recovery": opponent_recovery,
+            "side_weakening": side_weakening,
+            "side_strengthening": side_strengthening,
+            "edge_after_cost": round(edge, 6),
+            "recent_delta": round(recent_delta, 4),
+            "last_step_delta": round(last_step_delta, 4),
+            "spread": round(float(spread), 4) if spread is not None else None,
+            "winner_score": round(winner_score, 6),
+            "winning_side": winning_side,
+            "selected_side": selected_side,
+            "eps": round(eps, 4),
+            "strong_delta": round(strong_delta, 4),
+        }
+
     def _aion_confirm_momentum_entry(
         self,
         *,
@@ -8129,7 +8277,73 @@ class KalshiSniperBot:
         )
         side_contexts = [ctx for ctx in (initial.get("yes"), initial.get("no")) if isinstance(ctx, dict)]
         observed_span = max([self.to_float(ctx.get("history_span_seconds"), 0.0) or 0.0 for ctx in side_contexts] or [0.0])
-        wait_seconds = max(0.0, min(float(AION_MOMENTUM_ENTRY_CONFIRM_SECONDS or 0.0), float(AION_MOMENTUM_ENTRY_CONFIRM_SECONDS or 0.0) - observed_span))
+        confirm_plan = self._aion_adaptive_momentum_confirm_plan(
+            ticker=ticker,
+            family=family,
+            market=market,
+            initial=initial,
+            selected_side=payload.get("selected_side") or payload.get("side"),
+            observed_span=observed_span,
+        )
+        wait_seconds = self.to_float(confirm_plan.get("wait_seconds"), 0.0) or 0.0
+        try:
+            builtins.print(
+                "[AION-ADAPTIVE-CONFIRM] "
+                + json.dumps(
+                    {
+                        "ticker": ticker,
+                        "family": family,
+                        "phase": "plan",
+                        **confirm_plan,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            if confirm_plan.get("mode") == "strong_drift_instant":
+                builtins.print(
+                    "[AION-STRONG-DRIFT-INSTANT] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": confirm_plan.get("selected_side"),
+                            "winning_side": confirm_plan.get("winning_side"),
+                            "wait_seconds": round(wait_seconds, 3),
+                            "target_wait_seconds": confirm_plan.get("target_wait_seconds"),
+                            "edge_after_cost": confirm_plan.get("edge_after_cost"),
+                            "recent_delta": confirm_plan.get("recent_delta"),
+                            "last_step_delta": confirm_plan.get("last_step_delta"),
+                            "spread": confirm_plan.get("spread"),
+                            "sport": confirm_plan.get("sport"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            elif confirm_plan.get("mode") == "moderate_drift_confirm":
+                builtins.print(
+                    "[AION-MODERATE-DRIFT-CONFIRM] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": confirm_plan.get("selected_side"),
+                            "winning_side": confirm_plan.get("winning_side"),
+                            "wait_seconds": round(wait_seconds, 3),
+                            "target_wait_seconds": confirm_plan.get("target_wait_seconds"),
+                            "edge_after_cost": confirm_plan.get("edge_after_cost"),
+                            "recent_delta": confirm_plan.get("recent_delta"),
+                            "last_step_delta": confirm_plan.get("last_step_delta"),
+                            "spread": confirm_plan.get("spread"),
+                            "sport": confirm_plan.get("sport"),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        except Exception:
+            pass
         if wait_seconds >= 0.75:
             try:
                 builtins.print(
@@ -8140,6 +8354,9 @@ class KalshiSniperBot:
                             "family": family,
                             "phase": "observe",
                             "wait_seconds": round(wait_seconds, 3),
+                            "adaptive_mode": confirm_plan.get("mode"),
+                            "target_wait_seconds": confirm_plan.get("target_wait_seconds"),
+                            "sport": confirm_plan.get("sport"),
                             "observed_span_seconds": round(observed_span, 3),
                             "initial_winning_side": initial.get("winning_side"),
                             "initial_reason": initial.get("reason"),
@@ -8275,14 +8492,77 @@ class KalshiSniperBot:
                     default=str,
                 )
             )
+            try:
+                builtins.print(
+                    "[AION-NOISY-SIZE-DOWN] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": final_side,
+                            "selected_price": final_price,
+                            "reason": reason,
+                            "adjusted_size": payload.get("count"),
+                            "adaptive_mode": confirm_plan.get("mode"),
+                            "wait_seconds": round(wait_seconds, 3),
+                            "no_hard_block": True,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         elif side_weakening and not side_strengthening:
             payload["count"] = max(1, min(int(payload.get("count") or size or 1), 1))
             decision = "SIZE_DOWN"
             reason = "selected_side_weakening_sized_down"
+            try:
+                builtins.print(
+                    "[AION-NOISY-SIZE-DOWN] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": final_side,
+                            "selected_price": final_price,
+                            "reason": reason,
+                            "adjusted_size": payload.get("count"),
+                            "adaptive_mode": confirm_plan.get("mode"),
+                            "wait_seconds": round(wait_seconds, 3),
+                            "no_hard_block": True,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         elif opponent_recovery and not side_strengthening:
             payload["count"] = max(1, min(int(payload.get("count") or size or 1), 1))
             decision = "SIZE_DOWN"
             reason = "opponent_recovery_sized_down"
+            try:
+                builtins.print(
+                    "[AION-NOISY-SIZE-DOWN] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": final_side,
+                            "selected_price": final_price,
+                            "reason": reason,
+                            "adjusted_size": payload.get("count"),
+                            "adaptive_mode": confirm_plan.get("mode"),
+                            "wait_seconds": round(wait_seconds, 3),
+                            "no_hard_block": True,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         reentry_context = self._aion_recent_reentry_context(ticker=ticker, family=family)
         if reentry_context:
             reentry_tag = "AION-CAPITAL-RECYCLE-REENTRY" if str(reentry_context.get("position_intelligence_label") or "").upper() == "CAPITAL_RECYCLE" else "AION-FAST-REENTRY"
@@ -8317,6 +8597,9 @@ class KalshiSniperBot:
                         "family": family,
                         "phase": "confirmed",
                         "wait_seconds": round(wait_seconds, 3),
+                        "adaptive_mode": confirm_plan.get("mode"),
+                        "target_wait_seconds": confirm_plan.get("target_wait_seconds"),
+                        "sport": confirm_plan.get("sport"),
                         "side": final_side,
                         "selected_price": final_price,
                         "winning_side": winning_side,
@@ -8360,6 +8643,9 @@ class KalshiSniperBot:
             "confirmed_side": final_side,
             "confirmed_direction": final_context.get("direction"),
             "wait_seconds": round(wait_seconds, 3),
+            "adaptive_mode": confirm_plan.get("mode"),
+            "target_wait_seconds": confirm_plan.get("target_wait_seconds"),
+            "sport": confirm_plan.get("sport"),
         }
         return {
             "allowed": True,
