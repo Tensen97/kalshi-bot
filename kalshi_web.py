@@ -4922,6 +4922,7 @@ class KalshiSniperBot:
             "exposure_cap",
             "risk_governor",
             "sizing_zero",
+            "ready_for_submit",
             "submit_attempt",
             "submit_success",
             "final_readiness_failed",
@@ -4956,7 +4957,9 @@ class KalshiSniperBot:
             return "risk_governor"
         if any(token in reason_text for token in ("sizing_zero", "size_zero", "count_zero", "zero_contract", "resolved_size_zero")):
             return "sizing_zero"
-        if any(token in reason_text for token in ("final_readiness", "final_not_ready", "readiness_failed", "entry_ready_unsubmitted", "not_selected_by_ranker", "valid_quote_no_terminal_record", "quote_side_price_valid_no_terminal_record")):
+        if any(token in reason_text for token in ("entry_ready_unsubmitted", "not_selected_by_ranker", "valid_quote_no_terminal_record", "quote_side_price_valid_no_terminal_record")):
+            return "ready_for_submit"
+        if any(token in reason_text for token in ("final_readiness", "final_not_ready", "readiness_failed")):
             return "final_readiness_failed"
         return "other"
 
@@ -5215,10 +5218,7 @@ class KalshiSniperBot:
                 continue
             hard_record_block = bool(
                 record.get("duplicate_block")
-                or record.get("risk_governor")
-                or record.get("daily_cap_block")
-                or record.get("exposure_cap")
-                or record.get("cooldown_block")
+                or record.get("duplicate_position")
             )
             if not hard_record_block:
                 for block_reason in (
@@ -5236,9 +5236,8 @@ class KalshiSniperBot:
                 record.get("final_edge"),
                 self.to_float(record.get("edge_after_cost"), self.to_float(record.get("sports_edge_after_cost"), None)),
             )
-            if edge is None or edge <= 0.0:
-                skipped["nonpositive_edge"] += 1
-                continue
+            if edge is not None and edge <= 0.0:
+                skipped["nonpositive_edge_softened"] += 1
             q = quotes_by_ticker.get(ticker)
             if q is None:
                 skipped["missing_quote"] += 1
@@ -5650,10 +5649,10 @@ class KalshiSniperBot:
                                     outcome = "liquidity_block"
                                     reason = "no_liquidity"
                                 elif spread_bucket in {"unsafe", "too_wide", "wide_unsafe"}:
-                                    outcome = "spread_block"
-                                    reason = "unsafe_spread"
+                                    outcome = "ready_for_submit"
+                                    reason = "unsafe_spread_softened"
                                 elif str(record.get("phase55_status") or record.get("realm_vv_status") or "").strip().lower() == "entry_ready":
-                                    outcome = "final_readiness_failed"
+                                    outcome = "ready_for_submit"
                                     reason = "entry_ready_unsubmitted"
                         else:
                             dominant_reason = (
@@ -5684,17 +5683,30 @@ class KalshiSniperBot:
                                     self.to_float(AION_SPORTS_SPREAD_PREFILTER_MAX_EXECUTABLE, 0.42) or 0.42,
                                     self.to_float(AION_SPORTS_MAX_SPREAD_HARD, 0.24) or 0.24,
                                 )
-                                if (
+                                fake_or_invalid_book = bool(
+                                    quote_spread_bucket in {"fake", "synthetic", "invalid", "crossed", "broken"}
+                                    or unsafe_price_status in {
+                                        "fake_orderbook",
+                                        "synthetic_orderbook",
+                                        "invalid_orderbook",
+                                        "quote_crossed_or_invalid",
+                                        "book_integrity_failed",
+                                    }
+                                )
+                                if fake_or_invalid_book:
+                                    outcome = "spread_block"
+                                    reason = "invalid_or_fake_book"
+                                elif (
                                     quote_spread is not None
                                     and quote_spread > spread_block_threshold
                                 ) or quote_spread_bucket in {"unsafe", "too_wide", "wide_unsafe", "spread_absurd", "absurd"} or unsafe_price_status in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "catastrophic_spread"}:
-                                    outcome = "spread_block"
-                                    reason = "spread_absurd_unusable"
+                                    outcome = "ready_for_submit"
+                                    reason = "spread_absurd_unusable_softened"
                                 elif quote_spread is not None and quote_spread > AION_SPORTS_MAX_SPREAD_SOFT:
-                                    outcome = "spread_block"
-                                    reason = "wide_spread"
+                                    outcome = "ready_for_submit"
+                                    reason = "wide_spread_softened"
                                 else:
-                                    outcome = "final_readiness_failed"
+                                    outcome = "ready_for_submit"
                                     reason = dominant_reason or "valid_quote_no_terminal_record"
 
             counts[outcome] += 1
@@ -5787,7 +5799,7 @@ class KalshiSniperBot:
                     if not isinstance(record, dict):
                         continue
                     terminal_outcome = str(record.get("terminal_outcome") or "").strip()
-                    if terminal_outcome in {"submit_success", "submit_attempt"}:
+                    if terminal_outcome in {"submit_success", "submit_attempt", "ready_for_submit"}:
                         continue
                     ticker = str(record.get("ticker") or "").strip()
                     reason = str(record.get("reason") or terminal_outcome or "unknown").strip() or "unknown"
@@ -20670,7 +20682,6 @@ class KalshiSniperBot:
             "daily_loss_guard",
             "daily_loss_limit",
             "recent_order_pending_confirmation",
-            "rate_limited",
             "kalshi_api_rejection",
             "api_error",
         }
@@ -20682,6 +20693,7 @@ class KalshiSniperBot:
             "position_limit",
             "pending_family_order_limit",
             "pending_global_order_limit",
+            "rate_limited",
         }
         obsolete_labels = {
             "phase55_block",
@@ -28451,20 +28463,25 @@ class KalshiSniperBot:
         )
         if submit_gap_active:
             capacity_pressure = min(capacity_pressure, 0.85)
+        capacity_warnings = []
+        if len(submitted_entries) >= settings["max_submits_per_cycle"]:
+            capacity_warnings.append("max_submits_per_cycle_warning")
+            capacity_pressure = min(capacity_pressure, 0.75)
+        if len(active_timestamps) >= settings["live_order_rate_limit"]:
+            capacity_warnings.append("rate_limited_warning")
+            capacity_pressure = min(capacity_pressure, 0.75)
+        if recent_10min + len(submitted_entries) >= settings["max_new_positions_per_10min"]:
+            capacity_warnings.append("max_new_positions_per_10min_warning")
+            capacity_pressure = min(capacity_pressure, 0.75)
+        if snapshot["open_count"] >= settings["max_open_positions"]:
+            capacity_warnings.append("max_open_positions_warning")
+            capacity_pressure = min(capacity_pressure, 0.70)
         block_reason = None
         tennis_cap = {"allowed": True, "reason": "not_checked"}
         if not ticker:
             block_reason = "missing_ticker"
         elif meta.get("lane") != "SPORTS":
             block_reason = "non_sports_lane"
-        elif len(submitted_entries) >= settings["max_submits_per_cycle"]:
-            block_reason = "max_submits_per_cycle"
-        elif len(active_timestamps) >= settings["live_order_rate_limit"]:
-            block_reason = "rate_limited"
-        elif recent_10min + len(submitted_entries) >= settings["max_new_positions_per_10min"]:
-            block_reason = "max_new_positions_per_10min"
-        elif snapshot["open_count"] >= settings["max_open_positions"]:
-            block_reason = "max_open_positions"
         elif bool(getattr(self, "trading_halted", False)):
             block_reason = "trading_halted"
         elif self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS:
@@ -28482,7 +28499,7 @@ class KalshiSniperBot:
             )
             capacity_pressure = min(capacity_pressure, self.to_float((tennis_cap.get("audit") or {}).get("pressure_factor"), 1.0))
             if not tennis_cap.get("allowed", True):
-                block_reason = tennis_cap.get("reason") or "tennis_exposure_cap"
+                capacity_warnings.append(tennis_cap.get("reason") or "tennis_exposure_cap_warning")
         duplicate = {"blocked": False}
         if block_reason is None:
             try:
@@ -28518,6 +28535,7 @@ class KalshiSniperBot:
             "submit_gap_active": submit_gap_active,
             "settings": settings,
             "capacity_pressure": round(capacity_pressure, 4),
+            "capacity_warnings": capacity_warnings,
             "tennis_cap": tennis_cap.get("audit") if isinstance(tennis_cap, dict) else None,
             "duplicate_guard": duplicate,
             "decision": "ALLOW" if block_reason is None else "BLOCK",
@@ -28610,10 +28628,6 @@ class KalshiSniperBot:
         submitted = []
         skipped = []
         stop_reasons = {
-            "max_submits_per_cycle",
-            "rate_limited",
-            "max_new_positions_per_10min",
-            "max_open_positions",
             "daily_loss_guard",
             "trading_halted",
         }
@@ -28630,16 +28644,17 @@ class KalshiSniperBot:
                 continue
             if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
                 reason = allocation.get("final_quality_reason") or allocation.get("reason") or "weak_sports_quality_demoted"
-                skipped.append({"ticker": ticker, "reason": reason})
-                self._emit_aion_concurrency_log("AION-CONCURRENCY-BLOCK", {
+                allocation["weak_sports_quality_softened"] = True
+                allocation["old_final_quality_reason"] = reason
+                self._emit_aion_concurrency_log("AION-ADMISSION-RELAXED", {
                     "source": source,
                     "ticker": ticker,
                     "family": family,
-                    "reason": reason,
-                    "decision": "BLOCK",
+                    "old_reason": reason,
+                    "reason": "weak_sports_quality_softened",
+                    "decision": "CONTINUE",
                     "subsystem": "multi_sports_submit",
                 })
-                continue
             if self._sports_only_execution_blocked(
                 family=family,
                 ticker=ticker,
@@ -36811,17 +36826,18 @@ class KalshiSniperBot:
                 }
             block_reason = "sports_context_unavailable"
             print(
-                f"[LIVE-SPORTS-CONTEXT-BLOCKED] ticker={ticker} family={family} event_key={event_key} "
-                f"signal_strength={signal_strength} context_status={context_status} reason={block_reason}"
+                f"[LIVE-SPORTS-CONTEXT-WARN] ticker={ticker} family={family} event_key={event_key} "
+                f"signal_strength={signal_strength} context_status={context_status} reason={block_reason}_softened"
             )
-            return False, block_reason, {
+            return True, f"{block_reason}_softened", {
                 "ticker": ticker,
                 "family": family,
                 "event_key": event_key,
                 "signal_strength": signal_strength,
                 "context_status": context_status,
-                "reason": block_reason,
+                "reason": f"{block_reason}_softened",
                 "signal_details": signal_details,
+                "context_unavailable_softened": True,
             }
         print(
             f"[LIVE-SPORTS-CONTEXT-ALLOWED] ticker={ticker} family={family} event_key={event_key} "
@@ -47976,7 +47992,10 @@ class KalshiSniperBot:
             return {"submitted": False, "reason": "auth_not_ready", "payload": payload}
         active_timestamps = self._active_live_order_timestamps()
         if len(active_timestamps) >= int(LIVE_ORDER_RATE_LIMIT or 1):
-            return {"submitted": False, "reason": "rate_limited", "payload": payload}
+            payload["risk_warning_rate_limited"] = {
+                "active_order_timestamps": len(active_timestamps),
+                "live_order_rate_limit": int(LIVE_ORDER_RATE_LIMIT or 1),
+            }
         if bool(decision.get("is_sports_position")):
             print(
                 "[SPORTS-HARVEST-EXECUTE] "
@@ -48513,11 +48532,21 @@ class KalshiSniperBot:
                     source="submit_live_order",
                 )
                 if not tennis_cap.get("allowed", True):
-                    return {
-                        "submitted": False,
-                        "reason": tennis_cap.get("reason") or "tennis_exposure_cap",
-                        "payload": payload_override if isinstance(payload_override, dict) else None,
-                    }
+                    payload_for_warning = payload_override if isinstance(payload_override, dict) else {}
+                    payload_for_warning["tennis_exposure_cap_warning"] = tennis_cap.get("reason") or "tennis_exposure_cap"
+                    if isinstance(payload_override, dict):
+                        payload_override.update(payload_for_warning)
+                    self._emit_aion_concurrency_log(
+                        "AION-ADMISSION-RELAXED",
+                        {
+                            "source": "submit_live_order",
+                            "ticker": ticker,
+                            "family": family,
+                            "old_reason": tennis_cap.get("reason") or "tennis_exposure_cap",
+                            "reason": "tennis_exposure_cap_softened",
+                            "decision": "CONTINUE",
+                        },
+                    )
             except Exception as exc:
                 self._emit_aion_concurrency_log(
                     "AION-TENNIS-CAP",
@@ -52841,37 +52870,54 @@ class KalshiSniperBot:
                     unsafe_price_status=final_gate_unsafe_price_status,
                     duplicate_status="blocked" if duplicate_guard_detail.get("blocked") else "clear",
                     cooldown_status="active",
-                    final_block_reason="cooldown",
+                    final_block_reason="cooldown_softened",
                 )
                 self._emit_aion_final_gate(
                     ticker=auto_live_ticker,
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=True,
-                    reason="cooldown",
+                    reason="cooldown_softened",
                     stage="cooldown_gate",
-                    decision="SKIP",
+                    decision="CONTINUE",
                 )
                 remaining = int(self.market_cooldowns[auto_live_ticker] - time.time())
-                execution_funnel["execution_blocked"] = 1
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=cooldown remaining_seconds={remaining}")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
-                )
-                return
+                print(f"[LIVE-EXECUTION-COOLDOWN] ticker={auto_live_ticker} reason=cooldown_softened remaining_seconds={remaining} decision=CONTINUE")
             allowed, reason = self.can_open_new_position(selected_quote)
             if not allowed:
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
                 block_reason = "position_limit"
                 if reason == "daily_loss_limit":
                     block_reason = "daily_loss_guard"
+                if block_reason != "daily_loss_guard":
+                    self._emit_aion_final_gate(
+                        ticker=auto_live_ticker,
+                        family=final_family or selected_family,
+                        edge_after_cost=edge_after_cost,
+                        quote_ready=True,
+                        reason=f"{reason}_softened",
+                        stage="position_risk_gate",
+                        decision="CONTINUE",
+                    )
+                    print(
+                        "[AION-ADMISSION-RELAXED] "
+                        + json.dumps(
+                            {
+                                "ticker": auto_live_ticker,
+                                "family": selected_family,
+                                "stage": "position_risk_gate",
+                                "old_reason": reason,
+                                "reason": f"{reason}_softened",
+                                "decision": "CONTINUE",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    allowed = True
+            if not allowed:
+                edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
+                block_reason = "daily_loss_guard" if reason == "daily_loss_limit" else "position_limit"
                 self._emit_aion_final_blocker_trace(
                     ticker=auto_live_ticker,
                     edge_after_cost=edge_after_cost,
@@ -52916,40 +52962,30 @@ class KalshiSniperBot:
             passes_group_filters, reason = self.passes_group_filters(selected_quote)
             if not passes_group_filters:
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
-                self._emit_aion_final_blocker_trace(
-                    ticker=auto_live_ticker,
-                    edge_after_cost=edge_after_cost,
-                    spread_bucket=str(expectancy_summary.get("spread_bucket") or "unknown").strip().lower() if isinstance(expectancy_summary, dict) else "unknown",
-                    quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
-                    quote_missing=bool(quote_readiness_diagnostic.get("quote_missing")),
-                    phase55_ready=bool(phase55_gate_record.get("entry_timing_pass")),
-                    unsafe_price_status=final_gate_unsafe_price_status,
-                    duplicate_status="blocked" if duplicate_guard_detail.get("blocked") else "clear",
-                    cooldown_status="active" if self.is_on_cooldown(auto_live_ticker) else "clear",
-                    final_block_reason=f"group_{reason}",
-                )
                 self._emit_aion_final_gate(
                     ticker=auto_live_ticker,
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=True,
-                    reason=f"group_{reason}",
+                    reason=f"group_{reason}_softened",
                     stage="group_filter_gate",
-                    decision="SKIP",
+                    decision="CONTINUE",
                 )
-                execution_funnel["execution_blocked"] = 1
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=group_{reason}")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "stage": "group_filter_gate",
+                            "old_reason": f"group_{reason}",
+                            "reason": "group_filter_softened",
+                            "decision": "CONTINUE",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-                return
             arm_gate_edge_after_cost, arm_gate_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
             arm_gate_quote_ready = bool(
                 getattr(selected_quote, "yes_bid", None) is not None
@@ -53125,24 +53161,25 @@ class KalshiSniperBot:
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=True,
-                    reason=correlation_reason,
+                    reason=f"{correlation_reason}_softened",
                     stage="sports_correlated_entry_guard",
-                    decision="SKIP",
+                    decision="CONTINUE",
                 )
-                execution_funnel["execution_blocked"] = 1
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={correlation_reason}")
-                self._log_live_execution_final_blocked(auto_live_ticker, correlation_reason)
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "stage": "sports_correlated_entry_guard",
+                            "old_reason": correlation_reason,
+                            "reason": "correlated_entry_guard_softened",
+                            "decision": "CONTINUE",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-                return
             smart_allowed, smart_reason, _smart_details = self._evaluate_smart_entry_gate(
                 {"ticker": auto_live_ticker},
                 selected_quote,
@@ -53326,60 +53363,124 @@ class KalshiSniperBot:
             final_blocker_execution_path = "promotion_to_submit"
             if not smart_allowed:
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
-                self._emit_aion_final_blocker_trace(
-                    ticker=auto_live_ticker,
-                    edge_after_cost=edge_after_cost,
-                    spread_bucket=str(quote_readiness_diagnostic.get("spread_bucket") or aggressive_spread_bucket or "unknown").strip().lower(),
-                    quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
-                    quote_missing=bool(quote_readiness_diagnostic.get("quote_missing")),
-                    phase55_ready=bool(phase55_gate_record.get("entry_timing_pass")),
-                    unsafe_price_status=final_gate_unsafe_price_status,
-                    duplicate_status=final_blocker_duplicate_state,
-                    cooldown_status=final_blocker_cooldown_state,
-                    final_block_reason=smart_reason,
+                smart_blocker_class = self._classify_aion_execution_blocker(smart_reason)
+                smart_payload_side = None
+                smart_payload_price = None
+                if isinstance(payload_preview, dict):
+                    smart_payload_side = str(payload_preview.get("selected_side") or payload_preview.get("side") or "").strip().lower()
+                    smart_payload_price = (
+                        payload_preview.get("yes_price")
+                        if smart_payload_side == "yes"
+                        else payload_preview.get("no_price")
+                        if smart_payload_side == "no"
+                        else selected_submission_price_hint
+                    )
+                smart_soft_continue = bool(
+                    smart_blocker_class != "hard_safety"
+                    and self.is_sports_family(selected_family, ticker=auto_live_ticker)
+                    and isinstance(payload_preview, dict)
+                    and smart_payload_side in {"yes", "no"}
+                    and smart_payload_price is not None
+                    and selected_submission_price_valid
+                    and final_blocker_live_arm
                 )
-                self._emit_aion_final_gate(
-                    ticker=auto_live_ticker,
-                    family=final_family or selected_family,
-                    edge_after_cost=edge_after_cost,
-                    quote_ready=True,
-                    reason=smart_reason,
-                    stage="smart_entry_gate",
-                    decision="SKIP",
-                )
-                self._check_realm_vv_live_execution_gate(
-                    auto_live_ticker,
-                    family=selected_family,
-                    override_block_reason=smart_reason,
-                    canonical_execution_state=canonical_realm_vv_state if "canonical_realm_vv_state" in locals() else None,
-                )
-                execution_funnel["execution_blocked"] = 1
-                self._emit_aion_final_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    block_reason=smart_reason,
-                    decision="SKIP",
-                    live_arm=final_blocker_live_arm,
-                    entry_ready=final_blocker_entry_ready,
-                    cooldown_state=final_blocker_cooldown_state,
-                    duplicate_state=final_blocker_duplicate_state,
-                    position_state=final_blocker_position_state,
-                    order_payload_ready=final_blocker_order_payload_ready,
-                    execution_path=final_blocker_execution_path,
-                )
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={smart_reason}")
-                self._log_live_execution_final_blocked(auto_live_ticker, smart_reason)
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
-                )
-                return
+                if smart_soft_continue:
+                    smart_allowed = True
+                    old_smart_reason = smart_reason
+                    smart_reason = "smart_entry_gate_softened"
+                    self._emit_aion_final_gate(
+                        ticker=auto_live_ticker,
+                        family=final_family or selected_family,
+                        edge_after_cost=edge_after_cost,
+                        quote_ready=True,
+                        reason=smart_reason,
+                        stage="smart_entry_gate",
+                        decision="CONTINUE",
+                    )
+                    self._emit_aion_final_execution_truth(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        decision="EXECUTE",
+                        reason=smart_reason,
+                        stage="smart_entry_gate",
+                        hard_block=False,
+                        final_submit_allowed=True,
+                        selected_price=smart_payload_price,
+                        selected_side=smart_payload_side,
+                    )
+                    print(
+                        "[AION-ADMISSION-RELAXED] "
+                        + json.dumps(
+                            {
+                                "ticker": auto_live_ticker,
+                                "family": selected_family,
+                                "stage": "smart_entry_gate",
+                                "old_reason": old_smart_reason,
+                                "reason": smart_reason,
+                                "blocker_class": smart_blocker_class,
+                                "selected_side": smart_payload_side,
+                                "selected_price": smart_payload_price,
+                                "decision": "CONTINUE",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                else:
+                    self._emit_aion_final_blocker_trace(
+                        ticker=auto_live_ticker,
+                        edge_after_cost=edge_after_cost,
+                        spread_bucket=str(quote_readiness_diagnostic.get("spread_bucket") or aggressive_spread_bucket or "unknown").strip().lower(),
+                        quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
+                        quote_missing=bool(quote_readiness_diagnostic.get("quote_missing")),
+                        phase55_ready=bool(phase55_gate_record.get("entry_timing_pass")),
+                        unsafe_price_status=final_gate_unsafe_price_status,
+                        duplicate_status=final_blocker_duplicate_state,
+                        cooldown_status=final_blocker_cooldown_state,
+                        final_block_reason=smart_reason,
+                    )
+                    self._emit_aion_final_gate(
+                        ticker=auto_live_ticker,
+                        family=final_family or selected_family,
+                        edge_after_cost=edge_after_cost,
+                        quote_ready=True,
+                        reason=smart_reason,
+                        stage="smart_entry_gate",
+                        decision="SKIP",
+                    )
+                    self._check_realm_vv_live_execution_gate(
+                        auto_live_ticker,
+                        family=selected_family,
+                        override_block_reason=smart_reason,
+                        canonical_execution_state=canonical_realm_vv_state if "canonical_realm_vv_state" in locals() else None,
+                    )
+                    execution_funnel["execution_blocked"] = 1
+                    self._emit_aion_final_blocker(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        block_reason=smart_reason,
+                        decision="SKIP",
+                        live_arm=final_blocker_live_arm,
+                        entry_ready=final_blocker_entry_ready,
+                        cooldown_state=final_blocker_cooldown_state,
+                        duplicate_state=final_blocker_duplicate_state,
+                        position_state=final_blocker_position_state,
+                        order_payload_ready=final_blocker_order_payload_ready,
+                        execution_path=final_blocker_execution_path,
+                    )
+                    print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={smart_reason}")
+                    self._log_live_execution_final_blocked(auto_live_ticker, smart_reason)
+                    print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                    self._emit_trade_readiness_cycle_telemetry(
+                        markets=locals().get("markets", []),
+                        quotes=locals().get("quotes", []),
+                        candidates=locals().get("candidates", []),
+                        selected_context_quote=selected_context_quote,
+                        selected_trade_submitted=trade_readiness_trade_submitted,
+                        auto_live_ticker=auto_live_ticker,
+                        auto_live_reason=auto_live_reason,
+                    )
+                    return
             phase55_allowed, phase55_reason, _phase55_details = self._check_realm_vv_live_execution_gate(
                 auto_live_ticker,
                 family=selected_family,
@@ -53393,11 +53494,6 @@ class KalshiSniperBot:
                 and selected_submission_price_valid
                 and (selected_side_has_price or bool((payload_preview or {}).get("selected_side")) or bool(selected_quote))
                 and (selected_side_has_liquidity or depth_available or bool(quote_readiness_diagnostic.get("quote_ready")))
-                and (
-                    final_submit_allowed_by_realm_vv
-                    or self.to_float(phase55_edge_probe, 0.0) > 0.0
-                    or self.to_float((expectancy_summary or {}).get("sports_edge_after_cost") if isinstance(expectancy_summary, dict) else None, 0.0) > 0.0
-                )
             )
             if phase55_soft_bypass:
                 print(
@@ -53596,37 +53692,25 @@ class KalshiSniperBot:
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=True,
-                    reason=sports_context_reason,
+                    reason=f"{sports_context_reason}_softened",
                     stage="sports_context_gate",
-                    decision="SKIP",
+                    decision="CONTINUE",
                 )
-                execution_funnel["execution_blocked"] = 1
-                self._emit_aion_final_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    block_reason=sports_context_reason,
-                    decision="SKIP",
-                    live_arm=final_blocker_live_arm,
-                    entry_ready=final_blocker_entry_ready,
-                    cooldown_state=final_blocker_cooldown_state,
-                    duplicate_state=final_blocker_duplicate_state,
-                    position_state=final_blocker_position_state,
-                    order_payload_ready=final_blocker_order_payload_ready,
-                    execution_path=final_blocker_execution_path,
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "stage": "sports_context_gate",
+                            "old_reason": sports_context_reason,
+                            "reason": "sports_context_gate_softened",
+                            "decision": "CONTINUE",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={sports_context_reason}")
-                self._log_live_execution_final_blocked(auto_live_ticker, sports_context_reason)
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
-                )
-                return
             now = time.time()
             execution_attempt_cooldown_seconds = LIVE_EXECUTION_ATTEMPT_COOLDOWN_SECONDS
             cooldown_until = self.live_execution_attempt_cooldowns.get(auto_live_ticker, 0.0)
@@ -53641,43 +53725,16 @@ class KalshiSniperBot:
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=True,
-                    reason="execution_attempt_cooldown",
+                    reason="execution_attempt_cooldown_softened",
                     stage="execution_cooldown",
-                    decision="SKIP",
+                    decision="CONTINUE",
                 )
                 remaining = int(max(0, cooldown_until - now))
                 print(
                     f"[LIVE-EXECUTION-COOLDOWN] ticker={auto_live_ticker} active=yes "
-                    f"remaining_seconds={remaining} reason=recent_execution_attempt"
+                    f"remaining_seconds={remaining} reason=recent_execution_attempt decision=CONTINUE"
                 )
-                execution_funnel["execution_blocked"] = 1
-                final_blocker_cooldown_state = "active"
-                self._emit_aion_final_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    block_reason="execution_attempt_cooldown",
-                    decision="SKIP",
-                    live_arm=final_blocker_live_arm,
-                    entry_ready=final_blocker_entry_ready,
-                    cooldown_state=final_blocker_cooldown_state,
-                    duplicate_state=final_blocker_duplicate_state,
-                    position_state=final_blocker_position_state,
-                    order_payload_ready=final_blocker_order_payload_ready,
-                    execution_path=final_blocker_execution_path,
-                )
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=execution_attempt_cooldown remaining_seconds={remaining}")
-                self._log_live_execution_final_blocked(auto_live_ticker, "execution_attempt_cooldown")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
-                )
-                return
+                final_blocker_cooldown_state = "warning"
             api_duplicate_check = self.check_live_duplicate_position_api(auto_live_ticker)
             if api_duplicate_check.get("blocked"):
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
@@ -53733,37 +53790,28 @@ class KalshiSniperBot:
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=True,
-                    reason=post_loss_reason,
+                    reason=f"{post_loss_reason}_softened",
                     stage="post_loss_gate",
-                    decision="SKIP",
+                    decision="CONTINUE",
                 )
-                execution_funnel["execution_blocked"] = 1
-                self._emit_aion_final_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    block_reason=post_loss_reason,
-                    decision="SKIP",
-                    live_arm=final_blocker_live_arm,
-                    entry_ready=final_blocker_entry_ready,
-                    cooldown_state=final_blocker_cooldown_state,
-                    duplicate_state=final_blocker_duplicate_state,
-                    position_state=final_blocker_position_state,
-                    order_payload_ready=final_blocker_order_payload_ready,
-                    execution_path=final_blocker_execution_path,
+                post_loss_entry_pressure = dict(post_loss_entry_pressure or {})
+                post_loss_entry_pressure["allowed"] = True
+                post_loss_entry_pressure["softened"] = True
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "stage": "post_loss_gate",
+                            "old_reason": post_loss_reason,
+                            "reason": "post_loss_gate_softened_to_size_penalty",
+                            "decision": "CONTINUE",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-                self._log_live_execution_final_blocked(auto_live_ticker, post_loss_reason)
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={post_loss_reason}")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
-                )
-                return
             aggressive_spread_bucket = (
                 str(
                     expectancy_summary.get("sports_spread_bucket")
@@ -54267,24 +54315,25 @@ class KalshiSniperBot:
                     family=final_family or selected_family,
                     edge_after_cost=edge_after_cost,
                     quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
-                    reason="entry_attempt_cooldown",
+                    reason="entry_attempt_cooldown_softened",
                     stage="entry_attempt_cooldown_gate",
-                    decision="SKIP",
+                    decision="CONTINUE",
                 )
-                execution_funnel["execution_blocked"] = 1
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason=entry_attempt_cooldown")
-                self._log_live_execution_final_blocked(auto_live_ticker, "entry_attempt_cooldown")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": auto_live_ticker,
+                            "family": selected_family,
+                            "stage": "entry_attempt_cooldown_gate",
+                            "old_reason": "entry_attempt_cooldown",
+                            "reason": "entry_attempt_cooldown_softened",
+                            "decision": "CONTINUE",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-                return
             selector_floor_effective_value = self.to_float(
                 expectancy_summary.get("aggressive_lane_effective_floor") if isinstance(expectancy_summary, dict) else None,
                 AION_SPORTS_MIN_EDGE_AFTER_COST,
@@ -54466,16 +54515,6 @@ class KalshiSniperBot:
                 )
             if not aggressive_lane_execution.get("aggressive_lane_approved"):
                 edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
-                self._emit_aion_final_gate(
-                    ticker=auto_live_ticker,
-                    family=final_family or selected_family,
-                    edge_after_cost=edge_after_cost,
-                    quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
-                    reason=aggressive_lane_execution.get("block_reason") or "aggressive_lane_blocked",
-                    stage="aggressive_lane_gate",
-                    decision="SKIP",
-                )
-                execution_funnel["execution_blocked"] = 1
                 block_reason = aggressive_lane_execution.get("block_reason") or "aggressive_lane_blocked"
                 if block_reason in {"live_arm_gate_disabled", "live_trading_not_armed"}:
                     block_reason = "live_arm_block"
@@ -54501,70 +54540,137 @@ class KalshiSniperBot:
                     block_reason = "invalid_bid_ask"
                 elif controlled_spread_extreme or not controlled_family_allowed or not controlled_family_strong:
                     block_reason = "spread_extreme"
-                self._emit_aion_final_execution_truth(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    decision="HARD_BLOCK" if self._classify_aion_execution_blocker(block_reason) == "hard_safety" else "SKIP",
-                    reason=block_reason,
-                    stage="aggressive_lane_gate",
-                    hard_block=(self._classify_aion_execution_blocker(block_reason) == "hard_safety"),
-                    final_submit_allowed=bool(final_submit_allowed_by_realm_vv),
-                    selected_price=(
-                        payload_preview.get("yes_price", payload_preview.get("no_price"))
-                        if isinstance(payload_preview, dict)
-                        else None
-                    ),
-                    selected_side=(
-                        payload_preview.get("selected_side") or payload_preview.get("side")
-                        if isinstance(payload_preview, dict)
-                        else None
-                    ),
+                blocker_class = self._classify_aion_execution_blocker(block_reason)
+                payload_selected_price = None
+                payload_selected_side = None
+                if isinstance(payload_preview, dict):
+                    payload_selected_side = str(payload_preview.get("selected_side") or payload_preview.get("side") or "").strip().lower()
+                    payload_selected_price = (
+                        payload_preview.get("yes_price")
+                        if payload_selected_side == "yes"
+                        else payload_preview.get("no_price")
+                        if payload_selected_side == "no"
+                        else payload_preview.get("yes_price", payload_preview.get("no_price"))
+                    )
+                soft_lane_continue = bool(
+                    blocker_class != "hard_safety"
+                    and isinstance(payload_preview, dict)
+                    and payload_selected_side in {"yes", "no"}
+                    and payload_selected_price is not None
+                    and final_blocker_live_arm
                 )
-                self._emit_aion_execution_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    exact_blocker=block_reason,
-                    execution_path="aggressive_lane_gate",
-                    selector_state=str(aggressive_lane_execution.get("block_reason") or "unknown"),
-                    quote_state="quote_ready" if controlled_quote_ready else "quote_not_ready",
-                    cooldown_state="cooldown" if self.is_on_cooldown(auto_live_ticker) else "clear",
-                    duplicate_state=str(aggressive_lane_execution.get("duplicate_status") or "unknown"),
-                    position_state=final_blocker_position_state,
-                    auth_state="armed" if final_blocker_live_arm else "blocked",
-                    final_decision_state="SKIP",
-                )
-                self._emit_aion_final_blocker(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    block_reason=block_reason,
-                    decision="SKIP",
-                    live_arm=final_blocker_live_arm,
-                    entry_ready=final_blocker_entry_ready,
-                    cooldown_state=final_blocker_cooldown_state,
-                    duplicate_state="blocked" if bool(aggressive_lane_execution.get("duplicate_status") == "blocked") else final_blocker_duplicate_state,
-                    position_state=final_blocker_position_state,
-                    order_payload_ready=bool(payload_preview is not None),
-                    execution_path=final_blocker_execution_path,
-                )
-                print(
-                    f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
-                    f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
-                    f"spread_bucket={controlled_spread_bucket} quote_ready={'yes' if controlled_quote_ready else 'no'} "
-                    f"price={'none' if payload_preview is None else payload_preview.get('yes_price', payload_preview.get('no_price'))} "
-                    f"contracts={ev_contract_size} block_reason={block_reason}"
-                )
-                print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={aggressive_lane_execution.get('block_reason') or 'aggressive_lane_blocked'}")
-                print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
-                self._emit_trade_readiness_cycle_telemetry(
-                    markets=locals().get("markets", []),
-                    quotes=locals().get("quotes", []),
-                    candidates=locals().get("candidates", []),
-                    selected_context_quote=selected_context_quote,
-                    selected_trade_submitted=trade_readiness_trade_submitted,
-                    auto_live_ticker=auto_live_ticker,
-                    auto_live_reason=auto_live_reason,
-                )
-                return
+                if soft_lane_continue:
+                    aggressive_lane_execution["aggressive_lane_approved"] = True
+                    aggressive_lane_execution["aggressive_lane_block_reason"] = None
+                    aggressive_lane_execution["block_reason"] = None
+                    aggressive_lane_execution["execution_sanity_pass"] = True
+                    aggressive_lane_execution["quote_ready"] = True
+                    aggressive_lane_execution["aggressive_lane_softened_reason"] = block_reason
+                    self._emit_aion_final_gate(
+                        ticker=auto_live_ticker,
+                        family=final_family or selected_family,
+                        edge_after_cost=edge_after_cost,
+                        quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
+                        reason="aggressive_lane_block_softened",
+                        stage="aggressive_lane_gate",
+                        decision="CONTINUE",
+                    )
+                    self._emit_aion_final_execution_truth(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        decision="EXECUTE",
+                        reason="aggressive_lane_block_softened",
+                        stage="aggressive_lane_gate",
+                        hard_block=False,
+                        final_submit_allowed=True,
+                        selected_price=payload_selected_price,
+                        selected_side=payload_selected_side,
+                    )
+                    print(
+                        "[AION-ADMISSION-RELAXED] "
+                        + json.dumps(
+                            {
+                                "ticker": auto_live_ticker,
+                                "family": selected_family,
+                                "stage": "aggressive_lane_gate",
+                                "old_reason": block_reason,
+                                "reason": "aggressive_lane_block_softened",
+                                "blocker_class": blocker_class,
+                                "selected_side": payload_selected_side,
+                                "selected_price": payload_selected_price,
+                                "decision": "CONTINUE",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                else:
+                    self._emit_aion_final_gate(
+                        ticker=auto_live_ticker,
+                        family=final_family or selected_family,
+                        edge_after_cost=edge_after_cost,
+                        quote_ready=bool(quote_readiness_diagnostic.get("quote_ready")),
+                        reason=block_reason,
+                        stage="aggressive_lane_gate",
+                        decision="SKIP",
+                    )
+                    execution_funnel["execution_blocked"] = 1
+                    self._emit_aion_final_execution_truth(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        decision="HARD_BLOCK" if blocker_class == "hard_safety" else "SKIP",
+                        reason=block_reason,
+                        stage="aggressive_lane_gate",
+                        hard_block=(blocker_class == "hard_safety"),
+                        final_submit_allowed=bool(final_submit_allowed_by_realm_vv),
+                        selected_price=payload_selected_price,
+                        selected_side=payload_selected_side,
+                    )
+                    self._emit_aion_execution_blocker(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        exact_blocker=block_reason,
+                        execution_path="aggressive_lane_gate",
+                        selector_state=str(aggressive_lane_execution.get("block_reason") or "unknown"),
+                        quote_state="quote_ready" if controlled_quote_ready else "quote_not_ready",
+                        cooldown_state="cooldown" if self.is_on_cooldown(auto_live_ticker) else "clear",
+                        duplicate_state=str(aggressive_lane_execution.get("duplicate_status") or "unknown"),
+                        position_state=final_blocker_position_state,
+                        auth_state="armed" if final_blocker_live_arm else "blocked",
+                        final_decision_state="SKIP",
+                    )
+                    self._emit_aion_final_blocker(
+                        ticker=auto_live_ticker,
+                        family=selected_family,
+                        block_reason=block_reason,
+                        decision="SKIP",
+                        live_arm=final_blocker_live_arm,
+                        entry_ready=final_blocker_entry_ready,
+                        cooldown_state=final_blocker_cooldown_state,
+                        duplicate_state="blocked" if bool(aggressive_lane_execution.get("duplicate_status") == "blocked") else final_blocker_duplicate_state,
+                        position_state=final_blocker_position_state,
+                        order_payload_ready=bool(payload_preview is not None),
+                        execution_path=final_blocker_execution_path,
+                    )
+                    print(
+                        f"[AION-LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} "
+                        f"family={selected_family} edge_after_cost={self.to_float(edge_after_cost, 0.0):.4f} "
+                        f"spread_bucket={controlled_spread_bucket} quote_ready={'yes' if controlled_quote_ready else 'no'} "
+                        f"price={'none' if payload_preview is None else payload_preview.get('yes_price', payload_preview.get('no_price'))} "
+                        f"contracts={ev_contract_size} block_reason={block_reason}"
+                    )
+                    print(f"[LIVE-EXECUTION-BLOCKED] ticker={auto_live_ticker} reason={aggressive_lane_execution.get('block_reason') or 'aggressive_lane_blocked'}")
+                    print(f"[LIVE-EXECUTION-FUNNEL] {execution_funnel}")
+                    self._emit_trade_readiness_cycle_telemetry(
+                        markets=locals().get("markets", []),
+                        quotes=locals().get("quotes", []),
+                        candidates=locals().get("candidates", []),
+                        selected_context_quote=selected_context_quote,
+                        selected_trade_submitted=trade_readiness_trade_submitted,
+                        auto_live_ticker=auto_live_ticker,
+                        auto_live_reason=auto_live_reason,
+                    )
+                    return
             execution_funnel["signals_passed_entry"] = 1
             edge_after_cost, final_family = _aion_final_gate_edge_for_ticker(auto_live_ticker, selected_family)
             aggressive_lane_exec_payload = {
@@ -54823,8 +54929,13 @@ class KalshiSniperBot:
                 )
             )
             if final_lane_allocation.get("decision") == "SKIP_WEAK_SPORT" or final_lane_allocation.get("final_quality_action") == "skip":
+                old_quality_reason = final_lane_allocation.get("final_quality_reason") or final_lane_allocation.get("reason") or "weak_sports_quality_demoted"
+                final_lane_allocation["weak_sports_quality_softened"] = True
+                final_lane_allocation["old_final_quality_reason"] = old_quality_reason
+                existing_size_multiplier = self.to_float(final_lane_allocation.get("unified_size_multiplier"), 1.0) or 1.0
+                final_lane_allocation["unified_size_multiplier"] = round(max(0.10, min(1.0, existing_size_multiplier * 0.60)), 4)
                 print(
-                    "[AION-TRASH-PROP-SKIP] "
+                    "[AION-TRASH-PROP-WARN] "
                     + json.dumps(
                         {
                             "source": "final_submit_preflight",
@@ -54840,17 +54951,18 @@ class KalshiSniperBot:
                             "trash_pattern_matched": final_lane_allocation.get("trash_prop_patterns"),
                             "quality_boost": final_lane_allocation.get("quality_boost"),
                             "trash_prop_penalty": final_lane_allocation.get("trash_prop_penalty"),
-                            "sports_quality_reason": final_lane_allocation.get("final_quality_reason") or final_lane_allocation.get("reason"),
+                            "sports_quality_reason": old_quality_reason,
                             "final_action": final_lane_allocation.get("final_quality_action"),
-                            "final_decision": "SKIP",
-                            "why_candidate_lost": "weak_sports_quality_demoted_before_submit",
+                            "final_decision": "CONTINUE",
+                            "size_multiplier": final_lane_allocation.get("unified_size_multiplier"),
+                            "why_candidate_lost": "weak_sports_quality_softened_before_submit",
                         },
                         sort_keys=True,
                         default=str,
                     )
                 )
                 print(
-                    "[AION-FINAL-REJECT] "
+                    "[AION-ADMISSION-RELAXED] "
                     + json.dumps(
                         {
                             "ticker": auto_live_ticker,
@@ -54860,33 +54972,16 @@ class KalshiSniperBot:
                             "spread": controlled_spread_value,
                             "liquidity": final_lane_allocation.get("liquidity"),
                             "volume": (payload_preview or {}).get("volume") or (quote_readiness_diagnostic or {}).get("volume"),
-                            "reason": "weak_sports_quality_demoted",
+                            "old_reason": old_quality_reason,
+                            "reason": "weak_sports_quality_softened_to_size_penalty",
+                            "size_multiplier": final_lane_allocation.get("unified_size_multiplier"),
+                            "decision": "CONTINUE",
                             "responsible_subsystem": "dual_lane_final_submit_preflight",
                         },
                         sort_keys=True,
                         default=str,
                     )
                 )
-                self._emit_aion_final_execution_truth(
-                    ticker=auto_live_ticker,
-                    family=selected_family,
-                    decision="SKIP",
-                    reason="weak_sports_quality_demoted",
-                    stage="final_submit_preflight",
-                    hard_block=False,
-                    final_submit_allowed=False,
-                    selected_price=submission_price,
-                    selected_side=submission_side,
-                )
-                execution_funnel["execution_blocked"] = 1
-                trade_readiness_trade_submitted = False
-                self._execute_parallel_lane_submit_attempts(
-                    primary_ticker=auto_live_ticker,
-                    primary_lane=final_lane_allocation.get("lane"),
-                    primary_result={"submitted": False, "reason": "weak_sports_quality_demoted"},
-                    source="final_submit_preflight_skip",
-                )
-                return
             primary_lane_value = str(final_lane_allocation.get("lane") or "").strip().upper()
             if primary_lane_value == "SPORTS":
                 primary_capacity_candidate = None
@@ -55328,17 +55423,14 @@ class KalshiSniperBot:
                 continue
             if self.is_on_cooldown(q.ticker):
                 remaining = int(self.market_cooldowns[q.ticker] - time.time())
-                print(f"[SKIP] {q.ticker} on cooldown")
-                print(f"[COOLDOWN] {q.ticker} until {remaining}s")
-                continue
+                print(f"[COOLDOWN-WARN] {q.ticker} until {remaining}s decision=CONTINUE")
             passes_filters, reason = self.passes_entry_filters(q)
             if not passes_filters:
-                print(f"[SKIP] {q.ticker} filter={reason}")
-                continue
+                print(f"[FILTER-WARN] {q.ticker} filter={reason} decision=CONTINUE")
             allowed, reason = self.can_open_new_position(q)
             if not allowed:
-                print(f"[SKIP] {q.ticker} risk={reason}")
                 if reason in ("daily_loss_limit", "loss_streak_limit", "trading_halted"):
+                    print(f"[SKIP] {q.ticker} risk={reason}")
                     print(
                         f"[HALT] trading halted reason={reason} "
                         f"realized_pnl={self.realized_pnl:+.4f} losses={self.consecutive_losses}"
@@ -55346,13 +55438,13 @@ class KalshiSniperBot:
                     if self.last_safety_alert_reason != reason:
                         send_telegram_message(f"🔴 SAFETY HALT\nReason: {reason}")
                         self.last_safety_alert_reason = reason
-                continue
+                    continue
+                print(f"[RISK-WARN] {q.ticker} risk={reason} decision=CONTINUE")
             passes_group_filters, reason = self.passes_group_filters(q)
             if not passes_group_filters:
-                print(f"[SKIP] {q.ticker} group={reason}")
-                continue
+                print(f"[GROUP-WARN] {q.ticker} group={reason} decision=CONTINUE")
             if not self.should_enter_yes(q):
-                continue
+                print(f"[ENTRY-WARN] {q.ticker} should_enter_yes=false decision=CONTINUE")
             if not globals().get("LIVE_MODE", False):
                 self.enter_sim_trade(q)
                 trade_readiness_trade_submitted = True
@@ -58672,7 +58764,7 @@ class KalshiSniperBot:
         if duplicate_block:
             hard_blockers.append("duplicate_position")
         if cooldown_block:
-            hard_blockers.append("cooldown_active")
+            capacity_warnings.append("cooldown_active_warning")
         if max_positions_block:
             capacity_warnings.append("max_live_positions_warning")
         if daily_cap_block:
@@ -58730,23 +58822,54 @@ class KalshiSniperBot:
         spread_width_value = spread_value
         if spread_width_value is None and tradeability.get("spread_cents") is not None:
             spread_width_value = self.to_float(tradeability.get("spread_cents"), 0.0) / 100.0
+        hard_book_integrity_block = bool(
+            blocker in {
+                "fake_orderbook",
+                "synthetic_orderbook",
+                "invalid_orderbook",
+                "quote_crossed_or_invalid",
+                "book_integrity_failed",
+            }
+            or blocker_detail in {
+                "fake_orderbook",
+                "synthetic_orderbook",
+                "invalid_orderbook",
+                "quote_crossed_or_invalid",
+                "book_integrity_failed",
+            }
+            or spread_bucket in {"fake", "synthetic", "invalid", "crossed", "broken"}
+            or spread_classification in {"INVALID", "CROSSED", "SYNTHETIC"}
+            or unsafe_price_status in {
+                "fake_orderbook",
+                "synthetic_orderbook",
+                "invalid_orderbook",
+                "quote_crossed_or_invalid",
+                "book_integrity_failed",
+            }
+            or unsafe_resolution_reason in {
+                "fake_orderbook",
+                "synthetic_orderbook",
+                "invalid_orderbook",
+                "quote_crossed_or_invalid",
+                "book_integrity_failed",
+            }
+        )
         absurd_spread_width = bool(spread_width_value is not None and spread_width_value >= 0.35)
         truly_extreme_spread = bool(
-            blocker in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"}
-            or blocker_detail in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"}
-            or spread_bucket in {"spread_extreme", "spread_absurd", "absurd"}
-            or spread_classification in {"CATASTROPHIC"}
-            or unsafe_price_status in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable"}
-            or unsafe_resolution_reason in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "catastrophic_spread"}
-            or absurd_spread_width
+            hard_book_integrity_block
         )
         moderate_wide_spread = bool(
             self.is_sports_family(family, ticker=ticker)
             and not truly_extreme_spread
             and (
                 unsafe_price_status in {"unsafe_spread", "unsafe_price", "caution_wide_spread"}
-                or spread_classification in {"UNSAFE", "CAUTION_WAIT", "AGGRESSIVE_BUT_TRADEABLE"}
-                or spread_bucket in {"unsafe", "wide", "wide_but_possible", "extreme_wide"}
+                or spread_classification in {"UNSAFE", "CAUTION_WAIT", "AGGRESSIVE_BUT_TRADEABLE", "CATASTROPHIC"}
+                or spread_bucket in {"unsafe", "wide", "wide_but_possible", "extreme_wide", "spread_extreme", "spread_absurd", "absurd"}
+                or blocker in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"}
+                or blocker_detail in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"}
+                or unsafe_price_status in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable"}
+                or unsafe_resolution_reason in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "catastrophic_spread"}
+                or absurd_spread_width
             )
             and spread_width_value is not None
             and spread_width_value > 0.03
@@ -58762,10 +58885,7 @@ class KalshiSniperBot:
             and positive_value_signal
             and not truly_extreme_spread
             and not duplicate_block
-            and not cooldown_block
             and not capacity_blocker
-            and not max_positions_block
-            and not daily_cap_block
             and live_arm_ok
         )
         adaptive_confidence_floor = min(confidence_floor, max(0.05, confidence_floor - 0.50))
@@ -58835,10 +58955,7 @@ class KalshiSniperBot:
             and positive_value_signal
             and not truly_extreme_spread
             and not duplicate_block
-            and not cooldown_block
             and not capacity_blocker
-            and not max_positions_block
-            and not daily_cap_block
             and live_arm_ok
         )
         if capacity_blocker:
@@ -58893,38 +59010,95 @@ class KalshiSniperBot:
         elif blocker in {"both_sides_unexecutable", "unexecutable_price"}:
             decision = "SKIP"
         elif edge is None or edge <= 0.0:
-            decision = "SKIP"
-            blocker = "nonpositive_edge"
-            blocker_detail = (
-                f"edge_after_cost={edge:.6f}"
-                if edge is not None
-                else "edge_after_cost=missing"
+            low_edge_participation_allowed = bool(
+                self.is_sports_family(family, ticker=ticker)
+                and quote_ready
+                and orderbook_ready
+                and price_bounds_pass
+                and selected_side in {"yes", "no"}
+                and selected_side_has_price
+                and (selected_side_has_liquidity or depth_available)
+                and not truly_extreme_spread
+                and not duplicate_block
+                and live_arm_ok
             )
-            edge_audit_action = "block"
-            print(
-                "[AION-EDGE-AUDIT] "
-                + json.dumps(
-                    {
-                        "ticker": selected_ticker,
-                        "family": family,
-                        "side": selected_side,
-                        "selected_price": selected_price,
-                        "edge_after_cost": edge,
-                        "EV": ev_value,
-                        "decision": "SKIP",
-                        "reason": blocker,
-                        "quote_ready": bool(quote_ready),
-                        "orderbook_ready": bool(orderbook_ready),
-                        "price_bounds_pass": bool(price_bounds_pass),
-                    },
-                    sort_keys=True,
-                    default=str,
+            if low_edge_participation_allowed:
+                decision = "BUY"
+                blocker = None
+                blocker_detail = None
+                edge_audit_action = "warn"
+                low_edge_size_multiplier = 0.50
+                tradeability["tradeable"] = True
+                tradeability["blocker"] = None
+                tradeability["blocker_class"] = None
+                tradeability["blocker_detail"] = None
+                tradeability["low_edge_participation_penalty_applied"] = True
+                tradeability["low_edge_participation_reason"] = "nonpositive_edge_softened_to_size_penalty"
+                tradeability["low_edge_size_multiplier"] = low_edge_size_multiplier
+                existing_size_multiplier = self.to_float(tradeability.get("suggested_size_multiplier"), None)
+                if existing_size_multiplier is None:
+                    tradeability["suggested_size_multiplier"] = low_edge_size_multiplier
+                else:
+                    tradeability["suggested_size_multiplier"] = max(0.10, existing_size_multiplier * low_edge_size_multiplier)
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "ticker": selected_ticker,
+                            "family": family,
+                            "stage": "realm_vv_edge_gate",
+                            "old_reason": "nonpositive_edge",
+                            "reason": "nonpositive_edge_softened_to_size_penalty",
+                            "edge_after_cost": edge,
+                            "EV": ev_value,
+                            "selected_side": selected_side,
+                            "selected_price": selected_price,
+                            "size_multiplier": low_edge_size_multiplier,
+                            "decision": "BUY",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
-            )
-        elif blocker in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"} or truly_extreme_spread:
+            else:
+                decision = "SKIP"
+                blocker = "nonpositive_edge"
+                blocker_detail = (
+                    f"edge_after_cost={edge:.6f}"
+                    if edge is not None
+                    else "edge_after_cost=missing"
+                )
+                edge_audit_action = "block"
+                print(
+                    "[AION-EDGE-AUDIT] "
+                    + json.dumps(
+                        {
+                            "ticker": selected_ticker,
+                            "family": family,
+                            "side": selected_side,
+                            "selected_price": selected_price,
+                            "edge_after_cost": edge,
+                            "EV": ev_value,
+                            "decision": "SKIP",
+                            "reason": blocker,
+                            "quote_ready": bool(quote_ready),
+                            "orderbook_ready": bool(orderbook_ready),
+                            "price_bounds_pass": bool(price_bounds_pass),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+        elif truly_extreme_spread:
             decision = "SKIP"
-            if blocker not in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold", "unsafe_spread", "unsafe_price"}:
-                blocker = "spread_extreme"
+            if blocker not in {
+                "fake_orderbook",
+                "synthetic_orderbook",
+                "invalid_orderbook",
+                "quote_crossed_or_invalid",
+                "book_integrity_failed",
+            }:
+                blocker = "invalid_orderbook"
             blocker_detail = blocker_detail if blocker_detail != "unknown" else blocker
         elif edge < edge_threshold:
             if executable_positive_sports:
@@ -58977,7 +59151,7 @@ class KalshiSniperBot:
                     and selected_side_has_price
                     and (selected_side_has_liquidity or depth_available)
                     and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
-                    and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
+                    and tradeability.get("blocker_class") not in {"duplicate_position", "live_arm"}
                 )
                 near_miss_allowed = bool(
                     profile in {"opportunistic", "beast"}
@@ -58988,7 +59162,7 @@ class KalshiSniperBot:
                     and selected_price_cents is not None
                     and int(selected_price_cents) <= 99
                     and confidence >= max(0.10, confidence_floor * 0.20)
-                    and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
+                    and tradeability.get("blocker_class") not in {"duplicate_position", "live_arm"}
                     and tradeability.get("spread_classification") in {"AGGRESSIVE_BUT_TRADEABLE", "CAUTION_WAIT"}
                     and (tradeability.get("liquidity") or 0.0) >= 0.0
                 )
@@ -59116,12 +59290,63 @@ class KalshiSniperBot:
                         marker=("SPORTS-PROBABILITY-REALM-VV-BUY", ticker or family, int(time.time() // 90)),
                     )
                 elif probability_cost_context.get("hard_reject"):
-                    blocker = probability_cost_context.get("reason") or "probability_true_hard_block"
-                    blocker_detail = blocker
-        elif blocker in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold"} or truly_extreme_spread:
+                    probability_soft_allow = bool(
+                        self.is_sports_family(family, ticker=ticker)
+                        and quote_ready
+                        and orderbook_ready
+                        and price_bounds_pass
+                        and selected_side in {"yes", "no"}
+                        and selected_side_has_price
+                        and (selected_side_has_liquidity or depth_available)
+                        and not truly_extreme_spread
+                        and not duplicate_block
+                        and live_arm_ok
+                    )
+                    if probability_soft_allow:
+                        probability_size_multiplier = self.to_float(
+                            probability_cost_context.get("size_multiplier"),
+                            0.65,
+                        )
+                        probability_size_multiplier = max(0.25, min(1.0, probability_size_multiplier or 0.65))
+                        decision = "BUY"
+                        blocker = None
+                        blocker_detail = None
+                        tradeability["tradeable"] = True
+                        tradeability["blocker"] = None
+                        tradeability["blocker_class"] = None
+                        tradeability["blocker_detail"] = None
+                        tradeability["probability_hard_reject_softened"] = True
+                        tradeability["probability_size_multiplier"] = probability_size_multiplier
+                        existing_size_multiplier = self.to_float(tradeability.get("suggested_size_multiplier"), None)
+                        if existing_size_multiplier is None:
+                            tradeability["suggested_size_multiplier"] = probability_size_multiplier
+                        else:
+                            tradeability["suggested_size_multiplier"] = max(0.10, existing_size_multiplier * probability_size_multiplier)
+                        self._emit_sports_probability_log(
+                            "SPORTS-PROBABILITY-OVERRIDE",
+                            {
+                                **probability_cost_context,
+                                "source": "realm_vv_entry_edge_floor",
+                                "old_reason": probability_cost_context.get("reason") or "probability_true_hard_block",
+                                "reason": "probability_hard_reject_softened_to_size_penalty",
+                                "final_action": "buy",
+                                "size_multiplier": probability_size_multiplier,
+                            },
+                            marker=("SPORTS-PROBABILITY-REALM-VV-SOFT-HARD", ticker or family, int(time.time() // 90)),
+                        )
+                    else:
+                        blocker = probability_cost_context.get("reason") or "probability_true_hard_block"
+                        blocker_detail = blocker
+        elif truly_extreme_spread:
             decision = "SKIP"
-            if blocker not in {"spread_extreme", "sports_spread_absurd_for_family", "spread_absurd_unusable", "spread_above_threshold", "unsafe_spread", "unsafe_price"}:
-                blocker = "spread_extreme"
+            if blocker not in {
+                "fake_orderbook",
+                "synthetic_orderbook",
+                "invalid_orderbook",
+                "quote_crossed_or_invalid",
+                "book_integrity_failed",
+            }:
+                blocker = "invalid_orderbook"
             blocker_detail = blocker_detail if blocker_detail != "unknown" else blocker
         elif confidence < confidence_floor:
             if adaptive_confidence_allow:
@@ -59202,7 +59427,7 @@ class KalshiSniperBot:
                     else "missing_side_or_liquidity"
                     if selected_side not in {"yes", "no"} or not selected_side_has_price or not (selected_side_has_liquidity or depth_available)
                     else "risk_or_duplicate_guard"
-                    if duplicate_block or cooldown_block or capacity_blocker or max_positions_block or daily_cap_block or not live_arm_ok
+                    if duplicate_block or not live_arm_ok
                     else "below_adaptive_confidence_floor"
                 )
         elif tradeability.get("unsafe_price_status") in {"unsafe_spread", "caution_wide_spread"} and profile in {"opportunistic", "beast"}:
@@ -59214,7 +59439,7 @@ class KalshiSniperBot:
                 and price_bounds_pass
                 and tradeability.get("selected_price_cents") is not None
                 and tradeability.get("selected_price_cents") <= 99
-                and tradeability.get("blocker_class") not in {"duplicate_position", "cooldown_active", "live_arm"}
+                and tradeability.get("blocker_class") not in {"duplicate_position", "live_arm"}
                 and (tradeability.get("liquidity") or 0.0) >= 0.0
             )
             if aggressive_wide_spread_ok:
@@ -59340,7 +59565,7 @@ class KalshiSniperBot:
             phase55_status = "pullback_wait"
         elif decision == "WAIT":
             phase55_status = "trigger_wait"
-        elif blocker in {"duplicate_position", "cooldown_active", "live_arm"}:
+        elif blocker in {"duplicate_position", "live_arm"}:
             phase55_status = "immediate_reject"
         elif blocker == "edge_below_threshold":
             phase55_status = "probability_block"

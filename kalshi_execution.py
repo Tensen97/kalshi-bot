@@ -1523,7 +1523,10 @@ def submit_live_order(
         }
     active_timestamps = bot._active_live_order_timestamps()
     if len(active_timestamps) >= int(live_order_rate_limit or 1):
-        return {"submitted": False, "reason": "rate_limited", "payload": payload}
+        payload["risk_warning_rate_limited"] = {
+            "active_order_timestamps": len(active_timestamps),
+            "live_order_rate_limit": int(live_order_rate_limit or 1),
+        }
     side = str(payload.get("selected_side") or payload.get("side") or "").strip().lower()
     if side not in {"yes", "no"}:
         return {"submitted": False, "reason": "missing_selected_side", "payload": payload}

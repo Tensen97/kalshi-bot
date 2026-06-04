@@ -4655,8 +4655,9 @@ def _sports_momentum_pre_submit_check(self, *, q=None, market=None, payload=None
         reason = f"orderbook_invalid:{missing_reason}"
     spread = self.to_float(payload.get("spread"), self.to_float(allocation.get("spread"), getattr(q, "spread", None)))
     hard_spread_limit = max(0.12, float(SPORTS_ADAPTIVE_SPREAD_MAX or MAX_ENTRY_SPREAD) * 1.50)
+    spread_warning = None
     if reason is None and spread is not None and spread > hard_spread_limit:
-        reason = "spread_not_sane"
+        spread_warning = "spread_not_sane_softened"
     if reason is not None:
         self._emit_sports_regime_log(
             "SPORTS-MOMENTUM-SKIP",
@@ -4672,6 +4673,22 @@ def _sports_momentum_pre_submit_check(self, *, q=None, market=None, payload=None
             marker=("SPORTS-MOMENTUM-SKIP", source, ticker, reason, int(time.time() // 180)),
         )
         return {"allowed": False, "reason": reason}
+    if spread_warning:
+        self._emit_sports_regime_log(
+            "SPORTS-MOMENTUM-WARN",
+            {
+                "source": source,
+                "ticker": ticker,
+                "family": family,
+                "selected_side": selected_side,
+                "selected_price": selected_price,
+                "spread": self._safe_round(spread, 4, None),
+                "hard_spread_limit": self._safe_round(hard_spread_limit, 4, None),
+                "reason": spread_warning,
+                "decision": "CONTINUE",
+            },
+            marker=("SPORTS-MOMENTUM-WARN", source, ticker, spread_warning, int(time.time() // 180)),
+        )
     signal = self._get_live_sports_regime_signal(
         market=market,
         q=q,
@@ -4683,6 +4700,7 @@ def _sports_momentum_pre_submit_check(self, *, q=None, market=None, payload=None
     return {
         "allowed": True,
         "reason": signal.get("reason") or "sports_momentum_confirmed",
+        "warning": spread_warning,
         "signal": signal,
         "regime": signal.get("regime"),
         "momentum_classification": signal.get("momentum_classification"),
@@ -6551,7 +6569,20 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
         if not self._is_sports_only_allowed_candidate(family=family, ticker=ticker, market=market, q=q, lane="SPORTS"):
             continue
         if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
-            continue
+            allocation["weak_ladder_plan_softened"] = True
+            allocation["old_ladder_plan_decision"] = allocation.get("decision")
+            allocation["old_ladder_plan_quality_action"] = allocation.get("final_quality_action")
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-WARN",
+                {
+                    "source": source,
+                    "ticker": ticker,
+                    "family": family,
+                    "reason": "weak_ladder_plan_softened",
+                    "decision": "CONTINUE",
+                },
+                marker=("SPORTS-LADDER-WARN", source, ticker, "weak_ladder_plan_softened", int(time.time() // 180)),
+            )
         game_context = allocation.get("game_thesis_context") if isinstance(allocation.get("game_thesis_context"), dict) else {}
         game_id = str(allocation.get("game_id") or game_context.get("game_id") or getattr(q, "game_id", "") or "").strip()
         thesis_type = str(allocation.get("game_thesis_type") or game_context.get("thesis_type") or getattr(q, "game_thesis_type", "") or "").strip().lower()
@@ -6562,7 +6593,7 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
         if not game_id or not thesis_type or thesis_type == "weak_no_thesis":
             continue
         if confidence < max(float(AION_GAME_THESIS_STRONG_SCORE), float(AION_SPORTS_LADDER_MIN_CONFIDENCE)):
-            continue
+            allocation["weak_ladder_confidence_softened"] = True
         signal = allocation.get("game_thesis_signal") if isinstance(allocation.get("game_thesis_signal"), dict) else {}
         leg_type = self._sports_ladder_leg_type(family=family, ticker=ticker, market=market, q=q)
         alignment = self._sports_ladder_alignment_score(
@@ -6576,7 +6607,7 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
         unified_score = self._candidate_unified_score(candidate)
         allocation_score = self.to_float(allocation.get("allocation_score"), self.to_float(candidate.get("score"), 0.0)) or 0.0
         if unified_score < float(AION_SPORTS_LADDER_MIN_LEG_SCORE) and ticker != game_context.get("primary_candidate"):
-            continue
+            allocation["weak_ladder_score_softened"] = True
         book_quality = self._sports_ladder_book_quality(allocation)
         memory_strength = max(
             0.0,
@@ -6868,10 +6899,6 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
     skipped = []
     submitted_entries = []
     stop_reasons = {
-        "max_submits_per_cycle",
-        "rate_limited",
-        "max_new_positions_per_10min",
-        "max_open_positions",
         "daily_loss_guard",
         "trading_halted",
     }
@@ -6904,7 +6931,7 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
         submitted_entries.append(self._aion_concurrency_entry_from_meta(primary_meta, source="sports_ladder_primary"))
     if remaining_game_capacity <= 0:
         self._emit_sports_ladder_log(
-            "SPORTS-LADDER-SKIP",
+            "SPORTS-LADDER-WARN",
             {
                 "source": source,
                 "plan_id": plan.get("plan_id"),
@@ -6913,11 +6940,12 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
                 "thesis_confidence": plan.get("thesis_confidence"),
                 "existing_game_exposure": existing_exposure,
                 "max_game_contracts": game_exposure_cap,
-                "reason": "game_exposure_cap_reached",
+                "reason": "game_exposure_cap_softened",
+                "decision": "CONTINUE",
             },
             marker=("SPORTS-LADDER-SKIP", source, plan.get("plan_id"), "cap", int(time.time() // 180)),
         )
-        return {"submitted": False, "reason": "game_exposure_cap_reached", "plan": self.last_sports_ladder_plan}
+        remaining_game_capacity = max(1, int(MAX_LIVE_ORDER_SIZE or 1))
     for leg in plan.get("legs") or []:
         ticker = str(leg.get("ticker") or "").strip()
         if not ticker:
@@ -6946,8 +6974,12 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
             )
             continue
         if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
-            skipped.append({"ticker": ticker, "reason": "weak_ladder_leg"})
-            continue
+            allocation["weak_ladder_leg_softened"] = True
+            self._emit_sports_ladder_log(
+                "SPORTS-LADDER-WARN",
+                {"source": source, "plan_id": plan.get("plan_id"), "game_id": game_id, "ticker": ticker, "reason": "weak_ladder_leg_softened", "decision": "CONTINUE"},
+                marker=("SPORTS-LADDER-WARN", source, ticker, "weak_ladder_leg_softened", int(time.time() // 180)),
+            )
         if self._sports_only_execution_blocked(
             family=family,
             ticker=ticker,
@@ -7064,7 +7096,7 @@ def _execute_sports_ladder_attempts(self, *, primary_ticker=None, primary_result
             if reason in stop_reasons:
                 break
             continue
-        planned_size = max(1, min(int(leg.get("size_cap") or 1), remaining_game_capacity, int(MAX_LIVE_ORDER_SIZE or 1)))
+        planned_size = max(1, min(int(leg.get("size_cap") or 1), int(MAX_LIVE_ORDER_SIZE or 1)))
         self._apply_sports_ladder_leg_metadata(q=q, allocation=allocation, leg={**leg, "size_cap": planned_size}, plan=plan)
         self._emit_sports_ladder_log(
             "SPORTS-LADDER-LEG",
@@ -17279,6 +17311,7 @@ def find_best_live_ticker(self, markets=None):
             market=fast_market,
         )
         if fast_lane_allocation.get("decision") == "SKIP_WEAK_SPORT":
+            fast_lane_allocation["weak_sports_quality_softened"] = True
             print(
                 "[AION-WEAK-SPORT-DEMOTE] "
                 + json.dumps(
@@ -17293,23 +17326,71 @@ def find_best_live_ticker(self, markets=None):
                         "spread": fast_lane_allocation.get("spread"),
                         "liquidity": fast_lane_allocation.get("liquidity"),
                         "sports_quality_reason": fast_lane_allocation.get("reason"),
-                        "final_decision": "SKIP",
-                        "why_candidate_lost": "weak_sports_quality_demoted_before_fast_execution",
+                        "final_decision": "CONTINUE",
+                        "why_candidate_lost": "weak_sports_quality_softened_before_fast_execution",
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
-            continue
+            print(
+                "[AION-ADMISSION-RELAXED] "
+                + json.dumps(
+                    {
+                        "source": "fast_executable_preselection",
+                        "ticker": fast_ticker,
+                        "family": fast_family,
+                        "old_reason": fast_lane_allocation.get("reason") or "weak_sports_quality_demoted",
+                        "reason": "weak_sports_quality_softened",
+                        "decision": "CONTINUE",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         fast_authority_allows = bool(
             fast_decision in {"BUY", "LIVE_PROMOTION"}
             or fast_canonical_tradeability.get("final_submit_allowed_by_realm_vv")
             or fast_quote_diag.get("final_submit_allowed_by_realm_vv")
         )
         if self._is_sports_market_or_family(fast_family) and self.to_float(fast_edge_after_cost, 0.0) <= 0.0:
-            continue
+            print(
+                "[AION-ADMISSION-RELAXED] "
+                + json.dumps(
+                    {
+                        "source": "fast_executable_preselection",
+                        "ticker": fast_ticker,
+                        "family": fast_family,
+                        "old_reason": "nonpositive_edge",
+                        "reason": "nonpositive_edge_softened",
+                        "edge_after_cost": fast_edge_after_cost,
+                        "decision": "CONTINUE",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         if not fast_authority_allows:
-            continue
+            if self._is_sports_market_or_family(fast_family) and fast_side in {"yes", "no"} and fast_selected_price is not None:
+                print(
+                    "[AION-ADMISSION-RELAXED] "
+                    + json.dumps(
+                        {
+                            "source": "fast_executable_preselection",
+                            "ticker": fast_ticker,
+                            "family": fast_family,
+                            "old_reason": "authority_not_ready",
+                            "reason": "authority_not_ready_softened",
+                            "selected_side": fast_side,
+                            "selected_price": fast_selected_price,
+                            "decision": "CONTINUE",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            else:
+                continue
         fast_spread_bucket = str(
             fast_quote_diag.get("spread_bucket")
             or fast_sports_context.get("spread_bucket")
@@ -18737,9 +18818,7 @@ def find_best_live_ticker(self, markets=None):
         lane_allocation = expectancy_item.get("lane_allocation") if isinstance(expectancy_item, dict) else {}
         lane_allocation = lane_allocation if isinstance(lane_allocation, dict) else {}
         if lane_allocation.get("decision") == "SKIP_WEAK_SPORT":
-            decision_skip_count += 1
-            decision_skip_family_counts[family] = decision_skip_family_counts.get(family, 0) + 1
-            decision_skip_reasons["weak_sports_quality_demoted"] = decision_skip_reasons.get("weak_sports_quality_demoted", 0) + 1
+            lane_allocation["weak_sports_quality_softened"] = True
             print(
                 "[AION-WEAK-SPORT-DEMOTE] "
                 + json.dumps(
@@ -18753,40 +18832,28 @@ def find_best_live_ticker(self, markets=None):
                         "spread": lane_allocation.get("spread"),
                         "liquidity": lane_allocation.get("liquidity"),
                         "sports_quality_reason": lane_allocation.get("reason"),
-                        "final_decision": "SKIP",
-                        "why_candidate_lost": "weak_sports_quality_demoted_before_final_selection",
+                        "final_decision": "CONTINUE",
+                        "why_candidate_lost": "weak_sports_quality_softened_before_final_selection",
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
-            trade_readiness_records.append({
-                "trace_id": trace_id,
-                "ticker": q.ticker,
-                "family": family,
-                "candidate_source": candidate_trace_source,
-                "candidate_score": candidate_score,
-                "raw_candidate_score": score_result.get("candidate_score", candidate_score),
-                "probability_confidence": self.to_float(entry_timing_observation.get("probability_confidence"), 0.0),
-                "decision": "SKIP",
-                "decision_reason": "weak_sports_quality_demoted",
-                "phase55_status": entry_timing_observation.get("phase55_status"),
-                "entry_ready_reason": entry_timing_observation.get("entry_ready_reason"),
-                "reject_reason": "weak_sports_quality_demoted",
-                "score_breakdown": score_breakdown,
-                "spread": spread,
-                "liquidity": lane_allocation.get("liquidity"),
-                "execution_safety_blocked": False,
-                "payload_ready": False,
-                "phase55_ready": bool(entry_timing_observation.get("phase55_status") == "entry_ready"),
-                "expectancy_score": expectancy_summary.get("expectancy_score"),
-                "sports_edge_after_cost": expectancy_summary.get("sports_edge_after_cost"),
-                "sports_edge_context": getattr(q, "sports_edge_context", None) or getattr(q, "sports_edge_ranking_context", None),
-                "sports_edge_tags": getattr(q, "sports_edge_tags", None) or getattr(q, "sports_tags", None),
-                "sports_edge_rank_boost": getattr(q, "sports_edge_rank_boost", None),
-                "lane_allocation": lane_allocation,
-            })
-            continue
+            print(
+                "[AION-ADMISSION-RELAXED] "
+                + json.dumps(
+                    {
+                        "source": "trade_readiness_selection",
+                        "ticker": q.ticker,
+                        "family": family,
+                        "old_reason": lane_allocation.get("reason") or "weak_sports_quality_demoted",
+                        "reason": "weak_sports_quality_softened",
+                        "decision": "CONTINUE",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         if expectancy_summary.get("phase55_fastpath_allowed") and str(entry_timing_observation.get("phase55_status") or "").strip().lower() in {"trigger_wait", "pullback_wait"}:
             skipped_wait_type = entry_timing_observation.get("pullback_rule_path") or entry_timing_observation.get("phase55_status")
             entry_timing_observation = dict(entry_timing_observation)

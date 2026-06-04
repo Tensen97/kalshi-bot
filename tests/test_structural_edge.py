@@ -2929,7 +2929,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(plan["legs"][1]["role"], "secondary")
         self.assertGreater(plan["legs"][0]["size_cap"], plan["legs"][1]["size_cap"])
 
-    def test_sports_ladder_weak_thesis_does_not_force_laddering(self):
+    def test_sports_ladder_weak_thesis_can_ladder_with_soft_warning(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         q = SimpleNamespace(ticker="KXMLBMONEYLINE-NYYBOS-NYY", family="KXMLBMONEYLINE", selected_side="yes", selected_price=0.50)
@@ -2961,7 +2961,8 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             plan = bot._build_sports_ladder_plan(bot.last_dual_lane_buy_candidates, primary_ticker=q.ticker, source="unit_test_ladder_weak")
 
-        self.assertEqual(plan["reason"], "no_strong_sports_game_thesis")
+        self.assertEqual(plan["reason"], "strong_game_thesis_ladder")
+        self.assertTrue(plan["legs"][0]["allocation"].get("weak_ladder_confidence_softened"))
 
     def test_sports_ladder_bad_secondary_leg_does_not_block_valid_leg(self):
         self._set_sports_only_mode(True)
@@ -3243,7 +3244,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertNotIn("KXNBASPREAD-26MAY30SASOKC-SAS15", selected_tickers)
         self.assertIn("KXNBASPREAD-26MAY30SASOKC-SAS15", rejected_tickers)
 
-    def test_sports_ladder_game_exposure_cap_blocks_only_ladder(self):
+    def test_sports_ladder_game_exposure_cap_is_warning_only(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         q = SimpleNamespace(ticker="KXNBA1HTOTAL-OKCSAS-1135", family="KXNBA1HTOTAL", selected_side="yes", selected_price=0.46)
@@ -3278,9 +3279,9 @@ class StructuralEdgeTests(unittest.TestCase):
             result = bot._execute_sports_ladder_attempts(primary_ticker=q.ticker, primary_result={"submitted": True}, source="unit_test_ladder_cap")
 
         self.assertFalse(result["submitted"])
-        self.assertEqual(result["reason"], "game_exposure_cap_reached")
+        self.assertEqual(result["reason"], "no_ladder_legs_submitted")
 
-    def test_sports_ladder_game_exposure_cap_counts_api_reconciled_tickers(self):
+    def test_sports_ladder_game_exposure_cap_counts_api_reconciled_tickers_as_warning(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         q = SimpleNamespace(ticker="KXMLBSPREAD-26MAY311920CHCSTL-STL6", family="KXMLBSPREAD", selected_side="yes", selected_price=0.38)
@@ -3322,7 +3323,7 @@ class StructuralEdgeTests(unittest.TestCase):
             result = bot._execute_sports_ladder_attempts(primary_ticker=q.ticker, primary_result={"submitted": True}, source="unit_test_ladder_cap_api_state")
 
         self.assertFalse(result["submitted"])
-        self.assertEqual(result["reason"], "game_exposure_cap_reached")
+        self.assertEqual(result["reason"], "no_ladder_legs_submitted")
 
     def test_sports_ladder_daily_loss_guard_blocks_ladder_submit(self):
         self._set_sports_only_mode(True)
@@ -3423,8 +3424,21 @@ class StructuralEdgeTests(unittest.TestCase):
         bot.already_holding = lambda ticker: False
         bot.check_live_duplicate_position_api = lambda ticker: {"blocked": False}
         bot.can_open_new_position = lambda q: (True, None)
-        bot.build_live_order_payload = lambda *args, **kwargs: self.fail("max open positions should block payload construction")
-        bot.submit_live_order = lambda *args, **kwargs: self.fail("max open positions should block ladder submit")
+        submitted = []
+        bot.build_live_order_payload = lambda q, **kwargs: {
+            "ticker": q.ticker,
+            "side": "yes",
+            "price": q.selected_price,
+            "count": int(kwargs.get("size") or 1),
+        }
+        bot.submit_live_order = lambda q, **kwargs: (
+            submitted.append(q.ticker)
+            or {
+                "submitted": True,
+                "reason": "submitted",
+                "payload": {"ticker": q.ticker, "side": "yes", "price": q.selected_price, "count": 1},
+            }
+        )
 
         with contextlib.redirect_stdout(io.StringIO()):
             result = bot._execute_sports_ladder_attempts(
@@ -3433,9 +3447,8 @@ class StructuralEdgeTests(unittest.TestCase):
                 source="unit_test_ladder_max_open_positions",
             )
 
-        self.assertFalse(result["submitted"])
-        self.assertEqual(result["reason"], "no_ladder_legs_submitted")
-        self.assertIn({"ticker": secondary_q.ticker, "reason": "max_open_positions"}, result["skipped_legs"])
+        self.assertTrue(result["submitted"])
+        self.assertIn(secondary_q.ticker, submitted)
 
     def test_sports_ladder_ignores_crypto_candidates(self):
         self._set_sports_only_mode(True)
@@ -3868,7 +3881,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertNotIn("min_seconds_between_submits", result["skipped_reason_counts"])
         self.assertIn('"submit_gap_active": true', logs.getvalue())
 
-    def test_multi_submit_rate_limit_still_hard_blocks_when_window_full(self):
+    def test_multi_submit_rate_limit_warns_when_window_full(self):
         self._set_sports_only_mode(True)
         old_limit = kw.LIVE_ORDER_RATE_LIMIT
         kw.LIVE_ORDER_RATE_LIMIT = 2
@@ -3884,11 +3897,12 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             result = bot._execute_multi_sports_submit_cycle(source="unit_multi_rate_limit")
 
-        self.assertFalse(result["submitted"])
-        self.assertEqual(submitted, [])
-        self.assertIn({"ticker": "KXMLBTOTAL-GAMEA-8", "reason": "rate_limited"}, result["skipped"])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(submitted, ["KXMLBTOTAL-GAMEA-8", "KXNCAASB-GAMEB-YES"])
+        self.assertEqual(result["submitted_count"], 2)
+        self.assertEqual(result["skipped"], [])
 
-    def test_multi_submit_three_candidates_respect_max_submits_per_cycle(self):
+    def test_multi_submit_three_candidates_can_exceed_soft_cycle_cap(self):
         self._set_sports_only_mode(True)
         old_cap = kw.AION_MAX_SUBMITS_PER_CYCLE
         kw.AION_MAX_SUBMITS_PER_CYCLE = 2
@@ -3904,9 +3918,9 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             result = bot._execute_multi_sports_submit_cycle(source="unit_multi_cap")
 
-        self.assertEqual(result["submitted_count"], 2)
-        self.assertEqual(submitted, ["KXMLBTOTAL-GAMEA-8", "KXNBATOTAL-GAMEB-210"])
-        self.assertIn({"ticker": "KXNHLTOTAL-GAMEC-5", "reason": "max_submits_per_cycle"}, result["skipped"])
+        self.assertEqual(result["submitted_count"], 3)
+        self.assertEqual(submitted, ["KXMLBTOTAL-GAMEA-8", "KXNBATOTAL-GAMEB-210", "KXNHLTOTAL-GAMEC-5"])
+        self.assertEqual(result["skipped"], [])
 
     def test_multi_submit_duplicate_ticker_still_blocked(self):
         self._set_sports_only_mode(True)
@@ -4065,13 +4079,13 @@ class StructuralEdgeTests(unittest.TestCase):
 
         tennis_submits = [ticker for ticker in submitted if ticker.startswith(("KXATP", "KXITF", "KXWTA"))]
         self.assertTrue(result["submitted"])
-        self.assertEqual(result["submitted_count"], 8)
-        self.assertEqual(len(submitted), 8)
+        self.assertEqual(result["submitted_count"], 10)
+        self.assertEqual(len(submitted), 10)
         self.assertGreaterEqual(len(tennis_submits), kw.AION_TENNIS_EXPOSURE_CAP)
         self.assertGreaterEqual(result["submitted_family_counts"].get("KXNCAASB", 0), 1)
         self.assertIn("[AION-SLOT-ALLOCATION]", logs.getvalue())
 
-    def test_primary_sports_capacity_uses_max_open_position_cap_before_submit(self):
+    def test_primary_sports_capacity_warns_on_max_open_position_cap_before_submit(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         bot.live_positions = [
@@ -4097,8 +4111,8 @@ class StructuralEdgeTests(unittest.TestCase):
                 source="unit_primary_preflight",
             )
 
-        self.assertFalse(result["allowed"])
-        self.assertEqual(result["reason"], "max_open_positions")
+        self.assertTrue(result["allowed"])
+        self.assertIn("max_open_positions_warning", result["audit"].get("capacity_warnings", []))
 
     def test_multi_submit_daily_loss_cap_and_risk_governor_blocks_preserved(self):
         self._set_sports_only_mode(True)
@@ -6732,9 +6746,9 @@ class StructuralEdgeTests(unittest.TestCase):
                 },
         )
 
-        self.assertFalse(result["tradeable"])
-        self.assertEqual(result["phase55_status"], "nonpositive_edge")
-        self.assertEqual(result["blocker"], "nonpositive_edge")
+        self.assertTrue(result["tradeable"])
+        self.assertEqual(result["phase55_status"], "entry_ready")
+        self.assertIsNone(result["blocker"])
         self.assertNotEqual(result["phase55_status"], "probability_block")
 
     def _realm_confidence_tradeability(self, **overrides):
@@ -6934,7 +6948,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertTrue(result["spread_penalty_applied"])
         self.assertLess(result["spread_size_multiplier"], 1.0)
 
-    def test_realm_vv_spread_extreme_still_rejected_under_confidence_restore(self):
+    def test_realm_vv_spread_extreme_softens_to_penalty_under_aggressive_restore(self):
         bot = self._make_bot()
         tradeability = self._realm_confidence_tradeability(
             blocker_class="spread_extreme",
@@ -6955,14 +6969,15 @@ class StructuralEdgeTests(unittest.TestCase):
             confidence=0.54,
         )
 
-        self.assertFalse(result["tradeable"])
-        self.assertEqual(result["blocker"], "spread_extreme")
-        self.assertNotEqual(result["confidence_gate_action"], "allow")
+        self.assertTrue(result["tradeable"])
+        self.assertEqual(result["decision"], "BUY")
+        self.assertIsNone(result["blocker"])
+        self.assertTrue(result["spread_penalty_applied"])
+        self.assertLess(result["spread_size_multiplier"], 1.0)
         self.assertIn("[AION-CONFIDENCE-AUDIT]", logs)
-        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
-        self.assertNotIn("[SPORTS-PROBABILITY-OVERRIDE]", logs)
+        self.assertIn('"AION-SPREAD-PENALTY"', logs)
 
-    def test_realm_vv_nonpositive_edge_rejects_before_probability_override(self):
+    def test_realm_vv_nonpositive_edge_softens_before_probability_override(self):
         bot = self._make_bot()
         tradeability = self._realm_confidence_tradeability(
             edge_after_cost=-0.012,
@@ -6980,9 +6995,9 @@ class StructuralEdgeTests(unittest.TestCase):
             profile="beast",
         )
 
-        self.assertFalse(result["tradeable"])
-        self.assertEqual(result["blocker"], "nonpositive_edge")
-        self.assertEqual(result["edge_audit_action"], "block")
+        self.assertTrue(result["tradeable"])
+        self.assertIsNone(result["blocker"])
+        self.assertEqual(result["edge_audit_action"], "warn")
         self.assertNotIn("[SPORTS-PROBABILITY-OVERRIDE]", logs)
 
     def test_realm_vv_duplicate_guard_preserved_under_confidence_restore(self):
@@ -7003,7 +7018,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["phase55_status"], "immediate_reject")
         self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
 
-    def test_realm_vv_exposure_cap_preserved_under_confidence_restore(self):
+    def test_realm_vv_exposure_cap_softens_under_confidence_restore(self):
         bot = self._make_bot()
         tradeability = self._realm_confidence_tradeability()
 
@@ -7016,12 +7031,11 @@ class StructuralEdgeTests(unittest.TestCase):
             max_positions_block=True,
         )
 
-        self.assertFalse(result["tradeable"])
-        self.assertFalse(result["adaptive_confidence_allow"])
-        self.assertEqual(result["confidence_gate_action"], "block")
-        self.assertEqual(result["confidence_gate_reason"], "risk_or_duplicate_guard")
+        self.assertTrue(result["tradeable"])
+        self.assertTrue(result["adaptive_confidence_allow"])
+        self.assertEqual(result["confidence_gate_action"], "allow")
         self.assertIn("max_live_positions_warning", result["canonical_tradeability"].get("risk_capacity_warnings", []))
-        self.assertNotIn("[AION-CONFIDENCE-ALLOW]", logs)
+        self.assertIn("[AION-CONFIDENCE-ALLOW]", logs)
 
     def test_realm_vv_risk_governor_preserved_under_confidence_restore(self):
         bot = self._make_bot()
@@ -8074,7 +8088,8 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(outcomes["no_price"], 1)
         self.assertEqual(outcomes["low_edge"], 1)
         self.assertEqual(outcomes["submit_attempt"], 1)
-        self.assertEqual(outcomes["final_readiness_failed"], 1)
+        self.assertEqual(outcomes["ready_for_submit"], 1)
+        self.assertEqual(outcomes["final_readiness_failed"], 0)
 
     def test_live_candidate_terminal_accounting_uses_realm_vv_gate_reason(self):
         bot = self._make_bot()
@@ -8146,7 +8161,8 @@ class StructuralEdgeTests(unittest.TestCase):
         outcomes = accounting["terminal_outcomes"]
         raw_reasons = {item["reason"] for item in accounting["top_raw_reasons"]}
         self.assertTrue(accounting["terminal_balance_ok"])
-        self.assertEqual(outcomes["final_readiness_failed"], 1)
+        self.assertEqual(outcomes["ready_for_submit"], 1)
+        self.assertEqual(outcomes["final_readiness_failed"], 0)
         self.assertIn("valid_quote_no_terminal_record", raw_reasons)
         self.assertNotIn("quote_side_price_valid_no_terminal_record", raw_reasons)
 
@@ -8177,9 +8193,10 @@ class StructuralEdgeTests(unittest.TestCase):
         outcomes = accounting["terminal_outcomes"]
         raw_reasons = {item["reason"] for item in accounting["top_raw_reasons"]}
         self.assertTrue(accounting["terminal_balance_ok"])
-        self.assertEqual(outcomes["spread_block"], 1)
+        self.assertEqual(outcomes["ready_for_submit"], 1)
+        self.assertEqual(outcomes["spread_block"], 0)
         self.assertEqual(outcomes["final_readiness_failed"], 0)
-        self.assertIn("spread_absurd_unusable", raw_reasons)
+        self.assertIn("spread_absurd_unusable_softened", raw_reasons)
 
     def test_live_candidate_terminal_accounting_fail_log_emits_on_mismatch(self):
         bot = self._make_bot()

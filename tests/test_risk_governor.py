@@ -119,14 +119,14 @@ class RiskGovernorTests(unittest.TestCase):
         self.assertEqual(result["payload"]["count"], 2)
         self.assertIn("max_dollars_per_trade", result["cap_reasons"])
 
-    def test_family_exposure_blocks_only_when_capacity_exhausted(self):
+    def test_family_exposure_warns_when_capacity_exhausted(self):
         bot = RiskBotStub()
         bot.live_positions.append(
             {"ticker": "KXNCAABSPREAD-OTHER", "family": "KXNCAABSPREAD", "count": 10, "entry_price": 0.50}
         )
         result = self._evaluate(bot=bot)
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "max_family_exposure")
+        self.assertTrue(result["ok"])
+        self.assertIn("max_family_exposure_warning", result["warnings"])
 
     def test_duplicate_live_position_blocks(self):
         bot = RiskBotStub()
@@ -258,8 +258,8 @@ class RiskGovernorTests(unittest.TestCase):
             {"ticker": "KXNCAABSPREAD-OTHER", "family": "KXNCAABSPREAD", "count": 10, "avg_price": 0.50}
         ]
         result = self._evaluate(bot=bot)
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "max_family_exposure")
+        self.assertTrue(result["ok"])
+        self.assertIn("max_family_exposure_warning", result["warnings"])
 
     def test_daily_loss_blocks(self):
         bot = RiskBotStub()

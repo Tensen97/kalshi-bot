@@ -881,10 +881,9 @@ def evaluate_live_order_risk_governor(
         remaining_family = max(0.0, max_family - current_family_exposure)
         family_cap = int(remaining_family / selected_price)
         if family_cap <= 0:
-            return _block("max_family_exposure")
+            warnings.append("max_family_exposure_warning")
         if count > family_cap:
-            count = family_cap
-            cap_reasons.append("max_family_exposure")
+            warnings.append("max_family_exposure_warning")
     if count <= 0:
         return _block("risk_size_capped_to_zero")
     payload["count"] = int(count)
