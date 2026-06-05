@@ -48,6 +48,33 @@ class StructuralEdgeTests(unittest.TestCase):
         kw.AION_SPORTS_ONLY_MODE = bool(enabled)
         self.addCleanup(setattr, kw, "AION_SPORTS_ONLY_MODE", old_mode)
 
+    def _confirmed_entry_fields(self, *, side="yes", price=0.45, family="KXMLBMONEYLINE", ticker="UNIT"):
+        return {
+            "_aion_confirm_entry_passed": True,
+            "_aion_freshness_gate_checked": True,
+            "confirm_entry_passed": True,
+            "target_id": f"target-unit-{ticker}",
+            "trace_id": f"trace-unit-{ticker}",
+            "signal_age_seconds": 1.0,
+            "max_signal_age_seconds": 45.0,
+            "edge_after_cost": 0.04,
+            "expected_cashout_bid": price,
+            "expected_cashout_not_red": True,
+            "aion_trade_target": {
+                "target_id": f"target-unit-{ticker}",
+                "trace_id": f"trace-unit-{ticker}",
+                "ticker": ticker,
+                "family": family,
+                "selected_side": side,
+                "selected_price": price,
+                "signal_detected_ts": time.time() - 1.0,
+                "max_signal_age_seconds": 45.0,
+                "edge_after_cost": 0.04,
+                "expected_cashout_bid": price,
+                "reduce_only": False,
+            },
+        }
+
     def _set_position_flip_config(self, *, enabled=True, min_edge_delta=0.08, min_loss=0.05, cooldown=120, allow_reenter=True):
         old_values = {
             "AION_POSITION_FLIP_ENABLED": kw.AION_POSITION_FLIP_ENABLED,
@@ -1406,6 +1433,7 @@ class StructuralEdgeTests(unittest.TestCase):
                     "selected_price": price,
                     "price": price,
                     "count": 2,
+                    **self._confirmed_entry_fields(side=side, price=price, family=q.family, ticker=q.ticker),
                 },
             )
 
@@ -1466,6 +1494,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "price": 0.54,
                 "count": 1,
                 "_aion_sizing_resolved": True,
+                **self._confirmed_entry_fields(side="yes", price=0.54, family=q.family, ticker=q.ticker),
             },
         )
 
@@ -1619,6 +1648,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "yes_price": 46,
                 "selected_price": 0.46,
                 "_risk_governor_checked": True,
+                **self._confirmed_entry_fields(side="yes", price=0.46, family="KXMLBMONEYLINE", ticker="KXMLBMONEYLINE-26JUN01NYYBOS-BOS"),
             }
         )
 
@@ -1703,6 +1733,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "yes_price": 46,
                 "selected_price": 0.46,
                 "_risk_governor_checked": True,
+                **self._confirmed_entry_fields(side="yes", price=0.46, family="KXMLBMONEYLINE", ticker="KXMLBMONEYLINE-26JUN01NYYBOS-BOS"),
             }
         )
 
@@ -1752,6 +1783,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "yes_price": 46,
                 "selected_price": 0.46,
                 "_risk_governor_checked": True,
+                **self._confirmed_entry_fields(side="yes", price=0.46, family="KXMLBMONEYLINE", ticker="KXMLBMONEYLINE-26JUN01NYYBOS-BOS"),
             }
         )
 
@@ -1971,6 +2003,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "orderbook_ready": True,
                 "selected_side_has_liquidity": True,
                 "_risk_governor_checked": True,
+                **self._confirmed_entry_fields(side="yes", price=0.49, family="KXMLBSPREAD", ticker="KXMLBSPREAD-26JUN011840DETTB-DET2"),
             }
         )
 
@@ -2022,6 +2055,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "orderbook_ready": True,
                 "selected_side_has_liquidity": True,
                 "_risk_governor_checked": True,
+                **self._confirmed_entry_fields(side="yes", price=0.49, family="KXMLBSPREAD", ticker=future_ticker),
             }
         )
 
@@ -2098,6 +2132,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "yes_price": 44,
                 "selected_price": 0.44,
                 "_risk_governor_checked": True,
+                **self._confirmed_entry_fields(side="yes", price=0.44, family="KXNBAGAME", ticker="KXNBAGAME-26JUN01-BOSNYK-BOS"),
             }
         )
 
@@ -3247,6 +3282,7 @@ class StructuralEdgeTests(unittest.TestCase):
                 "selected_price": 0.41,
                 "price": 0.41,
                 "count": 2,
+                **self._confirmed_entry_fields(side="no", price=0.41, family=q.family, ticker=q.ticker),
             },
         )
 
@@ -4378,13 +4414,15 @@ class StructuralEdgeTests(unittest.TestCase):
 
     def test_slot_priority_profitable_mlb_outranks_mediocre_tennis(self):
         bot = self._make_bot()
-        mlb = self._multi_sports_candidate("KXMLBKS-GAMEA-YES", family="KXMLBKS", score=72, game_id="mlb:game_a")
+        mlb = self._multi_sports_candidate("KXMLBMONEYLINE-GAMEA-YES", family="KXMLBMONEYLINE", score=72, game_id="mlb:game_a")
         tennis = self._multi_sports_candidate("KXATPMATCH-GAMEB-YES", family="KXATPMATCH", score=91, game_id="tennis:game_b")
 
         with contextlib.redirect_stdout(io.StringIO()) as logs:
             ranked = bot._rank_slot_allocation_candidates([tennis, mlb], source="unit_slot_priority_mlb")
 
-        self.assertEqual(ranked[0]["ticker"], "KXMLBKS-GAMEA-YES")
+        self.assertEqual(ranked[0]["ticker"], "KXMLBMONEYLINE-GAMEA-YES")
+        self.assertEqual(len(ranked), 1)
+        self.assertIn("[AION-TENNIS-DISABLED]", logs.getvalue())
         self.assertIn("[AION-FAMILY-PRIORITY]", logs.getvalue())
 
     def test_slot_priority_profitable_ncaasb_outranks_mediocre_tennis(self):
@@ -4477,12 +4515,15 @@ class StructuralEdgeTests(unittest.TestCase):
 
         tennis_submits = [ticker for ticker in submitted if ticker.startswith(("KXATP", "KXITF", "KXWTA"))]
         self.assertTrue(result["submitted"])
-        self.assertEqual(result["submitted_count"], 6)
-        self.assertEqual(len(submitted), 6)
+        self.assertEqual(result["submitted_count"], 5)
+        self.assertEqual(len(submitted), 5)
         self.assertEqual(len(tennis_submits), 0)
         self.assertEqual(result["tennis_disabled_pre_rank_count"], 4)
+        self.assertEqual(result["disabled_family_pre_rank_count"], 1)
+        self.assertNotIn("KXMLBKS-GAMEE-YES", submitted)
         self.assertGreaterEqual(result["submitted_family_counts"].get("KXNCAASB", 0), 1)
         self.assertIn("[AION-TENNIS-DISABLED]", logs.getvalue())
+        self.assertIn("[AION-FAMILY-DISABLED]", logs.getvalue())
         self.assertIn("[AION-SLOT-ALLOCATION]", logs.getvalue())
 
     def test_primary_sports_capacity_warns_on_max_open_position_cap_before_submit(self):

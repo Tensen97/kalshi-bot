@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from types import SimpleNamespace
 
 
 CANONICAL_ORDER_ENDPOINT = "/trade-api/v2/portfolio/orders"
@@ -587,6 +588,75 @@ def place_live_order(bot, payload):
                 }
         except Exception:
             pass
+    if not exit_hint and action_hint in {"", "buy"}:
+        if not bool(payload.get("_aion_confirm_entry_passed")):
+            confirm_gate = getattr(bot, "_aion_canonical_submit_freshness_gate", None)
+            if callable(confirm_gate):
+                try:
+                    print(
+                        "[AION-SUBMIT-BYPASS-REMOVED] "
+                        + json.dumps(
+                            {
+                                "ticker": ticker_hint or None,
+                                "family": family_hint or None,
+                                "source": "kalshi_execution.place_live_order",
+                                "reason": "post_boundary_missing_confirm_entry",
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    q = SimpleNamespace(
+                        ticker=payload.get("ticker"),
+                        family=family_hint or payload.get("family"),
+                        selected_side=payload.get("selected_side") or payload.get("side"),
+                        side=payload.get("side") or payload.get("selected_side"),
+                        selected_price=payload.get("selected_price") or payload.get("price"),
+                        price=payload.get("price") or payload.get("selected_price"),
+                    )
+                    gate_result = confirm_gate(
+                        q,
+                        size=payload.get("count"),
+                        lane=payload.get("lane") or payload.get("entry_mode") or "execution_boundary",
+                        payload=payload,
+                        source="kalshi_execution.place_live_order",
+                    )
+                    if not bool((gate_result or {}).get("allowed")):
+                        return {
+                            "submitted": False,
+                            "reason": (gate_result or {}).get("reason") or "confirm_entry_rejected",
+                            "payload": (gate_result or {}).get("payload") or payload,
+                            "freshness": (gate_result or {}).get("freshness"),
+                        }
+                    payload = (gate_result or {}).get("payload") if isinstance((gate_result or {}).get("payload"), dict) else payload
+                    ticker_hint = str(payload.get("ticker") or ticker_hint or "").strip()
+                    family_hint = str(payload.get("family") or family_hint or "").strip().upper()
+                    action_hint = str(payload.get("action") or action_hint or "").strip().lower()
+                except Exception as exc:
+                    return {
+                        "submitted": False,
+                        "reason": f"confirm_entry_exception:{exc.__class__.__name__}",
+                        "payload": payload,
+                    }
+        try:
+            print(
+                "[AION-CANONICAL-SUBMIT-ONLY] "
+                + json.dumps(
+                    {
+                        "ticker": payload.get("ticker"),
+                        "family": family_hint or payload.get("family"),
+                        "target_id": payload.get("target_id"),
+                        "selected_side": payload.get("selected_side") or payload.get("side"),
+                        "signal_age_seconds": payload.get("signal_age_seconds"),
+                        "confirm_entry_passed": bool(payload.get("_aion_confirm_entry_passed")),
+                        "source": "kalshi_execution.place_live_order",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
     if not exit_hint and action_hint in {"", "buy"} and not bool(payload.get("_risk_governor_checked")):
         risk_governor = getattr(bot, "evaluate_live_order_risk_governor", None)
         if callable(risk_governor):
@@ -755,6 +825,12 @@ def place_live_order(bot, payload):
                 "action": legacy_payload.get("action"),
                 "selected_price_cents": selected_price,
                 "count": legacy_payload.get("count"),
+                "target_id": payload.get("target_id"),
+                "trace_id": payload.get("trace_id"),
+                "signal_age_seconds": payload.get("signal_age_seconds"),
+                "confirm_entry_passed": bool(payload.get("_aion_confirm_entry_passed")),
+                "edge_after_cost": payload.get("edge_after_cost"),
+                "expected_cashout_not_red": bool(payload.get("expected_cashout_not_red")),
                 "sports_live_guard_ok": None if sports_live_guard_result is None else bool(sports_live_guard_result.get("ok")),
                 "sports_live_guard_reason": None if sports_live_guard_result is None else sports_live_guard_result.get("reason"),
                 "sports_live_guard_block_reason": None if sports_live_guard_result is None else sports_live_guard_result.get("block_reason"),
@@ -780,6 +856,12 @@ def place_live_order(bot, payload):
                 "action": legacy_payload.get("action"),
                 "selected_price_cents": selected_price,
                 "count": legacy_payload.get("count"),
+                "target_id": payload.get("target_id"),
+                "trace_id": payload.get("trace_id"),
+                "signal_age_seconds": payload.get("signal_age_seconds"),
+                "confirm_entry_passed": bool(payload.get("_aion_confirm_entry_passed")),
+                "edge_after_cost": payload.get("edge_after_cost"),
+                "expected_cashout_not_red": bool(payload.get("expected_cashout_not_red")),
                 "time_in_force": request_payload.get("time_in_force"),
                 "reduce_only": request_payload.get("reduce_only"),
                 "post_only": request_payload.get("post_only"),
@@ -807,6 +889,12 @@ def place_live_order(bot, payload):
         "selected_price_cents": selected_price,
         "count": request_payload.get("count"),
         "buy_max_cost": request_payload.get("buy_max_cost"),
+        "target_id": payload.get("target_id"),
+        "trace_id": payload.get("trace_id"),
+        "signal_age_seconds": payload.get("signal_age_seconds"),
+        "confirm_entry_passed": bool(payload.get("_aion_confirm_entry_passed")),
+        "edge_after_cost": payload.get("edge_after_cost"),
+        "expected_cashout_not_red": bool(payload.get("expected_cashout_not_red")),
     }
     attempts = [attempt]
     if response.get("ok"):
@@ -1253,21 +1341,22 @@ def maybe_auto_reprice_recent_order(
         reason=f"spread={round(spread, 4)} momentum={round(momentum_value, 4)} edge={edge_reason}",
     )
     result = bot.place_live_order({**reprice_payload, **legacy_payload})
+    submit_payload = result.get("payload") if isinstance(result.get("payload"), dict) else reprice_payload
     state[order_key] = {"attempts": attempts + 1, "last_ts": now_ts, "ticker": ticker}
     if result.get("submitted"):
         bot._live_order_timestamps.append(time.time())
         bot.live_trade_count_today = int(bot.live_trade_count_today or 0) + 1
         order_summary = bot.extract_order_execution_summary(result.get("response") or {})
         new_order_id = order_summary.get("order_id")
-        bot.persist_live_entry_metadata(order=result.get("response") or {}, payload=reprice_payload, order_id=new_order_id)
+        bot.persist_live_entry_metadata(order=result.get("response") or {}, payload=submit_payload, order_id=new_order_id)
         bot.append_live_audit_log(
             "order_reprice_submitted",
             ticker=ticker,
             order_id=new_order_id,
-            side=legacy_payload.get("side"),
-            action=legacy_payload.get("action"),
-            count=legacy_payload.get("count"),
-            price=reprice_payload.get("price"),
+            side=submit_payload.get("side") or legacy_payload.get("side"),
+            action=submit_payload.get("action") or legacy_payload.get("action"),
+            count=submit_payload.get("count") or legacy_payload.get("count"),
+            price=submit_payload.get("price") or reprice_payload.get("price"),
             reason="auto_reprice",
             status_code=result.get("status_code"),
         )
@@ -1276,7 +1365,7 @@ def maybe_auto_reprice_recent_order(
             archive_writer(
                 "trade_opened",
                 q=q,
-                payload=reprice_payload,
+                payload=submit_payload,
                 order=result.get("response") or {},
                 result=result,
                 extra={
@@ -1331,18 +1420,25 @@ def maybe_auto_reprice_recent_order(
                 {
                     "ticker": ticker,
                     "side": legacy_payload.get("side"),
-                    "price": reprice_payload.get("price"),
+                    "price": submit_payload.get("price") or reprice_payload.get("price"),
                     "count": legacy_payload.get("count"),
                     "endpoint": result.get("endpoint"),
                     "lane": "auto_reprice",
                     "order_id": new_order_id,
+                    "target_id": submit_payload.get("target_id"),
+                    "trace_id": submit_payload.get("trace_id"),
+                    "selected_side": submit_payload.get("selected_side") or submit_payload.get("side"),
+                    "signal_age_seconds": submit_payload.get("signal_age_seconds"),
+                    "confirm_entry_passed": bool(submit_payload.get("_aion_confirm_entry_passed")),
+                    "edge_after_cost": submit_payload.get("edge_after_cost"),
+                    "expected_cashout_not_red": bool(submit_payload.get("expected_cashout_not_red")),
                 },
                 sort_keys=True,
                 default=str,
             )
         )
         _auto_reprice_log("AUTO-REPRICE-DONE", ticker=ticker, attempts=attempts + 1)
-        result["payload"] = reprice_payload
+        result["payload"] = submit_payload
         result["reason"] = "auto_reprice_submitted"
         result["auto_reprice"] = True
         return result
@@ -1828,6 +1924,12 @@ def submit_live_order(
                     "endpoint": result.get("endpoint"),
                     "lane": lane,
                     "order_id": order_id,
+                    "target_id": payload.get("target_id"),
+                    "trace_id": payload.get("trace_id"),
+                    "signal_age_seconds": payload.get("signal_age_seconds"),
+                    "confirm_entry_passed": bool(payload.get("_aion_confirm_entry_passed")),
+                    "edge_after_cost": payload.get("edge_after_cost"),
+                    "expected_cashout_not_red": bool(payload.get("expected_cashout_not_red")),
                 },
                 sort_keys=True,
                 default=str,

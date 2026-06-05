@@ -198,45 +198,51 @@ class SignalFreshnessTests(unittest.TestCase):
 
     def test_canonical_submit_wrapper_routes_alt_lane_through_freshness(self):
         bot = self._make_bot()
-        bot.get_market_family = lambda market: "KXATPCHALLENGERMATCH"
-        captured = {}
+        bot.get_market_family = lambda market: "KXMLBMONEYLINE"
+        bot.resolve_aion_orderbook_for_payload = lambda *args, **kwargs: {
+            "orderbook_ready": True,
+            "orderbook_exists": True,
+            "yes_bid": 0.42,
+            "yes_ask": 0.42,
+            "no_bid": 0.58,
+            "no_ask": 0.58,
+        }
+        bot._aion_detect_winning_side = lambda *args, **kwargs: {
+            "winning_side": "yes",
+            "winning_score": 12.0,
+            "opponent_recovery": False,
+            "yes": {"edge_after_cost": 0.04, "spread": 0.0, "side_strengthening": True, "side_weakening": False},
+            "no": {"edge_after_cost": 0.0, "spread": 0.0},
+        }
+        bot.resolve_canonical_tradeability = lambda *args, **kwargs: {
+            "tradeable": True,
+            "edge_after_cost": 0.04,
+            "probability_estimate": 0.46,
+        }
+        bot.already_holding = lambda ticker: False
+        bot.check_live_duplicate_position_api = lambda ticker: {"blocked": False}
+        bot.realized_pnl = 0.0
+        bot.live_realized_pnl_today = 0.0
+        bot._aion_mark_signal_freshness(
+            ticker="KXMLBMONEYLINE-FRESH",
+            family="KXMLBMONEYLINE",
+            side="yes",
+            signal_detected=True,
+            selected=True,
+            selected_price=0.42,
+            edge_after_cost=0.04,
+            source="unit_signal",
+            now_ts=100.0,
+        )
 
-        def fake_validation(**kwargs):
-            captured.update(kwargs)
-            return {
-                "allowed": True,
-                "reason": "freshness_repriced",
-                "payload": {
-                    "ticker": "KXMLBKS-FRESH",
-                    "family": "KXMLBKS",
-                    "side": "yes",
-                    "selected_side": "yes",
-                    "selected_price": 0.42,
-                    "price": 0.42,
-                    "yes_price": 42,
-                    "count": 1,
-                },
-                "size": 1,
-                "freshness": {
-                    "signal_age_seconds": 4.0,
-                    "max_signal_age_seconds": kw.AION_SIGNAL_FRESHNESS_ATP_MAX_AGE_SECONDS,
-                    "stale": False,
-                },
-                "spread": 0.02,
-                "edge_after_cost": 0.04,
-                "fast_submit": True,
-            }
-
-        bot._aion_final_submit_freshness_validation = fake_validation
-
-        with patch("kalshi_web.builtins.print"):
+        with patch("kalshi_web.time.time", return_value=104.0), patch("kalshi_web.builtins.print"):
             result = bot._aion_canonical_submit_freshness_gate(
-                SimpleNamespace(ticker="KXMLBKS-FRESH", family="KXMLBKS"),
+                SimpleNamespace(ticker="KXMLBMONEYLINE-FRESH", family="KXMLBMONEYLINE", selected_side="yes", selected_price=0.42),
                 size=1,
                 lane="sports_multi_submit",
                 payload={
-                    "ticker": "KXMLBKS-FRESH",
-                    "family": "KXMLBKS",
+                    "ticker": "KXMLBMONEYLINE-FRESH",
+                    "family": "KXMLBMONEYLINE",
                     "side": "yes",
                     "selected_price": 0.42,
                     "count": 1,
@@ -246,9 +252,11 @@ class SignalFreshnessTests(unittest.TestCase):
             )
 
         self.assertTrue(result["allowed"])
-        self.assertEqual(captured["source"], "canonical_submit:sports_multi_submit")
+        self.assertTrue(result["payload"]["_aion_confirm_entry_passed"])
         self.assertTrue(result["payload"]["_aion_freshness_gate_checked"])
-        self.assertEqual(result["payload"]["_aion_freshness_gate_source"], "canonical_submit:sports_multi_submit")
+        self.assertEqual(result["payload"]["signal_age_seconds"], 4.0)
+        self.assertEqual(result["payload"]["selected_side"], "yes")
+        self.assertIn("target_id", result["payload"])
 
     def test_reduce_only_payload_is_exempt_from_entry_freshness(self):
         bot = self._make_bot()

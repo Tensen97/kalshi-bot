@@ -16,7 +16,7 @@ import threading
 import subprocess
 import requests
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
 try:
@@ -2167,6 +2167,12 @@ AION_TENNIS_DISABLED_TEXT_MARKERS = (
     "ITF",
     "CHALLENGER",
 )
+AION_NEW_ENTRY_DISABLED_FAMILY_PREFIXES = (
+    "KXMLBKS",
+)
+AION_NEW_ENTRY_DISABLED_FAMILY_REASONS = {
+    "KXMLBKS": "KXMLBKS_realized_loss_source",
+}
 AION_TENNIS_EXPOSURE_CAP_ENABLED = get_env_bool("AION_TENNIS_EXPOSURE_CAP_ENABLED", 1)
 AION_TENNIS_EXPOSURE_CAP = max(1, get_env_int("AION_TENNIS_EXPOSURE_CAP", 2))
 AION_TENNIS_ELITE_EV = get_env_float("AION_TENNIS_ELITE_EV", 0.08)
@@ -2584,6 +2590,72 @@ class Quote:
     no_top_size: float = None
     selected_side: str = None
     selected_price: float = None
+
+
+@dataclass(frozen=True)
+class TradeTarget:
+    target_id: str
+    trace_id: str
+    ticker: str
+    market_title: str
+    sport: str
+    family: str
+    thesis_key: str
+    correlated_thesis_key: str
+    selected_side: str
+    selected_price: float
+    selected_probability: float
+    edge: float
+    signal_detected_ts: float
+    target_created_ts: float
+    max_signal_age_seconds: float
+    freshness_state: str
+    ranking_score: float
+    rank_position: int
+    entry_reason: str
+    orderbook_snapshot_id: str
+    yes_bid: float
+    yes_ask: float
+    no_bid: float
+    no_ask: float
+    spread: float
+    expected_cashout_bid: float
+    edge_after_cost: float
+    size: int
+    dollars: float
+    tp: float
+    sl: float
+    max_hold_seconds: float
+    trailing_policy: dict
+    reduce_only: bool = False
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class PositionExecutor:
+    target_id: str
+    ticker: str
+    family: str
+    entry_price: float
+    selected_side: str
+    position_size: int
+    tp: float
+    sl: float
+    max_hold_seconds: float
+    trailing_start: float
+    trailing_distance: float
+    fast_cut_threshold: float
+    profit_protect_threshold: float
+    current_mfe: float
+    current_mae: float
+    current_cashout: float
+    exit_reason: str
+    executor_state: str
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class KalshiSniperBot:
@@ -4407,6 +4479,18 @@ class KalshiSniperBot:
                 "reason": "tennis_live_trading_disabled",
                 "live_state": "disabled",
             }
+        disabled_family_context = self._aion_new_entry_family_disabled(
+            market=market if isinstance(market, dict) else {},
+            source=source,
+            stage="live_selector_admission",
+            emit=True,
+        )
+        if disabled_family_context.get("disabled"):
+            return False, {
+                "admit": False,
+                "reason": disabled_family_context.get("reason") or "family_disabled_for_new_entries",
+                "live_state": "disabled",
+            }
         try:
             state = self._aion_live_discovery_state(market=market)
         except Exception as exc:
@@ -4576,6 +4660,119 @@ class KalshiSniperBot:
         except Exception:
             pass
 
+    def _aion_new_entry_disabled_family_context(self, *, family=None, ticker=None, market=None, q=None, payload=None, source=None):
+        market = market if isinstance(market, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        ticker = str(ticker or payload.get("ticker") or market.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        family = str(
+            family
+            or payload.get("family")
+            or getattr(q, "family", "")
+            or market.get("series_ticker")
+            or (self.get_market_family(market or {"ticker": ticker}) if ticker else "")
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+        title = str(
+            market.get("title")
+            or market.get("market_title")
+            or market.get("event_title")
+            or payload.get("market_title")
+            or getattr(q, "market_title", "")
+            or getattr(q, "title", "")
+            or ""
+        ).strip()
+        family_or_ticker = f"{family} {ticker}".upper()
+        matched_family = None
+        for prefix in AION_NEW_ENTRY_DISABLED_FAMILY_PREFIXES:
+            prefix = str(prefix or "").strip().upper()
+            if prefix and (family.startswith(prefix) or ticker.upper().startswith(prefix) or f" {prefix}" in f" {family_or_ticker}"):
+                matched_family = prefix
+                break
+        side = self._aion_normalize_live_side(
+            payload.get("selected_side")
+            or payload.get("side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        return {
+            "disabled": bool(matched_family),
+            "ticker": ticker or None,
+            "family": family,
+            "market_title": title or None,
+            "side": side if side in {"yes", "no"} else None,
+            "selected_price": self.to_float(
+                payload.get("selected_price")
+                or payload.get("selected_price_dollars")
+                or payload.get("price")
+                or getattr(q, "selected_price", None),
+                None,
+            ),
+            "spread": self.to_float(payload.get("spread") or getattr(q, "spread", None), None),
+            "liquidity": self.to_float(payload.get("liquidity") or getattr(q, "liquidity", None), None),
+            "volume": self.to_float(payload.get("volume") or getattr(q, "volume", None), None),
+            "matched_family": matched_family,
+            "reason": AION_NEW_ENTRY_DISABLED_FAMILY_REASONS.get(matched_family, "family_disabled_for_new_entries") if matched_family else None,
+            "responsible_subsystem": "canonical_disabled_family",
+            "source": source,
+        }
+
+    def _emit_aion_family_disabled(self, context=None, *, source=None, stage=None):
+        context = context if isinstance(context, dict) else {}
+        payload = {
+            "source": source or context.get("source"),
+            "stage": stage,
+            "ticker": context.get("ticker"),
+            "family": context.get("family"),
+            "market_title": context.get("market_title"),
+            "side": context.get("side"),
+            "selected_price": context.get("selected_price"),
+            "spread": context.get("spread"),
+            "liquidity": context.get("liquidity"),
+            "volume": context.get("volume"),
+            "decision": "BLOCK",
+            "reason": context.get("reason") or "family_disabled_for_new_entries",
+            "matched_family": context.get("matched_family"),
+            "responsible_subsystem": context.get("responsible_subsystem") or "canonical_disabled_family",
+            "new_entries_allowed": False,
+            "existing_positions_managed": True,
+            "reduce_only_exits_allowed": True,
+        }
+        try:
+            builtins.print("[AION-FAMILY-DISABLED] " + json.dumps(payload, sort_keys=True, default=str))
+            builtins.print(
+                "[AION-FINAL-REJECT] "
+                + json.dumps(
+                    {
+                        "ticker": payload.get("ticker"),
+                        "family": payload.get("family"),
+                        "side": payload.get("side"),
+                        "selected_price": payload.get("selected_price"),
+                        "spread": payload.get("spread"),
+                        "liquidity": payload.get("liquidity"),
+                        "volume": payload.get("volume"),
+                        "reason": payload.get("reason"),
+                        "responsible_subsystem": payload.get("responsible_subsystem"),
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+
+    def _aion_new_entry_family_disabled(self, *, family=None, ticker=None, market=None, q=None, payload=None, source=None, stage=None, emit=True):
+        context = self._aion_new_entry_disabled_family_context(
+            family=family,
+            ticker=ticker,
+            market=market,
+            q=q,
+            payload=payload,
+            source=source,
+        )
+        if context.get("disabled") and emit:
+            self._emit_aion_family_disabled(context, source=source, stage=stage)
+        return context
+
     def _emit_aion_live_discovery_summary(self, tag, payload):
         try:
             print(f"[{tag}] " + json.dumps(payload if isinstance(payload, dict) else {}, sort_keys=True, default=str))
@@ -4616,6 +4813,9 @@ class KalshiSniperBot:
         block_examples = []
         tennis_block_examples = []
         tennis_blocked_family_counts = Counter()
+        disabled_family_block_examples = []
+        disabled_family_counts = Counter()
+        disabled_family_candidates_blocked = 0
         tennis_candidates_discovered = 0
         tennis_candidates_blocked = 0
         non_tennis_candidates_discovered = 0
@@ -4714,6 +4914,27 @@ class KalshiSniperBot:
                         }
                     )
                 self._emit_aion_tennis_disabled(tennis_context, source=source, stage="live_discovery")
+                continue
+            disabled_family_context = self._aion_new_entry_family_disabled(
+                family=family,
+                ticker=ticker,
+                market=market,
+                source=source,
+                stage="live_discovery",
+                emit=True,
+            )
+            if disabled_family_context.get("disabled"):
+                disabled_family_candidates_blocked += 1
+                disabled_family_counts[family] += 1
+                if len(disabled_family_block_examples) < 12:
+                    disabled_family_block_examples.append(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "market_title": disabled_family_context.get("market_title"),
+                            "reason": disabled_family_context.get("reason"),
+                        }
+                    )
                 continue
             non_tennis_candidates_discovered += 1
             state = self._aion_live_discovery_state(market=market)
@@ -4930,6 +5151,9 @@ class KalshiSniperBot:
             "tennis_candidates_blocked": int(tennis_candidates_blocked),
             "tennis_blocked_families": dict(tennis_blocked_family_counts.most_common(20)),
             "tennis_blocked_examples": tennis_block_examples,
+            "disabled_family_candidates_blocked": int(disabled_family_candidates_blocked),
+            "disabled_family_counts": dict(disabled_family_counts.most_common(20)),
+            "disabled_family_examples": disabled_family_block_examples,
             "non_tennis_candidates_discovered": int(non_tennis_candidates_discovered),
             "non_tennis_candidates_admitted": int(len(admitted)),
             "dropped_future_or_pregame": int(terminal_future_or_pregame_drops),
@@ -4978,6 +5202,8 @@ class KalshiSniperBot:
                 "tennis_candidates_discovered": int(tennis_candidates_discovered),
                 "tennis_candidates_blocked": int(tennis_candidates_blocked),
                 "tennis_blocked_families": dict(tennis_blocked_family_counts.most_common(12)),
+                "disabled_family_candidates_blocked": int(disabled_family_candidates_blocked),
+                "disabled_family_counts": dict(disabled_family_counts.most_common(12)),
                 "non_tennis_candidates_discovered": int(non_tennis_candidates_discovered),
                 "non_tennis_candidates_admitted": int(len(admitted)),
                 "admission_relaxed_count": int(payload["admission_relaxed_count"]),
@@ -8895,6 +9121,427 @@ class KalshiSniperBot:
             or payload.get("exit_order")
         )
 
+    def _aion_trade_target_dict(self, target):
+        if isinstance(target, TradeTarget):
+            return target.to_dict()
+        return target if isinstance(target, dict) else {}
+
+    def _aion_emit_confirm_entry_reject(self, target, *, reason, payload=None, current_orderbook=None, extra=None):
+        target_payload = self._aion_trade_target_dict(target)
+        payload = payload if isinstance(payload, dict) else {}
+        current_orderbook = current_orderbook if isinstance(current_orderbook, dict) else {}
+        extra = extra if isinstance(extra, dict) else {}
+        reject_payload = {
+            "target_id": target_payload.get("target_id"),
+            "trace_id": target_payload.get("trace_id") or payload.get("trace_id"),
+            "ticker": target_payload.get("ticker") or payload.get("ticker"),
+            "family": target_payload.get("family") or payload.get("family"),
+            "market_title": target_payload.get("market_title") or payload.get("market_title"),
+            "selected_side": target_payload.get("selected_side") or payload.get("selected_side") or payload.get("side"),
+            "selected_price": target_payload.get("selected_price") or payload.get("selected_price") or payload.get("price"),
+            "signal_age_seconds": extra.get("signal_age_seconds"),
+            "max_signal_age_seconds": target_payload.get("max_signal_age_seconds"),
+            "edge_after_cost": extra.get("edge_after_cost", target_payload.get("edge_after_cost")),
+            "spread": extra.get("spread", target_payload.get("spread")),
+            "expected_cashout_bid": extra.get("expected_cashout_bid", target_payload.get("expected_cashout_bid")),
+            "expected_cashout_not_red": bool(extra.get("expected_cashout_not_red", False)),
+            "orderbook_ready": bool(current_orderbook.get("orderbook_ready") or current_orderbook.get("orderbook_exists") or current_orderbook.get("normalized_orderbook_present") or current_orderbook.get("topbook_snapshot_present") or current_orderbook.get("topbook_depth_exists")),
+            "reason": reason,
+            "responsible_subsystem": "confirm_entry",
+        }
+        try:
+            builtins.print("[AION-CONFIRM-ENTRY-REJECT] " + json.dumps(reject_payload, sort_keys=True, default=str))
+            if str(reason or "") == "stale_signal":
+                builtins.print("[AION-STALE-SUBMIT-CANCELLED] " + json.dumps(reject_payload, sort_keys=True, default=str))
+            if str(reason or "") == "side_mismatch":
+                replacement_seed = f"{reject_payload.get('ticker')}:{extra.get('current_winning_side')}:{time.time_ns()}"
+                builtins.print(
+                    "[AION-TARGET-REPLACED] "
+                    + json.dumps(
+                        {
+                            **reject_payload,
+                            "old_target_id": reject_payload.get("target_id"),
+                            "replacement_target_id": "target-" + hashlib.sha256(replacement_seed.encode("utf-8")).hexdigest()[:18],
+                            "old_selected_side": reject_payload.get("selected_side"),
+                            "new_selected_side": extra.get("current_winning_side"),
+                            "action": "cancel_old_target_rerank_required",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            builtins.print(
+                "[AION-FINAL-REJECT] "
+                + json.dumps(
+                    {
+                        "ticker": reject_payload.get("ticker"),
+                        "family": reject_payload.get("family"),
+                        "side": reject_payload.get("selected_side"),
+                        "selected_price": reject_payload.get("selected_price"),
+                        "spread": reject_payload.get("spread"),
+                        "liquidity": current_orderbook.get("liquidity_depth") or current_orderbook.get("selected_top_size"),
+                        "volume": current_orderbook.get("volume") or payload.get("volume"),
+                        "reason": reason,
+                        "responsible_subsystem": "confirm_entry",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+
+    def _aion_build_trade_target(
+        self,
+        q=None,
+        *,
+        payload=None,
+        current_orderbook=None,
+        tradeability=None,
+        winning_context=None,
+        lane=None,
+        source="submit_live_order",
+    ):
+        payload = dict(payload or {})
+        current_orderbook = current_orderbook if isinstance(current_orderbook, dict) else {}
+        tradeability = tradeability if isinstance(tradeability, dict) else {}
+        winning_context = winning_context if isinstance(winning_context, dict) else {}
+        ticker = str(payload.get("ticker") or current_orderbook.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        family = str(
+            payload.get("family")
+            or current_orderbook.get("family")
+            or getattr(q, "family", "")
+            or (self.get_market_family({"ticker": ticker}) if ticker else "")
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+        selected_side, selected_price = self._aion_payload_side_and_price(payload)
+        if selected_side not in {"yes", "no"}:
+            selected_side = self._aion_normalize_live_side(
+                current_orderbook.get("selected_side")
+                or current_orderbook.get("chosen_side")
+                or getattr(q, "selected_side", None)
+                or getattr(q, "side", None)
+            )
+        if selected_side not in {"yes", "no"}:
+            return {"ok": False, "reason": "selected_side_missing"}
+        ask = self._aion_quote_price_to_dollars(current_orderbook.get(f"{selected_side}_ask_dollars", current_orderbook.get(f"{selected_side}_ask")))
+        bid = self._aion_quote_price_to_dollars(current_orderbook.get(f"{selected_side}_bid_dollars", current_orderbook.get(f"{selected_side}_bid")), allow_zero=True)
+        if selected_price is None:
+            selected_price = ask
+        selected_price = self._aion_quote_price_to_dollars(selected_price)
+        if selected_price is None:
+            return {"ok": False, "reason": "selected_price_missing"}
+        if ask is not None:
+            selected_price = round(float(ask), 4)
+        spread = self._aion_current_spread_for_side(current_orderbook, selected_side)
+        if spread is None and ask is not None and bid is not None:
+            spread = round(max(0.0, float(ask) - float(bid)), 4)
+        expected_cashout_bid = bid
+        original_edge = self.to_float(
+            tradeability.get("edge_after_cost"),
+            self.to_float(
+                tradeability.get("final_edge_value"),
+                self.to_float(
+                    payload.get("edge_after_cost"),
+                    self.to_float(getattr(q, "edge_after_cost", None), self.to_float(getattr(q, "edge", None), None)),
+                ),
+            ),
+        )
+        freshness = self._aion_signal_freshness_context(
+            ticker=ticker,
+            family=family,
+            side=selected_side,
+            selected_price=selected_price,
+            edge_after_cost=original_edge,
+            source=f"target_created:{source}",
+            trace_id=payload.get("trace_id"),
+            selected=True,
+            submitting=False,
+            emit=True,
+        )
+        now_ts = time.time()
+        trace_id = str(payload.get("trace_id") or freshness.get("trace_id") or "").strip()
+        if not trace_id:
+            trace_id = "trace-" + hashlib.sha256(f"{ticker}:{selected_side}:{now_ts}".encode("utf-8")).hexdigest()[:18]
+        target_seed = f"{ticker}:{selected_side}:{selected_price}:{freshness.get('signal_detected_ts')}:{now_ts}:{trace_id}"
+        target_id = "target-" + hashlib.sha256(target_seed.encode("utf-8")).hexdigest()[:18]
+        market_title = str(
+            payload.get("market_title")
+            or current_orderbook.get("market_title")
+            or getattr(q, "market_title", "")
+            or getattr(q, "title", "")
+            or ""
+        ).strip()
+        sport = "sports"
+        family_upper = family.upper()
+        if "MLB" in family_upper or "BASEBALL" in market_title.upper():
+            sport = "mlb"
+        elif "NHL" in family_upper or "HOCKEY" in market_title.upper():
+            sport = "nhl"
+        elif "NBA" in family_upper or "WNBA" in family_upper or "BASKETBALL" in market_title.upper():
+            sport = "basketball"
+        elif "NFL" in family_upper or "FOOTBALL" in market_title.upper():
+            sport = "football"
+        elif any(token in family_upper for token in ("ATP", "WTA", "ITF", "TENNIS")):
+            sport = "tennis"
+        thesis_profile = payload.get("thesis_profile") if isinstance(payload.get("thesis_profile"), dict) else {}
+        thesis_exposure = payload.get("thesis_exposure") if isinstance(payload.get("thesis_exposure"), dict) else {}
+        rank_position = self.to_float(payload.get("rank_position") or payload.get("rank"), None)
+        target = TradeTarget(
+            target_id=target_id,
+            trace_id=trace_id,
+            ticker=ticker,
+            market_title=market_title or None,
+            sport=sport,
+            family=family,
+            thesis_key=str(payload.get("thesis_key") or thesis_profile.get("thesis_key") or thesis_exposure.get("thesis_key") or ""),
+            correlated_thesis_key=str(payload.get("correlated_thesis_key") or thesis_exposure.get("event_key") or ""),
+            selected_side=selected_side,
+            selected_price=round(float(selected_price), 4),
+            selected_probability=self._safe_round(
+                tradeability.get("probability_estimate") or tradeability.get("selected_probability") or selected_price,
+                6,
+                None,
+            ),
+            edge=self._safe_round(payload.get("edge") or payload.get("EV") or original_edge, 6, None),
+            signal_detected_ts=self.to_float(freshness.get("signal_detected_ts"), now_ts),
+            target_created_ts=now_ts,
+            max_signal_age_seconds=self.to_float(freshness.get("max_signal_age_seconds"), self._aion_signal_freshness_threshold(family=family, ticker=ticker)) or self._aion_signal_freshness_threshold(family=family, ticker=ticker),
+            freshness_state="stale" if freshness.get("stale") else "fresh",
+            ranking_score=self._safe_round(payload.get("ranking_score") or payload.get("candidate_score") or payload.get("unified_opportunity_score"), 6, None),
+            rank_position=int(rank_position) if rank_position is not None else None,
+            entry_reason=str(payload.get("entry_reason") or payload.get("entry_mode") or lane or source or ""),
+            orderbook_snapshot_id="book-" + hashlib.sha256(json.dumps({key: current_orderbook.get(key) for key in ("yes_bid", "yes_ask", "no_bid", "no_ask", "orderbook_source")}, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:18],
+            yes_bid=self._safe_round(self._aion_quote_price_to_dollars(current_orderbook.get("yes_bid_dollars", current_orderbook.get("yes_bid")), allow_zero=True), 4, None),
+            yes_ask=self._safe_round(self._aion_quote_price_to_dollars(current_orderbook.get("yes_ask_dollars", current_orderbook.get("yes_ask"))), 4, None),
+            no_bid=self._safe_round(self._aion_quote_price_to_dollars(current_orderbook.get("no_bid_dollars", current_orderbook.get("no_bid")), allow_zero=True), 4, None),
+            no_ask=self._safe_round(self._aion_quote_price_to_dollars(current_orderbook.get("no_ask_dollars", current_orderbook.get("no_ask"))), 4, None),
+            spread=self._safe_round(spread, 4, None),
+            expected_cashout_bid=self._safe_round(expected_cashout_bid, 4, None),
+            edge_after_cost=self._safe_round(original_edge, 6, None),
+            size=int(max(1, min(int(MAX_LIVE_ORDER_SIZE or 1), int(self.to_float(payload.get("count"), 1) or 1)))),
+            dollars=self._safe_round((self.to_float(payload.get("count"), 1) or 1) * float(selected_price), 4, None),
+            tp=self.to_float(payload.get("tp"), self.to_float(getattr(q, "tp", None), getattr(self, "take_profit", 0.04))),
+            sl=self.to_float(payload.get("sl"), self.to_float(getattr(q, "sl", None), getattr(self, "stop_loss", 0.03))),
+            max_hold_seconds=self.to_float(payload.get("max_hold_seconds"), self.to_float(getattr(q, "max_hold_seconds", None), 900.0)),
+            trailing_policy=payload.get("trailing_policy") if isinstance(payload.get("trailing_policy"), dict) else {"mode": "position_intelligence", "source": "trade_target"},
+            reduce_only=bool(payload.get("reduce_only")),
+        )
+        try:
+            builtins.print("[AION-TARGET-CREATED] " + json.dumps(target.to_dict(), sort_keys=True, default=str))
+        except Exception:
+            pass
+        return {"ok": True, "target": target, "freshness": freshness}
+
+    def confirm_entry(self, target, current_orderbook=None, *, payload=None, q=None, source="confirm_entry"):
+        target_payload = self._aion_trade_target_dict(target)
+        current_orderbook = current_orderbook if isinstance(current_orderbook, dict) else {}
+        payload = dict(payload or {})
+        if bool(target_payload.get("reduce_only")) or self._aion_is_reduce_only_entry_payload(payload):
+            return {"allowed": True, "reason": "reduce_only_exit_exempt", "payload": payload, "target": target_payload}
+        ticker = str(target_payload.get("ticker") or payload.get("ticker") or "").strip()
+        family = str(target_payload.get("family") or payload.get("family") or (self.get_market_family({"ticker": ticker}) if ticker else "UNKNOWN") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        selected_side = self._aion_normalize_live_side(target_payload.get("selected_side"))
+        payload_side = self._aion_normalize_live_side(payload.get("selected_side") or payload.get("side"))
+        now_ts = time.time()
+        signal_ts = self.to_float(target_payload.get("signal_detected_ts"), None)
+        max_age = self.to_float(target_payload.get("max_signal_age_seconds"), self._aion_signal_freshness_threshold(family=family, ticker=ticker)) or self._aion_signal_freshness_threshold(family=family, ticker=ticker)
+        signal_age = max(0.0, now_ts - float(signal_ts)) if signal_ts is not None else None
+        ask = self._aion_quote_price_to_dollars(current_orderbook.get(f"{selected_side}_ask_dollars", current_orderbook.get(f"{selected_side}_ask")))
+        bid = self._aion_quote_price_to_dollars(current_orderbook.get(f"{selected_side}_bid_dollars", current_orderbook.get(f"{selected_side}_bid")), allow_zero=True)
+        selected_price = self._aion_quote_price_to_dollars(target_payload.get("selected_price") or payload.get("selected_price") or payload.get("price"))
+        if ask is not None:
+            selected_price = ask
+        spread = self._aion_current_spread_for_side(current_orderbook, selected_side)
+        if spread is None and ask is not None and bid is not None:
+            spread = round(max(0.0, float(ask) - float(bid)), 4)
+        edge_after_cost = self.to_float(target_payload.get("edge_after_cost"), self.to_float(payload.get("edge_after_cost"), None))
+        expected_cashout_bid = bid
+        expected_cashout_not_red = bool(
+            selected_price is not None
+            and expected_cashout_bid is not None
+            and float(expected_cashout_bid) + 0.001 >= float(selected_price)
+        )
+        orderbook_ready = bool(
+            current_orderbook.get("orderbook_ready")
+            or current_orderbook.get("orderbook_exists")
+            or current_orderbook.get("normalized_orderbook_present")
+            or current_orderbook.get("topbook_snapshot_present")
+            or current_orderbook.get("topbook_depth_exists")
+        )
+        fake_book = bool(
+            current_orderbook.get("synthetic")
+            or current_orderbook.get("fake_book")
+            or current_orderbook.get("synthetic_book")
+            or str(current_orderbook.get("orderbook_source") or "").strip().lower() in {"fake", "synthetic", "invalid"}
+        )
+        winning_side = self._aion_normalize_live_side(current_orderbook.get("_aion_winning_side"))
+        selected_current_context = current_orderbook.get(f"_aion_{selected_side}_context")
+        selected_current_context = selected_current_context if isinstance(selected_current_context, dict) else {}
+        if edge_after_cost is None:
+            edge_after_cost = self.to_float(selected_current_context.get("edge_after_cost"), None)
+        extra = {
+            "signal_age_seconds": self._safe_round(signal_age, 3, None),
+            "edge_after_cost": self._safe_round(edge_after_cost, 6, None),
+            "spread": self._safe_round(spread, 4, None),
+            "expected_cashout_bid": self._safe_round(expected_cashout_bid, 4, None),
+            "expected_cashout_not_red": expected_cashout_not_red,
+            "current_winning_side": winning_side,
+        }
+        tennis_context = self._aion_tennis_disabled_context(family=family, ticker=ticker, q=q, payload=payload, source=source)
+        if tennis_context.get("disabled"):
+            self._emit_aion_tennis_disabled(tennis_context, source=source, stage="confirm_entry")
+            self._aion_emit_confirm_entry_reject(target, reason="tennis_live_trading_disabled", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "tennis_live_trading_disabled", "payload": payload, "target": target_payload}
+        disabled_family = self._aion_new_entry_family_disabled(family=family, ticker=ticker, q=q, payload=payload, source=source, stage="confirm_entry", emit=True)
+        if disabled_family.get("disabled"):
+            reason = disabled_family.get("reason") or "family_disabled_for_new_entries"
+            self._aion_emit_confirm_entry_reject(target, reason=reason, payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": reason, "payload": payload, "target": target_payload}
+        if selected_side not in {"yes", "no"}:
+            self._aion_emit_confirm_entry_reject(target, reason="selected_side_missing", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "selected_side_missing", "payload": payload, "target": target_payload}
+        if payload_side in {"yes", "no"} and payload_side != selected_side:
+            self._aion_emit_confirm_entry_reject(target, reason="side_mismatch", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "side_mismatch", "payload": payload, "target": target_payload}
+        if winning_side in {"yes", "no"} and winning_side != selected_side:
+            self._aion_emit_confirm_entry_reject(target, reason="side_mismatch", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "side_mismatch", "payload": payload, "target": target_payload}
+        if signal_age is None or signal_age > float(max_age):
+            self._aion_emit_confirm_entry_reject(target, reason="stale_signal", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            self._aion_update_freshness_metrics(signal_age=signal_age, stale=True, cancelled=True, fast_submit=False, repriced=False, source=source)
+            return {"allowed": False, "reason": "stale_signal", "payload": payload, "target": target_payload}
+        if not orderbook_ready or fake_book:
+            reason = "orderbook_invalid" if not fake_book else "fake_or_synthetic_orderbook"
+            self._aion_emit_confirm_entry_reject(target, reason=reason, payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": reason, "payload": payload, "target": target_payload}
+        if selected_price is None or not (KALSHI_CONTRACT_MIN_PRICE <= float(selected_price) <= KALSHI_CONTRACT_MAX_PRICE):
+            self._aion_emit_confirm_entry_reject(target, reason="current_executable_price_invalid", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "current_executable_price_invalid", "payload": payload, "target": target_payload}
+        if spread is None or float(spread) < 0.0 or float(spread) > float(AION_SPORTS_MAX_SPREAD_HARD):
+            self._aion_emit_confirm_entry_reject(target, reason="spread_not_sane", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "spread_not_sane", "payload": payload, "target": target_payload}
+        if edge_after_cost is None or float(edge_after_cost) <= 0.0:
+            self._aion_emit_confirm_entry_reject(target, reason="negative_edge_after_cost", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "negative_edge_after_cost", "payload": payload, "target": target_payload}
+        if not expected_cashout_not_red:
+            self._aion_emit_confirm_entry_reject(target, reason="instant_red_expected", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "instant_red_expected", "payload": payload, "target": target_payload}
+        if self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS:
+            self._aion_emit_confirm_entry_reject(target, reason="daily_loss_guard", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "daily_loss_guard", "payload": payload, "target": target_payload}
+        if ticker and self.already_holding(ticker):
+            self._aion_emit_confirm_entry_reject(target, reason="duplicate_position_guard", payload=payload, current_orderbook=current_orderbook, extra=extra)
+            return {"allowed": False, "reason": "duplicate_position_guard", "payload": payload, "target": target_payload}
+        try:
+            duplicate = self.check_live_duplicate_position_api(ticker) if ticker else {"blocked": False}
+        except Exception as exc:
+            duplicate = {"blocked": True, "reason": f"duplicate_check_exception:{exc.__class__.__name__}"}
+        if duplicate.get("blocked"):
+            reason = duplicate.get("reason") or "duplicate_position_guard"
+            self._aion_emit_confirm_entry_reject(target, reason=reason, payload=payload, current_orderbook=current_orderbook, extra={**extra, "duplicate_guard": duplicate})
+            return {"allowed": False, "reason": reason, "payload": payload, "target": target_payload}
+        count = int(max(1, min(int(MAX_LIVE_ORDER_SIZE or 1), int(self.to_float(payload.get("count"), target_payload.get("size") or 1) or 1))))
+        payload.update(
+            {
+                "ticker": ticker,
+                "family": family,
+                "side": selected_side,
+                "selected_side": selected_side,
+                "action": "buy",
+                "count": count,
+                "price": round(float(selected_price), 4),
+                "selected_price": round(float(selected_price), 4),
+                "selected_price_dollars": round(float(selected_price), 4),
+                "selected_price_cents": max(1, min(99, int(round(float(selected_price) * 100.0)))),
+                "_aion_freshness_gate_checked": True,
+                "_aion_confirm_entry_passed": True,
+                "confirm_entry_passed": True,
+                "target_id": target_payload.get("target_id"),
+                "trace_id": target_payload.get("trace_id"),
+                "signal_age_seconds": self._safe_round(signal_age, 3, None),
+                "max_signal_age_seconds": self._safe_round(max_age, 3, None),
+                "edge_after_cost": self._safe_round(edge_after_cost, 6, None),
+                "spread": self._safe_round(spread, 4, None),
+                "expected_cashout_bid": self._safe_round(expected_cashout_bid, 4, None),
+                "expected_cashout_not_red": True,
+                "aion_trade_target": target_payload,
+            }
+        )
+        payload.pop("yes_price", None)
+        payload.pop("no_price", None)
+        payload["yes_price" if selected_side == "yes" else "no_price"] = payload["selected_price_cents"]
+        if isinstance(payload.get("entry_context"), dict):
+            payload["entry_context"]["aion_trade_target"] = target_payload
+            payload["entry_context"]["target_id"] = target_payload.get("target_id")
+            payload["entry_context"]["confirm_entry_passed"] = True
+            payload["entry_context"]["signal_age_seconds"] = payload.get("signal_age_seconds")
+        try:
+            setattr(q, "aion_trade_target", target_payload)
+            setattr(q, "aion_confirm_entry_passed", True)
+        except Exception:
+            pass
+        pass_payload = {
+            **extra,
+            "target_id": target_payload.get("target_id"),
+            "trace_id": target_payload.get("trace_id"),
+            "ticker": ticker,
+            "family": family,
+            "selected_side": selected_side,
+            "selected_price": payload.get("selected_price"),
+            "confirm_entry_passed": True,
+            "reason": "confirm_entry_passed",
+        }
+        try:
+            builtins.print("[AION-CONFIRM-ENTRY-PASS] " + json.dumps(pass_payload, sort_keys=True, default=str))
+            builtins.print("[AION-CANONICAL-SUBMIT-ONLY] " + json.dumps(pass_payload, sort_keys=True, default=str))
+            if (
+                signal_age <= float(max_age)
+                and edge_after_cost >= float(AION_SIGNAL_FRESHNESS_STRONG_EDGE)
+                and spread is not None
+                and spread <= float(AION_SIGNAL_FRESHNESS_TIGHT_SPREAD)
+            ):
+                builtins.print("[AION-FAST-SUBMIT] " + json.dumps({**pass_payload, "reason": "fresh_strong_target_confirmed"}, sort_keys=True, default=str))
+        except Exception:
+            pass
+        self._aion_update_freshness_metrics(signal_age=signal_age, stale=False, cancelled=False, fast_submit=False, repriced=False, source=source)
+        return {"allowed": True, "reason": "confirm_entry_passed", "payload": payload, "target": target_payload, "signal_age_seconds": signal_age}
+
+    def confirm_exit(self, position, decision, payload):
+        position = position if isinstance(position, dict) else {}
+        decision = decision if isinstance(decision, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        side = self._aion_normalize_live_side(payload.get("side") or decision.get("side") or position.get("side"))
+        action = str(payload.get("action") or "").strip().lower()
+        reason = None
+        if not payload.get("ticker"):
+            reason = "missing_ticker"
+        elif side not in {"yes", "no"}:
+            reason = "missing_side"
+        elif action not in {"sell", "exit", "close"}:
+            reason = "exit_action_not_reduce_only"
+        elif not bool(payload.get("reduce_only")):
+            reason = "exit_payload_not_reduce_only"
+        log_payload = {
+            "ticker": payload.get("ticker") or decision.get("ticker") or position.get("ticker"),
+            "family": payload.get("family") or decision.get("family") or position.get("family"),
+            "side": side,
+            "action": action,
+            "count": payload.get("count"),
+            "price": payload.get("price") or payload.get("selected_price"),
+            "exit_reason": decision.get("reason"),
+            "position_intelligence_label": decision.get("position_intelligence_label"),
+            "reduce_only": bool(payload.get("reduce_only")),
+            "reason": reason or "confirm_exit_passed",
+        }
+        try:
+            builtins.print(("[AION-CONFIRM-EXIT-REJECT] " if reason else "[AION-CONFIRM-EXIT-PASS] ") + json.dumps(log_payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+        if reason:
+            return {"allowed": False, "reason": reason, "payload": payload}
+        return {"allowed": True, "reason": "confirm_exit_passed", "payload": payload}
+
     def _aion_emit_submit_path_map(
         self,
         *,
@@ -8918,7 +9565,7 @@ class KalshiSniperBot:
                         "ticker": ticker,
                         "family": family,
                         "can_open_live_position": bool(can_open_live_position),
-                        "freshness_validation": "_aion_final_submit_freshness_validation" if freshness_validation else None,
+                        "freshness_validation": "TradeTarget.confirm_entry" if freshness_validation else None,
                         "freshness_required": bool(not reduce_only and can_open_live_position),
                         "reduce_only": bool(reduce_only),
                         "bypass_removed": bool(bypass_removed),
@@ -8985,15 +9632,44 @@ class KalshiSniperBot:
         if tennis_context.get("disabled"):
             self._emit_aion_tennis_disabled(tennis_context, source=source, stage="canonical_submit_gate")
             return {"allowed": False, "reason": "tennis_live_trading_disabled", "payload": payload, "size": size}
-        if payload.get("_aion_freshness_gate_checked"):
-            return {"allowed": True, "reason": "freshness_already_checked", "payload": payload, "size": size}
+        disabled_family = self._aion_new_entry_family_disabled(
+            family=family,
+            ticker=ticker,
+            market=payload or {"ticker": ticker, "series_ticker": family},
+            q=q,
+            payload=payload,
+            source=source,
+            stage="canonical_submit_gate",
+            emit=True,
+        )
+        if disabled_family.get("disabled"):
+            return {"allowed": False, "reason": disabled_family.get("reason") or "family_disabled_for_new_entries", "payload": payload, "size": size}
+        if payload.get("_aion_confirm_entry_passed"):
+            return {"allowed": True, "reason": "confirm_entry_already_passed", "payload": payload, "size": size}
+        if payload.get("_aion_freshness_gate_checked") and not payload.get("_aion_confirm_entry_passed"):
+            try:
+                builtins.print(
+                    "[AION-SUBMIT-BYPASS-REMOVED] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "lane": resolved_lane or None,
+                            "source": source,
+                            "reason": "legacy_freshness_flag_without_confirm_entry",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
         if not ticker:
             return {"allowed": False, "reason": "freshness_missing_ticker", "payload": payload, "size": size}
 
         original_side = self._aion_normalize_live_side(
             payload.get("selected_side") or payload.get("side") or getattr(q, "selected_side", None) or getattr(q, "side", None)
         )
-        original_count = self.to_float(payload.get("count"), self.to_float(size, None))
         edge_after_cost = self.to_float(
             payload.get("edge_after_cost"),
             self.to_float(
@@ -9005,70 +9681,99 @@ class KalshiSniperBot:
             ),
         )
         validation_source = f"canonical_submit:{lane_key or 'default'}"
-        freshness = self._aion_final_submit_freshness_validation(
-            ticker=ticker,
-            family=family,
-            q=q,
+        current_orderbook = self.resolve_aion_orderbook_for_payload(
+            ticker,
+            candidate=q,
             market=payload or {"ticker": ticker, "series_ticker": family},
             quote_diag=payload,
-            payload=payload,
-            size=size or payload.get("count") or 1,
-            edge_after_cost=edge_after_cost,
-            source=validation_source,
-            trace_id=payload.get("trace_id"),
-            cancel_on_decay=True,
-            record_metrics=True,
-            emit_fast_submit=True,
+            price_source="ask",
+            selected_side=original_side,
+            selection_stage=f"{validation_source}:target_refresh",
+            allow_refresh=True,
         )
-        freshness = freshness if isinstance(freshness, dict) else {"allowed": False, "reason": "freshness_validation_error", "payload": payload}
-        checked_payload = freshness.get("payload") if isinstance(freshness.get("payload"), dict) else payload
-        if isinstance(checked_payload, dict):
-            freshness_context = freshness.get("freshness") if isinstance(freshness.get("freshness"), dict) else {}
-            if original_side in {"yes", "no"}:
-                current_book = freshness.get("orderbook_resolution") if isinstance(freshness.get("orderbook_resolution"), dict) else {}
-                refreshed_price = self._aion_quote_price_to_dollars(
-                    current_book.get(f"{original_side}_ask_dollars", current_book.get(f"{original_side}_ask"))
-                )
-                if refreshed_price is None:
-                    refreshed_price = self._aion_quote_price_to_dollars(
-                        payload.get(f"{original_side}_ask_dollars", payload.get(f"{original_side}_ask"))
-                    )
-                if refreshed_price is None:
-                    price_field = payload.get(f"{original_side}_price")
-                    refreshed_price = self._aion_quote_price_to_dollars(
-                        payload.get("selected_price_dollars", payload.get("selected_price", payload.get("price", price_field)))
-                    )
-                checked_payload["side"] = original_side
-                checked_payload["selected_side"] = original_side
-                if refreshed_price is not None:
-                    refreshed_cents = max(1, min(99, int(round(float(refreshed_price) * 100.0))))
-                    checked_payload["price"] = round(refreshed_cents / 100.0, 4)
-                    checked_payload["selected_price"] = round(refreshed_cents / 100.0, 4)
-                    checked_payload["selected_price_dollars"] = round(refreshed_cents / 100.0, 4)
-                    checked_payload["selected_price_cents"] = refreshed_cents
-                    checked_payload.pop("yes_price", None)
-                    checked_payload.pop("no_price", None)
-                    checked_payload["yes_price" if original_side == "yes" else "no_price"] = refreshed_cents
-            atp_stale_size_down = bool(freshness_context.get("atp_freshness_family") and freshness_context.get("stale"))
-            if original_count is not None and original_count > 0 and not atp_stale_size_down:
-                checked_payload["count"] = max(1, int(round(float(original_count))))
-                freshness["size"] = checked_payload["count"]
-            checked_payload["_aion_freshness_gate_checked"] = True
-            checked_payload["_aion_freshness_gate_source"] = validation_source
+        current_orderbook = current_orderbook if isinstance(current_orderbook, dict) else {}
+        winning_context = self._aion_detect_winning_side(
+            ticker=ticker,
+            family=family,
+            market=payload or {"ticker": ticker, "series_ticker": family},
+            q=q,
+            quote_diag={**payload, **current_orderbook},
+            orderbook_resolution=current_orderbook,
+            preferred_side=original_side,
+            source=f"{validation_source}:confirm_entry",
+            emit=True,
+        )
+        if isinstance(winning_context, dict):
+            current_orderbook["_aion_winning_side"] = winning_context.get("winning_side")
+            current_orderbook["_aion_yes_context"] = winning_context.get("yes")
+            current_orderbook["_aion_no_context"] = winning_context.get("no")
+        tradeability = self.resolve_canonical_tradeability(
+            payload or {"ticker": ticker, "series_ticker": family},
+            quote=q,
+            context={
+                "ticker": ticker,
+                "selected_side": original_side,
+                "price_source": "ask",
+                "allow_refresh": False,
+                "selection_stage": f"{validation_source}:confirm_entry_tradeability",
+                "final_edge": edge_after_cost,
+                "quote_diag": {**payload, **current_orderbook},
+            },
+            source=f"{validation_source}:confirm_entry",
+        )
+        tradeability = tradeability if isinstance(tradeability, dict) else {}
+        target_result = self._aion_build_trade_target(
+            q,
+            payload=payload,
+            current_orderbook=current_orderbook,
+            tradeability=tradeability,
+            winning_context=winning_context,
+            lane=resolved_lane or lane,
+            source=validation_source,
+        )
+        if not target_result.get("ok"):
+            target_stub = {
+                "target_id": None,
+                "trace_id": payload.get("trace_id"),
+                "ticker": ticker,
+                "family": family,
+                "selected_side": original_side,
+                "selected_price": payload.get("selected_price") or payload.get("price"),
+                "max_signal_age_seconds": self._aion_signal_freshness_threshold(family=family, ticker=ticker),
+            }
+            self._aion_emit_confirm_entry_reject(
+                target_stub,
+                reason=target_result.get("reason") or "target_creation_failed",
+                payload=payload,
+                current_orderbook=current_orderbook,
+                extra={"edge_after_cost": edge_after_cost},
+            )
+            return {"allowed": False, "reason": target_result.get("reason") or "target_creation_failed", "payload": payload, "size": size}
+        confirm_result = self.confirm_entry(
+            target_result.get("target"),
+            current_orderbook,
+            payload=payload,
+            q=q,
+            source=validation_source,
+        )
+        confirm_payload = confirm_result.get("payload") if isinstance(confirm_result.get("payload"), dict) else payload
         log_payload = {
             "ticker": ticker,
             "family": family,
             "lane": resolved_lane or None,
             "source": source,
             "validation_source": validation_source,
-            "allowed": bool(freshness.get("allowed")),
-            "reason": freshness.get("reason"),
-            "signal_age_seconds": (freshness.get("freshness") or {}).get("signal_age_seconds") if isinstance(freshness.get("freshness"), dict) else None,
-            "max_signal_age_seconds": (freshness.get("freshness") or {}).get("max_signal_age_seconds") if isinstance(freshness.get("freshness"), dict) else None,
-            "stale": bool((freshness.get("freshness") or {}).get("stale")) if isinstance(freshness.get("freshness"), dict) else None,
-            "spread": freshness.get("spread"),
-            "edge_after_cost": freshness.get("edge_after_cost"),
-            "fast_submit": bool(freshness.get("fast_submit")),
+            "allowed": bool(confirm_result.get("allowed")),
+            "reason": confirm_result.get("reason"),
+            "target_id": confirm_payload.get("target_id"),
+            "selected_side": confirm_payload.get("selected_side") or confirm_payload.get("side"),
+            "signal_age_seconds": confirm_payload.get("signal_age_seconds"),
+            "max_signal_age_seconds": confirm_payload.get("max_signal_age_seconds"),
+            "stale": bool((confirm_payload.get("signal_age_seconds") or 0) > (confirm_payload.get("max_signal_age_seconds") or self._aion_signal_freshness_threshold(family=family, ticker=ticker))),
+            "spread": confirm_payload.get("spread"),
+            "edge_after_cost": confirm_payload.get("edge_after_cost"),
+            "expected_cashout_not_red": bool(confirm_payload.get("expected_cashout_not_red")),
+            "confirm_entry_passed": bool(confirm_payload.get("_aion_confirm_entry_passed")),
             "bypass_removed": bool(alt_lane),
         }
         try:
@@ -9078,20 +9783,18 @@ class KalshiSniperBot:
                 builtins.print("[AION-FRESHNESS-BYPASS-REMOVED] " + json.dumps(log_payload, sort_keys=True, default=str))
         except Exception:
             pass
-        if not bool(freshness.get("allowed", True)):
-            return {
-                "allowed": False,
-                "reason": freshness.get("reason") or "freshness_submit_cancelled",
-                "payload": checked_payload,
-                "size": freshness.get("size") or size,
-                "freshness": freshness,
-            }
         return {
-            "allowed": True,
-            "reason": freshness.get("reason") or "freshness_repriced",
-            "payload": checked_payload,
-            "size": freshness.get("size") or size,
-            "freshness": freshness,
+            "allowed": bool(confirm_result.get("allowed")),
+            "reason": confirm_result.get("reason") or ("confirm_entry_passed" if confirm_result.get("allowed") else "confirm_entry_rejected"),
+            "payload": confirm_payload,
+            "size": confirm_payload.get("count") or size,
+            "freshness": {
+                "target": self._aion_trade_target_dict(target_result.get("target")),
+                "confirm_entry": confirm_result,
+                "orderbook_resolution": current_orderbook,
+                "tradeability": tradeability,
+                "winning_context": winning_context,
+            },
         }
 
     def _aion_build_payload_for_side_from_resolution(self, resolution, side):
@@ -27928,8 +28631,34 @@ class KalshiSniperBot:
         spread = self.to_float(meta.get("spread"), 1.0)
         liquidity = self.to_float(meta.get("liquidity"), 0.0) or 0.0
         score = self.to_float(meta.get("score"), 0.0) or 0.0
+        signal_age = self.to_float(
+            meta.get("signal_age_seconds")
+            or (meta.get("allocation") or {}).get("signal_age_seconds")
+            or getattr(meta.get("q"), "signal_age_seconds", None),
+            None,
+        )
+        max_signal_age = self._aion_signal_freshness_threshold(family=meta.get("family"), ticker=meta.get("ticker"))
+        stale_penalty = 2 if signal_age is not None and signal_age > max_signal_age else 0
+        family_profile = {}
+        try:
+            family_profile = self._get_family_profitability_profile(meta.get("family"), selected_price=meta.get("selected_price"), log=False, source="slot_allocation_sort")
+        except Exception:
+            family_profile = {}
+        negative_family_penalty = 1 if self.to_float(family_profile.get("family_pnl"), 0.0) < 0.0 and int(self.to_float(family_profile.get("trade_count"), 0.0) or 0) >= 3 else 0
+        instant_red_penalty = 1 if spread is not None and spread > 0.0 and edge <= float(spread or 0.0) else 0
+        side_switch_penalty = 1 if bool((meta.get("allocation") or {}).get("side_switch_attempted")) and not bool((meta.get("allocation") or {}).get("side_switch_success")) else 0
+        overexposure_penalty = 1 if meta.get("game_key") and int((snapshot.get("game_counts") or {}).get(meta.get("game_key"), 0) or 0) > 0 else 0
         return (
+            999 if (
+                self._aion_tennis_disabled_context(family=meta.get("family"), ticker=meta.get("ticker"), market=meta.get("market"), q=meta.get("q"), payload=meta.get("allocation"), source="slot_allocation_sort").get("disabled")
+                or self._aion_new_entry_family_disabled(family=meta.get("family"), ticker=meta.get("ticker"), market=meta.get("market"), q=meta.get("q"), payload=meta.get("allocation"), source="slot_allocation_sort", emit=False).get("disabled")
+            ) else 0,
             int(priority.get("priority_bucket", 5)) + cap_pressure,
+            stale_penalty,
+            negative_family_penalty,
+            instant_red_penalty,
+            side_switch_penalty,
+            overexposure_penalty,
             -score,
             -edge,
             spread if spread is not None else 1.0,
@@ -27939,6 +28668,38 @@ class KalshiSniperBot:
 
     def _rank_slot_allocation_candidates(self, candidates, *, source="slot_allocation"):
         candidates = [candidate for candidate in (candidates or []) if isinstance(candidate, dict)]
+        rankable = []
+        disabled = []
+        tennis_disabled = []
+        for candidate in candidates:
+            meta = self._aion_concurrency_candidate_meta(candidate)
+            tennis_context = self._aion_tennis_disabled_context(
+                family=meta.get("family"),
+                ticker=meta.get("ticker"),
+                market=meta.get("market"),
+                q=meta.get("q"),
+                payload=meta.get("allocation"),
+                source=source,
+            )
+            if tennis_context.get("disabled"):
+                self._emit_aion_tennis_disabled(tennis_context, source=source, stage="slot_allocation_rank")
+                tennis_disabled.append({"ticker": meta.get("ticker"), "family": meta.get("family"), "reason": "tennis_live_trading_disabled"})
+                continue
+            disabled_context = self._aion_new_entry_family_disabled(
+                family=meta.get("family"),
+                ticker=meta.get("ticker"),
+                market=meta.get("market"),
+                q=meta.get("q"),
+                payload=meta.get("allocation"),
+                source=source,
+                stage="slot_allocation_rank",
+                emit=True,
+            )
+            if disabled_context.get("disabled"):
+                disabled.append({"ticker": meta.get("ticker"), "family": meta.get("family"), "reason": disabled_context.get("reason")})
+                continue
+            rankable.append(candidate)
+        candidates = rankable
         snapshot = self._aion_concurrency_snapshot([])
         before_rows = []
         after_rows = []
@@ -27953,11 +28714,30 @@ class KalshiSniperBot:
                 "confidence": self._safe_round(meta.get("confidence"), 4, None),
                 "spread": self._safe_round(meta.get("spread"), 4, None),
                 "liquidity": self._safe_round(meta.get("liquidity"), 4, None),
+                "signal_age_seconds": self._safe_round(
+                    meta.get("signal_age_seconds")
+                    or (meta.get("allocation") or {}).get("signal_age_seconds")
+                    or getattr(meta.get("q"), "signal_age_seconds", None),
+                    3,
+                    None,
+                ),
                 "market_quality": self._safe_round(self._candidate_market_quality_score(meta), 4, None),
                 "priority_bucket": priority.get("priority_bucket"),
                 "priority_label": priority.get("priority_label"),
                 "weak_tennis": priority.get("weak_tennis"),
                 "profitable_family": priority.get("profitable_family"),
+                "ranking_pressure": {
+                    "stale_signal": bool(
+                        self.to_float(
+                            meta.get("signal_age_seconds")
+                            or (meta.get("allocation") or {}).get("signal_age_seconds")
+                            or getattr(meta.get("q"), "signal_age_seconds", None),
+                            0.0,
+                        )
+                        > self._aion_signal_freshness_threshold(family=meta.get("family"), ticker=meta.get("ticker"))
+                    ),
+                    "instant_red_likely": bool((self.to_float(meta.get("spread"), 0.0) or 0.0) > 0.0 and (self.to_float(meta.get("edge"), 0.0) or 0.0) <= (self.to_float(meta.get("spread"), 0.0) or 0.0)),
+                },
             }
             before_rows.append(row)
         ranked = sorted(candidates, key=lambda item: self._slot_allocation_candidate_sort_key(item, snapshot=snapshot))
@@ -27981,6 +28761,10 @@ class KalshiSniperBot:
                 "candidate_count": len(candidates),
                 "weak_tennis_open_count": snapshot.get("weak_tennis_open_count"),
                 "tennis_exposure_cap": AION_TENNIS_EXPOSURE_CAP,
+                "tennis_disabled_pre_rank_count": int(len(tennis_disabled)),
+                "tennis_disabled_pre_rank_examples": tennis_disabled[:12],
+                "disabled_family_pre_rank_count": int(len(disabled)),
+                "disabled_family_pre_rank_examples": disabled[:12],
                 "before_score_top": sorted(before_rows, key=lambda row: self.to_float(row.get("candidate_score"), 0.0) or 0.0, reverse=True)[:8],
                 "after_priority_top": after_rows,
             },
@@ -30390,15 +31174,28 @@ class KalshiSniperBot:
         elif tennis_disabled_context.get("disabled"):
             block_reason = "tennis_live_trading_disabled"
             self._emit_aion_tennis_disabled(tennis_disabled_context, source=source, stage="concurrency_admission")
-        elif bool(getattr(self, "trading_halted", False)):
-            block_reason = "trading_halted"
-        elif self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS:
-            block_reason = "daily_loss_guard"
-        elif pending_same_ticker:
-            block_reason = "duplicate_cycle_ticker"
-        elif self.already_holding(ticker):
-            block_reason = "duplicate_position_guard"
         else:
+            disabled_family_context = self._aion_new_entry_family_disabled(
+                family=family,
+                ticker=ticker,
+                market=meta.get("market"),
+                q=meta.get("q"),
+                payload=meta.get("allocation"),
+                source=source,
+                stage="concurrency_admission",
+                emit=True,
+            )
+            if disabled_family_context.get("disabled"):
+                block_reason = disabled_family_context.get("reason") or "family_disabled_for_new_entries"
+        if block_reason is None and bool(getattr(self, "trading_halted", False)):
+            block_reason = "trading_halted"
+        elif block_reason is None and (self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS):
+            block_reason = "daily_loss_guard"
+        elif block_reason is None and pending_same_ticker:
+            block_reason = "duplicate_cycle_ticker"
+        elif block_reason is None and self.already_holding(ticker):
+            block_reason = "duplicate_position_guard"
+        elif block_reason is None:
             tennis_cap = self._evaluate_tennis_exposure_cap(
                 meta,
                 snapshot=snapshot,
@@ -30512,6 +31309,7 @@ class KalshiSniperBot:
     def _execute_multi_sports_submit_cycle(self, *, primary_ticker=None, primary_lane=None, primary_result=None, source="multi_submit_cycle"):
         raw_candidates = [candidate for candidate in (getattr(self, "last_dual_lane_buy_candidates", []) or []) if isinstance(candidate, dict)]
         tennis_disabled_candidates = []
+        disabled_family_candidates = []
         rankable_candidates = []
         for candidate in raw_candidates:
             meta = self._aion_concurrency_candidate_meta(candidate)
@@ -30526,6 +31324,19 @@ class KalshiSniperBot:
             if tennis_context.get("disabled"):
                 tennis_disabled_candidates.append({"ticker": meta.get("ticker"), "family": meta.get("family"), "reason": "tennis_live_trading_disabled"})
                 self._emit_aion_tennis_disabled(tennis_context, source=source, stage="multi_submit_pre_rank")
+                continue
+            disabled_family = self._aion_new_entry_family_disabled(
+                family=meta.get("family"),
+                ticker=meta.get("ticker"),
+                market=meta.get("market"),
+                q=meta.get("q"),
+                payload=meta.get("allocation"),
+                source=source,
+                stage="multi_submit_pre_rank",
+                emit=True,
+            )
+            if disabled_family.get("disabled"):
+                disabled_family_candidates.append({"ticker": meta.get("ticker"), "family": meta.get("family"), "reason": disabled_family.get("reason")})
                 continue
             rankable_candidates.append(candidate)
         candidates = self._rank_slot_allocation_candidates(
@@ -30733,6 +31544,8 @@ class KalshiSniperBot:
             "submitted_family_counts": dict(submitted_family_counts),
             "tennis_disabled_pre_rank_count": int(len(tennis_disabled_candidates)),
             "tennis_disabled_pre_rank_examples": tennis_disabled_candidates[:12],
+            "disabled_family_pre_rank_count": int(len(disabled_family_candidates)),
+            "disabled_family_pre_rank_examples": disabled_family_candidates[:12],
             "weak_tennis_submitted_count": sum(
                 count for family, count in submitted_family_counts.items() if self._is_family_profitability_weak_tennis(family)
             ),
@@ -51944,6 +52757,10 @@ class KalshiSniperBot:
         payload = self._build_live_exit_order_payload(position, decision)
         if not payload:
             return {"submitted": False, "reason": "invalid_exit_payload"}
+        exit_confirm = self.confirm_exit(position, decision, payload)
+        if not exit_confirm.get("allowed"):
+            return {"submitted": False, "reason": exit_confirm.get("reason") or "confirm_exit_rejected", "payload": payload}
+        payload = exit_confirm.get("payload") if isinstance(exit_confirm.get("payload"), dict) else payload
         authorization = self.get_live_submit_authorization(payload)
         if not authorization.get("ok"):
             return {"submitted": False, "reason": authorization.get("reason"), "payload": payload, "authorization": authorization}
@@ -52385,6 +53202,36 @@ class KalshiSniperBot:
             entry_context["thesis_profile"] = thesis_profile
             entry_context["thesis_key"] = thesis_exposure.get("thesis_key")
             entry_context["thesis_exposure_score"] = thesis_exposure.get("thesis_exposure_score")
+        target_context = getattr(q, "aion_trade_target", None) if q is not None else None
+        if not isinstance(target_context, dict):
+            target_context = entry_context.get("aion_trade_target") if isinstance(entry_context.get("aion_trade_target"), dict) else {}
+        target_id = target_context.get("target_id")
+        default_tp = self.to_float(getattr(self, "take_profit", None), 0.04)
+        default_sl = self.to_float(getattr(self, "stop_loss", None), 0.03)
+        executor = PositionExecutor(
+            target_id=target_id,
+            ticker=ticker,
+            family=family,
+            entry_price=price,
+            selected_side=side,
+            position_size=int(max(1, round(float(count)))),
+            tp=self.to_float(target_context.get("tp"), default_tp),
+            sl=self.to_float(target_context.get("sl"), default_sl),
+            max_hold_seconds=self.to_float(target_context.get("max_hold_seconds"), 900.0),
+            trailing_start=self.to_float((target_context.get("trailing_policy") or {}).get("trailing_start") if isinstance(target_context.get("trailing_policy"), dict) else None, default_tp),
+            trailing_distance=self.to_float((target_context.get("trailing_policy") or {}).get("trailing_distance") if isinstance(target_context.get("trailing_policy"), dict) else None, max(0.01, default_tp * 0.50)),
+            fast_cut_threshold=self.to_float(target_context.get("sl"), default_sl),
+            profit_protect_threshold=self.to_float(target_context.get("tp"), default_tp),
+            current_mfe=0.0,
+            current_mae=0.0,
+            current_cashout=price,
+            exit_reason=None,
+            executor_state="open",
+        )
+        executor_payload = executor.to_dict()
+        entry_context["aion_trade_target"] = target_context or None
+        entry_context["position_executor"] = executor_payload
+        entry_context["target_id"] = target_id
         row = {
             "ticker": ticker,
             "family": family,
@@ -52395,10 +53242,16 @@ class KalshiSniperBot:
             "entry_ts": time.time(),
             "order_id": order_id,
             "entry_context": entry_context,
+            "position_executor": executor_payload,
+            "executor_state": executor.executor_state,
             "thesis_profile": thesis_profile if thesis_profile.get("thesis_key") else None,
             "thesis_exposure": thesis_exposure if isinstance(thesis_exposure, dict) and thesis_exposure.get("enabled", True) else None,
             "thesis_key": thesis_exposure.get("thesis_key") if isinstance(thesis_exposure, dict) else None,
         }
+        try:
+            builtins.print("[AION-POSITION-EXECUTOR-CREATED] " + json.dumps(executor_payload, sort_keys=True, default=str))
+        except Exception:
+            pass
         self.live_positions = [
             position for position in (self.live_positions or [])
             if not (isinstance(position, dict) and str(position.get("ticker") or "").strip() == ticker)
@@ -52490,7 +53343,22 @@ class KalshiSniperBot:
                     "reason": "tennis_live_trading_disabled",
                     "payload": payload,
                 }
-        if not reduce_only_payload and not payload.get("_aion_freshness_gate_checked"):
+            disabled_family = self._aion_new_entry_family_disabled(
+                family=payload.get("family"),
+                ticker=payload.get("ticker"),
+                market=payload,
+                payload=payload,
+                source="place_live_order",
+                stage="direct_place_guard",
+                emit=True,
+            )
+            if disabled_family.get("disabled"):
+                return {
+                    "submitted": False,
+                    "reason": disabled_family.get("reason") or "family_disabled_for_new_entries",
+                    "payload": payload,
+                }
+        if not reduce_only_payload and not payload.get("_aion_confirm_entry_passed"):
             q = SimpleNamespace(
                 ticker=payload.get("ticker"),
                 family=payload.get("family"),
@@ -52548,6 +53416,22 @@ class KalshiSniperBot:
                 return {
                     "submitted": False,
                     "reason": "tennis_live_trading_disabled",
+                    "payload": payload_override if isinstance(payload_override, dict) else None,
+                }
+            disabled_family = self._aion_new_entry_family_disabled(
+                family=family,
+                ticker=ticker,
+                market=payload_override if isinstance(payload_override, dict) else {"ticker": ticker, "series_ticker": family},
+                q=q,
+                payload=payload_override if isinstance(payload_override, dict) else {},
+                source="submit_live_order",
+                stage="live_submit_guard",
+                emit=True,
+            )
+            if disabled_family.get("disabled"):
+                return {
+                    "submitted": False,
+                    "reason": disabled_family.get("reason") or "family_disabled_for_new_entries",
                     "payload": payload_override if isinstance(payload_override, dict) else None,
                 }
         if (not reduce_only_submit) and self._sports_only_execution_blocked(
@@ -59030,21 +59914,7 @@ class KalshiSniperBot:
                     )
                     return
             freshness_original_edge_after_cost = edge_after_cost
-            freshness_precheck = self._aion_final_submit_freshness_validation(
-                ticker=auto_live_ticker,
-                family=selected_family,
-                q=selected_quote_for_submission,
-                market=selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
-                quote_diag=quote_readiness_diagnostic,
-                payload=aggressive_fastpath_payload_override or payload_preview,
-                size=ev_contract_size,
-                edge_after_cost=freshness_original_edge_after_cost,
-                source="final_submit_preflight_precheck",
-                trace_id=trace_id,
-                cancel_on_decay=False,
-                record_metrics=False,
-                emit_fast_submit=True,
-            )
+            freshness_precheck = {}
             if isinstance(freshness_precheck, dict) and isinstance(freshness_precheck.get("payload"), dict):
                 payload_preview = dict(freshness_precheck.get("payload"))
                 if aggressive_fastpath_payload_override is not None:
@@ -59155,20 +60025,12 @@ class KalshiSniperBot:
                     "selected_price": momentum_confirmation.get("selected_price"),
                     "wait_seconds": momentum_confirmation.get("wait_seconds"),
                 }
-            final_freshness = self._aion_final_submit_freshness_validation(
-                ticker=auto_live_ticker,
-                family=selected_family,
-                q=selected_quote_for_submission,
-                market=selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
-                quote_diag=quote_readiness_diagnostic,
-                payload=aggressive_fastpath_payload_override or payload_preview,
+            final_freshness = self._aion_canonical_submit_freshness_gate(
+                selected_quote_for_submission,
                 size=ev_contract_size,
-                edge_after_cost=freshness_original_edge_after_cost,
+                lane="aggressive_positive_edge",
+                payload=aggressive_fastpath_payload_override or payload_preview,
                 source="final_submit_pre_submit",
-                trace_id=trace_id,
-                cancel_on_decay=True,
-                record_metrics=True,
-                emit_fast_submit=False,
             )
             if not bool((final_freshness or {}).get("allowed", True)):
                 freshness_block_reason = str((final_freshness or {}).get("reason") or "freshness_stale_cancelled").strip() or "freshness_stale_cancelled"
@@ -59202,8 +60064,8 @@ class KalshiSniperBot:
                     payload_preview["count"] = int(ev_contract_size)
                     if isinstance(aggressive_fastpath_payload_override, dict):
                         aggressive_fastpath_payload_override["count"] = int(ev_contract_size)
-                final_freshness_side = final_freshness.get("selected_side")
-                final_freshness_price = final_freshness.get("selected_price")
+                final_freshness_side = payload_preview.get("selected_side") or payload_preview.get("side")
+                final_freshness_price = payload_preview.get("selected_price") or payload_preview.get("price")
                 if final_freshness_side in {"yes", "no"}:
                     submission_side = final_freshness_side
                     final_lane_expectancy["selected_side"] = final_freshness_side
@@ -59225,26 +60087,28 @@ class KalshiSniperBot:
                         setattr(selected_quote_for_submission, "selected_price", final_freshness_price)
                     except Exception:
                         pass
-                final_freshness_spread = self.to_float(final_freshness.get("spread"), None)
+                final_freshness_spread = self.to_float(payload_preview.get("spread"), None)
                 if final_freshness_spread is not None:
                     controlled_spread_value = final_freshness_spread
                     final_lane_expectancy["spread"] = final_freshness_spread
                     final_lane_quality["spread"] = final_freshness_spread
                     final_lane_allocation["spread"] = final_freshness_spread
-                if final_freshness.get("edge_after_cost") is not None:
-                    edge_after_cost = self.to_float(final_freshness.get("edge_after_cost"), edge_after_cost)
+                if payload_preview.get("edge_after_cost") is not None:
+                    edge_after_cost = self.to_float(payload_preview.get("edge_after_cost"), edge_after_cost)
                     final_lane_expectancy["edge_after_cost"] = edge_after_cost
                     final_lane_expectancy["sports_edge_after_cost"] = edge_after_cost
                     final_lane_allocation["edge"] = edge_after_cost
-                quote_readiness_diagnostic["signal_age_seconds"] = (final_freshness.get("freshness") or {}).get("signal_age_seconds")
-                quote_readiness_diagnostic["max_signal_age_seconds"] = (final_freshness.get("freshness") or {}).get("max_signal_age_seconds")
-                quote_readiness_diagnostic["canonical_tradeability"] = final_freshness.get("tradeability") or quote_readiness_diagnostic.get("canonical_tradeability", {})
+                quote_readiness_diagnostic["signal_age_seconds"] = payload_preview.get("signal_age_seconds")
+                quote_readiness_diagnostic["max_signal_age_seconds"] = payload_preview.get("max_signal_age_seconds")
+                freshness_detail = final_freshness.get("freshness") if isinstance(final_freshness.get("freshness"), dict) else {}
+                quote_readiness_diagnostic["canonical_tradeability"] = freshness_detail.get("tradeability") or quote_readiness_diagnostic.get("canonical_tradeability", {})
                 final_lane_allocation["freshness"] = {
-                    "signal_age_seconds": (final_freshness.get("freshness") or {}).get("signal_age_seconds"),
-                    "max_signal_age_seconds": (final_freshness.get("freshness") or {}).get("max_signal_age_seconds"),
-                    "stale": bool((final_freshness.get("freshness") or {}).get("stale")),
+                    "target_id": payload_preview.get("target_id"),
+                    "signal_age_seconds": payload_preview.get("signal_age_seconds"),
+                    "max_signal_age_seconds": payload_preview.get("max_signal_age_seconds"),
+                    "stale": bool((payload_preview.get("signal_age_seconds") or 0) > (payload_preview.get("max_signal_age_seconds") or self._aion_signal_freshness_threshold(family=selected_family, ticker=auto_live_ticker))),
                     "reason": final_freshness.get("reason"),
-                    "edge_decay": final_freshness.get("edge_decay"),
+                    "confirm_entry_passed": bool(payload_preview.get("_aion_confirm_entry_passed")),
                 }
             print(
                 "[AION-QUALIFIED] "
@@ -62424,6 +63288,18 @@ class KalshiSniperBot:
                 source=selection_stage or "build_live_order_payload",
                 stage="payload_build",
             )
+            return None
+        disabled_family = self._aion_new_entry_family_disabled(
+            family=family,
+            ticker=ticker,
+            market=market,
+            q=q,
+            payload=quote_diag,
+            source=selection_stage or "build_live_order_payload",
+            stage="payload_build",
+            emit=True,
+        )
+        if disabled_family.get("disabled"):
             return None
         if self._sports_only_execution_blocked(
             family=family,
