@@ -294,6 +294,12 @@ AION_ADVISORY_LOG_INTERVAL_SECONDS = max(
     _aion_env_float("AION_ADVISORY_LOG_INTERVAL_SECONDS", 300.0),
 )
 AION_SPORTS_ONLY_MODE = _aion_env_bool("AION_SPORTS_ONLY_MODE", True)
+AION_SIGNAL_FRESHNESS_MAX_AGE_SECONDS = max(5.0, _aion_env_float("AION_SIGNAL_FRESHNESS_MAX_AGE_SECONDS", 45.0))
+AION_SIGNAL_FRESHNESS_ATP_MAX_AGE_SECONDS = max(5.0, _aion_env_float("AION_SIGNAL_FRESHNESS_ATP_MAX_AGE_SECONDS", 18.0))
+AION_SIGNAL_FRESHNESS_MATERIAL_EDGE_DECAY = max(0.001, _aion_env_float("AION_SIGNAL_FRESHNESS_MATERIAL_EDGE_DECAY", 0.010))
+AION_SIGNAL_FRESHNESS_STRONG_EDGE = max(0.001, _aion_env_float("AION_SIGNAL_FRESHNESS_STRONG_EDGE", 0.025))
+AION_SIGNAL_FRESHNESS_STRONG_WINNING_SCORE = _aion_env_float("AION_SIGNAL_FRESHNESS_STRONG_WINNING_SCORE", 12.0)
+AION_SIGNAL_FRESHNESS_TIGHT_SPREAD = max(0.001, _aion_env_float("AION_SIGNAL_FRESHNESS_TIGHT_SPREAD", 0.030))
 
 
 _TELEMETRY_LOCK = threading.RLock()
@@ -410,6 +416,14 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-SPORTS-ONLY-ALLOW",
     "AION-SPORTS-LANE-WINNER",
     "AION-SPORTS-SUBMIT-ATTEMPT",
+    "AION-SIGNAL-AGE",
+    "AION-SIGNAL-STALE",
+    "AION-FRESHNESS-REPRICE",
+    "AION-FAST-SUBMIT",
+    "AION-ATP-FRESHNESS",
+    "AION-EDGE-DECAY",
+    "AION-SUBMIT-CANCELLED-STALE",
+    "AION-FRESHNESS-METRICS",
     "AION-FINAL-ALLOCATION-TRUTH",
     "AION-FINAL-SUBMIT-BLOCKED",
     "AION-FINAL-BLOCKER",
@@ -2744,6 +2758,15 @@ class KalshiSniperBot:
         self.last_aion_discovery_dashboard_ts = 0.0
         self.relaxation_trades_today = 0
         self.relaxation_trade_pnl_today = 0.0
+        self.aion_signal_freshness_by_key = {}
+        self.aion_signal_freshness_metrics = {
+            "signal_ages": deque(maxlen=200),
+            "stale_candidate_count": 0,
+            "freshness_cancellations": 0,
+            "fast_submit_count": 0,
+            "freshness_reprice_count": 0,
+        }
+        self.last_aion_freshness_metrics = {}
         self.relaxation_trade_day = None
         self.relaxation_trade_tickers = set()
         self.controlled_loosening_last_summary = {}
@@ -8062,6 +8085,607 @@ class KalshiSniperBot:
         if price is not None and price > 1.0 and price <= 99.0:
             price = round(price / 100.0, 4)
         return side, price
+
+    def _aion_signal_freshness_key(self, ticker=None, side=None):
+        ticker_key = str(ticker or "").strip()
+        if not ticker_key:
+            return None
+        side_key = self._aion_normalize_live_side(side) or "unknown"
+        return f"{ticker_key}|{side_key}"
+
+    def _aion_signal_freshness_store(self):
+        store = getattr(self, "aion_signal_freshness_by_key", None)
+        if not isinstance(store, dict):
+            self.aion_signal_freshness_by_key = {}
+            store = self.aion_signal_freshness_by_key
+        return store
+
+    def _aion_is_atp_freshness_family(self, family=None, ticker=None):
+        family_key = str(family or "").strip().upper()
+        ticker_key = str(ticker or "").strip().upper()
+        return bool(
+            family_key.startswith("KXATPCHALLENGERMATCH")
+            or family_key.startswith("KXATP")
+            or ticker_key.startswith("KXATPCHALLENGERMATCH")
+        )
+
+    def _aion_signal_freshness_threshold(self, *, family=None, ticker=None):
+        if self._aion_is_atp_freshness_family(family=family, ticker=ticker):
+            return float(AION_SIGNAL_FRESHNESS_ATP_MAX_AGE_SECONDS)
+        return float(AION_SIGNAL_FRESHNESS_MAX_AGE_SECONDS)
+
+    def _aion_mark_signal_freshness(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        side=None,
+        signal_detected=False,
+        selected=False,
+        submitting=False,
+        confirmation=False,
+        selected_price=None,
+        edge_after_cost=None,
+        source=None,
+        now_ts=None,
+        trace_id=None,
+    ):
+        ticker_key = str(ticker or "").strip()
+        if not ticker_key:
+            return {}
+        now_ts = self.to_float(now_ts, None)
+        if now_ts is None:
+            now_ts = time.time()
+        side_key = self._aion_normalize_live_side(side)
+        store = self._aion_signal_freshness_store()
+        key = self._aion_signal_freshness_key(ticker_key, side_key)
+        unknown_key = self._aion_signal_freshness_key(ticker_key, None)
+        existing = dict(store.get(key, {}) or {}) if key else {}
+        if not existing and side_key in {"yes", "no"} and unknown_key and isinstance(store.get(unknown_key), dict):
+            existing = dict(store.get(unknown_key) or {})
+        if not existing:
+            trace_meta = self._resolve_aion_candidate_trace_meta(
+                ticker=ticker_key,
+                family=family,
+                stage="signal_freshness",
+                trace_id=trace_id,
+                allow_create=False,
+            )
+            trace_ts_ms = self.to_float(trace_meta.get("timestamp_ms") if isinstance(trace_meta, dict) else None, None)
+            signal_ts = round(trace_ts_ms / 1000.0, 6) if trace_ts_ms and trace_ts_ms > 0.0 else now_ts
+            existing = {
+                "ticker": ticker_key,
+                "family": str(family or "UNKNOWN").strip().upper() or "UNKNOWN",
+                "side": side_key or "unknown",
+                "signal_detected_ts": signal_ts,
+                "first_source": source,
+                "trace_id": trace_id or (trace_meta.get("trace_id") if isinstance(trace_meta, dict) else None),
+            }
+        if signal_detected and not existing.get("signal_detected_ts"):
+            existing["signal_detected_ts"] = now_ts
+        if selected:
+            existing.setdefault("candidate_selected_ts", now_ts)
+            existing["last_candidate_selected_ts"] = now_ts
+        if confirmation:
+            existing["confirmation_ts"] = now_ts
+        if submitting:
+            existing["submit_ts"] = now_ts
+        if selected_price is not None:
+            existing["selected_price"] = self.to_float(selected_price, selected_price)
+        if edge_after_cost is not None:
+            existing["edge_after_cost"] = self.to_float(edge_after_cost, edge_after_cost)
+        if family:
+            existing["family"] = str(family or existing.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        if side_key in {"yes", "no"}:
+            existing["side"] = side_key
+        if trace_id:
+            existing["trace_id"] = trace_id
+        existing["last_source"] = source
+        existing["last_seen_ts"] = now_ts
+        if key:
+            store[key] = existing
+        if unknown_key and side_key in {"yes", "no"} and unknown_key in store:
+            try:
+                del store[unknown_key]
+            except Exception:
+                pass
+        cutoff = now_ts - 900.0
+        for stale_key, stale_record in list(store.items()):
+            try:
+                last_seen = self.to_float((stale_record or {}).get("last_seen_ts"), self.to_float((stale_record or {}).get("signal_detected_ts"), now_ts))
+            except Exception:
+                last_seen = now_ts
+            if last_seen is not None and last_seen < cutoff:
+                try:
+                    del store[stale_key]
+                except Exception:
+                    pass
+        self.aion_signal_freshness_by_key = store
+        return dict(existing)
+
+    def _aion_signal_freshness_context(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        side=None,
+        selected_price=None,
+        edge_after_cost=None,
+        source=None,
+        trace_id=None,
+        signal_detected=False,
+        selected=False,
+        submitting=False,
+        confirmation=False,
+        emit=True,
+    ):
+        now_ts = time.time()
+        record = self._aion_mark_signal_freshness(
+            ticker=ticker,
+            family=family,
+            side=side,
+            signal_detected=signal_detected,
+            selected=selected,
+            submitting=submitting,
+            confirmation=confirmation,
+            selected_price=selected_price,
+            edge_after_cost=edge_after_cost,
+            source=source,
+            now_ts=now_ts,
+            trace_id=trace_id,
+        )
+        signal_ts = self.to_float(record.get("signal_detected_ts"), now_ts)
+        selected_ts = self.to_float(record.get("candidate_selected_ts"), None)
+        confirmation_ts = self.to_float(record.get("confirmation_ts"), None)
+        submit_ts = self.to_float(record.get("submit_ts"), None)
+        signal_age = max(0.0, now_ts - signal_ts) if signal_ts is not None else 0.0
+        threshold = self._aion_signal_freshness_threshold(family=family or record.get("family"), ticker=ticker)
+        stale = bool(signal_age > threshold)
+        context = {
+            **record,
+            "ticker": str(ticker or record.get("ticker") or "").strip() or None,
+            "family": str(family or record.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN",
+            "side": self._aion_normalize_live_side(side or record.get("side")) or "unknown",
+            "source": source,
+            "signal_detected_ts": signal_ts,
+            "candidate_selected_ts": selected_ts,
+            "confirmation_ts": confirmation_ts,
+            "submit_ts": submit_ts,
+            "now_ts": now_ts,
+            "signal_age_seconds": round(signal_age, 3),
+            "max_signal_age_seconds": round(float(threshold), 3),
+            "stale": stale,
+            "atp_freshness_family": self._aion_is_atp_freshness_family(family=family or record.get("family"), ticker=ticker),
+        }
+        if emit:
+            try:
+                builtins.print("[AION-SIGNAL-AGE] " + json.dumps(context, sort_keys=True, default=str))
+                if stale:
+                    builtins.print("[AION-SIGNAL-STALE] " + json.dumps(context, sort_keys=True, default=str))
+            except Exception:
+                pass
+        return context
+
+    def _aion_update_freshness_metrics(self, *, signal_age=None, stale=False, cancelled=False, fast_submit=False, repriced=False, source=None):
+        metrics = getattr(self, "aion_signal_freshness_metrics", None)
+        if not isinstance(metrics, dict):
+            metrics = {
+                "signal_ages": deque(maxlen=200),
+                "stale_candidate_count": 0,
+                "freshness_cancellations": 0,
+                "fast_submit_count": 0,
+                "freshness_reprice_count": 0,
+            }
+        ages = metrics.get("signal_ages")
+        if not isinstance(ages, deque):
+            ages = deque(list(ages or [])[-200:], maxlen=200)
+        age_value = self.to_float(signal_age, None)
+        if age_value is not None:
+            ages.append(float(age_value))
+        metrics["signal_ages"] = ages
+        if stale:
+            metrics["stale_candidate_count"] = int(metrics.get("stale_candidate_count", 0) or 0) + 1
+        if cancelled:
+            metrics["freshness_cancellations"] = int(metrics.get("freshness_cancellations", 0) or 0) + 1
+        if fast_submit:
+            metrics["fast_submit_count"] = int(metrics.get("fast_submit_count", 0) or 0) + 1
+        if repriced:
+            metrics["freshness_reprice_count"] = int(metrics.get("freshness_reprice_count", 0) or 0) + 1
+        age_list = list(ages)
+        avg_age = sum(age_list) / len(age_list) if age_list else 0.0
+        sorted_ages = sorted(age_list)
+        if sorted_ages:
+            mid = len(sorted_ages) // 2
+            median_age = sorted_ages[mid] if len(sorted_ages) % 2 else (sorted_ages[mid - 1] + sorted_ages[mid]) / 2.0
+        else:
+            median_age = 0.0
+        summary = {
+            "source": source,
+            "sample_count": len(age_list),
+            "average_signal_age_seconds": round(avg_age, 3),
+            "median_signal_age_seconds": round(median_age, 3),
+            "stale_candidate_count": int(metrics.get("stale_candidate_count", 0) or 0),
+            "freshness_cancellations": int(metrics.get("freshness_cancellations", 0) or 0),
+            "fast_submit_count": int(metrics.get("fast_submit_count", 0) or 0),
+            "freshness_reprice_count": int(metrics.get("freshness_reprice_count", 0) or 0),
+        }
+        metrics["last_summary"] = summary
+        self.aion_signal_freshness_metrics = metrics
+        self.last_aion_freshness_metrics = summary
+        try:
+            builtins.print("[AION-FRESHNESS-METRICS] " + json.dumps(summary, sort_keys=True, default=str))
+        except Exception:
+            pass
+        return summary
+
+    def _aion_current_spread_for_side(self, source, side):
+        source = source if isinstance(source, dict) else {}
+        side = self._aion_normalize_live_side(side)
+        if side == "yes":
+            bid = self._aion_quote_price_to_dollars(source.get("yes_bid_dollars", source.get("yes_bid")), allow_zero=True)
+            ask = self._aion_quote_price_to_dollars(source.get("yes_ask_dollars", source.get("yes_ask")))
+        elif side == "no":
+            bid = self._aion_quote_price_to_dollars(source.get("no_bid_dollars", source.get("no_bid")), allow_zero=True)
+            ask = self._aion_quote_price_to_dollars(source.get("no_ask_dollars", source.get("no_ask")))
+        else:
+            return None
+        if bid is None or ask is None:
+            return None
+        return round(max(0.0, float(ask) - float(bid)), 4)
+
+    def _aion_freshness_edge_decay(self, original_edge=None, current_edge=None, *, stale=False):
+        original = self.to_float(original_edge, None)
+        current = self.to_float(current_edge, None)
+        threshold = float(AION_SIGNAL_FRESHNESS_MATERIAL_EDGE_DECAY)
+        if current is None:
+            return {"material": False, "edge_delta": None, "reason": "current_edge_unknown"}
+        if original is None:
+            original = current
+        edge_delta = float(original) - float(current)
+        material = bool(
+            (current <= 0.0 and original > 0.0)
+            or (edge_delta >= threshold and (stale or current <= max(0.002, original * 0.50)))
+        )
+        return {
+            "material": material,
+            "edge_delta": round(edge_delta, 6),
+            "original_edge": round(float(original), 6),
+            "current_edge": round(float(current), 6),
+            "threshold": round(threshold, 6),
+            "reason": "material_edge_decay" if material else "edge_still_viable",
+        }
+
+    def _aion_is_strong_freshness_signal(
+        self,
+        *,
+        edge=None,
+        winning_score=None,
+        spread=None,
+        opponent_recovery=False,
+        selected_side=None,
+        winning_side=None,
+        side_strengthening=False,
+        side_weakening=False,
+    ):
+        edge_value = self.to_float(edge, 0.0) or 0.0
+        score_value = self.to_float(winning_score, 0.0) or 0.0
+        spread_value = self.to_float(spread, None)
+        selected_side = self._aion_normalize_live_side(selected_side)
+        winning_side = self._aion_normalize_live_side(winning_side)
+        side_match = bool(winning_side not in {"yes", "no"} or selected_side not in {"yes", "no"} or selected_side == winning_side)
+        return bool(
+            side_match
+            and not opponent_recovery
+            and not side_weakening
+            and (side_strengthening or edge_value >= float(AION_SIGNAL_FRESHNESS_STRONG_EDGE) or score_value >= float(AION_SIGNAL_FRESHNESS_STRONG_WINNING_SCORE))
+            and (edge_value >= float(AION_SIGNAL_FRESHNESS_STRONG_EDGE) or score_value >= float(AION_SIGNAL_FRESHNESS_STRONG_WINNING_SCORE))
+            and spread_value is not None
+            and spread_value <= float(AION_SIGNAL_FRESHNESS_TIGHT_SPREAD)
+        )
+
+    def _aion_clear_signal_freshness(self, ticker=None, side=None):
+        ticker_key = str(ticker or "").strip()
+        if not ticker_key:
+            return
+        store = self._aion_signal_freshness_store()
+        for key in (
+            self._aion_signal_freshness_key(ticker_key, side),
+            self._aion_signal_freshness_key(ticker_key, None),
+        ):
+            if key in store:
+                try:
+                    del store[key]
+                except Exception:
+                    pass
+        self.aion_signal_freshness_by_key = store
+
+    def _aion_final_submit_freshness_validation(
+        self,
+        *,
+        ticker=None,
+        family=None,
+        q=None,
+        market=None,
+        quote_diag=None,
+        payload=None,
+        size=None,
+        edge_after_cost=None,
+        source="final_submit_preflight",
+        trace_id=None,
+        cancel_on_decay=True,
+        record_metrics=True,
+        emit_fast_submit=True,
+    ):
+        payload = dict(payload or {})
+        market = market if isinstance(market, dict) else {}
+        quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
+        ticker = str(ticker or payload.get("ticker") or market.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        family = str(family or payload.get("family") or self.get_market_family({"ticker": ticker}) or "UNKNOWN").strip().upper() or "UNKNOWN"
+        selected_side, selected_price = self._aion_payload_side_and_price(payload)
+        if selected_side not in {"yes", "no"}:
+            selected_side = self._aion_normalize_live_side(getattr(q, "selected_side", None) or getattr(q, "side", None) or quote_diag.get("selected_side") or quote_diag.get("side"))
+        if selected_price is None:
+            selected_price = self.to_float(getattr(q, "selected_price", None), self.to_float(quote_diag.get("selected_price_dollars"), self.to_float(quote_diag.get("selected_price"), None)))
+        freshness = self._aion_signal_freshness_context(
+            ticker=ticker,
+            family=family,
+            side=selected_side,
+            selected_price=selected_price,
+            edge_after_cost=edge_after_cost,
+            source=source,
+            trace_id=trace_id,
+            selected=True,
+            submitting=True,
+            emit=True,
+        )
+        original_edge = self.to_float(
+            edge_after_cost,
+            self.to_float(payload.get("edge_after_cost"), self.to_float(quote_diag.get("edge_after_cost"), self.to_float(quote_diag.get("final_edge"), None))),
+        )
+        atp_freshness_family = bool(freshness.get("atp_freshness_family"))
+        refreshed_resolution = self.resolve_aion_orderbook_for_payload(
+            ticker,
+            candidate=q,
+            market=market,
+            quote_diag=quote_diag,
+            price_source="ask",
+            selected_side=selected_side,
+            selection_stage=f"{source}:freshness_reprice",
+            allow_refresh=True,
+        )
+        refreshed_resolution = refreshed_resolution if isinstance(refreshed_resolution, dict) else {}
+        winning_context = self._aion_detect_winning_side(
+            ticker=ticker,
+            family=family,
+            market=market,
+            q=q,
+            quote_diag={**quote_diag, **refreshed_resolution},
+            orderbook_resolution=refreshed_resolution,
+            preferred_side=selected_side,
+            source=f"{source}:freshness",
+            emit=True,
+        )
+        tradeability = self.resolve_canonical_tradeability(
+            market if isinstance(market, dict) else {"ticker": ticker},
+            quote=q,
+            context={
+                "ticker": ticker,
+                "selected_side": selected_side,
+                "price_source": "ask",
+                "allow_refresh": False,
+                "selection_stage": f"{source}:freshness_tradeability",
+                "final_edge": original_edge,
+                "final_submit_allowed_by_realm_vv": quote_diag.get("final_submit_allowed_by_realm_vv"),
+                "quote_diag": {**quote_diag, **refreshed_resolution},
+            },
+            source=f"{source}:freshness",
+        )
+        tradeability = tradeability if isinstance(tradeability, dict) else {}
+        refreshed_payload = self.build_live_order_payload(
+            q,
+            size=size or payload.get("count") or 1,
+            price_source="ask",
+            post_only=payload.get("post_only", False),
+            rest_remainder=payload.get("rest_remainder", True),
+            market=market,
+            quote_diag={**quote_diag, **refreshed_resolution, "canonical_tradeability": tradeability},
+            selected_ticker=ticker,
+            orderbook_resolution=refreshed_resolution,
+            selection_stage=f"{source}:freshness_reprice",
+            allow_orderbook_refresh=False,
+        )
+        if isinstance(refreshed_payload, dict):
+            refreshed_payload.setdefault("aion_freshness", {})
+            refreshed_payload["aion_freshness"].update(
+                {
+                    "signal_age_seconds": freshness.get("signal_age_seconds"),
+                    "max_signal_age_seconds": freshness.get("max_signal_age_seconds"),
+                    "stale": bool(freshness.get("stale")),
+                    "reprice_source": source,
+                }
+            )
+        refreshed_side, refreshed_price = self._aion_payload_side_and_price(refreshed_payload or payload)
+        selected_context = winning_context.get(refreshed_side) if isinstance(winning_context, dict) and refreshed_side in {"yes", "no"} else {}
+        selected_context = selected_context if isinstance(selected_context, dict) else {}
+        spread = self._aion_current_spread_for_side(refreshed_resolution, refreshed_side)
+        if spread is None:
+            spread = self.to_float(selected_context.get("spread"), None)
+        current_edge = self.to_float(
+            tradeability.get("edge_after_cost"),
+            self.to_float(tradeability.get("final_edge_value"), self.to_float(selected_context.get("edge_after_cost"), original_edge)),
+        )
+        edge_decay = self._aion_freshness_edge_decay(original_edge, current_edge, stale=bool(freshness.get("stale")))
+        winning_side = self._aion_normalize_live_side(winning_context.get("winning_side") if isinstance(winning_context, dict) else None)
+        winning_score = self.to_float(winning_context.get("winning_score") if isinstance(winning_context, dict) else None, None)
+        winning_context_dict = winning_context if isinstance(winning_context, dict) else {}
+        opponent_recovery = bool(selected_context.get("opponent_recovery") or winning_context_dict.get("opponent_recovery"))
+        side_strengthening = bool(selected_context.get("side_strengthening") or winning_context_dict.get("selected_side_strengthening"))
+        side_weakening = bool(selected_context.get("side_weakening") or winning_context_dict.get("selected_side_weakening"))
+        fast_submit = self._aion_is_strong_freshness_signal(
+            edge=current_edge,
+            winning_score=winning_score,
+            spread=spread,
+            opponent_recovery=opponent_recovery,
+            selected_side=refreshed_side,
+            winning_side=winning_side,
+            side_strengthening=side_strengthening,
+            side_weakening=side_weakening,
+        ) and not bool(freshness.get("stale"))
+        if atp_freshness_family:
+            try:
+                builtins.print(
+                    "[AION-ATP-FRESHNESS] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": refreshed_side,
+                            "signal_age_seconds": freshness.get("signal_age_seconds"),
+                            "max_signal_age_seconds": freshness.get("max_signal_age_seconds"),
+                            "stale": bool(freshness.get("stale")),
+                            "mandatory_reprice": True,
+                            "size_action": "size_down_stale" if bool(freshness.get("stale")) else "normal",
+                            "edge_decay": edge_decay,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+        if isinstance(refreshed_payload, dict) and atp_freshness_family and bool(freshness.get("stale")):
+            refreshed_payload["count"] = max(1, min(int(refreshed_payload.get("count") or size or 1), 1))
+        reprice_payload = {
+            "ticker": ticker,
+            "family": family,
+            "side": refreshed_side,
+            "old_price": selected_price,
+            "new_price": refreshed_price,
+            "old_edge": original_edge,
+            "current_edge": current_edge,
+            "spread": spread,
+            "signal_age_seconds": freshness.get("signal_age_seconds"),
+            "max_signal_age_seconds": freshness.get("max_signal_age_seconds"),
+            "stale": bool(freshness.get("stale")),
+            "winning_side": winning_side,
+            "winning_score": winning_score,
+            "opponent_recovery": opponent_recovery,
+            "orderbook_ready": bool(refreshed_resolution.get("orderbook_ready")),
+            "tradeable": bool(tradeability.get("tradeable")),
+            "source": source,
+        }
+        try:
+            builtins.print("[AION-FRESHNESS-REPRICE] " + json.dumps(reprice_payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+        cancel_reason = None
+        if not isinstance(refreshed_payload, dict):
+            cancel_reason = "freshness_reprice_payload_missing"
+        elif refreshed_price is None or refreshed_side not in {"yes", "no"}:
+            cancel_reason = "freshness_reprice_missing_price_or_side"
+        elif refreshed_price is not None and not (0.0 < self.to_float(refreshed_price, 0.0) < 1.0):
+            cancel_reason = "freshness_reprice_price_out_of_bounds"
+        elif not bool(refreshed_resolution.get("orderbook_ready") or refreshed_resolution.get("orderbook_exists") or refreshed_resolution.get("normalized_orderbook_present")):
+            cancel_reason = "freshness_reprice_orderbook_not_ready"
+        elif bool(edge_decay.get("material")):
+            cancel_reason = "edge_materially_decayed"
+        elif (
+            cancel_on_decay
+            and not atp_freshness_family
+            and bool(freshness.get("stale"))
+            and winning_side in {"yes", "no"}
+            and refreshed_side in {"yes", "no"}
+            and winning_side != refreshed_side
+            and (winning_score is None or winning_score >= float(AION_SIGNAL_FRESHNESS_STRONG_WINNING_SCORE))
+            and current_edge is not None
+            and current_edge <= float(AION_SIGNAL_FRESHNESS_MATERIAL_EDGE_DECAY)
+        ):
+            cancel_reason = "stale_signal_winning_side_changed"
+        elif (
+            cancel_on_decay
+            and not atp_freshness_family
+            and bool(freshness.get("stale"))
+            and opponent_recovery
+            and side_weakening
+            and current_edge is not None
+            and current_edge <= max(0.0, (original_edge or 0.0) - float(AION_SIGNAL_FRESHNESS_MATERIAL_EDGE_DECAY))
+        ):
+            cancel_reason = "stale_signal_opponent_recovery"
+        allowed = bool(cancel_reason is None or not cancel_on_decay)
+        if cancel_reason and cancel_on_decay:
+            cancel_payload = {
+                **reprice_payload,
+                "reason": cancel_reason,
+                "edge_decay": edge_decay,
+                "responsible_subsystem": "signal_freshness",
+            }
+            try:
+                if cancel_reason.startswith("edge_") or cancel_reason in {"edge_materially_decayed", "stale_signal_winning_side_changed", "stale_signal_opponent_recovery"}:
+                    builtins.print("[AION-EDGE-DECAY] " + json.dumps(cancel_payload, sort_keys=True, default=str))
+                builtins.print("[AION-SUBMIT-CANCELLED-STALE] " + json.dumps(cancel_payload, sort_keys=True, default=str))
+                builtins.print(
+                    "[AION-FINAL-REJECT] "
+                    + json.dumps(
+                        {
+                            "ticker": ticker,
+                            "family": family,
+                            "side": refreshed_side,
+                            "selected_price": refreshed_price,
+                            "spread": spread,
+                            "liquidity": refreshed_resolution.get("liquidity_depth") or refreshed_resolution.get("selected_top_size"),
+                            "volume": refreshed_resolution.get("volume") or quote_diag.get("volume"),
+                            "reason": cancel_reason,
+                            "responsible_subsystem": "signal_freshness",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+        if fast_submit and emit_fast_submit:
+            try:
+                builtins.print(
+                    "[AION-FAST-SUBMIT] "
+                    + json.dumps(
+                        {
+                            **reprice_payload,
+                            "edge": current_edge,
+                            "reason": "fresh_strong_signal_tight_spread",
+                            "bypass": "adaptive_confirmation_wait",
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                )
+            except Exception:
+                pass
+        if record_metrics:
+            self._aion_update_freshness_metrics(
+                signal_age=freshness.get("signal_age_seconds"),
+                stale=bool(freshness.get("stale")),
+                cancelled=bool(cancel_reason and cancel_on_decay),
+                fast_submit=bool(fast_submit),
+                repriced=True,
+                source=source,
+            )
+        return {
+            "allowed": allowed,
+            "reason": cancel_reason or ("fast_submit" if fast_submit else "freshness_repriced"),
+            "payload": refreshed_payload if isinstance(refreshed_payload, dict) else payload,
+            "selected_side": refreshed_side,
+            "selected_price": refreshed_price,
+            "size": int((refreshed_payload or payload or {}).get("count") or size or 1),
+            "freshness": freshness,
+            "orderbook_resolution": refreshed_resolution,
+            "tradeability": tradeability,
+            "winning_context": winning_context,
+            "spread": spread,
+            "edge_after_cost": current_edge,
+            "edge_decay": edge_decay,
+            "fast_submit": bool(fast_submit),
+            "cancelled": bool(cancel_reason and cancel_on_decay),
+        }
 
     def _aion_build_payload_for_side_from_resolution(self, resolution, side):
         resolution = dict(resolution or {})
@@ -45045,6 +45669,22 @@ class KalshiSniperBot:
                 first_blocker=corrected_block_reason,
                 final_block_reason=corrected_block_reason,
         )
+        if final_ready_value or canonical_ready or canonical_allow_lane:
+            freshness_context = self._aion_signal_freshness_context(
+                ticker=ticker,
+                family=family,
+                side=selected_side_for_quote,
+                selected_price=canonical_selected_price_value,
+                edge_after_cost=edge_value,
+                source="final_readiness_sync",
+                trace_id=trace_id,
+                signal_detected=True,
+                emit=False,
+            )
+            payload["signal_detected_ts"] = freshness_context.get("signal_detected_ts")
+            payload["candidate_selected_ts"] = freshness_context.get("candidate_selected_ts")
+            payload["signal_age_seconds"] = freshness_context.get("signal_age_seconds")
+            payload["max_signal_age_seconds"] = freshness_context.get("max_signal_age_seconds")
         print("[AION-FINAL-READINESS-SYNC] " + json.dumps(payload, sort_keys=True, default=str))
         print(
             "[AION-CANONICAL-FINAL] "
@@ -46196,6 +46836,7 @@ class KalshiSniperBot:
                 )
                 execution_funnel["execution_submitted"] = 1
                 payload = result.get("payload") or payload_preview
+                self._aion_clear_signal_freshness(auto_live_ticker, payload.get("side"))
                 self.record_live_position(
                     selected_quote,
                     size=payload.get("count"),
@@ -57787,7 +58428,8 @@ class KalshiSniperBot:
                         source="final_submit_primary_preflight_block",
                     )
                     return
-            momentum_confirmation = self._aion_confirm_momentum_entry(
+            freshness_original_edge_after_cost = edge_after_cost
+            freshness_precheck = self._aion_final_submit_freshness_validation(
                 ticker=auto_live_ticker,
                 family=selected_family,
                 q=selected_quote_for_submission,
@@ -57795,8 +58437,83 @@ class KalshiSniperBot:
                 quote_diag=quote_readiness_diagnostic,
                 payload=aggressive_fastpath_payload_override or payload_preview,
                 size=ev_contract_size,
-                source="final_submit_preflight",
+                edge_after_cost=freshness_original_edge_after_cost,
+                source="final_submit_preflight_precheck",
+                trace_id=trace_id,
+                cancel_on_decay=False,
+                record_metrics=False,
+                emit_fast_submit=True,
             )
+            if isinstance(freshness_precheck, dict) and isinstance(freshness_precheck.get("payload"), dict):
+                payload_preview = dict(freshness_precheck.get("payload"))
+                if aggressive_fastpath_payload_override is not None:
+                    aggressive_fastpath_payload_override = dict(payload_preview)
+                precheck_count = self.to_float(payload_preview.get("count"), None)
+                if precheck_count is not None and precheck_count > 0:
+                    ev_contract_size = int(min(int(MAX_LIVE_ORDER_SIZE or precheck_count), max(1, int(precheck_count))))
+                    payload_preview["count"] = int(ev_contract_size)
+                    if isinstance(aggressive_fastpath_payload_override, dict):
+                        aggressive_fastpath_payload_override["count"] = int(ev_contract_size)
+                precheck_side = freshness_precheck.get("selected_side")
+                precheck_price = freshness_precheck.get("selected_price")
+                if precheck_side in {"yes", "no"}:
+                    submission_side = precheck_side
+                    final_lane_expectancy["selected_side"] = precheck_side
+                    final_lane_quality["selected_side"] = precheck_side
+                    final_lane_allocation["selected_side"] = precheck_side
+                    try:
+                        setattr(selected_quote_for_submission, "selected_side", precheck_side)
+                        setattr(selected_quote_for_submission, "side", precheck_side)
+                    except Exception:
+                        pass
+                if precheck_price is not None:
+                    submission_price = precheck_price
+                    final_lane_expectancy["selected_price"] = precheck_price
+                    final_lane_expectancy["selected_price_dollars"] = precheck_price
+                    final_lane_quality["selected_price"] = precheck_price
+                    final_lane_quality["selected_price_dollars"] = precheck_price
+                    final_lane_allocation["selected_price"] = precheck_price
+                    try:
+                        setattr(selected_quote_for_submission, "selected_price", precheck_price)
+                    except Exception:
+                        pass
+                precheck_spread = self.to_float(freshness_precheck.get("spread"), None)
+                if precheck_spread is not None:
+                    controlled_spread_value = precheck_spread
+                    final_lane_expectancy["spread"] = precheck_spread
+                    final_lane_quality["spread"] = precheck_spread
+                    final_lane_allocation["spread"] = precheck_spread
+                if freshness_precheck.get("edge_after_cost") is not None:
+                    edge_after_cost = self.to_float(freshness_precheck.get("edge_after_cost"), edge_after_cost)
+                    final_lane_expectancy["edge_after_cost"] = edge_after_cost
+                    final_lane_expectancy["sports_edge_after_cost"] = edge_after_cost
+                    final_lane_allocation["edge"] = edge_after_cost
+                quote_readiness_diagnostic["signal_age_seconds"] = (freshness_precheck.get("freshness") or {}).get("signal_age_seconds")
+                quote_readiness_diagnostic["max_signal_age_seconds"] = (freshness_precheck.get("freshness") or {}).get("max_signal_age_seconds")
+                quote_readiness_diagnostic["canonical_tradeability"] = freshness_precheck.get("tradeability") or quote_readiness_diagnostic.get("canonical_tradeability", {})
+            if isinstance(freshness_precheck, dict) and freshness_precheck.get("fast_submit"):
+                momentum_confirmation = {
+                    "allowed": True,
+                    "payload": payload_preview,
+                    "decision": "FAST_SUBMIT",
+                    "reason": "fresh_strong_signal_tight_spread",
+                    "wait_seconds": 0.0,
+                    "winning_side": (freshness_precheck.get("winning_context") or {}).get("winning_side"),
+                    "selected_side": freshness_precheck.get("selected_side"),
+                    "selected_price": freshness_precheck.get("selected_price"),
+                    "confirmation": freshness_precheck.get("winning_context") or {},
+                }
+            else:
+                momentum_confirmation = self._aion_confirm_momentum_entry(
+                    ticker=auto_live_ticker,
+                    family=selected_family,
+                    q=selected_quote_for_submission,
+                    market=selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
+                    quote_diag=quote_readiness_diagnostic,
+                    payload=aggressive_fastpath_payload_override or payload_preview,
+                    size=ev_contract_size,
+                    source="final_submit_preflight",
+                )
             if isinstance(momentum_confirmation, dict) and isinstance(momentum_confirmation.get("payload"), dict):
                 payload_preview = dict(momentum_confirmation.get("payload"))
                 if aggressive_fastpath_payload_override is not None:
@@ -57836,6 +58553,97 @@ class KalshiSniperBot:
                     "selected_side": momentum_confirmation.get("selected_side"),
                     "selected_price": momentum_confirmation.get("selected_price"),
                     "wait_seconds": momentum_confirmation.get("wait_seconds"),
+                }
+            final_freshness = self._aion_final_submit_freshness_validation(
+                ticker=auto_live_ticker,
+                family=selected_family,
+                q=selected_quote_for_submission,
+                market=selected_market if isinstance(selected_market, dict) else {"ticker": auto_live_ticker},
+                quote_diag=quote_readiness_diagnostic,
+                payload=aggressive_fastpath_payload_override or payload_preview,
+                size=ev_contract_size,
+                edge_after_cost=freshness_original_edge_after_cost,
+                source="final_submit_pre_submit",
+                trace_id=trace_id,
+                cancel_on_decay=True,
+                record_metrics=True,
+                emit_fast_submit=False,
+            )
+            if not bool((final_freshness or {}).get("allowed", True)):
+                freshness_block_reason = str((final_freshness or {}).get("reason") or "freshness_stale_cancelled").strip() or "freshness_stale_cancelled"
+                self._emit_aion_final_execution_truth(
+                    ticker=auto_live_ticker,
+                    family=selected_family,
+                    decision="SKIP",
+                    reason=freshness_block_reason,
+                    stage="final_submit_freshness",
+                    hard_block=False,
+                    final_submit_allowed=False,
+                    selected_price=(final_freshness or {}).get("selected_price") or submission_price,
+                    selected_side=(final_freshness or {}).get("selected_side") or submission_side,
+                )
+                execution_funnel["execution_blocked"] = 1
+                trade_readiness_trade_submitted = False
+                self._execute_parallel_lane_submit_attempts(
+                    primary_ticker=auto_live_ticker,
+                    primary_lane=final_lane_allocation.get("lane"),
+                    primary_result={"submitted": False, "reason": freshness_block_reason},
+                    source="final_submit_freshness_block",
+                )
+                return
+            if isinstance(final_freshness, dict) and isinstance(final_freshness.get("payload"), dict):
+                payload_preview = dict(final_freshness.get("payload"))
+                if aggressive_fastpath_payload_override is not None:
+                    aggressive_fastpath_payload_override = dict(payload_preview)
+                final_freshness_count = self.to_float(payload_preview.get("count"), None)
+                if final_freshness_count is not None and final_freshness_count > 0:
+                    ev_contract_size = int(min(int(MAX_LIVE_ORDER_SIZE or final_freshness_count), max(1, int(final_freshness_count))))
+                    payload_preview["count"] = int(ev_contract_size)
+                    if isinstance(aggressive_fastpath_payload_override, dict):
+                        aggressive_fastpath_payload_override["count"] = int(ev_contract_size)
+                final_freshness_side = final_freshness.get("selected_side")
+                final_freshness_price = final_freshness.get("selected_price")
+                if final_freshness_side in {"yes", "no"}:
+                    submission_side = final_freshness_side
+                    final_lane_expectancy["selected_side"] = final_freshness_side
+                    final_lane_quality["selected_side"] = final_freshness_side
+                    final_lane_allocation["selected_side"] = final_freshness_side
+                    try:
+                        setattr(selected_quote_for_submission, "selected_side", final_freshness_side)
+                        setattr(selected_quote_for_submission, "side", final_freshness_side)
+                    except Exception:
+                        pass
+                if final_freshness_price is not None:
+                    submission_price = final_freshness_price
+                    final_lane_expectancy["selected_price"] = final_freshness_price
+                    final_lane_expectancy["selected_price_dollars"] = final_freshness_price
+                    final_lane_quality["selected_price"] = final_freshness_price
+                    final_lane_quality["selected_price_dollars"] = final_freshness_price
+                    final_lane_allocation["selected_price"] = final_freshness_price
+                    try:
+                        setattr(selected_quote_for_submission, "selected_price", final_freshness_price)
+                    except Exception:
+                        pass
+                final_freshness_spread = self.to_float(final_freshness.get("spread"), None)
+                if final_freshness_spread is not None:
+                    controlled_spread_value = final_freshness_spread
+                    final_lane_expectancy["spread"] = final_freshness_spread
+                    final_lane_quality["spread"] = final_freshness_spread
+                    final_lane_allocation["spread"] = final_freshness_spread
+                if final_freshness.get("edge_after_cost") is not None:
+                    edge_after_cost = self.to_float(final_freshness.get("edge_after_cost"), edge_after_cost)
+                    final_lane_expectancy["edge_after_cost"] = edge_after_cost
+                    final_lane_expectancy["sports_edge_after_cost"] = edge_after_cost
+                    final_lane_allocation["edge"] = edge_after_cost
+                quote_readiness_diagnostic["signal_age_seconds"] = (final_freshness.get("freshness") or {}).get("signal_age_seconds")
+                quote_readiness_diagnostic["max_signal_age_seconds"] = (final_freshness.get("freshness") or {}).get("max_signal_age_seconds")
+                quote_readiness_diagnostic["canonical_tradeability"] = final_freshness.get("tradeability") or quote_readiness_diagnostic.get("canonical_tradeability", {})
+                final_lane_allocation["freshness"] = {
+                    "signal_age_seconds": (final_freshness.get("freshness") or {}).get("signal_age_seconds"),
+                    "max_signal_age_seconds": (final_freshness.get("freshness") or {}).get("max_signal_age_seconds"),
+                    "stale": bool((final_freshness.get("freshness") or {}).get("stale")),
+                    "reason": final_freshness.get("reason"),
+                    "edge_decay": final_freshness.get("edge_decay"),
                 }
             print(
                 "[AION-QUALIFIED] "
@@ -62583,6 +63391,32 @@ class KalshiSniperBot:
                 "execution_quality_markers": execution_quality_markers,
                 "subsystem": "realm_vv_entry",
             }
+            if phase55_status == "entry_ready" and selected_side in {"yes", "no"}:
+                freshness_context = self._aion_signal_freshness_context(
+                    ticker=selected_ticker,
+                    family=family,
+                    side=selected_side,
+                    selected_price=selected_price,
+                    edge_after_cost=edge,
+                    source="realm_vv_entry_ready",
+                    signal_detected=True,
+                    selected=True,
+                    emit=True,
+                )
+                for freshness_field in (
+                    "signal_detected_ts",
+                    "candidate_selected_ts",
+                    "signal_age_seconds",
+                    "max_signal_age_seconds",
+                    "stale",
+                ):
+                    result[freshness_field] = freshness_context.get(freshness_field)
+                    confidence_audit[freshness_field] = freshness_context.get(freshness_field)
+                self._aion_update_freshness_metrics(
+                    signal_age=freshness_context.get("signal_age_seconds"),
+                    stale=bool(freshness_context.get("stale")),
+                    source="realm_vv_entry_ready",
+                )
             print("[AION-CONFIDENCE-AUDIT] " + json.dumps(confidence_audit, sort_keys=True, default=str))
             if edge_audit_action == "block":
                 print("[AION-EDGE-AUDIT] " + json.dumps({**confidence_audit, "reason": blocker, "action": "block"}, sort_keys=True, default=str))
