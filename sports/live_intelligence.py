@@ -17166,8 +17166,6 @@ def find_best_live_ticker(self, markets=None):
         )
         if fast_side_selection.get("selected_price") is not None:
             fast_selected_price = self.to_float(fast_side_selection.get("selected_price"), fast_selected_price)
-        if isinstance(fast_btc_direction_decision, dict) and fast_btc_direction_decision.get("selected_price") is not None:
-            fast_selected_price = self.to_float(fast_btc_direction_decision.get("selected_price"), fast_selected_price)
         if fast_selected_price is None:
             fast_selected_price = self.to_float(
                 getattr(fast_q, "yes_ask", None) if fast_side == "yes" else getattr(fast_q, "no_ask", None) if fast_side == "no" else None,
@@ -17566,14 +17564,13 @@ def find_best_live_ticker(self, markets=None):
         self.realm_vv_live_execution_gate_by_ticker[fast_key or fast_ticker] = fast_gate_record
         self.phase55_live_execution_gate_by_ticker = self.realm_vv_live_execution_gate_by_ticker
         self.live_direction_decisions_by_ticker[fast_ticker] = {
-            **(fast_btc_direction_decision if isinstance(fast_btc_direction_decision, dict) else {}),
             "ticker": fast_ticker,
             "family": fast_family,
             "intended_side": fast_side,
             "selected_side": fast_side,
             "selected_price": round(float(fast_selected_price_cents) / 100.0, 4),
             "selected_price_cents": fast_selected_price_cents,
-            "reason": (fast_btc_direction_decision.get("reason") if isinstance(fast_btc_direction_decision, dict) and fast_btc_direction_decision.get("reason") else "fast_executable_strict_candidate"),
+            "reason": "fast_executable_strict_candidate",
         }
         fast_expectancy_summary = {
             **fast_sports_context,
