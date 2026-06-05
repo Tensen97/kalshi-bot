@@ -196,6 +196,83 @@ class SignalFreshnessTests(unittest.TestCase):
         self.assertEqual(result["reason"], "edge_materially_decayed")
         self.assertTrue(result["edge_decay"]["material"])
 
+    def test_canonical_submit_wrapper_routes_alt_lane_through_freshness(self):
+        bot = self._make_bot()
+        bot.get_market_family = lambda market: "KXATPCHALLENGERMATCH"
+        captured = {}
+
+        def fake_validation(**kwargs):
+            captured.update(kwargs)
+            return {
+                "allowed": True,
+                "reason": "freshness_repriced",
+                "payload": {
+                    "ticker": "KXATPCHALLENGERMATCH-FRESH",
+                    "family": "KXATPCHALLENGERMATCH",
+                    "side": "yes",
+                    "selected_side": "yes",
+                    "selected_price": 0.42,
+                    "price": 0.42,
+                    "yes_price": 42,
+                    "count": 1,
+                },
+                "size": 1,
+                "freshness": {
+                    "signal_age_seconds": 4.0,
+                    "max_signal_age_seconds": kw.AION_SIGNAL_FRESHNESS_ATP_MAX_AGE_SECONDS,
+                    "stale": False,
+                },
+                "spread": 0.02,
+                "edge_after_cost": 0.04,
+                "fast_submit": True,
+            }
+
+        bot._aion_final_submit_freshness_validation = fake_validation
+
+        with patch("kalshi_web.builtins.print"):
+            result = bot._aion_canonical_submit_freshness_gate(
+                SimpleNamespace(ticker="KXATPCHALLENGERMATCH-FRESH", family="KXATPCHALLENGERMATCH"),
+                size=1,
+                lane="sports_multi_submit",
+                payload={
+                    "ticker": "KXATPCHALLENGERMATCH-FRESH",
+                    "family": "KXATPCHALLENGERMATCH",
+                    "side": "yes",
+                    "selected_price": 0.42,
+                    "count": 1,
+                    "edge_after_cost": 0.04,
+                },
+                source="submit_live_order",
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(captured["source"], "canonical_submit:sports_multi_submit")
+        self.assertTrue(result["payload"]["_aion_freshness_gate_checked"])
+        self.assertEqual(result["payload"]["_aion_freshness_gate_source"], "canonical_submit:sports_multi_submit")
+
+    def test_reduce_only_payload_is_exempt_from_entry_freshness(self):
+        bot = self._make_bot()
+        bot.get_market_family = lambda market: "KXMLBKS"
+
+        with patch("kalshi_web.builtins.print"):
+            result = bot._aion_canonical_submit_freshness_gate(
+                SimpleNamespace(ticker="KXMLBKS-TEST", family="KXMLBKS"),
+                size=1,
+                lane="exit",
+                payload={
+                    "ticker": "KXMLBKS-TEST",
+                    "family": "KXMLBKS",
+                    "side": "yes",
+                    "action": "sell",
+                    "reduce_only": True,
+                    "count": 1,
+                },
+                source="submit_live_order",
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["reason"], "reduce_only_exit_exempt")
+
 
 if __name__ == "__main__":
     unittest.main()

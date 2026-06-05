@@ -8495,6 +8495,8 @@ class KalshiSniperBot:
             allow_orderbook_refresh=False,
         )
         if isinstance(refreshed_payload, dict):
+            refreshed_payload["_aion_freshness_gate_checked"] = True
+            refreshed_payload["_aion_freshness_gate_source"] = source
             refreshed_payload.setdefault("aion_freshness", {})
             refreshed_payload["aion_freshness"].update(
                 {
@@ -8623,6 +8625,7 @@ class KalshiSniperBot:
                 if cancel_reason.startswith("edge_") or cancel_reason in {"edge_materially_decayed", "stale_signal_winning_side_changed", "stale_signal_opponent_recovery"}:
                     builtins.print("[AION-EDGE-DECAY] " + json.dumps(cancel_payload, sort_keys=True, default=str))
                 builtins.print("[AION-SUBMIT-CANCELLED-STALE] " + json.dumps(cancel_payload, sort_keys=True, default=str))
+                builtins.print("[AION-STALE-SUBMIT-CANCELLED] " + json.dumps(cancel_payload, sort_keys=True, default=str))
                 builtins.print(
                     "[AION-FINAL-REJECT] "
                     + json.dumps(
@@ -8685,6 +8688,204 @@ class KalshiSniperBot:
             "edge_decay": edge_decay,
             "fast_submit": bool(fast_submit),
             "cancelled": bool(cancel_reason and cancel_on_decay),
+        }
+
+    def _aion_is_reduce_only_entry_payload(self, payload):
+        payload = payload if isinstance(payload, dict) else {}
+        action = str(payload.get("action") or "").strip().lower()
+        return bool(
+            action in {"sell", "exit", "close"}
+            or payload.get("reduce_only")
+            or payload.get("exit_reason")
+            or payload.get("exit_order")
+        )
+
+    def _aion_emit_submit_path_map(
+        self,
+        *,
+        source=None,
+        lane=None,
+        ticker=None,
+        family=None,
+        can_open_live_position=True,
+        freshness_validation=True,
+        reduce_only=False,
+        bypass_removed=False,
+    ):
+        try:
+            builtins.print(
+                "[AION-SUBMIT-PATH-MAP] "
+                + json.dumps(
+                    {
+                        "file": "kalshi_web.py",
+                        "function": source,
+                        "lane": lane,
+                        "ticker": ticker,
+                        "family": family,
+                        "can_open_live_position": bool(can_open_live_position),
+                        "freshness_validation": "_aion_final_submit_freshness_validation" if freshness_validation else None,
+                        "freshness_required": bool(not reduce_only and can_open_live_position),
+                        "reduce_only": bool(reduce_only),
+                        "bypass_removed": bool(bypass_removed),
+                        "catastrophic_guards": [
+                            "sports_only",
+                            "duplicate_live_position",
+                            "exact_same_ticker_opposite_side",
+                            "daily_loss_cap",
+                            "sane_max_sizing",
+                            "valid_payload_orderbook",
+                            "fake_book_rejection",
+                            "crash_prevention",
+                        ],
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+        except Exception:
+            pass
+
+    def _aion_canonical_submit_freshness_gate(
+        self,
+        q=None,
+        *,
+        size=None,
+        lane=None,
+        payload=None,
+        source="submit_live_order",
+    ):
+        payload = dict(payload or {})
+        resolved_lane = str(lane or payload.get("lane") or payload.get("entry_mode") or "").strip()
+        lane_key = resolved_lane.lower()
+        ticker = str(payload.get("ticker") or getattr(q, "ticker", "") or "").strip()
+        family = str(payload.get("family") or getattr(q, "family", "") or "").strip().upper()
+        if not family and ticker:
+            family = str(self.get_market_family({"ticker": ticker}) or "UNKNOWN").strip().upper()
+        family = family or "UNKNOWN"
+        reduce_only = self._aion_is_reduce_only_entry_payload(payload)
+        alt_lane = bool(
+            lane_key in {"sports_multi_submit", "sports_ladder", "dual_lane_secondary", "auto_reprice"}
+            or str(source or "").strip() == "place_live_order"
+        )
+        self._aion_emit_submit_path_map(
+            source=f"KalshiSniperBot.{source}",
+            lane=resolved_lane or None,
+            ticker=ticker or None,
+            family=family,
+            can_open_live_position=not reduce_only,
+            freshness_validation=not reduce_only,
+            reduce_only=reduce_only,
+            bypass_removed=alt_lane and not reduce_only,
+        )
+        if reduce_only:
+            return {"allowed": True, "reason": "reduce_only_exit_exempt", "payload": payload, "size": size}
+        if payload.get("_aion_freshness_gate_checked"):
+            return {"allowed": True, "reason": "freshness_already_checked", "payload": payload, "size": size}
+        if not ticker:
+            return {"allowed": False, "reason": "freshness_missing_ticker", "payload": payload, "size": size}
+
+        original_side = self._aion_normalize_live_side(
+            payload.get("selected_side") or payload.get("side") or getattr(q, "selected_side", None) or getattr(q, "side", None)
+        )
+        original_count = self.to_float(payload.get("count"), self.to_float(size, None))
+        edge_after_cost = self.to_float(
+            payload.get("edge_after_cost"),
+            self.to_float(
+                payload.get("final_edge"),
+                self.to_float(
+                    payload.get("expected_edge"),
+                    self.to_float(getattr(q, "edge_after_cost", None), self.to_float(getattr(q, "edge", None), None)),
+                ),
+            ),
+        )
+        validation_source = f"canonical_submit:{lane_key or 'default'}"
+        freshness = self._aion_final_submit_freshness_validation(
+            ticker=ticker,
+            family=family,
+            q=q,
+            market=payload or {"ticker": ticker, "series_ticker": family},
+            quote_diag=payload,
+            payload=payload,
+            size=size or payload.get("count") or 1,
+            edge_after_cost=edge_after_cost,
+            source=validation_source,
+            trace_id=payload.get("trace_id"),
+            cancel_on_decay=True,
+            record_metrics=True,
+            emit_fast_submit=True,
+        )
+        freshness = freshness if isinstance(freshness, dict) else {"allowed": False, "reason": "freshness_validation_error", "payload": payload}
+        checked_payload = freshness.get("payload") if isinstance(freshness.get("payload"), dict) else payload
+        if isinstance(checked_payload, dict):
+            freshness_context = freshness.get("freshness") if isinstance(freshness.get("freshness"), dict) else {}
+            if original_side in {"yes", "no"}:
+                current_book = freshness.get("orderbook_resolution") if isinstance(freshness.get("orderbook_resolution"), dict) else {}
+                refreshed_price = self._aion_quote_price_to_dollars(
+                    current_book.get(f"{original_side}_ask_dollars", current_book.get(f"{original_side}_ask"))
+                )
+                if refreshed_price is None:
+                    refreshed_price = self._aion_quote_price_to_dollars(
+                        payload.get(f"{original_side}_ask_dollars", payload.get(f"{original_side}_ask"))
+                    )
+                if refreshed_price is None:
+                    price_field = payload.get(f"{original_side}_price")
+                    refreshed_price = self._aion_quote_price_to_dollars(
+                        payload.get("selected_price_dollars", payload.get("selected_price", payload.get("price", price_field)))
+                    )
+                checked_payload["side"] = original_side
+                checked_payload["selected_side"] = original_side
+                if refreshed_price is not None:
+                    refreshed_cents = max(1, min(99, int(round(float(refreshed_price) * 100.0))))
+                    checked_payload["price"] = round(refreshed_cents / 100.0, 4)
+                    checked_payload["selected_price"] = round(refreshed_cents / 100.0, 4)
+                    checked_payload["selected_price_dollars"] = round(refreshed_cents / 100.0, 4)
+                    checked_payload["selected_price_cents"] = refreshed_cents
+                    checked_payload.pop("yes_price", None)
+                    checked_payload.pop("no_price", None)
+                    checked_payload["yes_price" if original_side == "yes" else "no_price"] = refreshed_cents
+            atp_stale_size_down = bool(freshness_context.get("atp_freshness_family") and freshness_context.get("stale"))
+            if original_count is not None and original_count > 0 and not atp_stale_size_down:
+                checked_payload["count"] = max(1, int(round(float(original_count))))
+                freshness["size"] = checked_payload["count"]
+            checked_payload["_aion_freshness_gate_checked"] = True
+            checked_payload["_aion_freshness_gate_source"] = validation_source
+        log_payload = {
+            "ticker": ticker,
+            "family": family,
+            "lane": resolved_lane or None,
+            "source": source,
+            "validation_source": validation_source,
+            "allowed": bool(freshness.get("allowed")),
+            "reason": freshness.get("reason"),
+            "signal_age_seconds": (freshness.get("freshness") or {}).get("signal_age_seconds") if isinstance(freshness.get("freshness"), dict) else None,
+            "max_signal_age_seconds": (freshness.get("freshness") or {}).get("max_signal_age_seconds") if isinstance(freshness.get("freshness"), dict) else None,
+            "stale": bool((freshness.get("freshness") or {}).get("stale")) if isinstance(freshness.get("freshness"), dict) else None,
+            "spread": freshness.get("spread"),
+            "edge_after_cost": freshness.get("edge_after_cost"),
+            "fast_submit": bool(freshness.get("fast_submit")),
+            "bypass_removed": bool(alt_lane),
+        }
+        try:
+            builtins.print("[AION-FRESHNESS-GATE-HIT] " + json.dumps(log_payload, sort_keys=True, default=str))
+            if alt_lane:
+                builtins.print("[AION-ALT-LANE-FRESHNESS] " + json.dumps(log_payload, sort_keys=True, default=str))
+                builtins.print("[AION-FRESHNESS-BYPASS-REMOVED] " + json.dumps(log_payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+        if not bool(freshness.get("allowed", True)):
+            return {
+                "allowed": False,
+                "reason": freshness.get("reason") or "freshness_submit_cancelled",
+                "payload": checked_payload,
+                "size": freshness.get("size") or size,
+                "freshness": freshness,
+            }
+        return {
+            "allowed": True,
+            "reason": freshness.get("reason") or "freshness_repriced",
+            "payload": checked_payload,
+            "size": freshness.get("size") or size,
+            "freshness": freshness,
         }
 
     def _aion_build_payload_for_side_from_resolution(self, resolution, side):
@@ -51964,6 +52165,31 @@ class KalshiSniperBot:
         )
 
     def place_live_order(self, payload):
+        payload = dict(payload or {}) if isinstance(payload, dict) else {}
+        if not self._aion_is_reduce_only_entry_payload(payload) and not payload.get("_aion_freshness_gate_checked"):
+            q = SimpleNamespace(
+                ticker=payload.get("ticker"),
+                family=payload.get("family"),
+                selected_side=payload.get("selected_side") or payload.get("side"),
+                side=payload.get("side") or payload.get("selected_side"),
+                selected_price=payload.get("selected_price") or payload.get("selected_price_dollars") or payload.get("price"),
+                price=payload.get("price") or payload.get("selected_price"),
+            )
+            freshness_gate = self._aion_canonical_submit_freshness_gate(
+                q,
+                size=payload.get("count"),
+                lane=payload.get("lane") or payload.get("entry_mode") or "direct_place_live_order",
+                payload=payload,
+                source="place_live_order",
+            )
+            if not bool(freshness_gate.get("allowed", True)):
+                return {
+                    "submitted": False,
+                    "reason": freshness_gate.get("reason") or "freshness_submit_cancelled",
+                    "payload": freshness_gate.get("payload") or payload,
+                    "freshness": freshness_gate.get("freshness"),
+                }
+            payload = freshness_gate.get("payload") if isinstance(freshness_gate.get("payload"), dict) else payload
         return kalshi_execution_module.place_live_order(self, payload)
 
     def submit_live_order(self, q, size=None, lane=None, payload_override=None):
@@ -52073,6 +52299,36 @@ class KalshiSniperBot:
                         "reason": f"tennis_cap_check_exception:{exc.__class__.__name__}",
                     },
                 )
+        if not reduce_only_submit:
+            freshness_gate = self._aion_canonical_submit_freshness_gate(
+                q,
+                size=size,
+                lane=resolved_lane or lane,
+                payload=payload_override if isinstance(payload_override, dict) else {},
+                source="submit_live_order",
+            )
+            if not bool(freshness_gate.get("allowed", True)):
+                return {
+                    "submitted": False,
+                    "reason": freshness_gate.get("reason") or "freshness_submit_cancelled",
+                    "payload": freshness_gate.get("payload") if isinstance(freshness_gate.get("payload"), dict) else payload_override if isinstance(payload_override, dict) else None,
+                    "freshness": freshness_gate.get("freshness"),
+                }
+            if isinstance(freshness_gate.get("payload"), dict):
+                payload_override = freshness_gate.get("payload")
+            if freshness_gate.get("size") is not None:
+                size = freshness_gate.get("size")
+        else:
+            self._aion_emit_submit_path_map(
+                source="KalshiSniperBot.submit_live_order",
+                lane=resolved_lane or None,
+                ticker=ticker or None,
+                family=family,
+                can_open_live_position=False,
+                freshness_validation=False,
+                reduce_only=True,
+                bypass_removed=False,
+            )
         return kalshi_execution_module.submit_live_order(
             self,
             q,
