@@ -587,23 +587,6 @@ def place_live_order(bot, payload):
                 }
         except Exception:
             pass
-    loss_bucket_guard = getattr(bot, "evaluate_loss_bucket_entry_block", None)
-    if callable(loss_bucket_guard):
-        try:
-            guard_result = loss_bucket_guard(
-                payload,
-                q=None,
-                source="kalshi_execution.place_live_order",
-            )
-        except Exception:
-            guard_result = {"blocked": False}
-        if isinstance(guard_result, dict) and guard_result.get("blocked"):
-            return {
-                "submitted": False,
-                "reason": guard_result.get("reason") or "loss_bucket_entry_block",
-                "payload": payload,
-                "loss_bucket_guard": guard_result,
-            }
     if not exit_hint and action_hint in {"", "buy"} and not bool(payload.get("_risk_governor_checked")):
         risk_governor = getattr(bot, "evaluate_live_order_risk_governor", None)
         if callable(risk_governor):
@@ -1447,23 +1430,6 @@ def submit_live_order(
     payload = dict(payload_override) if isinstance(payload_override, dict) else bot.build_live_order_payload(q, size=size)
     if not payload:
         return {"submitted": False, "reason": "invalid_payload", "payload": payload}
-    loss_bucket_guard = getattr(bot, "evaluate_loss_bucket_entry_block", None)
-    if callable(loss_bucket_guard):
-        try:
-            guard_result = loss_bucket_guard(
-                payload,
-                q=q,
-                source="kalshi_execution.submit_live_order",
-            )
-        except Exception:
-            guard_result = {"blocked": False}
-        if isinstance(guard_result, dict) and guard_result.get("blocked"):
-            return {
-                "submitted": False,
-                "reason": guard_result.get("reason") or "loss_bucket_entry_block",
-                "payload": payload,
-                "loss_bucket_guard": guard_result,
-            }
     sizing_resolved = bool(payload.get("_aion_sizing_resolved"))
     try:
         sizing_resolved_count = int(bot.to_float(payload.get("count"), 0) or 0)

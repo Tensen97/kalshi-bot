@@ -9113,12 +9113,12 @@ def _build_aion_market_priority_profile(self, *, market=None, q=None, family=Non
     if price_family_state.get("recent_rejects", 0) > 0:
         quality_reasons.append("price_family_pressure")
     if price_family_state.get("cooldown_active"):
-        quality_reasons.append("price_family_cooldown")
+        quality_reasons.append("price_family_pressure")
     quality_score -= min(24.0, float(price_family_state.get("penalty", 0.0) or 0.0))
     if missing_spread_state.get("recent_rejects", 0) > 0:
         quality_reasons.append("missing_spread_family_pressure")
     if missing_spread_state.get("cooldown_active"):
-        quality_reasons.append("missing_spread_family_cooldown")
+        quality_reasons.append("missing_spread_family_pressure")
     quality_score -= min(24.0, float(missing_spread_state.get("penalty", 0.0) or 0.0))
     quality_score = round(quality_score, 4)
     quality_bonus = 10.0 if priority_tier == 1 else 6.0 if priority_tier == 2 else 0.0
@@ -9137,7 +9137,7 @@ def _build_aion_market_priority_profile(self, *, market=None, q=None, family=Non
     elif spread is None:
         deprioritize_reason = "spread_missing"
     elif price_family_state.get("cooldown_active"):
-        deprioritize_reason = "price_family_cooldown"
+        deprioritize_reason = "price_family_pressure"
     elif price_family_state.get("recent_rejects", 0) >= int(AION_PRICE_FAMILY_MIN_REJECTIONS):
         deprioritize_reason = "price_family_penalty"
     elif self.to_float(execution_quality_profile.get("orderbook_age_seconds"), 0.0) and self.to_float(execution_quality_profile.get("orderbook_age_seconds"), 0.0) > 300.0:
@@ -9145,7 +9145,7 @@ def _build_aion_market_priority_profile(self, *, market=None, q=None, family=Non
     elif execution_quality_profile.get("near_pass_count", 0) >= 2:
         deprioritize_reason = "repeated_near_pass"
     elif missing_spread_state.get("cooldown_active"):
-        deprioritize_reason = "missing_spread_family_cooldown"
+        deprioritize_reason = "missing_spread_family_pressure"
     elif family in DEPRIORITIZED_MARKET_FAMILIES:
         deprioritize_reason = "deprioritized_family"
     execution_probability = self._clamp(
@@ -9196,11 +9196,11 @@ def _build_aion_market_priority_profile(self, *, market=None, q=None, family=Non
         "market_quality_score": quality_score,
         "market_quality_reasons": quality_reasons,
         "price_family_recent_rejects": price_family_state.get("recent_rejects", 0),
-        "price_family_cooldown_active": bool(price_family_state.get("cooldown_active")),
+        "price_family_pressure_active": bool(price_family_state.get("cooldown_active")),
         "price_family_penalty": round(float(price_family_state.get("penalty", 0.0) or 0.0), 4),
         "missing_spread_family_penalty": round(float(missing_spread_state.get("penalty", 0.0) or 0.0), 4),
         "missing_spread_family_recent_rejects": missing_spread_state.get("recent_rejects", 0),
-        "missing_spread_family_cooldown_active": bool(missing_spread_state.get("cooldown_active")),
+        "missing_spread_family_pressure_active": bool(missing_spread_state.get("cooldown_active")),
         "near_resolved": bool(
             (yes_ask is not None and yes_ask >= 0.95 and no_bid is not None and no_bid <= 0.05)
             or (selected_price_value is not None and selected_price_value >= 0.99)
@@ -13252,7 +13252,7 @@ def find_best_live_ticker(self, markets=None):
     targeted_selection_count = 0
     broad_selection_count = 0
     merged_selection_count = len(markets) if markets is not None else 0
-    cycle_targeted_dead_book_suppressed_families = []
+    cycle_targeted_dead_book_pressure_families = []
     self.targeted_orderbook_cache = {}
     self.targeted_family_activity = {}
     targeted_family_activity = {
@@ -13865,8 +13865,8 @@ def find_best_live_ticker(self, markets=None):
                         broad_family_priority,
                         broad_family_diagnostics,
                     )
-                    broad_quote_suppressed_families = []
-                    broad_spread_suppressed_families = []
+                    broad_quote_pressure_families = []
+                    broad_spread_pressure_families = []
                     broad_deprioritized_families = []
                     broad_retained_families = []
                     for family in broad_family_priority:
@@ -13890,39 +13890,38 @@ def find_best_live_ticker(self, markets=None):
                             and stats.get("prefilter_survivors", 0) <= 0
                         )
                         if quote_dead_for_cycle:
-                            broad_quote_suppressed_families.append(family)
+                            broad_quote_pressure_families.append(family)
                             print(
-                                f"[LIVE-SELECT-BROAD-FAMILY-QUOTE-SUPPRESS] family={family} candidates_seen={family_market_count} "
+                                f"[LIVE-SELECT-BROAD-FAMILY-QUOTE-PRESSURE] family={family} candidates_seen={family_market_count} "
                                 f"yes_quote_count={stats.get('yes_quote_count', 0)} no_quote_count={stats.get('no_quote_count', 0)} "
                                 f"both_sides_quote_count={stats.get('both_sides_quoted', 0)} missing_quote_count={stats.get('missing_quotes', 0)} "
-                                f"reason=cycle_quote_dead_family"
+                                f"reason=cycle_quote_dead_family action=deprioritize_only"
                             )
-                            continue
                         if spread_dead_for_cycle:
-                            broad_spread_suppressed_families.append(family)
+                            broad_spread_pressure_families.append(family)
                             print(
-                                f"[LIVE-SELECT-BROAD-FAMILY-SPREAD-SUPPRESS] family={family} in_window_count={stats.get('target_window', 0)} "
+                                f"[LIVE-SELECT-BROAD-FAMILY-SPREAD-PRESSURE] family={family} in_window_count={stats.get('target_window', 0)} "
                                 f"both_sides_quoted_count={stats.get('both_sides_quoted', 0)} narrow_spread_count={stats.get('narrow_spread', 0)} "
-                                f"recent_activity_count={stats.get('recent_activity', 0)} reason=cycle_zero_narrow_spread_family"
+                                f"recent_activity_count={stats.get('recent_activity', 0)} reason=cycle_zero_narrow_spread_family action=deprioritize_only"
                             )
-                            continue
-                        if poor_quality_for_cycle:
+                        if quote_dead_for_cycle or spread_dead_for_cycle or poor_quality_for_cycle:
                             broad_deprioritized_families.append(family)
-                            print(
-                                f"[LIVE-SELECT-BROAD-FAMILY-DEPRIORITIZE] family={family} reason=quoted_but_empty_top_book_cycle_quality "
-                                f"scan_count={family_market_count} both_sides_quoted_count={stats.get('both_sides_quoted', 0)} "
-                                f"non_empty_top_book_count={stats.get('non_empty_top_book', 0)} "
-                                f"prefilter_survivors={stats.get('prefilter_survivors', 0)} final_candidates=0"
-                            )
+                            if poor_quality_for_cycle:
+                                print(
+                                    f"[LIVE-SELECT-BROAD-FAMILY-DEPRIORITIZE] family={family} reason=quoted_but_empty_top_book_cycle_quality "
+                                    f"scan_count={family_market_count} both_sides_quoted_count={stats.get('both_sides_quoted', 0)} "
+                                    f"non_empty_top_book_count={stats.get('non_empty_top_book', 0)} "
+                                    f"prefilter_survivors={stats.get('prefilter_survivors', 0)} final_candidates=0"
+                                )
                         else:
                             broad_retained_families.append(family)
                     broad_family_priority = broad_retained_families + broad_deprioritized_families
                     print(
-                        f"[LIVE-SELECT-BROAD-FAMILY-QUOTE-SUPPRESS-SUMMARY] suppressed_families={broad_quote_suppressed_families} "
+                        f"[LIVE-SELECT-BROAD-FAMILY-QUOTE-PRESSURE-SUMMARY] pressure_families={broad_quote_pressure_families} "
                         f"deprioritized_families={broad_deprioritized_families}"
                     )
                     print(
-                        f"[LIVE-SELECT-BROAD-FAMILY-SPREAD-SUPPRESS-SUMMARY] suppressed_families={broad_spread_suppressed_families} "
+                        f"[LIVE-SELECT-BROAD-FAMILY-SPREAD-PRESSURE-SUMMARY] pressure_families={broad_spread_pressure_families} "
                         f"deprioritized_families={broad_deprioritized_families}"
                     )
                     if broad_deprioritized_families:
@@ -13964,15 +13963,15 @@ def find_best_live_ticker(self, markets=None):
                             reject_reason = "quality_score_not_positive"
                             diagnostic_blockers.append("quality_score_not_positive")
                         if degenerate_state.get("cooldown_active"):
-                            reject_reason = "degenerate_family_cooldown"
-                            diagnostic_blockers.append("degenerate_family_cooldown")
+                            reject_reason = "degenerate_family_pressure"
+                            diagnostic_blockers.append("degenerate_family_pressure")
                         elif degenerate_state.get("recent_rejects", 0) >= int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS):
                             reject_reason = "degenerate_family_penalty"
                             diagnostic_blockers.append("degenerate_family_penalty")
                         if preferred_prefix is None:
                             diagnostic_blockers.append("preferred_prefix_mismatch")
                         soft_admit_reason = None
-                        if reject_reason in {"degenerate_family_cooldown", "degenerate_family_penalty"}:
+                        if reject_reason in {"degenerate_family_pressure", "degenerate_family_penalty"}:
                             print(
                                 "[AION-SCAN-CONTINUE-AFTER-DEGENERATE] "
                                 + json.dumps(
@@ -13981,7 +13980,7 @@ def find_best_live_ticker(self, markets=None):
                                         "reason": reject_reason,
                                         "recent_rejects": degenerate_state.get("recent_rejects", 0),
                                         "cooldown_remaining_seconds": degenerate_state.get("cooldown_remaining_seconds", 0),
-                                        "next_action": "continue_scan",
+                                        "next_action": "scan_with_rank_pressure",
                                     },
                                     sort_keys=True,
                                     default=str,
@@ -13999,7 +13998,7 @@ def find_best_live_ticker(self, markets=None):
                                     f"reason={reject_reason} stage=broad_family_admission"
                                 )
                                 broad_family_rejections.append((family, reject_reason))
-                            continue
+                            soft_admit_reason = reject_reason
                         if family in viable_broad_families:
                             broad_family_admitted_pre_cap.append(family)
                             broad_family_admission_debug[family] = {
@@ -14154,20 +14153,17 @@ def find_best_live_ticker(self, markets=None):
                     and targeted_selected_usable_top_book <= 0
                     and current_cycle_dead_targeted_families
                 )
-                cycle_targeted_dead_book_suppressed_families = list(current_cycle_dead_targeted_families) if promote_broad_over_dead_targeted else []
-                if cycle_targeted_dead_book_suppressed_families:
-                    for family in cycle_targeted_dead_book_suppressed_families:
+                cycle_targeted_dead_book_pressure_families = list(current_cycle_dead_targeted_families) if promote_broad_over_dead_targeted else []
+                if cycle_targeted_dead_book_pressure_families:
+                    for family in cycle_targeted_dead_book_pressure_families:
                         stats = targeted_family_activity.get(family, {})
                         print(
-                            f"[LIVE-SELECT-FAMILY-SUPPRESS] family={family} cycle_id={self._get_phase55_cycle_id()} "
-                            f"suppress_reason=cycle_targeted_dead_book_fallback_promotion action=applied "
+                            f"[LIVE-SELECT-FAMILY-PRESSURE] family={family} cycle_id={self._get_phase55_cycle_id()} "
+                            f"pressure_reason=cycle_targeted_dead_book_fallback_promotion action=rank_pressure_only "
                             f"in_window={stats.get('in_window', 0)} non_empty_top_book={stats.get('non_empty_top_book', 0)} "
                             f"prefilter_survivors={stats.get('prefilter_survivors', 0)}"
                         )
-                expanded_markets = [
-                    market for market in targeted_in_window
-                    if self.get_market_family(market) not in set(cycle_targeted_dead_book_suppressed_families)
-                ]
+                expanded_markets = list(targeted_in_window)
                 added_family_counts = {}
                 seen_expanded_tickers = {
                     str(market.get("ticker", "") or "").strip()
@@ -14186,23 +14182,20 @@ def find_best_live_ticker(self, markets=None):
                 print(
                     f"[LIVE-SELECT-QUALITY-EXPANSION] added_family_scan_counts={sorted(added_family_counts.items())}"
                 )
-                if cycle_targeted_dead_book_suppressed_families:
-                    effective_targeted_order = [
-                        family for family in prioritized_in_window
-                        if family not in set(cycle_targeted_dead_book_suppressed_families)
-                    ]
+                if cycle_targeted_dead_book_pressure_families:
+                    effective_targeted_order = list(prioritized_in_window)
                     print(
                         f"[LIVE-SELECT-TARGETED-ROUTING] cycle_id={self._get_phase55_cycle_id()} "
-                        f"suppressed_dead_book_families={cycle_targeted_dead_book_suppressed_families} "
-                        f"suppression_reason=cycle_targeted_dead_book_fallback_promotion "
+                        f"pressure_dead_book_families={cycle_targeted_dead_book_pressure_families} "
+                        f"pressure_reason=cycle_targeted_dead_book_fallback_promotion "
                         f"adapted_order={effective_targeted_order} broad_promoted=yes "
                         f"promoted_broad_families={sorted(added_family_counts.items())}"
                     )
                 broad_origin_families = set(added_family_counts.keys())
                 markets = expanded_markets
                 selection_merge_source = (
-                    "targeted_plus_broad_dead_targeted_suppressed"
-                    if cycle_targeted_dead_book_suppressed_families
+                    "targeted_plus_broad_dead_targeted_pressure"
+                    if cycle_targeted_dead_book_pressure_families
                     else "targeted_plus_broad"
                 )
                 targeted_selection_count = len(expanded_markets) - sum(added_family_counts.values())
@@ -14783,7 +14776,7 @@ def find_best_live_ticker(self, markets=None):
         if universe_health_state.get("cooldown_active") or universe_health_state.get("suppressed"):
             skip_reasons.append(str(universe_health_state.get("suppress_reason") or "universe_health_suppressed"))
             print(
-                "[AION-UNIVERSE-BLOCK] "
+                "[AION-UNIVERSE-PRESSURE] "
                 + json.dumps(
                     {
                         "family": family,
@@ -14796,17 +14789,16 @@ def find_best_live_ticker(self, markets=None):
                         "malformed_book_rate": universe_health_state.get("malformed_book_rate", 0.0),
                         "cooldown_active": bool(universe_health_state.get("cooldown_active")),
                         "cooldown_remaining_seconds": universe_health_state.get("cooldown_remaining_seconds", 0),
-                        "next_action": "continue_scan",
+                        "next_action": "scan_with_rank_pressure",
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
-            return True, skip_reasons
         degenerate_state = self._get_degenerate_family_penalty_state(family)
         missing_spread_state = self._get_missing_spread_family_penalty_state(family)
         if degenerate_state.get("cooldown_active"):
-            skip_reasons.append("degenerate_family_cooldown")
+            skip_reasons.append("degenerate_family_pressure")
         elif degenerate_state.get("recent_rejects", 0) >= int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS):
             skip_reasons.append("degenerate_family_penalty")
         if skip_reasons and any(reason.startswith("degenerate_family") for reason in skip_reasons):
@@ -14818,15 +14810,14 @@ def find_best_live_ticker(self, markets=None):
                         "reason": skip_reasons[0],
                         "recent_rejects": degenerate_state.get("recent_rejects", 0),
                         "cooldown_remaining_seconds": degenerate_state.get("cooldown_remaining_seconds", 0),
-                        "next_action": "continue_scan",
+                        "next_action": "scan_with_rank_pressure",
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
-            return True, skip_reasons
         if missing_spread_state.get("cooldown_active"):
-            skip_reasons.append("missing_spread_family_cooldown")
+            skip_reasons.append("missing_spread_family_pressure")
         elif missing_spread_state.get("recent_rejects", 0) >= int(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS):
             skip_reasons.append("missing_spread_family_penalty")
         if skip_reasons and any(reason.startswith("missing_spread_family") for reason in skip_reasons):
@@ -14838,13 +14829,12 @@ def find_best_live_ticker(self, markets=None):
                         "reason": skip_reasons[0],
                         "recent_rejects": missing_spread_state.get("recent_rejects", 0),
                         "cooldown_remaining_seconds": missing_spread_state.get("cooldown_remaining_seconds", 0),
-                        "next_action": "continue_scan",
+                        "next_action": "scan_with_rank_pressure",
                     },
                     sort_keys=True,
                     default=str,
                 )
             )
-            return True, skip_reasons
         if stats.get("missing_quotes_rate", 0.0) >= FAMILY_MAX_MISSING_QUOTES_RATE:
             skip_reasons.append("missing_quotes_rate")
         if stats.get("wide_spread_rate", 0.0) >= FAMILY_MAX_WIDE_SPREAD_RATE:
@@ -14884,7 +14874,7 @@ def find_best_live_ticker(self, markets=None):
                         f"reason={soft_reason}"
                     )
                 return False, skip_reasons
-        return bool(skip_reasons), skip_reasons
+        return False, skip_reasons
 
     for phase_name, family_order in (("preferred", preferred_order), ("fallback", fallback_order)):
         if phase_name == "fallback" and preferred_pass_survivors > 0 and not expand_to_additional_families:
@@ -15041,13 +15031,12 @@ def find_best_live_ticker(self, markets=None):
                                 else "degenerate_family_penalty",
                                 "recent_rejects": family_scan_state.get("recent_rejects", 0),
                                 "cooldown_remaining_seconds": family_scan_state.get("cooldown_remaining_seconds", 0),
-                                "next_action": "continue_scan",
+                                "next_action": "scan_with_rank_pressure",
                             },
                             sort_keys=True,
                             default=str,
                         )
                     )
-                    break
                 ticker = str(market.get("ticker", "") or "").strip()
                 family = self.get_market_family(market)
                 raw_orderbook_payload = False
@@ -15768,9 +15757,9 @@ def find_best_live_ticker(self, markets=None):
             f"components={prescore['components']}"
         )
 
-    family_suppression_cycle_id = self._get_phase55_cycle_id()
-    missing_quote_suppressed_families = []
-    family_suppression_skipped_by_family = {}
+    family_pressure_cycle_id = self._get_phase55_cycle_id()
+    missing_quote_pressure_families = []
+    family_pressure_skipped_by_family = {}
     for family, fetched_count in sorted(family_scanned_counts.items()):
         if fetched_count <= 0:
             continue
@@ -15784,29 +15773,23 @@ def find_best_live_ticker(self, markets=None):
             if reject_family == family
         )
         if prefilter_survivors > 0:
-            family_suppression_skipped_by_family[family] = prefilter_survivors
+            family_pressure_skipped_by_family[family] = prefilter_survivors
             print(
-                f"[LIVE-SELECT-FAMILY-SUPPRESS] family={family} cycle_id={family_suppression_cycle_id} "
-                f"suppress_reason=cycle_missing_quote_family action=skipped_due_to_prefilter_survivor fetched_in_cycle={fetched_count} "
+                f"[LIVE-SELECT-FAMILY-PRESSURE] family={family} cycle_id={family_pressure_cycle_id} "
+                f"pressure_reason=cycle_missing_quote_family action=rank_pressure_only fetched_in_cycle={fetched_count} "
                 f"missing_quotes_in_cycle={missing_quotes_in_cycle} "
                 f"prefilter_survivors_in_cycle={prefilter_survivors}"
             )
             continue
         if missing_quotes_in_cycle <= 0 or total_rejects_for_family != missing_quotes_in_cycle:
             continue
-        missing_quote_suppressed_families.append(family)
+        missing_quote_pressure_families.append(family)
         print(
-            f"[LIVE-SELECT-FAMILY-SUPPRESS] family={family} cycle_id={family_suppression_cycle_id} "
-            f"suppress_reason=cycle_missing_quote_family action=applied fetched_in_cycle={fetched_count} "
+            f"[LIVE-SELECT-FAMILY-PRESSURE] family={family} cycle_id={family_pressure_cycle_id} "
+            f"pressure_reason=cycle_missing_quote_family action=rank_pressure_only fetched_in_cycle={fetched_count} "
             f"missing_quotes_in_cycle={missing_quotes_in_cycle} "
             f"prefilter_survivors_in_cycle={prefilter_survivors}"
         )
-    if missing_quote_suppressed_families:
-        family_adaptive_probe_pool = [
-            (prescore, market)
-            for prescore, market in family_adaptive_probe_pool
-            if prescore.get("family") not in set(missing_quote_suppressed_families)
-        ]
 
     candidates = []
     final_family_counts = {}
@@ -15861,8 +15844,8 @@ def find_best_live_ticker(self, markets=None):
         if family in broad_origin_families
     )
     strict_pool_initial_count = len(strict_pool)
-    strict_pool_after_family_suppression_count = strict_pool_initial_count
-    strict_pool_removed_by_family_suppression = 0
+    strict_pool_after_family_pressure_count = strict_pool_initial_count
+    strict_pool_removed_by_family_pressure = 0
     strict_pool_removed_by_prestrict = 0
     shadow_entry_timing_stats = {
         "shadow_candidates_seen": 0,
@@ -15976,11 +15959,11 @@ def find_best_live_ticker(self, markets=None):
         family = prescore.get("family")
         if family:
             strict_pool_initial_family_counts[family] = strict_pool_initial_family_counts.get(family, 0) + 1
-    family_suppression_stats = {}
+    family_pressure_stats = {}
     for prescore, market in strict_pool:
         family = prescore["family"]
         is_family_probe = bool(prescore.get("adaptive_probe"))
-        family_stats = family_suppression_stats.setdefault(
+        family_stats = family_pressure_stats.setdefault(
             family,
             {
                 "candidate_count": 0,
@@ -16054,65 +16037,42 @@ def find_best_live_ticker(self, markets=None):
                 family_stats["zero_book_rejects"] += 1
         if dead_book_reason is not None:
             family_stats["dead_book_rejects"] += 1
-    suppressed_families = sorted(
+    dead_book_candidate_pressure_families = sorted(
         family
-        for family, stats in family_suppression_stats.items()
+        for family, stats in family_pressure_stats.items()
         if stats.get("candidate_count", 0) > 0
         and stats.get("candidate_count", 0) == stats.get("dead_book_rejects", 0)
         and stats.get("positive_top_size_candidates", 0) <= 0
     )
-    refined_suppressed_families = []
-    for family in suppressed_families:
-        stats = family_suppression_stats.get(family, {})
+    refined_dead_book_pressure_families = []
+    for family in dead_book_candidate_pressure_families:
+        stats = family_pressure_stats.get(family, {})
         prefilter_survivors = prefilter_survivor_family_counts.get(family, 0)
         if prefilter_survivors > 0:
-            family_suppression_skipped_by_family[family] = prefilter_survivors
+            family_pressure_skipped_by_family[family] = prefilter_survivors
             print(
-                f"[LIVE-SELECT-FAMILY-SUPPRESS] family={family} cycle_id={family_suppression_cycle_id} "
-                f"suppress_reason=cycle_dead_book_family action=skipped_due_to_prefilter_survivor dead_book_rejects_in_cycle={stats.get('dead_book_rejects', 0)} "
+                f"[LIVE-SELECT-FAMILY-PRESSURE] family={family} cycle_id={family_pressure_cycle_id} "
+                f"pressure_reason=cycle_dead_book_family action=rank_pressure_only dead_book_rejects_in_cycle={stats.get('dead_book_rejects', 0)} "
                 f"missing_size_rejects_in_cycle={stats.get('missing_size_rejects', 0)} "
                 f"zero_book_rejects_in_cycle={stats.get('zero_book_rejects', 0)} "
                 f"positive_top_size_candidates_in_cycle={stats.get('positive_top_size_candidates', 0)}"
             )
             continue
-        refined_suppressed_families.append(family)
+        refined_dead_book_pressure_families.append(family)
         print(
-            f"[LIVE-SELECT-FAMILY-SUPPRESS] family={family} cycle_id={family_suppression_cycle_id} "
-            f"suppress_reason=cycle_dead_book_family action=applied dead_book_rejects_in_cycle={stats.get('dead_book_rejects', 0)} "
+            f"[LIVE-SELECT-FAMILY-PRESSURE] family={family} cycle_id={family_pressure_cycle_id} "
+            f"pressure_reason=cycle_dead_book_family action=rank_pressure_only dead_book_rejects_in_cycle={stats.get('dead_book_rejects', 0)} "
             f"missing_size_rejects_in_cycle={stats.get('missing_size_rejects', 0)} "
             f"zero_book_rejects_in_cycle={stats.get('zero_book_rejects', 0)} "
             f"positive_top_size_candidates_in_cycle={stats.get('positive_top_size_candidates', 0)}"
         )
-    suppressed_families = refined_suppressed_families
-    if suppressed_families:
-        for family in suppressed_families:
-            dropped_count = strict_pool_initial_family_counts.get(family, 0)
-            if dropped_count > 0:
-                print(
-                    f"[LIVE-SELECT-STRICT-DROP] family={family} count={dropped_count} "
-                    f"reason=cycle_dead_book_family_suppressed gate=family_suppression"
-                )
-        rebuilt_strict_pool = []
-        seen_rebuilt_tickers = set()
-        for prescore, market in list(strict_pool) + list(strict_pool_overflow):
-            ticker = str(market.get("ticker", "") or "").strip()
-            family = prescore.get("family")
-            if family in suppressed_families:
-                continue
-            if ticker and ticker in seen_rebuilt_tickers:
-                continue
-            if ticker:
-                seen_rebuilt_tickers.add(ticker)
-            rebuilt_strict_pool.append((prescore, market))
-            if len(rebuilt_strict_pool) >= strict_pool_target_count:
-                break
-        strict_pool = rebuilt_strict_pool
-    strict_pool_after_family_suppression_count = len(strict_pool)
-    strict_pool_removed_by_family_suppression = max(0, strict_pool_initial_count - strict_pool_after_family_suppression_count)
+    dead_book_pressure_families = list(refined_dead_book_pressure_families)
+    strict_pool_after_family_pressure_count = len(strict_pool)
+    strict_pool_removed_by_family_pressure = max(0, strict_pool_initial_count - strict_pool_after_family_pressure_count)
     print(
-        f"[LIVE-SELECT-STRICT-POOL-ASSEMBLY] strict_pool_size={strict_pool_after_family_suppression_count} "
+        f"[LIVE-SELECT-STRICT-POOL-ASSEMBLY] strict_pool_size={strict_pool_after_family_pressure_count} "
         f"families_represented={sorted({prescore.get('family') for prescore, _market in strict_pool if prescore.get('family')})} "
-        f"all_prefilter_survivors_removed_before_pool={'yes' if prefilter_survivors_total > 0 and strict_pool_after_family_suppression_count == 0 else 'no'}"
+        f"all_prefilter_survivors_removed_before_pool={'yes' if prefilter_survivors_total > 0 and strict_pool_after_family_pressure_count == 0 else 'no'}"
     )
     if market_sanity_build_market_sanity_summary is not None:
         layer1_sanity_summary = market_sanity_build_market_sanity_summary(len(strict_pool))
@@ -16179,19 +16139,19 @@ def find_best_live_ticker(self, markets=None):
     rejected_by_family_counts = sorted(
         (
             (family, stats.get("dead_book_rejects", 0))
-            for family, stats in family_suppression_stats.items()
+            for family, stats in family_pressure_stats.items()
             if stats.get("dead_book_rejects", 0) > 0
         ),
         key=lambda item: item[1],
         reverse=True,
     )
-    all_suppressed_families = sorted(set(suppressed_families).union(set(missing_quote_suppressed_families)))
+    all_pressure_families = sorted(set(dead_book_pressure_families).union(set(missing_quote_pressure_families)))
     print(
-        f"[LIVE-SELECT-FAMILY-SUPPRESS-SUMMARY] suppressed_families={all_suppressed_families} "
-        f"suppressed_count={len(all_suppressed_families)} rejected_by_family={rejected_by_family_counts} "
-        f"missing_quote_suppressed_families={missing_quote_suppressed_families} "
-        f"skipped_due_to_prefilter_survivor={sorted(family_suppression_skipped_by_family.items(), key=lambda item: item[1], reverse=True)} "
-        f"skipped_by_family={sorted(family_suppression_skipped_by_family.items(), key=lambda item: item[1], reverse=True)} "
+        f"[LIVE-SELECT-FAMILY-PRESSURE-SUMMARY] pressure_families={all_pressure_families} "
+        f"pressure_count={len(all_pressure_families)} rejected_by_family={rejected_by_family_counts} "
+        f"missing_quote_pressure_families={missing_quote_pressure_families} "
+        f"skipped_due_to_prefilter_survivor={sorted(family_pressure_skipped_by_family.items(), key=lambda item: item[1], reverse=True)} "
+        f"skipped_by_family={sorted(family_pressure_skipped_by_family.items(), key=lambda item: item[1], reverse=True)} "
         f"surviving_family_counts={sorted(surviving_family_counts.items(), key=lambda item: item[1], reverse=True)}"
     )
     strict_pool_tickers = {
@@ -16216,10 +16176,10 @@ def find_best_live_ticker(self, markets=None):
         included_in_strict_pool = ticker in strict_pool_tickers
         exclusion_reason = None
         if not included_in_strict_pool:
-            if family in missing_quote_suppressed_families:
-                exclusion_reason = "cycle_missing_quote_family_suppressed"
-            elif family in suppressed_families:
-                exclusion_reason = "cycle_dead_book_family_suppressed"
+            if family in missing_quote_pressure_families:
+                exclusion_reason = "cycle_missing_quote_family_pressure"
+            elif family in dead_book_pressure_families:
+                exclusion_reason = "cycle_dead_book_family_pressure"
             elif index >= effective_strict_validation_pool_cap:
                 exclusion_reason = "strict_pool_cap_not_backfilled"
             else:
@@ -16368,7 +16328,7 @@ def find_best_live_ticker(self, markets=None):
             f"reason={reject_reason}"
         )
     strict_pool = filtered_strict_pool
-    strict_pool_removed_by_prestrict = max(0, strict_pool_after_family_suppression_count - len(strict_pool))
+    strict_pool_removed_by_prestrict = max(0, strict_pool_after_family_pressure_count - len(strict_pool))
     print(
         f"[LIVE-SELECT-PRESTRICT-REJECT-SUMMARY] total_removed={prestrict_reject_summary['total_removed']} "
         f"removed_zero_zero={prestrict_reject_summary['removed_zero_zero']} "
@@ -16826,9 +16786,9 @@ def find_best_live_ticker(self, markets=None):
         f"targeted_prefilter_survivors={targeted_prefilter_survivors_total_handoff} "
         f"broad_prefilter_survivors={broad_prefilter_survivors_total_handoff} "
         f"candidates_entering_strict_validation={len(strict_pool)} "
-        f"source_breakdown={{'strict_pool_initial': {strict_pool_initial_count}, 'strict_pool_post_family_suppression': {strict_pool_after_family_suppression_count}, 'strict_pool_post_prestrict': {len(strict_pool)}}} "
+        f"source_breakdown={{'strict_pool_initial': {strict_pool_initial_count}, 'strict_pool_post_family_pressure': {strict_pool_after_family_pressure_count}, 'strict_pool_post_prestrict': {len(strict_pool)}}} "
         f"removed_between={'yes' if strict_pool_initial_count != len(strict_pool) else 'no'} "
-        f"removed_by_family_suppression={strict_pool_removed_by_family_suppression} "
+        f"removed_by_family_pressure={strict_pool_removed_by_family_pressure} "
         f"removed_by_prestrict={strict_pool_removed_by_prestrict}"
     )
     print(f"[LIVE-SELECT-DEBUG] entering_strict_validation={len(strict_pool)} source=strict_pool_post_prestrict")
@@ -17188,20 +17148,10 @@ def find_best_live_ticker(self, markets=None):
             or getattr(fast_q, "selected_side", None)
             or getattr(fast_q, "side", None)
         )
-        fast_btc_direction_decision = {}
-        if fast_family == "KXBTC15M":
-            fast_btc_direction_decision = self._resolve_btc15m_live_direction_decision(
-                fast_market,
-                fast_q,
-                fast_family,
-                entry_timing_observation={"phase55_status": "entry_ready", "entry_ready_reason": "fast_executable_strict_candidate"},
-            )
-            if fast_btc_direction_decision.get("intended_side") in {"yes", "no"}:
-                fast_side = fast_btc_direction_decision.get("intended_side")
         fast_side_selection = self._aion_select_bidirectional_side(
             ticker=getattr(fast_q, "ticker", None) or fast_market.get("ticker"),
             family=fast_family,
-            lane="CRYPTO_LADDER" if self._is_crypto_ladder_market(family=fast_family, ticker=getattr(fast_q, "ticker", None), market=fast_market, q=fast_q) else "SPORTS" if self._is_sports_market_or_family(fast_family) else None,
+            lane="SPORTS" if self._is_sports_market_or_family(fast_family) else None,
             market=fast_market,
             q=fast_q,
             quote_diag=fast_quote_diag,
@@ -17865,15 +17815,15 @@ def find_best_live_ticker(self, markets=None):
         and (
             targeted_non_empty_top_book_total <= 0
             or targeted_prefilter_survivors_total <= 0
-            or bool(targeted_priority_adaptation.get("suppressed_families"))
+            or bool(targeted_priority_adaptation.get("pressure_families"))
         )
     )
     if targeted_non_empty_top_book_total <= 0:
         promotion_reason = "targeted_zero_non_empty_top_book"
     elif targeted_prefilter_survivors_total <= 0:
         promotion_reason = "targeted_zero_prefilter_survivors"
-    elif targeted_priority_adaptation.get("suppressed_families"):
-        promotion_reason = "targeted_dead_book_family_suppressed"
+    elif targeted_priority_adaptation.get("pressure_families"):
+        promotion_reason = "targeted_dead_book_family_pressure"
     else:
         promotion_reason = "none"
     print(
@@ -17886,18 +17836,15 @@ def find_best_live_ticker(self, markets=None):
         f"broad_survivor_families={broad_prefilter_survivor_families} "
         f"selection_source={selection_merge_source}"
     )
-    effective_cycle_suppressed_families = sorted(
-        set(targeted_priority_adaptation.get('suppressed_families', [])).union(
-            set(cycle_targeted_dead_book_suppressed_families)
+    effective_cycle_pressure_families = sorted(
+        set(targeted_priority_adaptation.get('pressure_families', [])).union(
+            set(cycle_targeted_dead_book_pressure_families)
         )
     )
-    effective_adapted_order = [
-        family for family in targeted_priority_adaptation.get('adapted_order', targeted_cycle_order)
-        if family not in set(cycle_targeted_dead_book_suppressed_families)
-    ]
+    effective_adapted_order = list(targeted_priority_adaptation.get('adapted_order', targeted_cycle_order))
     print(
         f"[LIVE-SELECT-TARGETED-ADAPT] hour_utc={current_hour_utc} "
-        f"suppressed_dead_book_families={effective_cycle_suppressed_families} "
+        f"pressure_dead_book_families={effective_cycle_pressure_families} "
         f"deprioritized_dead_book_families={targeted_priority_adaptation.get('deprioritized_families', [])} "
         f"adapted_order={effective_adapted_order} "
         f"promoted_viable_broad_families={'yes' if promoted_viable_broad_families else 'no'} "
@@ -18046,7 +17993,6 @@ def find_best_live_ticker(self, markets=None):
         ranked,
         prefilter_survivor_family_counts,
     )
-    ranked = self._apply_btc15m_contract_rotation(ranked, markets)
     ranked = self._apply_execution_diversity_bonus(ranked, markets)
     ranked = self._filter_unexecutable_price_ranked_candidates(
         ranked,
@@ -20246,19 +20192,6 @@ def find_best_live_ticker(self, markets=None):
                 f"capital_state={entry_timing_observation.get('capital_state')} "
                 f"capital_blocked={'yes' if entry_timing_observation.get('capital_execution_blocked') else 'no'}"
             )
-        if family == "KXBTC15M" and decision == "BUY":
-            direction_decision = self._resolve_btc15m_live_direction_decision(
-                market,
-                q,
-                family,
-                entry_timing_observation=entry_timing_observation,
-            )
-            self.live_direction_decisions_by_ticker[q.ticker] = direction_decision
-            if direction_decision.get("intended_side") not in ("yes", "no"):
-                decision_skip_count += 1
-                decision_skip_family_counts[family] = decision_skip_family_counts.get(family, 0) + 1
-                decision_skip_reasons["btc15m_direction_skip"] = decision_skip_reasons.get("btc15m_direction_skip", 0) + 1
-                continue
         # AION SHADOW TRADE TRACKING HOOK
         positive_edge_after_cost = self.to_float(expectancy_summary.get("sports_edge_after_cost"), 0.0)
         if AION_SHADOW_TRADE_TRACKING_ENABLED and (
@@ -22491,11 +22424,11 @@ def _rank_selector_families(self, family_markets, max_minutes_to_event=None):
         if degenerate_family_state.get("recent_rejects", 0) > 0:
             quality_reasons.append("degenerate_family_pressure")
         if degenerate_family_state.get("cooldown_active"):
-            quality_reasons.append("degenerate_family_cooldown")
+            quality_reasons.append("degenerate_family_pressure")
         if missing_spread_family_state.get("recent_rejects", 0) > 0:
             quality_reasons.append("missing_spread_family_pressure")
         if missing_spread_family_state.get("cooldown_active"):
-            quality_reasons.append("missing_spread_family_cooldown")
+            quality_reasons.append("missing_spread_family_pressure")
         if spread_quality_score > 0:
             quality_reasons.append("promote_narrow_spread")
         elif wide_spread_rate > 0.4:
@@ -22561,18 +22494,18 @@ def _rank_selector_families(self, family_markets, max_minutes_to_event=None):
             "family_suppressed": family_suppressed,
             "family_cooldown_active": family_cooldown_active,
             "degenerate_family_recent_rejects": degenerate_family_state.get("recent_rejects", 0),
-            "degenerate_family_cooldown_active": bool(degenerate_family_state.get("cooldown_active")),
-            "degenerate_family_cooldown_remaining_seconds": degenerate_family_state.get("cooldown_remaining_seconds", 0),
+            "degenerate_family_pressure_active": bool(degenerate_family_state.get("cooldown_active")),
+            "degenerate_family_pressure_remaining_seconds": degenerate_family_state.get("cooldown_remaining_seconds", 0),
             "degenerate_family_penalty": round(float(degenerate_family_state.get("penalty", 0.0) or 0.0), 4),
             "missing_spread_family_recent_rejects": missing_spread_family_state.get("recent_rejects", 0),
-            "missing_spread_family_cooldown_active": bool(missing_spread_family_state.get("cooldown_active")),
-            "missing_spread_family_cooldown_remaining_seconds": missing_spread_family_state.get("cooldown_remaining_seconds", 0),
+            "missing_spread_family_pressure_active": bool(missing_spread_family_state.get("cooldown_active")),
+            "missing_spread_family_pressure_remaining_seconds": missing_spread_family_state.get("cooldown_remaining_seconds", 0),
             "missing_spread_family_penalty": round(float(missing_spread_family_state.get("penalty", 0.0) or 0.0), 4),
             "universe_health_score": round(universe_health_score, 4),
             "universe_health_adjustment": round(universe_health_adjustment, 4),
             "universe_health_penalty": round(universe_health_penalty, 4),
-            "universe_health_cooldown_active": bool(universe_health_state.get("cooldown_active")),
-            "universe_health_cooldown_remaining_seconds": universe_health_state.get("cooldown_remaining_seconds", 0),
+            "universe_health_pressure_active": bool(universe_health_state.get("cooldown_active")),
+            "universe_health_pressure_remaining_seconds": universe_health_state.get("cooldown_remaining_seconds", 0),
             "universe_health_suppressed": bool(universe_health_state.get("suppressed")),
             "universe_health_suppress_reason": universe_health_state.get("suppress_reason"),
             "usable_orderbook_rate": universe_health_state.get("usable_orderbook_rate", 0.0),

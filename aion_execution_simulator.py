@@ -20,9 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from types import SimpleNamespace
 
 from aion_telemetry import emit_compact_event, emit_event, emit_error_event, emit_once_per_key, emit_rate_limited, emit_state_transition, emit_summary_counter, flush_cycle_summary, redact_sensitive_fields, telemetry_print as print
-from aion_family_profit_engine import compute_family_heatmap, summarize_family_promotion
-from aion_live_promotion_policy import get_family_live_policy, load_latest_family_promotion_policy
-from family_diversity_controller import discover_enabled_categories, discover_enabled_families, select_diverse_market_batch
 from runtime.paths import ensure_runtime_layout, safe_atomic_json_write
 
 from kalshi_web import (
@@ -762,6 +759,15 @@ def _candidate_family_key(candidate: Dict[str, Any]) -> str:
     if ticker:
         return ticker.split("-")[0]
     return "UNKNOWN"
+
+
+def _candidate_category_key(candidate: Dict[str, Any]) -> str:
+    return str(
+        candidate.get("category")
+        or candidate.get("market_type")
+        or candidate.get("market_kind")
+        or "unknown"
+    ).strip().lower() or "unknown"
 
 
 def _extract_candidate_record(tag: str, payload: Dict[str, Any], *, source: str) -> Optional[Dict[str, Any]]:
@@ -2127,8 +2133,8 @@ def run_profit_discovery(*, batches: int = 25, sample_size: int = 30, random_rea
     family_seen_counts: Dict[str, int] = {}
     family_discovery_mode = bool(family_discovery_mode or force_family_diversity)
     market_universe = _discover_open_market_universe(bot, limit=max(800, sample_count * 16), force_family_diversity=family_discovery_mode) if family_discovery_mode else []
-    discovered_families = discover_enabled_families(market_universe) if family_discovery_mode else []
-    discovered_categories = discover_enabled_categories(market_universe) if family_discovery_mode else []
+    discovered_families = sorted({_candidate_family_key(market) for market in market_universe}) if family_discovery_mode else []
+    discovered_categories = sorted({_candidate_category_key(market) for market in market_universe}) if family_discovery_mode else []
     diversity_issue_reason = None
     if family_discovery_mode:
         if not market_universe:
@@ -2193,15 +2199,12 @@ def run_profit_discovery(*, batches: int = 25, sample_size: int = 30, random_rea
         category_seen_counts: Dict[str, int] = {}
         for batch_index in range(1, batch_count + 1):
             if family_discovery_mode:
-                batch_markets, family_rotation = select_diverse_market_batch(
-                    market_universe,
-                    sample_size=sample_count,
-                    family_seen_counts=family_seen_counts,
-                    category_seen_counts=category_seen_counts,
-                    max_family_share=0.15,
-                    min_distinct_families=8,
-                    min_distinct_categories=3,
-                )
+                batch_markets = random.sample(market_universe, min(sample_count, len(market_universe))) if market_universe else []
+                family_rotation = {
+                    "selected_family_counts": dict(Counter(_candidate_family_key(market) for market in batch_markets)),
+                    "selected_category_counts": dict(Counter(_candidate_category_key(market) for market in batch_markets)),
+                    "reason": "simulator_inline_random_sample",
+                }
                 for fam, count in (family_rotation.get("selected_family_counts") or {}).items():
                     family_seen_counts[fam] = int(family_seen_counts.get(fam, 0) + int(count or 0))
                 for category, count in (family_rotation.get("selected_category_counts") or {}).items():
@@ -2430,9 +2433,29 @@ def run_profit_discovery(*, batches: int = 25, sample_size: int = 30, random_rea
                     )
                 )
     summary, family_rankings, rule_profitability = _aggregate_profit_batches(rows)
-    family_heatmap = compute_family_heatmap(rows)
+    profitable_families = [
+        str(row.get("family") or "UNKNOWN")
+        for row in family_rankings
+        if float(row.get("avg_expected_value") or 0.0) > 0.0
+    ]
+    dangerous_families = [
+        str(row.get("family") or "UNKNOWN")
+        for row in reversed(family_rankings)
+        if float(row.get("avg_expected_value") or 0.0) < 0.0 or int(row.get("hard_block_count") or 0) > 0
+    ]
+    family_heatmap = {
+        "families": family_rankings,
+        "best_families": [str(row.get("family") or "UNKNOWN") for row in family_rankings[:10]],
+        "worst_families": [str(row.get("family") or "UNKNOWN") for row in list(reversed(family_rankings))[:10]],
+        "profitable_families": profitable_families[:25],
+        "dangerous_families": dangerous_families[:25],
+    }
     family_heatmap["generated_at"] = _now_iso()
-    family_heatmap["live_policy"] = summarize_family_promotion(family_heatmap)
+    family_heatmap["live_policy"] = {
+        "source": "simulator_inline_family_summary",
+        "promote_families": profitable_families[:10],
+        "avoid_families": dangerous_families[:10],
+    }
     family_counts = Counter(str(row.get("family") or "UNKNOWN").strip().upper() or "UNKNOWN" for row in rows)
     category_counts = Counter(str(row.get("category") or row.get("market_type") or "unknown").strip().lower() or "unknown" for row in rows)
     top_family_share = round((max(family_counts.values()) / max(1, len(rows))), 4) if family_counts else 0.0

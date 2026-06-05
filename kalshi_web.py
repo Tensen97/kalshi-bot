@@ -337,10 +337,6 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-NO-EDGE",
     "AION-NO-SIDE-AUDIT",
     "AION-NO-SIDE-ALLOW",
-    "AION-NO-SIDE-BLOCK",
-    "AION-LOSS-BUCKET-BLOCK",
-    "AION-FAMILY-BLOCK",
-    "AION-PRICE-ZONE-BLOCK",
     "AION-BIDIRECTIONAL-RANKING",
     "AION-CONFIDENCE-AUDIT",
     "AION-CONFIDENCE-BLOCK",
@@ -1822,28 +1818,18 @@ ENABLE_NEGATIVE_EDGE_ENTRY_GUARD = True
 ENABLE_STALE_SIGNAL_GUARD = True
 # Defensive retry guard: avoid hammering the same ticker after immediate negative-edge rejection.
 IMMEDIATE_NEGATIVE_EDGE_BLOCK_COOLDOWN_SECONDS = 15
-# Short ticker cooldown when a quote is genuinely too expensive to enter.
-AION_PRICE_RANGE_REJECT_TICKER_COOLDOWN_SECONDS = int(_env_float("AION_PRICE_RANGE_REJECT_TICKER_COOLDOWN_SECONDS", 45))
-# Short ticker cooldown when spread data is truly unavailable.
-AION_MISSING_SPREAD_TICKER_COOLDOWN_SECONDS = int(_env_float("AION_MISSING_SPREAD_TICKER_COOLDOWN_SECONDS", 60))
-# Family-level cooldown when repeated degenerate books keep surfacing.
+# Family pressure when repeated degenerate books keep surfacing.
 KALSHI_DEGENERATE_FAMILY_WINDOW_SECONDS = int(_env_float("KALSHI_DEGENERATE_FAMILY_WINDOW_SECONDS", 900))
 KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS = int(_env_float("KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS", 3))
-KALSHI_DEGENERATE_FAMILY_COOLDOWN_SECONDS = int(_env_float("KALSHI_DEGENERATE_FAMILY_COOLDOWN_SECONDS", 600))
 KALSHI_DEGENERATE_FAMILY_BASE_PENALTY = _env_float("KALSHI_DEGENERATE_FAMILY_BASE_PENALTY", 12.0)
-KALSHI_DEGENERATE_FAMILY_ACTIVE_COOLDOWN_PENALTY = _env_float("KALSHI_DEGENERATE_FAMILY_ACTIVE_COOLDOWN_PENALTY", 35.0)
-# Family-level cooldown when repeated missing-spread books keep surfacing.
+# Family pressure when repeated missing-spread books keep surfacing.
 AION_MISSING_SPREAD_FAMILY_WINDOW_SECONDS = int(_env_float("AION_MISSING_SPREAD_FAMILY_WINDOW_SECONDS", 900))
 AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS = int(_env_float("AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS", 2))
-AION_MISSING_SPREAD_FAMILY_COOLDOWN_SECONDS = int(_env_float("AION_MISSING_SPREAD_FAMILY_COOLDOWN_SECONDS", 600))
 AION_MISSING_SPREAD_FAMILY_BASE_PENALTY = _env_float("AION_MISSING_SPREAD_FAMILY_BASE_PENALTY", 10.0)
-AION_MISSING_SPREAD_FAMILY_ACTIVE_COOLDOWN_PENALTY = _env_float("AION_MISSING_SPREAD_FAMILY_ACTIVE_COOLDOWN_PENALTY", 25.0)
-# Family-level cooldown when repeated near-certain price rejects keep surfacing.
+# Family pressure when repeated near-certain price rejects keep surfacing.
 AION_PRICE_FAMILY_WINDOW_SECONDS = int(_env_float("AION_PRICE_FAMILY_WINDOW_SECONDS", 900))
 AION_PRICE_FAMILY_MIN_REJECTIONS = int(_env_float("AION_PRICE_FAMILY_MIN_REJECTIONS", 2))
-AION_PRICE_FAMILY_COOLDOWN_SECONDS = int(_env_float("AION_PRICE_FAMILY_COOLDOWN_SECONDS", 600))
 AION_PRICE_FAMILY_BASE_PENALTY = _env_float("AION_PRICE_FAMILY_BASE_PENALTY", 10.0)
-AION_PRICE_FAMILY_ACTIVE_COOLDOWN_PENALTY = _env_float("AION_PRICE_FAMILY_ACTIVE_COOLDOWN_PENALTY", 25.0)
 AION_UNIVERSE_HEALTH_WINDOW_SECONDS = int(_env_float("AION_UNIVERSE_HEALTH_WINDOW_SECONDS", 86400))
 AION_UNIVERSE_HEALTH_SUMMARY_SECONDS = int(_env_float("AION_UNIVERSE_HEALTH_SUMMARY_SECONDS", 300))
 AION_UNIVERSE_HEALTH_SUPPRESS_SCAN_THRESHOLD = int(_env_float("AION_UNIVERSE_HEALTH_SUPPRESS_SCAN_THRESHOLD", 20))
@@ -1851,7 +1837,6 @@ AION_UNIVERSE_HEALTH_SUPPRESS_ZERO_ONE_RATE = _env_float("AION_UNIVERSE_HEALTH_S
 AION_UNIVERSE_HEALTH_SUPPRESS_MALFORMED_RATE = _env_float("AION_UNIVERSE_HEALTH_SUPPRESS_MALFORMED_RATE", 0.30)
 AION_UNIVERSE_HEALTH_SUPPRESS_EXECUTABLE_RATE = _env_float("AION_UNIVERSE_HEALTH_SUPPRESS_EXECUTABLE_RATE", 0.05)
 AION_UNIVERSE_HEALTH_SUPPRESS_USABLE_RATE = _env_float("AION_UNIVERSE_HEALTH_SUPPRESS_USABLE_RATE", 0.10)
-AION_UNIVERSE_HEALTH_COOLDOWN_SECONDS = int(_env_float("AION_UNIVERSE_HEALTH_COOLDOWN_SECONDS", 900))
 # Defensive edge threshold: allow normal 1-cent top-of-book entry cost, block worse starts.
 MAX_ACCEPTABLE_IMMEDIATE_EDGE_LOSS = -0.05
 ENTRY_ATTEMPT_TICKER_COOLDOWN_SECONDS = 120
@@ -2664,13 +2649,9 @@ class KalshiSniperBot:
         self.aion_profit_engine_log_markers = {}
         self.dynamic_exit_log_markers = {}
         self.live_degenerate_family_reject_history = {}
-        self.live_degenerate_family_cooldowns = {}
         self.live_missing_spread_family_reject_history = {}
-        self.live_missing_spread_family_cooldowns = {}
         self.live_price_family_reject_history = {}
-        self.live_price_family_cooldowns = {}
         self.family_universe_health_history = {}
-        self.family_universe_health_cooldowns = {}
         self.last_universe_summary_ts = 0.0
         self.last_universe_summary = {}
         self.live_family_runtime_stats = {}
@@ -6918,213 +6899,6 @@ class KalshiSniperBot:
         print("[AION-FINAL-REJECT] " + json.dumps(payload, sort_keys=True, default=str))
         return payload
 
-    def evaluate_loss_bucket_entry_block(
-        self,
-        payload=None,
-        q=None,
-        *,
-        market=None,
-        family=None,
-        ticker=None,
-        side=None,
-        selected_price=None,
-        selected_price_cents=None,
-        candidate_score=None,
-        source=None,
-    ):
-        payload = payload if isinstance(payload, dict) else {}
-        market = market if isinstance(market, dict) else {}
-        action = str(payload.get("action") or DEFAULT_LIVE_ORDER_ACTION or "buy").strip().lower()
-        reduce_only = bool(
-            payload.get("reduce_only")
-            or payload.get("exit_order")
-            or payload.get("exit_reason")
-            or action in {"sell", "exit", "close"}
-        )
-        if reduce_only or action not in {"", "buy"}:
-            return {"ok": True, "blocked": False, "reason": "exit_or_non_buy_allowed"}
-
-        ticker_value = str(
-            ticker
-            or payload.get("ticker")
-            or getattr(q, "ticker", "")
-            or market.get("ticker", "")
-            or ""
-        ).strip()
-        family_value = str(
-            family
-            or payload.get("family")
-            or market.get("series_ticker")
-            or market.get("family")
-            or ""
-        ).strip().upper()
-        if not family_value and ticker_value:
-            try:
-                family_value = str(self.get_market_family(market if market else {"ticker": ticker_value}) or "").strip().upper()
-            except Exception:
-                family_value = ticker_value.split("-")[0].upper()
-        family_value = family_value or "UNKNOWN"
-        side_value = self._aion_normalize_live_side(
-            side
-            or payload.get("selected_side")
-            or payload.get("side")
-            or getattr(q, "selected_side", None)
-            or getattr(q, "side", None)
-            or market.get("selected_side")
-        )
-
-        def _to_cents(value):
-            numeric = self.to_float(value, None)
-            if numeric is None:
-                return None
-            try:
-                if 0.0 < float(numeric) <= 1.0:
-                    return int(round(float(numeric) * 100.0))
-                return int(round(float(numeric)))
-            except Exception:
-                return None
-
-        cents_value = _to_cents(selected_price_cents)
-        if cents_value is None:
-            cents_value = _to_cents(payload.get("selected_price_cents"))
-        if cents_value is None and side_value == "yes":
-            cents_value = _to_cents(payload.get("yes_price"))
-        if cents_value is None and side_value == "no":
-            cents_value = _to_cents(payload.get("no_price"))
-        price_value = self.to_float(
-            selected_price
-            if selected_price is not None
-            else payload.get("selected_price_dollars")
-            if payload.get("selected_price_dollars") is not None
-            else payload.get("selected_price")
-            if payload.get("selected_price") is not None
-            else payload.get("price"),
-            None,
-        )
-        if cents_value is None:
-            cents_value = _to_cents(price_value)
-        if price_value is not None and price_value > 1.0 and price_value <= 99.0:
-            price_value = round(float(price_value) / 100.0, 4)
-        if price_value is None and cents_value is not None:
-            price_value = round(float(cents_value) / 100.0, 4)
-
-        if cents_value is None:
-            price_zone = "unknown"
-        elif cents_value >= 90:
-            price_zone = "90-100"
-        else:
-            lower = max(0, int(cents_value // 10) * 10)
-            price_zone = f"{lower}-{lower + 10}"
-
-        score_value = candidate_score
-        if score_value is None:
-            for container in (payload, market):
-                for key in (
-                    "candidate_score",
-                    "unified_opportunity_score",
-                    "unified_score",
-                    "rank_score",
-                    "score",
-                    "sports_execution_quality_score",
-                    "sports_momentum_score",
-                    "EV",
-                    "edge_after_cost",
-                    "edge",
-                ):
-                    if isinstance(container, dict) and container.get(key) is not None:
-                        score_value = container.get(key)
-                        break
-                if score_value is not None:
-                    break
-        if score_value is None and q is not None:
-            for key in (
-                "candidate_score",
-                "unified_opportunity_score",
-                "unified_score",
-                "rank_score",
-                "score",
-                "sports_execution_quality_score",
-                "sports_momentum_score",
-                "EV",
-                "edge_after_cost",
-                "edge",
-            ):
-                try:
-                    score_value = getattr(q, key, None)
-                except Exception:
-                    score_value = None
-                if score_value is not None:
-                    break
-
-        block_reasons = []
-        specific_tags = []
-        if family_value in {"KXATPCHALLENGERMATCH", "KXITFWMATCH"}:
-            block_reasons.append("family_loss_bucket")
-            specific_tags.append("AION-FAMILY-BLOCK")
-        if side_value == "no":
-            block_reasons.append("no_side_loss_bucket")
-            specific_tags.append("AION-NO-SIDE-BLOCK")
-        if cents_value is not None and 30 <= int(cents_value) < 50:
-            block_reasons.append("entry_price_zone_30_50_loss_bucket")
-            specific_tags.append("AION-PRICE-ZONE-BLOCK")
-
-        if not block_reasons:
-            return {
-                "ok": True,
-                "blocked": False,
-                "reason": "loss_bucket_clear",
-                "ticker": ticker_value or None,
-                "family": family_value,
-                "side": side_value,
-                "selected_price": price_value,
-                "selected_price_cents": cents_value,
-                "price_zone": price_zone,
-            }
-
-        primary_reason = block_reasons[0]
-        log_payload = {
-            "ticker": ticker_value or None,
-            "family": family_value,
-            "side": side_value,
-            "selected_price": price_value,
-            "selected_price_cents": cents_value,
-            "price_zone": price_zone,
-            "candidate_score": score_value,
-            "block_reason": primary_reason,
-            "block_reasons": block_reasons,
-            "action": action or "buy",
-            "reduce_only": False,
-            "source": source or "loss_bucket_entry_block",
-            "responsible_subsystem": "loss_bucket_entry_block",
-        }
-        for tag in ["AION-LOSS-BUCKET-BLOCK", *specific_tags]:
-            try:
-                tag_payload = dict(log_payload)
-                if tag == "AION-FAMILY-BLOCK":
-                    tag_payload["block_reason"] = "family_loss_bucket"
-                elif tag == "AION-NO-SIDE-BLOCK":
-                    tag_payload["block_reason"] = "no_side_loss_bucket"
-                elif tag == "AION-PRICE-ZONE-BLOCK":
-                    tag_payload["block_reason"] = "entry_price_zone_30_50_loss_bucket"
-                print(f"[{tag}] " + json.dumps(tag_payload, sort_keys=True, default=str))
-            except Exception:
-                pass
-        try:
-            self._emit_aion_final_reject(
-                ticker=ticker_value,
-                family=family_value,
-                side=side_value,
-                selected_price=price_value,
-                spread=payload.get("spread") or market.get("spread"),
-                liquidity=payload.get("liquidity") or payload.get("liquidity_depth") or market.get("liquidity"),
-                volume=payload.get("volume") or market.get("volume"),
-                exact_rejection_reason="loss_bucket_block:" + "|".join(block_reasons),
-                subsystem="loss_bucket_entry_block",
-            )
-        except Exception:
-            pass
-        return dict(log_payload, ok=False, blocked=True, reason=primary_reason)
-
     def _record_live_reject_telemetry(self, *, reason, ticker=None, family=None, spread=None, stage=None, category=None, details=None, subsystem=None):
         self._record_execution_failure_audit(reason=reason, stage=stage, category=category)
         collector = getattr(self, "live_reject_telemetry", None)
@@ -9313,7 +9087,7 @@ class KalshiSniperBot:
             try:
                 print("[AION-BIDIRECTIONAL-RANKING] " + json.dumps(payload, sort_keys=True, default=str))
                 print("[AION-NO-SIDE-AUDIT] " + json.dumps(no_payload, sort_keys=True, default=str))
-                print(("[AION-NO-SIDE-ALLOW] " if no_eligible else "[AION-NO-SIDE-BLOCK] ") + json.dumps(no_payload, sort_keys=True, default=str))
+                print(("[AION-NO-SIDE-ALLOW] " if no_eligible else "[AION-NO-SIDE-NOT-SELECTED] ") + json.dumps(no_payload, sort_keys=True, default=str))
             except Exception:
                 pass
         if emit_log:
@@ -22976,117 +22750,6 @@ class KalshiSniperBot:
         print("[AION-FINAL-BLOCKER] " + json.dumps(payload, sort_keys=True, default=str))
         return payload
 
-    def _check_phase55_live_execution_gate(
-        self,
-        ticker,
-        family=None,
-        decision=None,
-        override_block_reason=None,
-        canonical_execution_state=None,
-    ):
-        gate_record = self._get_realm_vv_live_execution_gate_record(ticker, stage="realm_vv_gate")
-        canonical_execution_state = canonical_execution_state if isinstance(canonical_execution_state, dict) else {}
-        realm_vv_status = gate_record.get("realm_vv_status")
-        realm_vv_ready = gate_record.get("realm_vv_ready")
-        realm_vv_explicit_approval = gate_record.get("realm_vv_explicit_approval")
-        if canonical_execution_state:
-            realm_vv_status = (
-                canonical_execution_state.get("realm_vv_status")
-                or canonical_execution_state.get("canonical_readiness_state")
-                or canonical_execution_state.get("final_realm_vv_status")
-                or realm_vv_status
-            )
-            if canonical_execution_state.get("realm_vv_ready") is not None:
-                realm_vv_ready = canonical_execution_state.get("realm_vv_ready")
-            elif canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv") is not None:
-                realm_vv_ready = canonical_execution_state.get("canonical_final_submit_allowed_by_realm_vv")
-            if canonical_execution_state.get("realm_vv_explicit_approval") is not None:
-                realm_vv_explicit_approval = canonical_execution_state.get("realm_vv_explicit_approval")
-        effective_family = family or gate_record.get("family") or "UNKNOWN"
-        effective_decision = decision or canonical_execution_state.get("canonical_execution_decision") or gate_record.get("decision") or "unknown"
-        live_mode_active = bool(globals().get("LIVE_MODE", False))
-        live_arm_active = bool(globals().get("LIVE_ARMED", False))
-        service_active = bool(self is not None)
-        canonical_execute_requested = bool(self._canonical_execution_requested(canonical_execution_state))
-        legacy_metadata_reason = None
-        blocked = False
-        reason = "approved"
-        if override_block_reason:
-            override_role = self._classify_aion_execution_blocker(override_block_reason)
-            if canonical_execute_requested and override_role == "obsolete_legacy":
-                legacy_metadata_reason = str(override_block_reason)
-                reason = "approved"
-            else:
-                blocked = True
-                reason = str(override_block_reason)
-        elif realm_vv_status is None or not isinstance(realm_vv_status, str) or not realm_vv_status.strip():
-            if canonical_execute_requested:
-                legacy_metadata_reason = "missing_realm_vv_status"
-            else:
-                blocked = True
-                reason = "missing_realm_vv_status"
-        elif str(realm_vv_status).strip().lower() != "entry_ready":
-            if canonical_execute_requested:
-                legacy_metadata_reason = f"realm_vv_status_{str(realm_vv_status).strip().lower()}"
-            else:
-                blocked = True
-                reason = f"realm_vv_status_{str(realm_vv_status).strip().lower()}"
-        elif realm_vv_ready is not True and realm_vv_explicit_approval is not True:
-            if canonical_execute_requested:
-                legacy_metadata_reason = "realm_vv_explicit_approval_not_true"
-            else:
-                blocked = True
-                reason = "realm_vv_explicit_approval_not_true"
-        compatibility_alias_only = bool(
-            "phase55_status" in gate_record
-            or "entry_timing_pass" in gate_record
-            or "phase55_ready" in gate_record
-        )
-        gate_log_payload = {
-            "ticker": ticker,
-            "family": effective_family,
-            "realm_vv_status": realm_vv_status,
-            "realm_vv_ready": realm_vv_ready,
-            "realm_vv_explicit_approval": realm_vv_explicit_approval,
-            "decision": effective_decision,
-            "botStatus": "LIVE" if service_active and live_mode_active and live_arm_active and not blocked else ("BLOCKED" if blocked else ("WAITING" if live_mode_active else "OFFLINE")),
-            "phase": "realm_vv",
-            "live_mode": live_mode_active,
-            "live_arm": live_arm_active,
-            "service_active": service_active,
-            "entry_ready": bool(not blocked),
-            "block_reason": None if not blocked else reason,
-            "compatibility_alias_only": compatibility_alias_only,
-            "legacy_metadata_reason": legacy_metadata_reason,
-            "canonical_execute_requested": bool(canonical_execute_requested),
-        }
-        print("[AION-REALM-VV-SOLE-AUTHORITY] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
-        if compatibility_alias_only:
-            print("[AION-PHASE55-PURGED] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
-            print("[AION-PHASE55-COMPAT-ONLY] " + json.dumps(gate_log_payload, sort_keys=True, default=str))
-        self._write_seraph_telemetry_status_snapshot(
-            bot_status=gate_log_payload["botStatus"],
-            risk_status="NORMAL",
-            phase="realm_vv",
-            live_mode=live_mode_active,
-            live_arm=live_arm_active,
-            service_active=service_active,
-            entry_ready=bool(not blocked),
-            block_reason=None if not blocked else reason,
-        )
-        return (not blocked), reason, {
-            "ticker": ticker,
-            "family": effective_family,
-            "realm_vv_status": realm_vv_status,
-            "realm_vv_ready": realm_vv_ready,
-            "realm_vv_explicit_approval": realm_vv_explicit_approval,
-            "decision": effective_decision,
-            "reason": reason,
-            "compatibility_alias_only": compatibility_alias_only,
-            "legacy_metadata_reason": legacy_metadata_reason,
-            "canonical_execute_requested": bool(canonical_execute_requested),
-        }
-
     def _build_aion_execution_quality_profile(self, *args, **kwargs):
         return _call_sports_live_intelligence("_build_aion_execution_quality_profile", self, *args, **kwargs)
 
@@ -26522,25 +26185,7 @@ class KalshiSniperBot:
         }
 
     def _evaluate_mlb_total_entry_confirmation(self, ticker, recent_prices, recent_delta, spread, adaptive_allow=False):
-        recent_prices = [float(price) for price in (recent_prices or []) if price is not None]
-        if spread is None or spread > 0.03:
-            return False, "spread_not_tight_enough"
-        if len(recent_prices) < 3:
-            return False, "insufficient_recent_price_history"
-        recent_range = max(recent_prices) - min(recent_prices)
-        last_step_delta = recent_prices[-1] - recent_prices[-2]
-        reversing = recent_prices[-1] < recent_prices[-2]
-        if recent_delta is None or recent_delta < MLB_TOTAL_MIN_MOMENTUM_DELTA:
-            return False, "momentum_too_weak"
-        if recent_range < MLB_TOTAL_MIN_MOMENTUM_RANGE:
-            return False, "price_action_flat"
-        if last_step_delta < MLB_TOTAL_MIN_LAST_STEP_DELTA:
-            return False, "last_step_not_improving"
-        if reversing:
-            return False, "recent_reversal_detected"
-        if adaptive_allow and last_step_delta <= 0:
-            return False, "adaptive_allow_without_stronger_confirmation"
-        return True, "confirmed"
+        return True, "mlb_total_confirmation_removed"
 
     def _evaluate_smart_entry_gate(self, market, q, payload=None):
         ticker = getattr(q, "ticker", "") or str((market or {}).get("ticker", "") or "").strip()
@@ -26764,19 +26409,14 @@ class KalshiSniperBot:
             print("[AION-SPREAD-REAL-REJECT] " + json.dumps(spread_trace, sort_keys=True, default=str))
             reject_ticker = ticker or None
             if reject_ticker:
-                cooldown_until = reject_ts + float(AION_MISSING_SPREAD_TICKER_COOLDOWN_SECONDS)
-                current_cooldown_until = float(self.market_cooldowns.get(reject_ticker, 0.0) or 0.0)
-                if cooldown_until > current_cooldown_until:
-                    self.market_cooldowns[reject_ticker] = cooldown_until
                 print(
-                    "[AION-MISSING-SPREAD-TICKER-COOLDOWN] "
+                    "[AION-MISSING-SPREAD-PRESSURE] "
                     + json.dumps(
                         {
                             "ticker": reject_ticker,
                             "family": family,
                             "reason": reason,
-                            "cooldown_seconds": int(AION_MISSING_SPREAD_TICKER_COOLDOWN_SECONDS),
-                            "cooldown_until": round(cooldown_until, 3),
+                            "action": "rank_pressure_only",
                             "source_fields_checked": sorted(set(price_source_fields_checked + spread_source_fields_checked)),
                         },
                         sort_keys=True,
@@ -26791,7 +26431,7 @@ class KalshiSniperBot:
                             "family": family,
                             "reason": reason,
                             "next_action": "continue_scan",
-                            "cooldown_applied": True,
+                            "pressure_applied": True,
                         },
                         sort_keys=True,
                         default=str,
@@ -26992,47 +26632,6 @@ class KalshiSniperBot:
             "no_bid": no_bid,
             "source_fields_checked": sorted(set(price_source_fields_checked + spread_source_fields_checked)),
         }
-
-    def _is_high_prob_submission_candidate(self, q, market=None):
-        ticker = getattr(q, "ticker", "") or str((market or {}).get("ticker", "") or "").strip()
-        market = market or {"ticker": ticker}
-        family = self.get_market_family(market) if ticker else "UNKNOWN"
-        yes_bid = self.normalize_contract_price(getattr(q, "yes_bid", 0.0) or 0.0, ticker=ticker, source="submission_candidate.yes_bid")
-        yes_ask = self.normalize_contract_price(getattr(q, "yes_ask", 0.0) or 0.0, ticker=ticker, source="submission_candidate.yes_ask")
-        spread = (yes_ask - yes_bid) if yes_ask and yes_bid else None
-        recent_delta = None
-        momentum_ok = True
-        if yes_ask is None or yes_ask < KALSHI_CONTRACT_MIN_PRICE or yes_ask > KALSHI_CONTRACT_MAX_PRICE or spread is None or spread < 0 or spread > 0.045:
-            return False, {"ticker": ticker, "family": family, "yes_ask": yes_ask, "spread": spread, "recent_delta": recent_delta}
-        timing_history_key = self._build_phase55_timing_history_key(market, q, family=family)
-        rolling_history_map = getattr(self, "phase55_rolling_price_history", {})
-        rolling_history = list((rolling_history_map if isinstance(rolling_history_map, dict) else {}).get(str(timing_history_key or "").strip(), []))
-        recent_prices = [float(price) for price in rolling_history[-4:] if price is not None]
-        if len(recent_prices) >= 2:
-            recent_delta = recent_prices[-1] - recent_prices[0]
-            momentum_ok = recent_delta >= 0
-        return bool(momentum_ok), {"ticker": ticker, "family": family, "yes_ask": yes_ask, "spread": spread, "recent_delta": recent_delta}
-
-    def _classify_entry_block_reason(self, reason):
-        reason = str(reason or "").strip().lower()
-        if (
-            "phase55" in reason
-            or reason in {
-                "insufficient_data",
-                "trigger_wait",
-                "no_crossover",
-                "pullback_wait",
-                "immediate_entry_block",
-            }
-        ):
-            return "phase55"
-        if "negative_edge" in reason or "top_book" in reason:
-            return "negative_edge"
-        if "stale_signal" in reason or "direction_changed" in reason or "spread_deteriorated" in reason:
-            return "stale"
-        if "duplicate" in reason or "sim_position_open" in reason or "live_position_open_same_ticker" in reason:
-            return "duplicate"
-        return "other"
 
     def _record_live_family_performance(self, family, realized_value):
         return kalshi_memory_module.record_live_family_performance(self, family, realized_value)
@@ -28629,65 +28228,6 @@ class KalshiSniperBot:
         )
         if last_price is not None:
             return round(max(0.01, min(0.99, last_price)), 6)
-        return None
-
-    def _init_btc_1h_history_learner(self):
-        self.btc_1h_history_store = None
-        self.btc_1h_history_audit = {"disabled": True, "reason": "sports_only_crypto_history_removed"}
-        return None
-
-    def _btc_1h_history_session_bucket(self, when=None):
-        return "disabled"
-
-    def _btc_1h_history_time_bucket(self, market=None, family=None):
-        return "disabled"
-
-    def _get_btc_1h_history_signal_for_context(self, **kwargs):
-        return {"available": False, "reason": "sports_only_crypto_history_removed"}
-
-    def _btc1h_cycle_series_tickers(self):
-        return []
-
-    def _get_btc1h_cycle_write_store(self):
-        return None
-
-    def _btc1h_market_to_history_record(self, market=None, *, data_source="kalshi_api:live_cycle", backfill_run_id=None):
-        return None
-
-    def _fetch_btc1h_cycle_markets(self, *, status="open", limit=None):
-        self._emit_sports_only_execution_log(
-            "AION-NONSPORTS-PURGED",
-            reason="crypto_cycle_market_fetch_removed",
-            category="crypto",
-            source="btc1h_cycle_fetch_removed",
-        )
-        return [], [{"series": "crypto", "status": status, "reason": "sports_only_crypto_discovery_removed"}]
-
-    def _score_btc1h_cycle_markets(self, markets=None, *, source="btc1h_cycle"):
-        return {"groups": {}, "promoted": {}, "score_rows": [], "markets": [], "reason": "sports_only_crypto_scoring_removed"}
-
-    def _refresh_btc1h_settlement_learning(self, *, source="btc1h_cycle"):
-        return {"stored": 0, "updated": 0, "duplicates": 0, "malformed": 0, "errors": 0, "records_seen": 0, "reason": "sports_only_crypto_learning_removed"}
-
-    def _run_btc1h_adaptive_cycle(self, *, markets=None, quotes_by_ticker=None, source="live_cycle", force=False):
-        self.btc1h_cycle_priority_by_ticker = {}
-        self.btc1h_cycle_last_summary = {
-            "enabled": False,
-            "markets_to_merge": [],
-            "reason": "sports_only_mode_crypto_discovery_removed",
-        }
-        self._emit_sports_only_execution_log(
-            "AION-NONSPORTS-PURGED",
-            reason="btc1h_adaptive_cycle_removed",
-            category="crypto",
-            source=source,
-        )
-        return dict(self.btc1h_cycle_last_summary)
-
-    def _get_btc1h_cycle_rank_adjustment(self, ticker=None, *, source="ranking"):
-        return {"available": False, "boost": 0.0, "reason": "sports_only_crypto_ranking_removed"}
-
-    def _emit_btc1h_live_execute_log(self, ticker=None, *, result=None, payload=None, family=None):
         return None
 
     def _candidate_execution_lane(self, *, family=None, ticker=None, market=None, q=None, expectancy_item=None):
@@ -30427,12 +29967,6 @@ class KalshiSniperBot:
                                 default=str,
                             )
                         )
-                        self._emit_btc1h_live_execute_log(
-                            ticker,
-                            result=result,
-                            payload=submitted_payload,
-                            family=family,
-                        )
             if not payload and not result.get("submitted"):
                 print(
                     attempt_tag
@@ -30599,9 +30133,6 @@ class KalshiSniperBot:
     def _crypto_ladder_timeframe(self, *, family=None, ticker=None, market=None, q=None):
         return None
 
-    def _crypto_ladder_market_structure_type(self, *, family=None, ticker=None, market=None, q=None):
-        return None
-
     def _is_crypto_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
         return False
 
@@ -30615,24 +30146,6 @@ class KalshiSniperBot:
             "missing_reason": "sports_only_crypto_execution_removed",
             "blockers": ["sports_only_crypto_execution_removed"],
         }
-
-    def _is_btc_1h_ladder_market(self, *, family=None, ticker=None, market=None, q=None):
-        return False
-
-    def _parse_crypto_ladder_strike(self, *values, asset_symbol=None):
-        return None
-
-    def _parse_btc_1h_ladder_strike(self, *values):
-        return None
-
-    def _btc_1h_ladder_group_key(self, market=None, *, ticker=None, family=None):
-        return None
-
-    def _btc_1h_ladder_contract_snapshot(self, market=None):
-        return None
-
-    def _get_btc_1h_ladder_rank_adjustment(self, **kwargs):
-        return {"enabled": False, "score": 0.0, "boost": 0.0, "reason": "sports_only_crypto_ladder_removed", "tags": []}
 
     def _build_structural_family_profile(self, family=None, category=None, market_type=None):
         family_text = str(family or "").strip().upper() or "UNKNOWN"
@@ -31343,21 +30856,6 @@ class KalshiSniperBot:
     def _get_orderbook_imbalance_adjustment(self, *args, **kwargs):
         return _call_sports_live_intelligence("_get_orderbook_imbalance_adjustment", self, *args, **kwargs)
 
-    def _is_btc_volatility_family(self, family=None, *, ticker=None, market=None, q=None):
-        return False
-
-    def _coerce_btc_volatility_price(self, value):
-        return self.normalize_contract_price(value, source="sports_only_btc_volatility_removed")
-
-    def _extract_btc_volatility_price_context(self, *, market=None, q=None, selected_side=None):
-        return {"active": False, "reason": "sports_only_btc_volatility_removed"}
-
-    def _get_btc_volatility_mode(self, *, market=None, q=None, family=None, spread=None, source="ranking", log=True):
-        return {"active": False, "direction": "neutral", "volatility": 0.0, "preferred_side": None, "score_boost": 0.0, "threshold_relaxation": 0.0, "spread_relaxation": 0.0, "reason": "sports_only_btc_volatility_removed"}
-
-    def _get_btc_volatility_rank_adjustment(self, item=None, *, market=None, q=None, spread=None, family=None, log=True, source="ranking"):
-        return {"available": False, "active": False, "rank_adjustment": 0.0, "score_boost": 0.0, "threshold_relaxation": 0.0, "spread_relaxation": 0.0, "reason": "sports_only_btc_volatility_removed"}
-
     def _attach_ev_score_to_candidate(
         self,
         item=None,
@@ -31943,7 +31441,7 @@ class KalshiSniperBot:
             if now_ts - float((event or {}).get("ts", 0.0) or 0.0) <= recent_window
         ]
 
-    def _prune_degenerate_family_cooldowns(self, now_ts=None):
+    def _prune_degenerate_family_pressure_history(self, now_ts=None):
         now_ts = float(now_ts or time.time())
         window_seconds = float(KALSHI_DEGENERATE_FAMILY_WINDOW_SECONDS)
         history_container = getattr(self, "live_degenerate_family_reject_history", {}) or {}
@@ -31959,20 +31457,11 @@ class KalshiSniperBot:
                 history_container[family] = state
             else:
                 history_container.pop(family, None)
-        cooldown_container = getattr(self, "live_degenerate_family_cooldowns", {}) or {}
-        for family, event in list(cooldown_container.items()):
-            expires_at = float((event or {}).get("expires_at", 0.0) or 0.0)
-            if expires_at and expires_at <= now_ts:
-                print(
-                    f"[AION-DEGENERATE-FAMILY-COOLDOWN-EXPIRED] family={family} "
-                    f"reason={(event or {}).get('reason')} cooldown_until={round(expires_at, 3)}"
-                )
-                cooldown_container.pop(family, None)
 
     def _get_degenerate_family_penalty_state(self, family, now_ts=None):
         now_ts = float(now_ts or time.time())
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
-        self._prune_degenerate_family_cooldowns(now_ts=now_ts)
+        self._prune_degenerate_family_pressure_history(now_ts=now_ts)
         history = dict((self.live_degenerate_family_reject_history or {}).get(family, {}) or {})
         recent_timestamps = [
             float(ts)
@@ -31980,25 +31469,18 @@ class KalshiSniperBot:
             if now_ts - float(ts or 0.0) <= float(KALSHI_DEGENERATE_FAMILY_WINDOW_SECONDS)
         ]
         recent_rejects = len(recent_timestamps)
-        cooldown_event = dict((self.live_degenerate_family_cooldowns or {}).get(family, {}) or {})
-        cooldown_expires_at = float(cooldown_event.get("expires_at", 0.0) or 0.0)
-        cooldown_remaining_seconds = max(0.0, cooldown_expires_at - now_ts)
-        cooldown_active = cooldown_remaining_seconds > 0.0
         penalty = 0.0
         if recent_rejects > 0:
             penalty += float(recent_rejects) * float(KALSHI_DEGENERATE_FAMILY_BASE_PENALTY)
         if recent_rejects >= int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS):
             penalty += 18.0 + max(0.0, float(recent_rejects) - float(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS)) * 4.0
-        if cooldown_active:
-            penalty += float(KALSHI_DEGENERATE_FAMILY_ACTIVE_COOLDOWN_PENALTY)
-        penalty += min(20.0, cooldown_remaining_seconds / 30.0) if cooldown_active else 0.0
         return {
             "family": family,
             "recent_rejects": recent_rejects,
-            "cooldown_active": cooldown_active,
-            "cooldown_remaining_seconds": int(max(0.0, cooldown_remaining_seconds)),
-            "cooldown_reason": str(cooldown_event.get("reason") or "degenerate_family_cooldown"),
-            "cooldown_until": round(cooldown_expires_at, 3) if cooldown_expires_at else 0.0,
+            "cooldown_active": False,
+            "cooldown_remaining_seconds": 0,
+            "cooldown_reason": "degenerate_family_pressure",
+            "cooldown_until": 0.0,
             "penalty": round(penalty, 4),
             "window_seconds": int(KALSHI_DEGENERATE_FAMILY_WINDOW_SECONDS),
             "trigger_rejections": int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS),
@@ -32009,7 +31491,7 @@ class KalshiSniperBot:
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
         ticker = str(ticker or "").strip().upper()
         reason = str(reason or "degenerate_book").strip() or "degenerate_book"
-        self._prune_degenerate_family_cooldowns(now_ts=now_ts)
+        self._prune_degenerate_family_pressure_history(now_ts=now_ts)
         history = dict((self.live_degenerate_family_reject_history or {}).get(family, {}) or {})
         recent_timestamps = [
             float(ts)
@@ -32041,49 +31523,9 @@ class KalshiSniperBot:
                 default=str,
             )
         )
-        if family_state.get("recent_rejects", 0) >= int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS):
-            cooldown_until = now_ts + float(KALSHI_DEGENERATE_FAMILY_COOLDOWN_SECONDS)
-            current_cooldown_until = float((self.live_degenerate_family_cooldowns or {}).get(family, {}).get("expires_at", 0.0) or 0.0)
-            if cooldown_until > current_cooldown_until:
-                self.live_degenerate_family_cooldowns[family] = {
-                    "family": family,
-                    "ticker": ticker,
-                    "reason": "repeated_degenerate_book",
-                    "recent_rejects": family_state.get("recent_rejects", 0),
-                    "expires_at": cooldown_until,
-                }
-                print(
-                    "[AION-DEGENERATE-FAMILY-COOLDOWN] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "ticker": ticker,
-                            "reason": "repeated_degenerate_book",
-                            "recent_rejects": family_state.get("recent_rejects", 0),
-                            "cooldown_seconds": int(KALSHI_DEGENERATE_FAMILY_COOLDOWN_SECONDS),
-                            "cooldown_until": round(cooldown_until, 3),
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
-                )
-                print(
-                    "[AION-SCAN-CONTINUE-AFTER-DEGENERATE] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "ticker": ticker,
-                            "reason": "repeated_degenerate_book",
-                            "next_action": "continue_scan",
-                            "cooldown_applied": True,
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
-                )
         return family_state
 
-    def _prune_missing_spread_family_cooldowns(self, now_ts=None):
+    def _prune_missing_spread_family_pressure_history(self, now_ts=None):
         now_ts = float(now_ts or time.time())
         history_container = getattr(self, "live_missing_spread_family_reject_history", {}) or {}
         for family, state in list(history_container.items()):
@@ -32098,20 +31540,11 @@ class KalshiSniperBot:
                 history_container[family] = state
             else:
                 history_container.pop(family, None)
-        cooldown_container = getattr(self, "live_missing_spread_family_cooldowns", {}) or {}
-        for family, event in list(cooldown_container.items()):
-            expires_at = float((event or {}).get("expires_at", 0.0) or 0.0)
-            if expires_at and expires_at <= now_ts:
-                print(
-                    f"[AION-MISSING-SPREAD-FAMILY-COOLDOWN-EXPIRED] family={family} "
-                    f"reason={(event or {}).get('reason')} cooldown_until={round(expires_at, 3)}"
-                )
-                cooldown_container.pop(family, None)
 
     def _get_missing_spread_family_penalty_state(self, family, now_ts=None):
         now_ts = float(now_ts or time.time())
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
-        self._prune_missing_spread_family_cooldowns(now_ts=now_ts)
+        self._prune_missing_spread_family_pressure_history(now_ts=now_ts)
         history = dict((self.live_missing_spread_family_reject_history or {}).get(family, {}) or {})
         recent_timestamps = [
             float(ts)
@@ -32119,25 +31552,18 @@ class KalshiSniperBot:
             if now_ts - float(ts or 0.0) <= float(AION_MISSING_SPREAD_FAMILY_WINDOW_SECONDS)
         ]
         recent_rejects = len(recent_timestamps)
-        cooldown_event = dict((self.live_missing_spread_family_cooldowns or {}).get(family, {}) or {})
-        cooldown_expires_at = float(cooldown_event.get("expires_at", 0.0) or 0.0)
-        cooldown_remaining_seconds = max(0.0, cooldown_expires_at - now_ts)
-        cooldown_active = cooldown_remaining_seconds > 0.0
         penalty = 0.0
         if recent_rejects > 0:
             penalty += float(recent_rejects) * float(AION_MISSING_SPREAD_FAMILY_BASE_PENALTY)
         if recent_rejects >= int(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS):
             penalty += 15.0 + max(0.0, float(recent_rejects) - float(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS)) * 4.0
-        if cooldown_active:
-            penalty += float(AION_MISSING_SPREAD_FAMILY_ACTIVE_COOLDOWN_PENALTY)
-        penalty += min(18.0, cooldown_remaining_seconds / 30.0) if cooldown_active else 0.0
         return {
             "family": family,
             "recent_rejects": recent_rejects,
-            "cooldown_active": cooldown_active,
-            "cooldown_remaining_seconds": int(max(0.0, cooldown_remaining_seconds)),
-            "cooldown_reason": str(cooldown_event.get("reason") or "missing_spread_family_cooldown"),
-            "cooldown_until": round(cooldown_expires_at, 3) if cooldown_expires_at else 0.0,
+            "cooldown_active": False,
+            "cooldown_remaining_seconds": 0,
+            "cooldown_reason": "missing_spread_family_pressure",
+            "cooldown_until": 0.0,
             "penalty": round(penalty, 4),
             "window_seconds": int(AION_MISSING_SPREAD_FAMILY_WINDOW_SECONDS),
             "trigger_rejections": int(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS),
@@ -32148,7 +31574,7 @@ class KalshiSniperBot:
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
         ticker = str(ticker or "").strip().upper()
         reason = str(reason or "missing_spread").strip() or "missing_spread"
-        self._prune_missing_spread_family_cooldowns(now_ts=now_ts)
+        self._prune_missing_spread_family_pressure_history(now_ts=now_ts)
         history = dict((self.live_missing_spread_family_reject_history or {}).get(family, {}) or {})
         recent_timestamps = [
             float(ts)
@@ -32180,49 +31606,9 @@ class KalshiSniperBot:
                 default=str,
             )
         )
-        if family_state.get("recent_rejects", 0) >= int(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS):
-            cooldown_until = now_ts + float(AION_MISSING_SPREAD_FAMILY_COOLDOWN_SECONDS)
-            current_cooldown_until = float((self.live_missing_spread_family_cooldowns or {}).get(family, {}).get("expires_at", 0.0) or 0.0)
-            if cooldown_until > current_cooldown_until:
-                self.live_missing_spread_family_cooldowns[family] = {
-                    "family": family,
-                    "ticker": ticker,
-                    "reason": "repeated_missing_spread",
-                    "recent_rejects": family_state.get("recent_rejects", 0),
-                    "expires_at": cooldown_until,
-                }
-                print(
-                    "[AION-MISSING-SPREAD-FAMILY-COOLDOWN] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "ticker": ticker,
-                            "reason": "repeated_missing_spread",
-                            "recent_rejects": family_state.get("recent_rejects", 0),
-                            "cooldown_seconds": int(AION_MISSING_SPREAD_FAMILY_COOLDOWN_SECONDS),
-                            "cooldown_until": round(cooldown_until, 3),
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
-                )
-                print(
-                    "[AION-SCAN-CONTINUE-AFTER-SPREAD-REJECT] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "ticker": ticker,
-                            "reason": "repeated_missing_spread",
-                            "next_action": "continue_scan",
-                            "cooldown_applied": True,
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
-                )
         return family_state
 
-    def _prune_price_family_cooldowns(self, now_ts=None):
+    def _prune_price_family_pressure_history(self, now_ts=None):
         now_ts = float(now_ts or time.time())
         history_container = getattr(self, "live_price_family_reject_history", {}) or {}
         if not isinstance(history_container, dict):
@@ -32240,25 +31626,12 @@ class KalshiSniperBot:
                 history_container[family] = state
             else:
                 history_container.pop(family, None)
-        cooldown_container = getattr(self, "live_price_family_cooldowns", {}) or {}
-        if not isinstance(cooldown_container, dict):
-            self.live_price_family_cooldowns = {}
-            cooldown_container = self.live_price_family_cooldowns
-        for family, event in list(cooldown_container.items()):
-            expires_at = float((event or {}).get("expires_at", 0.0) or 0.0)
-            if expires_at and expires_at <= now_ts:
-                print(
-                    f"[AION-PRICE-FAMILY-COOLDOWN-EXPIRED] family={family} "
-                    f"reason={(event or {}).get('reason')} cooldown_until={round(expires_at, 3)}"
-                )
-                cooldown_container.pop(family, None)
 
     def _get_price_family_penalty_state(self, family, now_ts=None):
         now_ts = float(now_ts or time.time())
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
-        self._prune_price_family_cooldowns(now_ts=now_ts)
+        self._prune_price_family_pressure_history(now_ts=now_ts)
         history_store = getattr(self, "live_price_family_reject_history", {}) or {}
-        cooldown_store = getattr(self, "live_price_family_cooldowns", {}) or {}
         history = dict(history_store.get(family, {}) or {}) if isinstance(history_store, dict) else {}
         recent_timestamps = [
             float(ts)
@@ -32266,25 +31639,18 @@ class KalshiSniperBot:
             if now_ts - float(ts or 0.0) <= float(AION_PRICE_FAMILY_WINDOW_SECONDS)
         ]
         recent_rejects = len(recent_timestamps)
-        cooldown_event = dict(cooldown_store.get(family, {}) or {}) if isinstance(cooldown_store, dict) else {}
-        cooldown_expires_at = float(cooldown_event.get("expires_at", 0.0) or 0.0)
-        cooldown_remaining_seconds = max(0.0, cooldown_expires_at - now_ts)
-        cooldown_active = cooldown_remaining_seconds > 0.0
         penalty = 0.0
         if recent_rejects > 0:
             penalty += float(recent_rejects) * float(AION_PRICE_FAMILY_BASE_PENALTY)
         if recent_rejects >= int(AION_PRICE_FAMILY_MIN_REJECTIONS):
             penalty += 15.0 + max(0.0, float(recent_rejects) - float(AION_PRICE_FAMILY_MIN_REJECTIONS)) * 4.0
-        if cooldown_active:
-            penalty += float(AION_PRICE_FAMILY_ACTIVE_COOLDOWN_PENALTY)
-        penalty += min(18.0, cooldown_remaining_seconds / 30.0) if cooldown_active else 0.0
         return {
             "family": family,
             "recent_rejects": recent_rejects,
-            "cooldown_active": cooldown_active,
-            "cooldown_remaining_seconds": int(max(0.0, cooldown_remaining_seconds)),
-            "cooldown_reason": str(cooldown_event.get("reason") or "price_family_cooldown"),
-            "cooldown_until": round(cooldown_expires_at, 3) if cooldown_expires_at else 0.0,
+            "cooldown_active": False,
+            "cooldown_remaining_seconds": 0,
+            "cooldown_reason": "price_family_pressure",
+            "cooldown_until": 0.0,
             "penalty": round(penalty, 4),
             "window_seconds": int(AION_PRICE_FAMILY_WINDOW_SECONDS),
             "trigger_rejections": int(AION_PRICE_FAMILY_MIN_REJECTIONS),
@@ -32295,7 +31661,7 @@ class KalshiSniperBot:
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
         ticker = str(ticker or "").strip().upper()
         reason = str(reason or "price_out_of_range").strip() or "price_out_of_range"
-        self._prune_price_family_cooldowns(now_ts=now_ts)
+        self._prune_price_family_pressure_history(now_ts=now_ts)
         history_store = getattr(self, "live_price_family_reject_history", None)
         if not isinstance(history_store, dict):
             self.live_price_family_reject_history = {}
@@ -32331,46 +31697,6 @@ class KalshiSniperBot:
                 default=str,
             )
         )
-        if family_state.get("recent_rejects", 0) >= int(AION_PRICE_FAMILY_MIN_REJECTIONS):
-            cooldown_until = now_ts + float(AION_PRICE_FAMILY_COOLDOWN_SECONDS)
-            current_cooldown_until = float((self.live_price_family_cooldowns or {}).get(family, {}).get("expires_at", 0.0) or 0.0)
-            if cooldown_until > current_cooldown_until:
-                self.live_price_family_cooldowns[family] = {
-                    "family": family,
-                    "ticker": ticker,
-                    "reason": "repeated_price_out_of_range",
-                    "recent_rejects": family_state.get("recent_rejects", 0),
-                    "expires_at": cooldown_until,
-                }
-                print(
-                    "[AION-PRICE-FAMILY-COOLDOWN] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "ticker": ticker,
-                            "reason": "repeated_price_out_of_range",
-                            "recent_rejects": family_state.get("recent_rejects", 0),
-                            "cooldown_seconds": int(AION_PRICE_FAMILY_COOLDOWN_SECONDS),
-                            "cooldown_until": round(cooldown_until, 3),
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
-                )
-                print(
-                    "[AION-SCAN-CONTINUE-AFTER-PRICE-REJECT] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "ticker": ticker,
-                            "reason": "repeated_price_out_of_range",
-                            "next_action": "continue_scan",
-                            "cooldown_applied": True,
-                        },
-                        sort_keys=True,
-                        default=str,
-                )
-                )
         return family_state
 
     def _prune_family_universe_health_history(self, now_ts=None):
@@ -32385,15 +31711,6 @@ class KalshiSniperBot:
                 history_container[family] = samples
             else:
                 history_container.pop(family, None)
-        cooldown_container = getattr(self, "family_universe_health_cooldowns", {}) or {}
-        for family, event in list(cooldown_container.items()):
-            expires_at = float((event or {}).get("expires_at", 0.0) or 0.0)
-            if expires_at and expires_at <= now_ts:
-                print(
-                    f"[AION-UNIVERSE-COOLDOWN-EXPIRED] family={family} "
-                    f"reason={(event or {}).get('reason')} cooldown_until={round(expires_at, 3)}"
-                )
-                cooldown_container.pop(family, None)
 
     def _build_family_universe_health_sample(
         self,
@@ -32701,17 +32018,13 @@ class KalshiSniperBot:
         family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
         self._prune_family_universe_health_history(now_ts=now_ts)
         history = list((self.family_universe_health_history or {}).get(family, deque()) or [])
-        cooldown_event = dict((self.family_universe_health_cooldowns or {}).get(family, {}) or {})
-        cooldown_expires_at = float(cooldown_event.get("expires_at", 0.0) or 0.0)
-        cooldown_remaining_seconds = max(0.0, cooldown_expires_at - now_ts)
-        cooldown_active = cooldown_remaining_seconds > 0.0
         if not history:
             return {
                 "family": family,
-                "cooldown_active": bool(cooldown_active),
-                "cooldown_remaining_seconds": int(max(0.0, cooldown_remaining_seconds)),
-                "cooldown_reason": str(cooldown_event.get("reason") or "universe_health_cooldown"),
-                "cooldown_until": round(cooldown_expires_at, 3) if cooldown_expires_at else 0.0,
+                "cooldown_active": False,
+                "cooldown_remaining_seconds": 0,
+                "cooldown_reason": "universe_health_pressure",
+                "cooldown_until": 0.0,
                 "suppressed": False,
                 "suppress_reason": None,
                 "health_score": 50.0,
@@ -32857,58 +32170,32 @@ class KalshiSniperBot:
                 suppress_reason = "unusable_orderbook_family"
             elif recent_snapshot.get("executable_quote_rate", 0.0) <= float(AION_UNIVERSE_HEALTH_SUPPRESS_EXECUTABLE_RATE):
                 suppress_reason = "no_executable_quote_family"
-        suppressed = suppress_reason is not None
-        if suppressed and not cooldown_active:
-            cooldown_until = now_ts + float(AION_UNIVERSE_HEALTH_COOLDOWN_SECONDS)
-            current_cooldown_until = float((self.family_universe_health_cooldowns or {}).get(family, {}).get("expires_at", 0.0) or 0.0)
-            if cooldown_until > current_cooldown_until:
-                self.family_universe_health_cooldowns[family] = {
-                    "family": family,
-                    "reason": suppress_reason,
-                    "recent_scan_count": recent_snapshot.get("scan_count", 0),
-                    "expires_at": cooldown_until,
-                }
-                cooldown_active = True
-                cooldown_remaining_seconds = float(AION_UNIVERSE_HEALTH_COOLDOWN_SECONDS)
-                print(
-                    "[AION-UNIVERSE-BLOCK] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "reason": suppress_reason,
-                            "cooldown_seconds": int(AION_UNIVERSE_HEALTH_COOLDOWN_SECONDS),
-                            "cooldown_until": round(cooldown_until, 3),
-                            "scan_count": recent_snapshot.get("scan_count", 0),
-                            "usable_orderbook_rate": recent_snapshot.get("usable_orderbook_rate", 0.0),
-                            "executable_quote_rate": recent_snapshot.get("executable_quote_rate", 0.0),
-                            "zero_one_book_rate": recent_snapshot.get("zero_one_book_rate", 0.0),
-                            "malformed_book_rate": recent_snapshot.get("malformed_book_rate", 0.0),
-                            "health_score": health_score,
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
+        if suppress_reason is not None:
+            print(
+                "[AION-UNIVERSE-PRESSURE] "
+                + json.dumps(
+                    {
+                        "family": family,
+                        "reason": suppress_reason,
+                        "scan_count": recent_snapshot.get("scan_count", 0),
+                        "usable_orderbook_rate": recent_snapshot.get("usable_orderbook_rate", 0.0),
+                        "executable_quote_rate": recent_snapshot.get("executable_quote_rate", 0.0),
+                        "zero_one_book_rate": recent_snapshot.get("zero_one_book_rate", 0.0),
+                        "malformed_book_rate": recent_snapshot.get("malformed_book_rate", 0.0),
+                        "health_score": health_score,
+                        "action": "rank_pressure_only",
+                    },
+                    sort_keys=True,
+                    default=str,
                 )
-                print(
-                    "[AION-UNIVERSE-COOLDOWN] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "reason": suppress_reason,
-                            "cooldown_seconds": int(AION_UNIVERSE_HEALTH_COOLDOWN_SECONDS),
-                            "cooldown_until": round(cooldown_until, 3),
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
-                )
+            )
         health_state = {
             "family": family,
-            "cooldown_active": bool(cooldown_active),
-            "cooldown_remaining_seconds": int(max(0.0, cooldown_remaining_seconds)),
-            "cooldown_reason": str(cooldown_event.get("reason") or suppress_reason or "universe_health_cooldown"),
-            "cooldown_until": round(cooldown_expires_at, 3) if cooldown_expires_at else 0.0,
-            "suppressed": bool(suppressed),
+            "cooldown_active": False,
+            "cooldown_remaining_seconds": 0,
+            "cooldown_reason": None,
+            "cooldown_until": 0.0,
+            "suppressed": False,
             "suppress_reason": suppress_reason,
             "health_score": health_score,
             "windows": snapshots,
@@ -32991,7 +32278,7 @@ class KalshiSniperBot:
             + (stale_quote_rate * 12.0)
         )
         scanner_score = round((family_quality_factor * liquidity_factor * executable_quote_factor * 110.0) + executable_signal_bonus - penalty_score - dead_book_penalty + max(-10.0, min(10.0, trend_score * 0.15)), 4)
-        suppressed = bool(universe_health_state.get("suppressed"))
+        suppressed = False
         suppress_reason = universe_health_state.get("suppress_reason")
         recent_bad_book_rate = max(usable_orderbook_rate <= 0.0 and 1.0 or 0.0, malformed_book_rate, zero_one_book_rate)
         if family.startswith(("KXATPGSPREAD", "KXATPGTOTAL")) and (
@@ -33001,10 +32288,8 @@ class KalshiSniperBot:
             or executable_quote_rate <= 0.10
             or live_submit_attempt_rate <= 0.02
         ):
-            suppressed = True
             suppress_reason = suppress_reason or "dead_family_pattern"
         elif health_score < 35.0 and universe_health_state.get("scan_count", 0) >= 8 and recent_bad_book_rate >= 0.35 and executable_quote_rate <= 0.08:
-            suppressed = True
             suppress_reason = suppress_reason or "low_family_health"
         if suppressed:
             scan_tier = "D"
@@ -33022,7 +32307,6 @@ class KalshiSniperBot:
             scan_tier = "D"
             promote_reason = None
             suppress_reason = suppress_reason or "low_routing_score"
-            suppressed = True
         return {
             "family": family,
             "health_score": round(health_score, 4),
@@ -33034,9 +32318,9 @@ class KalshiSniperBot:
             "scan_tier": scan_tier,
             "promote_reason": promote_reason,
             "suppress_reason": suppress_reason,
-            "suppressed": bool(suppressed),
-            "cooldown_active": bool(universe_health_state.get("cooldown_active")),
-            "cooldown_remaining_seconds": int(universe_health_state.get("cooldown_remaining_seconds", 0) or 0),
+            "suppressed": False,
+            "cooldown_active": False,
+            "cooldown_remaining_seconds": 0,
             "usable_orderbook_rate": round(usable_orderbook_rate, 4),
             "executable_quote_rate": round(executable_quote_rate, 4),
             "canonical_pass_rate": round(canonical_pass_rate, 4),
@@ -33085,14 +32369,14 @@ class KalshiSniperBot:
             rows.append(row)
         healthiest = sorted(rows, key=lambda row: (self.to_float(row.get("health_score"), 0.0), self.to_float(row.get("rank_score"), 0.0)), reverse=True)[:5]
         worst = sorted(rows, key=lambda row: (self.to_float(row.get("health_score"), 0.0), self.to_float(row.get("rank_score"), 0.0)))[:5]
-        suppressed = [row for row in rows if row.get("suppressed")]
+        pressure_families = [row for row in rows if row.get("suppressed")]
         summary = {
             "timestamp": round(now_ts, 3),
             "families_considered": len(rows),
             "healthy_families": healthiest,
             "worst_families": worst,
-            "suppressed_family_count": len(suppressed),
-            "suppressed_families": suppressed[:10],
+            "pressure_family_count": len(pressure_families),
+            "pressure_families": pressure_families[:10],
             "top_priority_families": family_priority[:10],
         }
         self.last_universe_summary_ts = now_ts
@@ -37014,17 +36298,17 @@ class KalshiSniperBot:
             )
             if dead_book_suppressed:
                 print(
-                    f"[LIVE-SELECT-FAMILY-SUPPRESS] family={series_ticker} cycle_id={self._get_phase55_cycle_id()} "
-                    f"suppress_reason=targeted_dead_book_hour action=applied dead_book_cycles={dead_book_cycles} "
+                    f"[LIVE-SELECT-FAMILY-PRESSURE] family={series_ticker} cycle_id={self._get_phase55_cycle_id()} "
+                    f"pressure_reason=targeted_dead_book_hour action=deprioritized dead_book_cycles={dead_book_cycles} "
                     f"in_window_cycles={in_window_cycles} non_empty_top_book_cycles={non_empty_top_book_cycles} "
                     f"quote_alive_cycles={quote_alive_cycles} prefilter_survivor_cycles={prefilter_survivor_cycles}"
                 )
-                suppressed.append(series_ticker)
+                deprioritized.append(series_ticker)
                 continue
             if dead_book_deprioritized:
                 print(
-                    f"[LIVE-SELECT-FAMILY-SUPPRESS] family={series_ticker} cycle_id={self._get_phase55_cycle_id()} "
-                    f"suppress_reason=targeted_dead_book_hour action=deprioritized dead_book_cycles={dead_book_cycles} "
+                    f"[LIVE-SELECT-FAMILY-PRESSURE] family={series_ticker} cycle_id={self._get_phase55_cycle_id()} "
+                    f"pressure_reason=targeted_dead_book_hour action=deprioritized dead_book_cycles={dead_book_cycles} "
                     f"in_window_cycles={in_window_cycles} non_empty_top_book_cycles={non_empty_top_book_cycles} "
                     f"quote_alive_cycles={quote_alive_cycles} prefilter_survivor_cycles={prefilter_survivor_cycles}"
                 )
@@ -37062,7 +36346,7 @@ class KalshiSniperBot:
             "base_order": base_order,
             "adapted_order": list(ordered),
             "quality_adjusted_order": list(quality_adjusted_order),
-            "suppressed_families": list(suppressed),
+            "pressure_families": list(suppressed),
             "deprioritized_families": list(deprioritized),
             "details": adaptation_details,
             "quality_inputs": quality_inputs,
@@ -37080,7 +36364,7 @@ class KalshiSniperBot:
             )
         print(
             f"[LIVE-SELECT-DEBUG] targeted_priority_order hour_utc={utc_hour} ordered={ordered} "
-            f"suppressed_dead_book_families={suppressed} deprioritized_dead_book_families={deprioritized}"
+            f"pressure_dead_book_families={suppressed} deprioritized_dead_book_families={deprioritized}"
         )
         return ordered
 
@@ -40481,21 +39765,6 @@ class KalshiSniperBot:
             "denied_reasons": denied_reasons,
         }
 
-    def _get_btc15m_raw_book_present(self, ticker, market, cached=None):
-        return False
-
-    def _update_btc15m_rotation_persistence(self, ticker, executable, raw_book_present, yes_top, no_top, spread):
-        return {"disabled": True, "reason": "sports_only_btc15m_rotation_removed"}
-
-    def _set_btc15m_dead_contract_cooldown(self, ticker, reason):
-        return None, "sports_only_btc15m_rotation_removed"
-
-    def _get_btc15m_rotation_quality(self, market, q=None, spread=None):
-        return {"ticker": str((market or {}).get("ticker", "") or ""), "executable": False, "reason": "sports_only_btc15m_rotation_removed", "score": 0.0}
-
-    def _apply_btc15m_contract_rotation(self, ranked, markets):
-        return self._filter_sports_only_ranked_candidates(ranked, markets=markets, source="btc15m_rotation_removed") if self._sports_only_mode_enabled() else (ranked or [])
-
     def _resolve_selector_family_order(self, fetched_family_counts):
         available_families = [family for family in fetched_family_counts if family not in BLOCKED_MARKET_FAMILIES]
         family_profiles = []
@@ -40524,7 +39793,7 @@ class KalshiSniperBot:
                 )
             else:
                 print(
-                    "[AION-FAMILY-SUPPRESS] "
+                    "[AION-FAMILY-PRESSURE] "
                     + json.dumps(
                         {
                             "family": family,
@@ -40535,7 +39804,8 @@ class KalshiSniperBot:
                             "executable_quote_rate": routing_profile.get("executable_quote_rate", 0.0),
                             "canonical_pass_rate": routing_profile.get("canonical_pass_rate", 0.0),
                             "trend_score": routing_profile.get("trend_score", 0.0),
-                            "suppress_reason": routing_profile.get("suppress_reason") or "routing_tier_d",
+                            "pressure_reason": routing_profile.get("suppress_reason") or "routing_tier_d",
+                            "action": "fallback_rank_pressure",
                         },
                         sort_keys=True,
                         default=str,
@@ -40561,35 +39831,32 @@ class KalshiSniperBot:
             price_family_state = self._get_price_family_penalty_state(family)
             universe_health_state = self._get_family_universe_health_snapshot(family)
             routing_profile = self._compute_family_execution_routing_profile(family, stats=stats, universe_health_state=universe_health_state)
+            pressure_reasons = []
             if stats.get("target_window", 0) <= 0:
-                continue
+                pressure_reasons.append("outside_target_window")
             if stats.get("missing_quotes_rate", 0.0) >= FAMILY_MAX_MISSING_QUOTES_RATE:
-                continue
+                pressure_reasons.append("missing_quotes_rate")
             if stats.get("wide_spread_rate", 0.0) >= FAMILY_MAX_WIDE_SPREAD_RATE:
-                continue
+                pressure_reasons.append("wide_spread_rate")
             if stats.get("low_liquidity_rate", 0.0) >= FAMILY_MAX_LOW_LIQUIDITY_RATE:
-                continue
+                pressure_reasons.append("low_liquidity_rate")
             if stats.get("too_early_share", 0.0) >= FAMILY_MAX_TOO_EARLY_RATE:
-                continue
-            if degenerate_state.get("cooldown_active"):
-                continue
-            if degenerate_state.get("recent_rejects", 0) >= int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS):
-                continue
-            if missing_spread_state.get("cooldown_active"):
-                continue
-            if missing_spread_state.get("recent_rejects", 0) >= int(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS):
-                continue
-            if price_family_state.get("cooldown_active"):
-                continue
-            if price_family_state.get("recent_rejects", 0) >= int(AION_PRICE_FAMILY_MIN_REJECTIONS):
-                continue
-            if routing_profile.get("scan_tier") == "D" or routing_profile.get("suppressed") or universe_health_state.get("cooldown_active") or universe_health_state.get("suppressed"):
+                pressure_reasons.append("too_early_rate")
+            if degenerate_state.get("cooldown_active") or degenerate_state.get("recent_rejects", 0) >= int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS):
+                pressure_reasons.append("degenerate_family_pressure")
+            if missing_spread_state.get("cooldown_active") or missing_spread_state.get("recent_rejects", 0) >= int(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS):
+                pressure_reasons.append("missing_spread_family_pressure")
+            if price_family_state.get("cooldown_active") or price_family_state.get("recent_rejects", 0) >= int(AION_PRICE_FAMILY_MIN_REJECTIONS):
+                pressure_reasons.append("price_family_pressure")
+            if routing_profile.get("scan_tier") == "D" or routing_profile.get("suppress_reason") or universe_health_state.get("suppress_reason"):
+                pressure_reasons.append(routing_profile.get("suppress_reason") or universe_health_state.get("suppress_reason") or "low_routing_score")
+            if pressure_reasons:
                 print(
-                    "[AION-UNIVERSE-BLOCK] "
+                    "[AION-FAMILY-ADMISSION-PRESSURE] "
                     + json.dumps(
                         {
                             "family": family,
-                            "reason": routing_profile.get("suppress_reason") or universe_health_state.get("suppress_reason") or "universe_health_suppressed",
+                            "reasons": list(dict.fromkeys(pressure_reasons)),
                             "health_score": universe_health_state.get("health_score", 0.0),
                             "scan_count": universe_health_state.get("scan_count", 0),
                             "usable_orderbook_rate": universe_health_state.get("usable_orderbook_rate", 0.0),
@@ -40600,13 +39867,12 @@ class KalshiSniperBot:
                             "cooldown_remaining_seconds": universe_health_state.get("cooldown_remaining_seconds", 0),
                             "scanner_score": routing_profile.get("scanner_score", 0.0),
                             "scan_tier": routing_profile.get("scan_tier"),
-                            "next_action": "continue_scan",
+                            "next_action": "admit_with_rank_pressure",
                         },
                         sort_keys=True,
                         default=str,
                     )
                 )
-                continue
             viable_families.append(family)
         return viable_families
 
@@ -40658,19 +39924,19 @@ class KalshiSniperBot:
                 reason = "deprioritized_family"
             elif degenerate_state.get("cooldown_active"):
                 decision = "reject"
-                reason = "degenerate_family_cooldown"
+                reason = "degenerate_family_pressure"
             elif degenerate_state.get("recent_rejects", 0) >= int(KALSHI_DEGENERATE_FAMILY_MIN_REJECTIONS):
                 decision = "reject"
                 reason = "degenerate_family_penalty"
             elif missing_spread_state.get("cooldown_active"):
                 decision = "reject"
-                reason = "missing_spread_family_cooldown"
+                reason = "missing_spread_family_pressure"
             elif missing_spread_state.get("recent_rejects", 0) >= int(AION_MISSING_SPREAD_FAMILY_MIN_REJECTIONS):
                 decision = "reject"
                 reason = "missing_spread_family_penalty"
             elif price_family_state.get("cooldown_active"):
                 decision = "reject"
-                reason = "price_family_cooldown"
+                reason = "price_family_pressure"
             elif price_family_state.get("recent_rejects", 0) >= int(AION_PRICE_FAMILY_MIN_REJECTIONS):
                 decision = "reject"
                 reason = "price_family_penalty"
@@ -40693,6 +39959,23 @@ class KalshiSniperBot:
                 decision = "consider"
                 reason = "preferred_family_prefix" if preferred_prefix else "quality_pass"
                 eligible_families.append((quality_total, family))
+            family_pressure_reasons = {
+                "degenerate_family_pressure",
+                "degenerate_family_penalty",
+                "missing_spread_family_pressure",
+                "missing_spread_family_penalty",
+                "price_family_pressure",
+                "price_family_penalty",
+                "zero_one_book_family",
+                "malformed_book_family",
+                "unusable_orderbook_family",
+                "no_executable_quote_family",
+                "universe_health_suppressed",
+            }
+            if decision == "reject" and reason in family_pressure_reasons:
+                decision = "consider"
+                reason = f"{reason}_pressure"
+                eligible_families.append((quality_total, family))
             decisions[family] = {
                 "decision": decision,
                 "reason": reason,
@@ -40700,45 +39983,22 @@ class KalshiSniperBot:
                 "quality_total": round(quality_total, 4),
                 "degenerate_family_penalty": round(float(degenerate_state.get("penalty", 0.0) or 0.0), 4),
                 "degenerate_family_recent_rejects": degenerate_state.get("recent_rejects", 0),
-                "degenerate_family_cooldown_active": bool(degenerate_state.get("cooldown_active")),
+                "degenerate_family_pressure_active": bool(degenerate_state.get("cooldown_active")),
                 "missing_spread_family_recent_rejects": missing_spread_state.get("recent_rejects", 0),
-                "missing_spread_family_cooldown_active": bool(missing_spread_state.get("cooldown_active")),
+                "missing_spread_family_pressure_active": bool(missing_spread_state.get("cooldown_active")),
                 "missing_spread_family_penalty": round(float(missing_spread_state.get("penalty", 0.0) or 0.0), 4),
                 "price_family_recent_rejects": price_family_state.get("recent_rejects", 0),
-                "price_family_cooldown_active": bool(price_family_state.get("cooldown_active")),
+                "price_family_pressure_active": bool(price_family_state.get("cooldown_active")),
                 "price_family_penalty": round(float(price_family_state.get("penalty", 0.0) or 0.0), 4),
                 "universe_health_score": round(float(universe_health_state.get("health_score", 0.0) or 0.0), 4),
-                "universe_health_cooldown_active": bool(universe_health_state.get("cooldown_active")),
-                "universe_health_cooldown_remaining_seconds": universe_health_state.get("cooldown_remaining_seconds", 0),
+                "universe_health_pressure_active": bool(universe_health_state.get("cooldown_active")),
+                "universe_health_pressure_remaining_seconds": universe_health_state.get("cooldown_remaining_seconds", 0),
                 "universe_health_suppressed": bool(universe_health_state.get("suppressed")),
                 "universe_health_suppress_reason": universe_health_state.get("suppress_reason"),
                 "universe_health_usable_orderbook_rate": universe_health_state.get("usable_orderbook_rate", 0.0),
                 "universe_health_executable_quote_rate": universe_health_state.get("executable_quote_rate", 0.0),
                 "universe_health_zero_one_book_rate": universe_health_state.get("zero_one_book_rate", 0.0),
             }
-            if decision == "reject" and reason in {"zero_one_book_family", "malformed_book_family", "unusable_orderbook_family", "no_executable_quote_family", "universe_health_suppressed"}:
-                print(
-                    "[AION-UNIVERSE-BLOCK] "
-                    + json.dumps(
-                        {
-                            "family": family,
-                            "reason": reason,
-                            "health_score": universe_health_state.get("health_score", 0.0),
-                            "scan_count": universe_health_state.get("scan_count", 0),
-                            "usable_orderbook_rate": universe_health_state.get("usable_orderbook_rate", 0.0),
-                            "executable_quote_rate": universe_health_state.get("executable_quote_rate", 0.0),
-                            "zero_one_book_rate": universe_health_state.get("zero_one_book_rate", 0.0),
-                            "malformed_book_rate": universe_health_state.get("malformed_book_rate", 0.0),
-                            "cooldown_active": bool(universe_health_state.get("cooldown_active")),
-                            "cooldown_remaining_seconds": universe_health_state.get("cooldown_remaining_seconds", 0),
-                            "scanner_score": routing_profile.get("scanner_score", 0.0),
-                            "scan_tier": routing_profile.get("scan_tier"),
-                            "next_action": "continue_scan",
-                        },
-                        sort_keys=True,
-                        default=str,
-                    )
-                )
         eligible_families.sort(reverse=True)
         for _quality_total, family in eligible_families:
             if len(selected) >= MAX_QUALITY_EXPANSION_FAMILIES:
@@ -41269,9 +40529,6 @@ class KalshiSniperBot:
             "history_points": 0,
             "history_reason": "no_price_series",
         }
-
-    def _extract_phase55_price_series_from_payload(self, payload):
-        return self._extract_phase55_price_series_context_from_payload(payload).get("series", [])
 
     def _build_phase55_snapshot_series(self, market, q):
         previous_price = self._extract_entry_timing_float(
@@ -47183,9 +46440,7 @@ class KalshiSniperBot:
                 continue
             if self.is_on_cooldown(q.ticker):
                 remaining = int(self.market_cooldowns[q.ticker] - time.time())
-                print(f"[SKIP] {q.ticker} on cooldown")
-                print(f"[COOLDOWN] {q.ticker} until {remaining}s")
-                continue
+                print(f"[COOLDOWN-WARN] {q.ticker} until {remaining}s decision=CONTINUE")
             passes_filters, reason = self.passes_entry_filters(q)
             if not passes_filters:
                 print(f"[SKIP] {q.ticker} filter={reason}")
@@ -47268,20 +46523,14 @@ class KalshiSniperBot:
             if result.get("reason") == "price_out_of_range":
                 reject_ticker = str(q.ticker or "").strip() or None
                 if reject_ticker:
-                    now_ts = time.time()
-                    cooldown_until = now_ts + float(AION_PRICE_RANGE_REJECT_TICKER_COOLDOWN_SECONDS)
-                    current_cooldown_until = float(self.market_cooldowns.get(reject_ticker, 0.0) or 0.0)
-                    if cooldown_until > current_cooldown_until:
-                        self.market_cooldowns[reject_ticker] = cooldown_until
                     print(
-                        "[AION-PRICE-RANGE-COOLDOWN] "
+                        "[AION-PRICE-RANGE-PRESSURE] "
                         + json.dumps(
                             {
                                 "ticker": reject_ticker,
                                 "family": self.get_market_family({"ticker": reject_ticker}),
                                 "reason": result.get("reason"),
-                                "cooldown_seconds": int(AION_PRICE_RANGE_REJECT_TICKER_COOLDOWN_SECONDS),
-                                "cooldown_until": round(cooldown_until, 3),
+                                "action": "rank_pressure_only",
                                 "source_fields_checked": [
                                     "submit_live_order.payload.canonical_quote_object",
                                     "submit_live_order.payload.canonical_selected_quote",
@@ -47303,7 +46552,7 @@ class KalshiSniperBot:
                                 "family": self.get_market_family({"ticker": reject_ticker}),
                                 "reason": result.get("reason"),
                                 "next_action": "continue_scan",
-                                "cooldown_applied": True,
+                                "pressure_applied": True,
                             },
                             sort_keys=True,
                             default=str,
@@ -52419,13 +51668,6 @@ class KalshiSniperBot:
         except Exception:
             pass
 
-    def _is_btc15m_overnight_mode(self, family=None, now_ts=None):
-        family = str(family or "").strip().upper()
-        if family != "KXBTC15M":
-            return False
-        hour = datetime.fromtimestamp(float(now_ts or time.time()), tz=timezone.utc).hour
-        return hour < 11 or hour >= 23
-
     def _is_combo_like_market(self, market):
         text = ""
         if isinstance(market, dict):
@@ -52613,17 +51855,6 @@ class KalshiSniperBot:
             proxy = self._canonical_quote_object_from_candidate({"ticker": ticker, **cached})
             return proxy, {"quote_fixed": True, "reason": "targeted_orderbook_cache"}
         return q, {"quote_fixed": q is not None, "reason": "existing_quote"}
-
-    def _resolve_btc15m_live_direction_decision(self, market=None, q=None, family=None, entry_timing_observation=None):
-        return {
-            "ticker": str(self._read_field(q, "ticker", default="") or ((market or {}).get("ticker") if isinstance(market, dict) else "") or "").strip() or None,
-            "family": family,
-            "intended_side": None,
-            "selected_side": None,
-            "selected_price": None,
-            "reason": "sports_only_btc15m_direction_removed",
-            "btc_volatility_active": False,
-        }
 
     def _check_realm_vv_live_execution_gate(self, ticker, family=None, override_block_reason=None, canonical_execution_state=None):
         if override_block_reason:
@@ -52883,15 +52114,6 @@ class KalshiSniperBot:
         if not ticker:
             return
         now_ts = time.time()
-        cooldown_until = now_ts + float(AION_PRICE_RANGE_REJECT_TICKER_COOLDOWN_SECONDS)
-        market_cooldowns = getattr(self, "market_cooldowns", None)
-        if not isinstance(market_cooldowns, dict):
-            self.market_cooldowns = {}
-            market_cooldowns = self.market_cooldowns
-        current_cooldown_until = float(market_cooldowns.get(ticker, 0.0) or 0.0)
-        if current_cooldown_until > now_ts:
-            return
-        market_cooldowns[ticker] = max(cooldown_until, current_cooldown_until)
         self._record_price_family_reject(family, ticker, reason, now_ts=now_ts)
         print(
             "[AION-PRICE-RANGE-PREFILTER] "
@@ -52901,7 +52123,7 @@ class KalshiSniperBot:
                     "family": family,
                     "reason": reason,
                     "source": source,
-                    "cooldown_seconds": int(AION_PRICE_RANGE_REJECT_TICKER_COOLDOWN_SECONDS),
+                    "action": "rank_pressure_only",
                     "next_action": "continue_scan",
                 },
                 sort_keys=True,
@@ -53250,123 +52472,6 @@ class KalshiSniperBot:
             'legacy_final_submit_bypassed': bool(legacy_final_submit_bypassed),
         }
 
-    def _live_dispatch_decision_smoke_test(self):
-        cases = [
-            {
-                'ticker': 'TEST-YES',
-                'family': 'TEST',
-                'selected_price': 0.5,
-                'selected_side': 'yes',
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': True,
-                'auth_ready': True,
-                'payload_ready': True,
-                'duplicate_block': False,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-            {
-                'ticker': 'TEST-AUTH',
-                'family': 'TEST',
-                'selected_price': 0.5,
-                'selected_side': 'yes',
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': True,
-                'auth_ready': False,
-                'payload_ready': True,
-                'duplicate_block': False,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-            {
-                'ticker': 'TEST-PAYLOAD',
-                'family': 'TEST',
-                'selected_price': 0.5,
-                'selected_side': 'yes',
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': True,
-                'auth_ready': True,
-                'payload_ready': False,
-                'duplicate_block': False,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-            {
-                'ticker': 'TEST-DUP',
-                'family': 'TEST',
-                'selected_price': 0.5,
-                'selected_side': 'yes',
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': True,
-                'auth_ready': True,
-                'payload_ready': True,
-                'duplicate_block': True,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-            {
-                'ticker': 'TEST-SPREAD',
-                'family': 'TEST',
-                'selected_price': 0.5,
-                'selected_side': 'yes',
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': False,
-                'auth_ready': True,
-                'payload_ready': True,
-                'duplicate_block': False,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-            {
-                'ticker': 'TEST-PRICE',
-                'family': 'TEST',
-                'selected_price': 1.0,
-                'selected_side': 'yes',
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': True,
-                'auth_ready': True,
-                'payload_ready': True,
-                'duplicate_block': False,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-            {
-                'ticker': 'TEST-NO-PRICE',
-                'family': 'TEST',
-                'selected_price': None,
-                'selected_side': 'yes',
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': True,
-                'auth_ready': True,
-                'payload_ready': True,
-                'duplicate_block': False,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-            {
-                'ticker': 'TEST-NO-SIDE',
-                'family': 'TEST',
-                'selected_price': 0.5,
-                'selected_side': None,
-                'quote_content_pass': True,
-                'executable_quote_pass': True,
-                'spread_present': True,
-                'auth_ready': True,
-                'payload_ready': True,
-                'duplicate_block': False,
-                'final_submit_allowed': True,
-                'submit_quote_present': True,
-            },
-        ]
-        return [self.build_live_dispatch_decision(case) for case in cases]
-
     def _build_aion_canonical_quote_payload(self, *, quote=None, payload=None, quote_diag=None, orderbook_resolution=None, selected_side=None, ticker=None, fallback_source_used=None):
         payload = payload if isinstance(payload, dict) else {}
         quote_diag = quote_diag if isinstance(quote_diag, dict) else {}
@@ -53489,15 +52594,6 @@ class KalshiSniperBot:
                 "selected_ticker": selected_ticker,
             }
             print("[AION-SUBMIT-QUOTE-FOUND] " + json.dumps(payload, sort_keys=True, default=str))
-        except Exception:
-            pass
-
-    def _emit_aion_spread_missing_detail_trace(self, **payload_context):
-        try:
-            print(
-                "[AION-SPREAD-MISSING-DETAIL] "
-                + json.dumps(payload_context, sort_keys=True, default=str)
-            )
         except Exception:
             pass
 
@@ -59014,12 +58110,6 @@ class KalshiSniperBot:
                         default=str,
                     )
                 )
-                self._emit_btc1h_live_execute_log(
-                    auto_live_ticker,
-                    result=result,
-                    payload=payload,
-                    family=selected_family,
-                )
                 primary_lane = None
                 for lane_candidate in getattr(self, "last_dual_lane_buy_candidates", []) or []:
                     if str(lane_candidate.get("ticker") or "").strip() == str(auto_live_ticker or "").strip():
@@ -61974,19 +61064,6 @@ class KalshiSniperBot:
                 "no_bid": orderbook_resolution.get("no_bid"),
             }
         )
-        loss_bucket_guard = self.evaluate_loss_bucket_entry_block(
-            sizing_context,
-            q=q,
-            market=market,
-            family=family,
-            ticker=ticker,
-            side=intended_side,
-            selected_price=sizing_context.get("selected_price_dollars") or sizing_context.get("selected_price"),
-            selected_price_cents=sizing_context.get("selected_price_cents"),
-            source=selection_stage or "build_live_order_payload",
-        )
-        if loss_bucket_guard.get("blocked"):
-            return None
         requested_count = self._resolve_dynamic_live_entry_size(
             q,
             explicit_size=size,
@@ -62306,20 +61383,6 @@ class KalshiSniperBot:
         if selected_price_cents is None or selected_price_cents < 1 or selected_price_cents > 99:
             return None
         selected_price = round(float(selected_price_cents) / 100.0, 4)
-        loss_bucket_guard = self.evaluate_loss_bucket_entry_block(
-            payload,
-            q=q,
-            market=market,
-            family=family,
-            ticker=ticker,
-            side=intended_side,
-            selected_price=selected_price,
-            selected_price_cents=selected_price_cents,
-            candidate_score=quote_diag.get("unified_opportunity_score") or quote_diag.get("candidate_score") or quote_diag.get("sports_execution_quality_score"),
-            source=selection_stage or "build_live_order_payload",
-        )
-        if loss_bucket_guard.get("blocked"):
-            return None
         if str(DEFAULT_LIVE_ORDER_ACTION or "").strip().lower() not in {"buy", "sell"}:
             return None
         def _emit_order_side_payload(payload_obj):

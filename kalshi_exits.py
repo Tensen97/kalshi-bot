@@ -1029,7 +1029,6 @@ def evaluate_dynamic_live_exit(
     defensive_sports_collapse = bool(
         is_sports_position
         and executable_exit_price
-        and hold_seconds >= fast_cut_min_hold_seconds
         and (
             probability_collapse
             or current_price <= max(0.03, entry_price - max(0.025, entry_price * 0.18))
@@ -1048,7 +1047,6 @@ def evaluate_dynamic_live_exit(
     dead_prop_exit = bool(
         is_sports_position
         and executable_exit_price
-        and hold_seconds >= fast_cut_min_hold_seconds
         and (
             current_price <= 0.04
             or (current_price <= max(0.05, entry_price * 0.35) and pnl_per_contract < 0.0)
@@ -1121,7 +1119,7 @@ def evaluate_dynamic_live_exit(
 
     action = "hold"
     reason = "existing_hold_logic"
-    required_loss_confirmations = int(loss_exit_confirmation_checks or 1)
+    required_loss_confirmations = 1
     if not dynamic_exit_enabled:
         reason = "dynamic_exit_disabled"
     elif not executable_exit_price:
@@ -1185,22 +1183,22 @@ def evaluate_dynamic_live_exit(
     elif pnl_per_contract >= base_take_profit and not strong_momentum:
         action = "exit"
         reason = "take_profit"
-    elif pnl_per_contract <= severe_stop_loss and hold_seconds >= fast_cut_min_hold_seconds:
+    elif pnl_per_contract <= severe_stop_loss:
         action = "exit"
         reason = "severe_stop_loss"
         required_loss_confirmations = 1
-    elif pnl_per_contract <= dynamic_stop_loss and adverse_movement and hold_seconds >= fast_cut_min_hold_seconds:
+    elif pnl_per_contract <= dynamic_stop_loss and adverse_movement:
         action = "exit"
         reason = "adverse_fast_cut"
         required_loss_confirmations = 1
-    elif is_sports_position and probability_collapse and hold_seconds >= fast_cut_min_hold_seconds and pnl_per_contract <= -max(0.01, base_stop_loss * 0.45):
+    elif is_sports_position and probability_collapse and pnl_per_contract <= -max(0.01, base_stop_loss * 0.45):
         action = "exit"
         reason = "defensive_exit"
         required_loss_confirmations = 1
     elif late_or_stale_sports and weak_momentum and pnl_per_contract < 0.0:
         action = "exit"
         reason = "stale_sports_exit"
-    elif pnl_per_contract <= -base_stop_loss and hold_seconds >= min_hold_seconds:
+    elif pnl_per_contract <= -base_stop_loss:
         action = "exit"
         reason = "stop_loss"
     elif pnl_per_contract > 0.0 and weak_momentum and pnl_per_contract >= weak_take_profit:
@@ -1217,17 +1215,7 @@ def evaluate_dynamic_live_exit(
         action = "hold"
         reason = "pregame_loss_exit_blocked"
 
-    if action == "exit" and pnl_per_contract < 0.0:
-        loss_counts = getattr(bot, "live_loss_exit_confirmation_counts", {})
-        if not isinstance(loss_counts, dict):
-            loss_counts = {}
-        current_count = int(loss_counts.get(ticker, 0) or 0) + 1
-        loss_counts[ticker] = current_count
-        bot.live_loss_exit_confirmation_counts = loss_counts
-        if current_count < max(1, required_loss_confirmations):
-            action = "hold"
-            reason = f"loss_confirmation_{current_count}_of_{max(1, required_loss_confirmations)}"
-    elif pnl_per_contract >= 0.0:
+    if pnl_per_contract >= 0.0:
         try:
             bot.live_loss_exit_confirmation_counts.pop(ticker, None)
         except Exception:

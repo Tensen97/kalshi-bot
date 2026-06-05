@@ -7,7 +7,6 @@ testable services without changing its public CLI.
 
 from .core import BackoffConfig, CircuitBreaker, KalshiHttpClient, RateLimiter
 from .discovery import MarketDiscoveryConfig, MarketDiscoveryService
-from .live import LiveQuoteStreamService, TelegramCommandService
 from .risk import EntryExitGuardService, GuardThresholds
 
 __all__ = [
@@ -16,9 +15,7 @@ __all__ = [
     "EntryExitGuardService",
     "GuardThresholds",
     "KalshiHttpClient",
-    "LiveQuoteStreamService",
     "MarketDiscoveryConfig",
     "MarketDiscoveryService",
     "RateLimiter",
-    "TelegramCommandService",
 ]

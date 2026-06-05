@@ -615,7 +615,6 @@ def get_momentum_rank_adjustment(
     market=None,
     family=None,
     imbalance_context=None,
-    btc_volatility_context=None,
     ev_context=None,
     source="ranking",
     log=True,
@@ -637,7 +636,6 @@ def get_momentum_rank_adjustment(
     family = str(family or "UNKNOWN").strip().upper() or "UNKNOWN"
     ev_context = ev_context if isinstance(ev_context, dict) else {}
     imbalance_context = imbalance_context if isinstance(imbalance_context, dict) else {}
-    btc_volatility_context = btc_volatility_context if isinstance(btc_volatility_context, dict) else {}
     side = _selected_side(bot, item, market, q, ev_context=ev_context)
     series, series_source = _extract_yes_probability_series(bot, item, market, q)
     current_yes, current_source = _current_yes_probability(bot, item, market, q)
@@ -717,17 +715,6 @@ def get_momentum_rank_adjustment(
         momentum -= min(0.10, abs(side_imbalance) * 0.12)
         reason_parts.append("orderbook_pressure_opposed")
     momentum = _clamp(momentum, -1.0, 1.0)
-
-    btc_direction = str(btc_volatility_context.get("direction") or "neutral").strip().lower()
-    btc_preferred_side = str(btc_volatility_context.get("preferred_side") or "").strip().lower()
-    btc_active = bool(btc_volatility_context.get("active"))
-    if btc_active and side in {"yes", "no"}:
-        if btc_preferred_side == side:
-            momentum = min(1.0, momentum + 0.22 * _clamp(btc_volatility_context.get("volatility"), 0.0, 3.0) / 3.0)
-            reason_parts.append(f"btc_{btc_direction}_aligned")
-        elif btc_preferred_side in {"yes", "no"}:
-            momentum = max(-1.0, momentum - 0.10 * _clamp(btc_volatility_context.get("volatility"), 0.0, 3.0) / 3.0)
-            reason_parts.append(f"btc_{btc_direction}_opposed")
 
     ev_edge = bot.to_float(ev_context.get("ev_edge"), None)
     if ev_edge is not None and ev_edge > 0.0 and momentum > 0.0:
@@ -809,12 +796,6 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             log=True,
             source=source,
         )
-        btc_volatility_context = bot._get_btc_volatility_rank_adjustment(
-            item,
-            market=market,
-            log=True,
-            source=source,
-        )
         if hasattr(bot, "_get_structural_edge_rank_adjustment"):
             structural_edge_context = bot._get_structural_edge_rank_adjustment(
                 item,
@@ -874,7 +855,6 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             market=market,
             family=family,
             imbalance_context=imbalance_context,
-            btc_volatility_context=btc_volatility_context,
             ev_context=ev_context,
             source=source,
             log=True,
@@ -883,7 +863,6 @@ def apply_rank_only_memory_adjustments(bot, ranked, *, source="ranking", markets
             bot._rank_score_for_family_profit_memory(item)
             + family_adjustment
             + bot.to_float(imbalance_context.get("adjustment"), 0.0)
-            + bot.to_float(btc_volatility_context.get("adjustment"), 0.0)
             + bot.to_float(structural_edge_context.get("boost"), 0.0)
             + bot.to_float(elite_signal_context.get("boost"), 0.0)
             + bot.to_float(sports_edge_context.get("boost"), 0.0)

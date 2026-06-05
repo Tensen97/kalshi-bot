@@ -1255,21 +1255,6 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertEqual([market["ticker"] for market in filtered], ["KXNCAABSPREAD-PURMICH", "KXMLBMONEYLINE-NYYBOS", "KXITFMATCH-26MAY26CLAJOH-CLA"])
 
-    def test_sports_only_btc_cycle_discovery_is_disabled(self):
-        self._set_sports_only_mode(True)
-        bot = self._make_bot()
-        bot._fetch_btc1h_cycle_markets = lambda *args, **kwargs: self.fail("sports-only mode should not fetch crypto cycle markets")
-
-        summary = bot._run_btc1h_adaptive_cycle(
-            markets=[{"ticker": "KXBTC1H-CYCLE-70000", "series_ticker": "KXBTC1H", "title": "Bitcoin above $70,000"}],
-            source="unit_test_sports_only",
-            force=True,
-        )
-
-        self.assertFalse(summary["enabled"])
-        self.assertEqual(summary["markets_to_merge"], [])
-        self.assertEqual(summary["reason"], "sports_only_mode_crypto_discovery_removed")
-
     def test_sports_only_final_ranking_purges_crypto_and_weather(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
