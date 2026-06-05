@@ -1587,8 +1587,8 @@ class StructuralEdgeTests(unittest.TestCase):
         posted = []
         bot.live_positions = [
             {
-                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-MIL",
-                "family": "KXATPCHALLENGERMATCH",
+                "ticker": "KXMLBMONEYLINE-26JUN01NYYBOS-NYY",
+                "family": "KXMLBMONEYLINE",
                 "side": "yes",
                 "count": 2,
                 "entry_price": 0.60,
@@ -1611,8 +1611,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.place_live_order(
             {
-                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
-                "family": "KXATPCHALLENGERMATCH",
+                "ticker": "KXMLBMONEYLINE-26JUN01NYYBOS-BOS",
+                "family": "KXMLBMONEYLINE",
                 "side": "yes",
                 "action": "buy",
                 "count": 2,
@@ -1624,7 +1624,7 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertTrue(result["submitted"])
         self.assertEqual(len(posted), 1)
-        self.assertEqual(posted[0]["ticker"], "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN")
+        self.assertEqual(posted[0]["ticker"], "KXMLBMONEYLINE-26JUN01NYYBOS-BOS")
 
     def test_canonical_place_order_allows_reduce_only_exit_with_conflict(self):
         self._set_sports_only_mode(True)
@@ -1695,8 +1695,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.place_live_order(
             {
-                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
-                "family": "KXATPCHALLENGERMATCH",
+                "ticker": "KXMLBMONEYLINE-26JUN01NYYBOS-BOS",
+                "family": "KXMLBMONEYLINE",
                 "side": "yes",
                 "action": "buy",
                 "count": 2,
@@ -1707,7 +1707,7 @@ class StructuralEdgeTests(unittest.TestCase):
         )
 
         self.assertTrue(result["submitted"])
-        self.assertEqual(posted[0]["ticker"], "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN")
+        self.assertEqual(posted[0]["ticker"], "KXMLBMONEYLINE-26JUN01NYYBOS-BOS")
         self.assertEqual(posted[0]["side"], "yes")
         self.assertEqual(posted[0]["action"], "buy")
         self.assertEqual(posted[0]["count"], 2)
@@ -1722,7 +1722,7 @@ class StructuralEdgeTests(unittest.TestCase):
         future_start = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXATPCHALLENGERMATCH",
+            "series_ticker": "KXMLBMONEYLINE",
             "status": "active",
             "start_time": future_start,
         }
@@ -1744,8 +1744,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.place_live_order(
             {
-                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
-                "family": "KXATPCHALLENGERMATCH",
+                "ticker": "KXMLBMONEYLINE-26JUN01NYYBOS-BOS",
+                "family": "KXMLBMONEYLINE",
                 "side": "yes",
                 "action": "buy",
                 "count": 2,
@@ -1756,17 +1756,17 @@ class StructuralEdgeTests(unittest.TestCase):
         )
 
         self.assertTrue(result["submitted"])
-        self.assertEqual(posted[0]["ticker"], "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN")
+        self.assertEqual(posted[0]["ticker"], "KXMLBMONEYLINE-26JUN01NYYBOS-BOS")
         self.assertEqual(posted[0]["side"], "yes")
         self.assertEqual(posted[0]["yes_price"], 46)
 
-    def test_sports_live_state_guard_allows_atp_live_flag_despite_future_occurrence(self):
+    def test_sports_live_state_guard_allows_squash_live_flag_despite_future_occurrence(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXATPCHALLENGERMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "event_status": "in_play",
             "occurrence_datetime": future_occurrence,
@@ -1775,8 +1775,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.evaluate_sports_live_state_pre_submit_guard(
             {
-                "ticker": "KXATPCHALLENGERMATCH-26JUN01BIRM-LIVE",
-                "family": "KXATPCHALLENGERMATCH",
+                "ticker": "KXSQUASHMATCH-26JUN01BIRM-LIVE",
+                "family": "KXSQUASHMATCH",
                 "side": "yes",
                 "action": "buy",
                 "count": 1,
@@ -1790,13 +1790,13 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(result["reason"], "sports_live_state_ok")
         self.assertEqual(result["occurrence_key"], "occurrence_datetime")
 
-    def test_sports_live_state_guard_allows_itf_scoreboard_despite_future_occurrence(self):
+    def test_sports_live_state_guard_allows_squash_scoreboard_despite_future_occurrence(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXITFMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "occurrence_datetime": future_occurrence,
             "scoreboard": {"set": 2, "game_status": "in_progress", "clock": "live"},
@@ -1804,8 +1804,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.evaluate_sports_live_state_pre_submit_guard(
             {
-                "ticker": "KXITFMATCH-26JUN01ITF-LIVE",
-                "family": "KXITFMATCH",
+                "ticker": "KXSQUASHMATCH-26JUN01LIVE-LIVE",
+                "family": "KXSQUASHMATCH",
                 "side": "no",
                 "action": "buy",
                 "count": 1,
@@ -1826,7 +1826,7 @@ class StructuralEdgeTests(unittest.TestCase):
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXITFMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "occurrence_datetime": future_occurrence,
             "expected_expiration_time": future_occurrence,
@@ -1834,8 +1834,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.evaluate_sports_live_state_pre_submit_guard(
             {
-                "ticker": "KXITFMATCH-26JUN01ITF-OPEN",
-                "family": "KXITFMATCH",
+                "ticker": "KXSQUASHMATCH-26JUN01LIVE-OPEN",
+                "family": "KXSQUASHMATCH",
                 "side": "yes",
                 "action": "buy",
                 "count": 1,
@@ -1858,7 +1858,7 @@ class StructuralEdgeTests(unittest.TestCase):
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat().replace("+00:00", "Z")
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXITFMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "occurrence_datetime": future_occurrence,
             "expected_expiration_time": future_occurrence,
@@ -1866,8 +1866,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.evaluate_sports_live_state_pre_submit_guard(
             {
-                "ticker": "KXITFMATCH-26JUN01ITF-OPEN",
-                "family": "KXITFMATCH",
+                "ticker": "KXSQUASHMATCH-26JUN01LIVE-OPEN",
+                "family": "KXSQUASHMATCH",
                 "side": "yes",
                 "action": "buy",
                 "count": 1,
@@ -1887,15 +1887,15 @@ class StructuralEdgeTests(unittest.TestCase):
         future_start = future_dt.astimezone(timezone(timedelta(hours=-4))).isoformat()
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXATPCHALLENGERMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "start_time": future_start,
         }
 
         result = bot.evaluate_sports_live_state_pre_submit_guard(
             {
-                "ticker": "KXATPCHALLENGERMATCH-26JUN01TZ-FUT",
-                "family": "KXATPCHALLENGERMATCH",
+                "ticker": "KXSQUASHMATCH-26JUN01TZ-FUT",
+                "family": "KXSQUASHMATCH",
                 "side": "yes",
                 "action": "buy",
                 "count": 1,
@@ -1917,8 +1917,8 @@ class StructuralEdgeTests(unittest.TestCase):
 
         result = bot.evaluate_sports_live_state_pre_submit_guard(
             {
-                "ticker": "KXATPCHALLENGERMATCH-26JUN01MILLAN-LAN",
-                "family": "KXATPCHALLENGERMATCH",
+                "ticker": "KXSQUASHMATCH-26JUN01LIVE-LAN",
+                "family": "KXSQUASHMATCH",
                 "side": "yes",
                 "action": "buy",
                 "count": 1,
@@ -2159,9 +2159,9 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = self._make_bot()
         future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
         live_market = {
-            "ticker": "KXITFWMATCH-26JUN01LIVE-LIVE",
-            "series_ticker": "KXITFWMATCH",
-            "title": "ITF live match",
+            "ticker": "KXSQUASHMATCH-26JUN01LIVE-LIVE",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash live match",
             "status": "active",
             "game_status": "in_progress",
             "yes_ask": 0.48,
@@ -2169,9 +2169,9 @@ class StructuralEdgeTests(unittest.TestCase):
             "volume": 200,
         }
         future_market = {
-            "ticker": "KXATPCHALLENGERMATCH-26JUN02FUT-FUT",
-            "series_ticker": "KXATPCHALLENGERMATCH",
-            "title": "ATP Challenger tomorrow",
+            "ticker": "KXSQUASHMATCH-26JUN02FUT-FUT",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash match tomorrow",
             "status": "scheduled",
             "occurrence_datetime": future_start,
             "yes_ask": 0.42,
@@ -2199,9 +2199,9 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = self._make_bot()
         token = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
         future_market = {
-            "ticker": f"KXATPCHALLENGERMATCH-{token}UNIT-FUT",
-            "series_ticker": "KXATPCHALLENGERMATCH",
-            "title": "ATP Challenger future without occurrence metadata",
+            "ticker": f"KXSQUASHMATCH-{token}UNIT-FUT",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash future without occurrence metadata",
             "status": "active",
             "yes_ask": 0.42,
             "yes_bid": 0.39,
@@ -2228,9 +2228,9 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = self._make_bot()
         token = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%y%b%d").upper()
         live_market = {
-            "ticker": f"KXITFMATCH-{token}UNIT-LIVE",
-            "series_ticker": "KXITFMATCH",
-            "title": "ITF ambiguous date live market",
+            "ticker": f"KXSQUASHMATCH-{token}UNIT-LIVE",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash ambiguous date live market",
             "status": "active",
             "yes_ask": 0.47,
             "yes_bid": 0.45,
@@ -2257,9 +2257,9 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = self._make_bot()
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
         live_market = {
-            "ticker": "KXITFMATCH-26JUN01ACTIVE-YES",
-            "series_ticker": "KXITFMATCH",
-            "title": "ITF active executable market",
+            "ticker": "KXSQUASHMATCH-26JUN01ACTIVE-YES",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash active executable market",
             "status": "active",
             "occurrence_datetime": future_occurrence,
             "expected_expiration_time": future_occurrence,
@@ -2290,16 +2290,16 @@ class StructuralEdgeTests(unittest.TestCase):
         past_token = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%y%b%d").upper()
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
         live_market = {
-            "ticker": f"KXITFMATCH-{past_token}ACTIVE-HYDRATE",
-            "series_ticker": "KXITFMATCH",
-            "title": "ITF active market requiring orderbook hydration",
+            "ticker": f"KXSQUASHMATCH-{past_token}ACTIVE-HYDRATE",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash active market requiring orderbook hydration",
             "status": "active",
             "occurrence_datetime": future_occurrence,
             "expected_expiration_time": future_occurrence,
         }
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXITFMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "occurrence_datetime": future_occurrence,
             "expected_expiration_time": future_occurrence,
@@ -2338,15 +2338,15 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = self._make_bot()
         token = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%y%b%d").upper()
         thin_live_market = {
-            "ticker": f"KXITFWMATCH-{token}UNIT-HYDRATE",
-            "series_ticker": "KXITFWMATCH",
-            "title": "ITF ambiguous date list payload",
+            "ticker": f"KXSQUASHMATCH-{token}UNIT-HYDRATE",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash ambiguous date list payload",
             "status": "active",
             "volume": 500,
         }
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXITFWMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
         }
         bot.get_live_market_orderbook = lambda ticker: {
@@ -2382,15 +2382,15 @@ class StructuralEdgeTests(unittest.TestCase):
         token = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%y%b%d").upper()
         exact_future = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
         thin_future_market = {
-            "ticker": f"KXITFWMATCH-{token}UNIT-FUTURE",
-            "series_ticker": "KXITFWMATCH",
-            "title": "ITF exact future list payload",
+            "ticker": f"KXSQUASHMATCH-{token}UNIT-FUTURE",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash exact future list payload",
             "status": "active",
             "volume": 500,
         }
         bot.get_live_market_detail = lambda ticker: {
             "ticker": ticker,
-            "series_ticker": "KXITFWMATCH",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "occurrence_datetime": exact_future,
         }
@@ -2422,9 +2422,9 @@ class StructuralEdgeTests(unittest.TestCase):
         future_token = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
         past_start = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
         future_market = {
-            "ticker": f"KXATPCHALLENGERMATCH-{future_token}UNIT-FUT",
-            "series_ticker": "KXATPCHALLENGERMATCH",
-            "title": "ATP Challenger future with ambiguous timestamp",
+            "ticker": f"KXSQUASHMATCH-{future_token}UNIT-FUT",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash future with ambiguous timestamp",
             "status": "active",
             "start_time": past_start,
             "yes_ask": 0.42,
@@ -2444,13 +2444,21 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(summary["admitted_future_or_pregame"], 1)
         self.assertEqual(summary["reason_counts"]["future_start_time"], 1)
 
-    def test_live_discovery_admits_itf_atp_wta_match_series(self):
+    def test_live_discovery_removes_tennis_match_series_from_targeted_universe(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
-        exact_series = ("KXITFMATCH", "KXITFWMATCH", "KXATPMATCH", "KXWTAMATCH", "KXSQUASHMATCH")
-        for family in exact_series:
-            self.assertIn(family, kw.TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS)
+        tennis_series = ("KXITFMATCH", "KXITFWMATCH", "KXATPMATCH", "KXWTAMATCH")
+        for family in tennis_series:
+            self.assertNotIn(family, kw.TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS)
             self.assertTrue(bot.is_sports_family(family, ticker=f"{family}-26JUN01LIVE-TEST"))
+            self.assertTrue(
+                bot._aion_is_tennis_live_trading_disabled(
+                    family=family,
+                    ticker=f"{family}-26JUN01LIVE-TEST",
+                    source="unit_test",
+                )
+            )
+        self.assertIn("KXSQUASHMATCH", kw.TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS)
 
     def test_sports_only_keeps_squash_ticker_with_sol_player_code(self):
         self._set_sports_only_mode(True)
@@ -2513,9 +2521,9 @@ class StructuralEdgeTests(unittest.TestCase):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         market = {
-            "ticker": "KXATPCHALLENGERMATCH-26JUN01BIRM-LIVE",
-            "series_ticker": "KXATPCHALLENGERMATCH",
-            "title": "ATP Challenger Birmingham live",
+            "ticker": "KXSQUASHMATCH-26JUN01BIRM-LIVE",
+            "series_ticker": "KXSQUASHMATCH",
+            "title": "Squash Birmingham live",
             "status": "active",
             "scoreboard": {"set": 2, "clock": "live"},
             "yes_ask": 0.57,
@@ -2535,7 +2543,7 @@ class StructuralEdgeTests(unittest.TestCase):
         self.assertEqual(summary["admitted_count"], 1)
         self.assertIn("scoreboard_live_state", summary["reason_counts"])
 
-    def test_live_discovery_admits_live_tennis_despite_future_occurrence(self):
+    def test_live_discovery_blocks_live_tennis_despite_future_occurrence(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_occurrence = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat().replace("+00:00", "Z")
@@ -2553,32 +2561,34 @@ class StructuralEdgeTests(unittest.TestCase):
             "volume": 125,
         }
 
-        with contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()) as logs:
             admitted, summary = bot._filter_live_sports_discovery_markets(
                 [market],
                 source="unit_test",
                 limit=10,
             )
 
-        self.assertEqual([item["ticker"] for item in admitted], [market["ticker"]])
-        self.assertEqual(summary["admitted_count"], 1)
-        self.assertIn("scoreboard_live_state", summary["reason_counts"])
+        self.assertEqual([item["ticker"] for item in admitted], [])
+        self.assertEqual(summary["admitted_count"], 0)
+        self.assertEqual(summary["tennis_candidates_discovered"], 1)
+        self.assertEqual(summary["tennis_candidates_blocked"], 1)
+        self.assertIn("[AION-TENNIS-DISABLED]", logs.getvalue())
 
     def test_live_discovery_expanded_scan_recovers_live_market_after_future_root(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
         future_market = {
-            "ticker": "KXATPCHALLENGERMATCH-26JUN02ROOT-FUT",
-            "series_ticker": "KXATPCHALLENGERMATCH",
+            "ticker": "KXSQUASHMATCH-26JUN02ROOT-FUT",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "occurrence_datetime": future_start,
             "yes_ask": 0.44,
             "yes_bid": 0.41,
         }
         live_market = {
-            "ticker": "KXITFMATCH-26JUN01LIVE-RECOVERED",
-            "series_ticker": "KXITFMATCH",
+            "ticker": "KXSQUASHMATCH-26JUN01LIVE-RECOVERED",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "event_status": "in_play",
             "yes_ask": 0.52,
@@ -2607,8 +2617,8 @@ class StructuralEdgeTests(unittest.TestCase):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         market = {
-            "ticker": "KXATPMATCH-26JUN01LIVE-ONE",
-            "series_ticker": "KXATPMATCH",
+            "ticker": "KXSQUASHMATCH-26JUN01LIVE-ONE",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "event_status": "in_play",
             "yes_bid": 0.24,
@@ -2630,8 +2640,8 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = self._make_bot()
         future_start = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
         market = {
-            "ticker": "KXATPMATCH-26JUN02FUT-ONE",
-            "series_ticker": "KXATPMATCH",
+            "ticker": "KXSQUASHMATCH-26JUN02FUT-ONE",
+            "series_ticker": "KXSQUASHMATCH",
             "status": "active",
             "start_time": future_start,
             "yes_bid": 0.24,
@@ -2653,8 +2663,8 @@ class StructuralEdgeTests(unittest.TestCase):
         bot = self._make_bot()
         live_markets = [
             {
-                "ticker": "KXATPMATCH-26JUN01LIVE-ONE",
-                "series_ticker": "KXATPMATCH",
+                "ticker": "KXSQUASHMATCH-26JUN01LIVE-ONE",
+                "series_ticker": "KXSQUASHMATCH",
                 "status": "active",
                 "event_status": "in_play",
                 "yes_bid": 0.24,
@@ -2675,7 +2685,7 @@ class StructuralEdgeTests(unittest.TestCase):
             calls.append(markets)
             bot.last_live_select_summary = {
                 "within_window": len(markets or []),
-                "families_in_window": ["KXATPMATCH"] if markets else [],
+                "families_in_window": ["KXSQUASHMATCH"] if markets else [],
                 "candidates_found": 0,
             }
             return None, None
@@ -4387,7 +4397,7 @@ class StructuralEdgeTests(unittest.TestCase):
 
         self.assertEqual(ranked[0]["ticker"], "KXNCAASB-GAMEA-YES")
 
-    def test_tennis_exposure_cap_softens_weak_tennis_after_two_open(self):
+    def test_tennis_shutdown_blocks_weak_tennis_before_exposure_cap(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         self._configure_multi_submit_bot(bot, [])
@@ -4400,12 +4410,11 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as logs:
             result = bot._evaluate_aion_concurrency_candidate(candidate, submitted_entries=[], source="unit_tennis_cap")
 
-        self.assertTrue(result["allowed"])
-        self.assertEqual(result["reason"], "concurrency_capacity_available")
-        self.assertEqual(result["audit"]["tennis_cap"]["reason"], "tennis_exposure_pressure")
-        self.assertIn("[AION-TENNIS-CAP]", logs.getvalue())
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "tennis_live_trading_disabled")
+        self.assertIn("[AION-TENNIS-DISABLED]", logs.getvalue())
 
-    def test_elite_tennis_can_exceed_exposure_cap(self):
+    def test_tennis_shutdown_blocks_elite_tennis_exception(self):
         self._set_sports_only_mode(True)
         bot = self._make_bot()
         self._configure_multi_submit_bot(bot, [])
@@ -4431,8 +4440,10 @@ class StructuralEdgeTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as logs:
             result = bot._evaluate_aion_concurrency_candidate(candidate, submitted_entries=[], source="unit_elite_tennis")
 
-        self.assertTrue(result["allowed"])
-        self.assertIn("[AION-TENNIS-ELITE-ALLOW]", logs.getvalue())
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "tennis_live_trading_disabled")
+        self.assertIn("[AION-TENNIS-DISABLED]", logs.getvalue())
+        self.assertNotIn("[AION-TENNIS-ELITE-ALLOW]", logs.getvalue())
 
     def test_multi_submit_fills_slots_without_weak_tennis_majority(self):
         self._set_sports_only_mode(True)
@@ -4466,10 +4477,12 @@ class StructuralEdgeTests(unittest.TestCase):
 
         tennis_submits = [ticker for ticker in submitted if ticker.startswith(("KXATP", "KXITF", "KXWTA"))]
         self.assertTrue(result["submitted"])
-        self.assertEqual(result["submitted_count"], 10)
-        self.assertEqual(len(submitted), 10)
-        self.assertGreaterEqual(len(tennis_submits), kw.AION_TENNIS_EXPOSURE_CAP)
+        self.assertEqual(result["submitted_count"], 6)
+        self.assertEqual(len(submitted), 6)
+        self.assertEqual(len(tennis_submits), 0)
+        self.assertEqual(result["tennis_disabled_pre_rank_count"], 4)
         self.assertGreaterEqual(result["submitted_family_counts"].get("KXNCAASB", 0), 1)
+        self.assertIn("[AION-TENNIS-DISABLED]", logs.getvalue())
         self.assertIn("[AION-SLOT-ALLOCATION]", logs.getvalue())
 
     def test_primary_sports_capacity_warns_on_max_open_position_cap_before_submit(self):
@@ -4485,10 +4498,10 @@ class StructuralEdgeTests(unittest.TestCase):
             for i in range(kw.AION_MAX_OPEN_POSITIONS)
         ]
         candidate = self._multi_sports_candidate(
-            "KXWTAMATCH-GAMEZ-YES",
-            family="KXWTAMATCH",
+            "KXMLBSPREAD-GAMEZ-YES",
+            family="KXMLBSPREAD",
             score=91,
-            game_id="tennis:game_z",
+            game_id="mlb:game_z",
         )
 
         with contextlib.redirect_stdout(io.StringIO()):

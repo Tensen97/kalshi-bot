@@ -421,6 +421,7 @@ _TELEMETRY_CRITICAL_TAGS = {
     "AION-FRESHNESS-REPRICE",
     "AION-FAST-SUBMIT",
     "AION-ATP-FRESHNESS",
+    "AION-TENNIS-DISABLED",
     "AION-EDGE-DECAY",
     "AION-SUBMIT-CANCELLED-STALE",
     "AION-FRESHNESS-METRICS",
@@ -521,6 +522,7 @@ _AION_EXECUTION_CRITICAL_PREFIXES = (
     "AION-CONCURRENCY-",
     "AION-MULTI-SUBMIT-CYCLE",
     "AION-FAMILY-PRIORITY",
+    "AION-TENNIS-DISABLED",
     "AION-TENNIS-CAP",
     "AION-TENNIS-ELITE-ALLOW",
     "AION-SLOT-ALLOCATION",
@@ -1930,15 +1932,6 @@ TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS = [
     "KXNCAAF",
     "KXCFB",
     "KXCBB",
-    "KXATPCHALLENGERMATCH",
-    "KXATPMATCH",
-    "KXTENNISMATCH",
-    "KXITFMATCH",
-    "KXITFWMATCH",
-    "KXWTAMATCH",
-    "KXATP",
-    "KXWTA",
-    "KXITF",
     "KXSQUASHMATCH",
     "KXGOLF",
     "KXEPL",
@@ -1960,8 +1953,8 @@ AION_HIGH_LIQUIDITY_ALLOWED_FAMILIES = HIGH_LIQUIDITY_PRIORITY_FAMILIES
 LIQUIDITY_PRIORITY_TIER_1_PREFIXES = ("KXNBA1H", "KXNBASPREAD")
 LIQUIDITY_PRIORITY_TIER_2_PREFIXES = (
     "KXNBA", "KXWNBA", "KXMLB", "KXNFL", "KXNHL", "KXNCAA", "KXCFB", "KXCBB",
-    "KXATP", "KXWTA", "KXITF", "KXTENNIS", "KXSQUASH", "KXGOLF", "KXEPL", "KXSOCCER",
-    "NBA", "MLB", "NFL", "NHL", "NCAA", "TENNIS", "GOLF", "SOCCER",
+    "KXSQUASH", "KXGOLF", "KXEPL", "KXSOCCER",
+    "NBA", "MLB", "NFL", "NHL", "NCAA", "GOLF", "SOCCER",
 )
 DISCOVERY_DEPRIORITIZED_FAMILIES = (
     "KXTEMP",
@@ -1994,15 +1987,6 @@ TARGETED_SERIES_PRIORITY_WINDOWS = {
     "KXNCAAF": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXCFB": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXCBB": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXATPCHALLENGERMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXATPMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXTENNISMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXITFMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXITFWMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXWTAMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXATP": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXWTA": {"hours_utc": (), "reason": "sports_expansion_window"},
-    "KXITF": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXSQUASHMATCH": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXGOLF": {"hours_utc": (), "reason": "sports_expansion_window"},
     "KXEPL": {"hours_utc": (), "reason": "sports_expansion_window"},
@@ -2032,12 +2016,6 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
             "KXNHLGOAL",
             "KXNCAAB",
             "KXNCAAF",
-            "KXATPCHALLENGERMATCH",
-            "KXATPMATCH",
-            "KXTENNISMATCH",
-            "KXITFMATCH",
-            "KXITFWMATCH",
-            "KXWTAMATCH",
             "KXSQUASHMATCH",
             "KXGOLF",
             "KXEPL",
@@ -2064,12 +2042,6 @@ TARGETED_FAMILY_PRIORITY_SCHEDULES = (
             "KXNHLGOAL",
             "KXNCAAB",
             "KXNCAAF",
-            "KXATPCHALLENGERMATCH",
-            "KXATPMATCH",
-            "KXTENNISMATCH",
-            "KXITFMATCH",
-            "KXITFWMATCH",
-            "KXWTAMATCH",
             "KXSQUASHMATCH",
             "KXGOLF",
             "KXEPL",
@@ -2162,6 +2134,38 @@ AION_WEAK_TENNIS_FAMILY_PREFIXES = (
     "ATP",
     "WTA",
     "ITF",
+)
+AION_TENNIS_LIVE_TRADING_DISABLED = True
+AION_DISABLED_TENNIS_FAMILY_PREFIXES = (
+    "KXATPCHALLENGERMATCH",
+    "KXWTACHALLENGERMATCH",
+    "KXATPEXACTMATCH",
+    "KXWTAEXACTMATCH",
+    "KXATPSETWINNER",
+    "KXWTASETWINNER",
+    "KXATPGSPREAD",
+    "KXATPGTOTAL",
+    "KXATPADVANCE",
+    "KXITFWMATCH",
+    "KXITFMATCH",
+    "KXWTAMATCH",
+    "KXATPMATCH",
+    "KXTENNISMATCH",
+    "KXTENNIS",
+    "KXATP",
+    "KXWTA",
+    "KXITF",
+    "TENNIS",
+    "ATP",
+    "WTA",
+    "ITF",
+)
+AION_TENNIS_DISABLED_TEXT_MARKERS = (
+    "TENNIS",
+    "ATP",
+    "WTA",
+    "ITF",
+    "CHALLENGER",
 )
 AION_TENNIS_EXPOSURE_CAP_ENABLED = get_env_bool("AION_TENNIS_EXPOSURE_CAP_ENABLED", 1)
 AION_TENNIS_EXPOSURE_CAP = max(1, get_env_int("AION_TENNIS_EXPOSURE_CAP", 2))
@@ -3993,6 +3997,25 @@ class KalshiSniperBot:
                 "side": side,
                 "source": source,
             }
+        tennis_context = self._aion_tennis_disabled_context(
+            family=family,
+            ticker=ticker,
+            market=payload.get("market") if isinstance(payload.get("market"), dict) else payload,
+            q=q,
+            payload=payload,
+            source=source,
+        )
+        if tennis_context.get("disabled"):
+            self._emit_aion_tennis_disabled(tennis_context, source=source, stage="pre_submit_live_state_guard")
+            return {
+                "ok": False,
+                "reason": "tennis_live_trading_disabled",
+                "block_reason": "tennis_live_trading_disabled",
+                "ticker": ticker,
+                "family": family,
+                "side": side,
+                "source": source,
+            }
 
         metadata = []
         for candidate in (
@@ -4373,6 +4396,17 @@ class KalshiSniperBot:
         source = str(selection_merge_source or "").strip()
         if not self._sports_only_mode_enabled() or source not in {"provided_markets", "sports_only_live_discovery_selector"}:
             return False, {"reason": "selector_live_admission_not_applicable"}
+        tennis_context = self._aion_tennis_disabled_context(
+            market=market if isinstance(market, dict) else {},
+            source=source,
+        )
+        if tennis_context.get("disabled"):
+            self._emit_aion_tennis_disabled(tennis_context, source=source, stage="live_selector_admission")
+            return False, {
+                "admit": False,
+                "reason": "tennis_live_trading_disabled",
+                "live_state": "disabled",
+            }
         try:
             state = self._aion_live_discovery_state(market=market)
         except Exception as exc:
@@ -4414,6 +4448,134 @@ class KalshiSniperBot:
             deduped.append(market)
         return deduped
 
+    def _aion_tennis_disabled_context(self, *, family=None, ticker=None, market=None, q=None, payload=None, source=None):
+        market = market if isinstance(market, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        ticker = str(
+            ticker
+            or payload.get("ticker")
+            or market.get("ticker")
+            or getattr(q, "ticker", "")
+            or ""
+        ).strip()
+        family = str(
+            family
+            or payload.get("family")
+            or getattr(q, "family", "")
+            or market.get("series_ticker")
+            or (self.get_market_family(market or {"ticker": ticker}) if ticker else "")
+            or "UNKNOWN"
+        ).strip().upper() or "UNKNOWN"
+        title = str(
+            market.get("title")
+            or market.get("market_title")
+            or market.get("event_title")
+            or payload.get("market_title")
+            or getattr(q, "market_title", "")
+            or getattr(q, "title", "")
+            or ""
+        ).strip()
+        text_parts = [
+            family,
+            ticker,
+            str(market.get("series_ticker") or ""),
+            str(market.get("event_ticker") or ""),
+            title,
+            str(market.get("subtitle") or ""),
+            str(market.get("rules_primary") or ""),
+            str(market.get("rules_secondary") or ""),
+        ]
+        text = " ".join(part for part in text_parts if str(part or "").strip()).upper()
+        family_or_ticker = f"{family} {ticker}".upper()
+        matched_family = None
+        for prefix in AION_DISABLED_TENNIS_FAMILY_PREFIXES:
+            prefix = str(prefix or "").strip().upper()
+            if not prefix:
+                continue
+            if family.startswith(prefix) or ticker.upper().startswith(prefix):
+                matched_family = prefix
+                break
+            if prefix.startswith("KX") and f" {prefix}" in f" {family_or_ticker}":
+                matched_family = prefix
+                break
+        matched_text = None
+        delimited_text = f" {text} "
+        if matched_family is None:
+            for marker in AION_TENNIS_DISABLED_TEXT_MARKERS:
+                marker = str(marker or "").strip().upper()
+                if marker and f" {marker} " in delimited_text:
+                    matched_text = marker
+                    break
+        disabled = bool(AION_TENNIS_LIVE_TRADING_DISABLED and (matched_family or matched_text))
+        side = self._aion_normalize_live_side(
+            payload.get("selected_side")
+            or payload.get("side")
+            or getattr(q, "selected_side", None)
+            or getattr(q, "side", None)
+        )
+        selected_price = self.to_float(
+            payload.get("selected_price")
+            or payload.get("selected_price_dollars")
+            or payload.get("price")
+            or getattr(q, "selected_price", None),
+            None,
+        )
+        return {
+            "disabled": disabled,
+            "ticker": ticker or None,
+            "family": family,
+            "market_title": title or None,
+            "side": side if side in {"yes", "no"} else None,
+            "selected_price": selected_price,
+            "spread": self.to_float(payload.get("spread") or getattr(q, "spread", None), None),
+            "liquidity": self.to_float(payload.get("liquidity") or getattr(q, "liquidity", None), None),
+            "volume": self.to_float(payload.get("volume") or getattr(q, "volume", None), None),
+            "matched_family": matched_family,
+            "matched_text": matched_text,
+            "source": source,
+            "reason": "tennis_live_trading_disabled",
+            "responsible_subsystem": "tennis_shutdown",
+        }
+
+    def _aion_is_tennis_live_trading_disabled(self, *, family=None, ticker=None, market=None, q=None, payload=None, source=None):
+        return bool(
+            self._aion_tennis_disabled_context(
+                family=family,
+                ticker=ticker,
+                market=market,
+                q=q,
+                payload=payload,
+                source=source,
+            ).get("disabled")
+        )
+
+    def _emit_aion_tennis_disabled(self, context=None, *, source=None, stage=None):
+        context = context if isinstance(context, dict) else {}
+        payload = {
+            "source": source or context.get("source"),
+            "stage": stage,
+            "ticker": context.get("ticker"),
+            "family": context.get("family"),
+            "market_title": context.get("market_title"),
+            "side": context.get("side"),
+            "selected_price": context.get("selected_price"),
+            "spread": context.get("spread"),
+            "liquidity": context.get("liquidity"),
+            "volume": context.get("volume"),
+            "decision": "BLOCK",
+            "reason": context.get("reason") or "tennis_live_trading_disabled",
+            "matched_family": context.get("matched_family"),
+            "matched_text": context.get("matched_text"),
+            "responsible_subsystem": context.get("responsible_subsystem") or "tennis_shutdown",
+            "new_entries_allowed": False,
+            "existing_positions_managed": True,
+            "reduce_only_exits_allowed": True,
+        }
+        try:
+            builtins.print("[AION-TENNIS-DISABLED] " + json.dumps(payload, sort_keys=True, default=str))
+        except Exception:
+            pass
+
     def _emit_aion_live_discovery_summary(self, tag, payload):
         try:
             print(f"[{tag}] " + json.dumps(payload if isinstance(payload, dict) else {}, sort_keys=True, default=str))
@@ -4429,6 +4591,10 @@ class KalshiSniperBot:
                 "input_count": len(markets),
                 "admitted_count": len(markets),
                 "sports_only_mode": False,
+                "tennis_candidates_discovered": 0,
+                "tennis_candidates_blocked": 0,
+                "non_tennis_candidates_discovered": len(markets),
+                "non_tennis_candidates_admitted": len(markets),
             }
 
         admitted_entries = []
@@ -4448,6 +4614,11 @@ class KalshiSniperBot:
         classification_fix_examples = []
         relaxed_examples = []
         block_examples = []
+        tennis_block_examples = []
+        tennis_blocked_family_counts = Counter()
+        tennis_candidates_discovered = 0
+        tennis_candidates_blocked = 0
+        non_tennis_candidates_discovered = 0
         terminal_future_or_pregame_drops = 0
 
         def _should_hydrate_ambiguous_date_market(state):
@@ -4523,6 +4694,28 @@ class KalshiSniperBot:
             family_counts[family] += 1
             if not self.is_sports_family(family, ticker=ticker):
                 continue
+            tennis_context = self._aion_tennis_disabled_context(
+                family=family,
+                ticker=ticker,
+                market=market,
+                source=source,
+            )
+            if tennis_context.get("disabled"):
+                tennis_candidates_discovered += 1
+                tennis_candidates_blocked += 1
+                tennis_blocked_family_counts[family] += 1
+                if len(tennis_block_examples) < 12:
+                    tennis_block_examples.append(
+                        {
+                            "ticker": ticker or None,
+                            "family": family,
+                            "market_title": tennis_context.get("market_title"),
+                            "reason": "tennis_live_trading_disabled",
+                        }
+                    )
+                self._emit_aion_tennis_disabled(tennis_context, source=source, stage="live_discovery")
+                continue
+            non_tennis_candidates_discovered += 1
             state = self._aion_live_discovery_state(market=market)
             if (
                 not state.get("admit")
@@ -4733,6 +4926,12 @@ class KalshiSniperBot:
             "source": source,
             "input_count": int(len(markets)),
             "admitted_count": int(len(admitted)),
+            "tennis_candidates_discovered": int(tennis_candidates_discovered),
+            "tennis_candidates_blocked": int(tennis_candidates_blocked),
+            "tennis_blocked_families": dict(tennis_blocked_family_counts.most_common(20)),
+            "tennis_blocked_examples": tennis_block_examples,
+            "non_tennis_candidates_discovered": int(non_tennis_candidates_discovered),
+            "non_tennis_candidates_admitted": int(len(admitted)),
             "dropped_future_or_pregame": int(terminal_future_or_pregame_drops),
             "admitted_future_or_pregame": int(
                 sum(
@@ -4776,6 +4975,11 @@ class KalshiSniperBot:
                 "source": source,
                 "input_count": int(len(markets)),
                 "admitted_count": int(len(admitted)),
+                "tennis_candidates_discovered": int(tennis_candidates_discovered),
+                "tennis_candidates_blocked": int(tennis_candidates_blocked),
+                "tennis_blocked_families": dict(tennis_blocked_family_counts.most_common(12)),
+                "non_tennis_candidates_discovered": int(non_tennis_candidates_discovered),
+                "non_tennis_candidates_admitted": int(len(admitted)),
                 "admission_relaxed_count": int(payload["admission_relaxed_count"]),
                 "active_hydration_attempts": int(active_hydration_attempts),
                 "active_hydration_success": int(active_hydration_success),
@@ -4885,15 +5089,6 @@ class KalshiSniperBot:
 
         add_markets(root_markets)
         focus_series = [
-            "KXATPCHALLENGERMATCH",
-            "KXATPMATCH",
-            "KXTENNISMATCH",
-            "KXITFMATCH",
-            "KXITFWMATCH",
-            "KXWTAMATCH",
-            "KXATP",
-            "KXWTA",
-            "KXITF",
             "KXSQUASHMATCH",
         ]
         focus_fetched = {}
@@ -8779,6 +8974,17 @@ class KalshiSniperBot:
         )
         if reduce_only:
             return {"allowed": True, "reason": "reduce_only_exit_exempt", "payload": payload, "size": size}
+        tennis_context = self._aion_tennis_disabled_context(
+            family=family,
+            ticker=ticker,
+            market=payload or {"ticker": ticker, "series_ticker": family},
+            q=q,
+            payload=payload,
+            source=source,
+        )
+        if tennis_context.get("disabled"):
+            self._emit_aion_tennis_disabled(tennis_context, source=source, stage="canonical_submit_gate")
+            return {"allowed": False, "reason": "tennis_live_trading_disabled", "payload": payload, "size": size}
         if payload.get("_aion_freshness_gate_checked"):
             return {"allowed": True, "reason": "freshness_already_checked", "payload": payload, "size": size}
         if not ticker:
@@ -30169,10 +30375,21 @@ class KalshiSniperBot:
             capacity_pressure = min(capacity_pressure, 0.70)
         block_reason = None
         tennis_cap = {"allowed": True, "reason": "not_checked"}
+        tennis_disabled_context = self._aion_tennis_disabled_context(
+            family=family,
+            ticker=ticker,
+            market=meta.get("market"),
+            q=meta.get("q"),
+            payload=meta.get("allocation"),
+            source=source,
+        )
         if not ticker:
             block_reason = "missing_ticker"
         elif meta.get("lane") != "SPORTS":
             block_reason = "non_sports_lane"
+        elif tennis_disabled_context.get("disabled"):
+            block_reason = "tennis_live_trading_disabled"
+            self._emit_aion_tennis_disabled(tennis_disabled_context, source=source, stage="concurrency_admission")
         elif bool(getattr(self, "trading_halted", False)):
             block_reason = "trading_halted"
         elif self.to_float(getattr(self, "realized_pnl", 0.0), 0.0) <= -MAX_DAILY_LOSS or self.to_float(getattr(self, "live_realized_pnl_today", 0.0), 0.0) <= -MAX_DAILY_LOSS:
@@ -30293,8 +30510,26 @@ class KalshiSniperBot:
                     pass
 
     def _execute_multi_sports_submit_cycle(self, *, primary_ticker=None, primary_lane=None, primary_result=None, source="multi_submit_cycle"):
+        raw_candidates = [candidate for candidate in (getattr(self, "last_dual_lane_buy_candidates", []) or []) if isinstance(candidate, dict)]
+        tennis_disabled_candidates = []
+        rankable_candidates = []
+        for candidate in raw_candidates:
+            meta = self._aion_concurrency_candidate_meta(candidate)
+            tennis_context = self._aion_tennis_disabled_context(
+                family=meta.get("family"),
+                ticker=meta.get("ticker"),
+                market=meta.get("market"),
+                q=meta.get("q"),
+                payload=meta.get("allocation"),
+                source=source,
+            )
+            if tennis_context.get("disabled"):
+                tennis_disabled_candidates.append({"ticker": meta.get("ticker"), "family": meta.get("family"), "reason": "tennis_live_trading_disabled"})
+                self._emit_aion_tennis_disabled(tennis_context, source=source, stage="multi_submit_pre_rank")
+                continue
+            rankable_candidates.append(candidate)
         candidates = self._rank_slot_allocation_candidates(
-            [candidate for candidate in (getattr(self, "last_dual_lane_buy_candidates", []) or []) if isinstance(candidate, dict)],
+            rankable_candidates,
             source=source,
         )
         primary_ticker = str(primary_ticker or "").strip()
@@ -30496,6 +30731,8 @@ class KalshiSniperBot:
             "submitted_count": len(submitted),
             "submitted_tickers": [entry.get("ticker") for entry in submitted],
             "submitted_family_counts": dict(submitted_family_counts),
+            "tennis_disabled_pre_rank_count": int(len(tennis_disabled_candidates)),
+            "tennis_disabled_pre_rank_examples": tennis_disabled_candidates[:12],
             "weak_tennis_submitted_count": sum(
                 count for family, count in submitted_family_counts.items() if self._is_family_profitability_weak_tennis(family)
             ),
@@ -30543,6 +30780,33 @@ class KalshiSniperBot:
                 continue
             if not target_lanes and primary_lane and lane == primary_lane:
                 continue
+            if lane == "SPORTS":
+                meta = self._aion_concurrency_candidate_meta(candidate)
+                tennis_context = self._aion_tennis_disabled_context(
+                    family=meta.get("family"),
+                    ticker=meta.get("ticker"),
+                    market=meta.get("market"),
+                    q=meta.get("q"),
+                    payload=allocation,
+                    source=source,
+                )
+                if tennis_context.get("disabled"):
+                    self._emit_aion_tennis_disabled(tennis_context, source=source, stage="secondary_lane_pre_route")
+                    result = {"submitted": False, "reason": "tennis_live_trading_disabled"}
+                    truth_payload = self._lane_submit_truth_payload(
+                        candidate=candidate,
+                        allocation=allocation,
+                        result=result,
+                        submit_allowed=False,
+                        reason=result.get("reason"),
+                        source=source,
+                    )
+                    print("[AION-PROMOTED-NOT-SUBMITTED] " + json.dumps(truth_payload, sort_keys=True, default=str))
+                    print("[AION-PARALLEL-SUBMIT] " + json.dumps(truth_payload, sort_keys=True, default=str))
+                    last_attempt_result = result
+                    if target_lanes:
+                        return result
+                    continue
             if self._sports_only_crypto_execution_blocked(
                 family=candidate.get("family") or allocation.get("family"),
                 ticker=ticker,
@@ -36846,6 +37110,24 @@ class KalshiSniperBot:
         seen_tickers = set()
         total_found = 0
         targeted_series = list(self.get_prioritized_targeted_series() or [])[:MAX_FAMILIES_PER_SCAN]
+        tennis_series_blocked = []
+        filtered_targeted_series = []
+        for series_ticker in targeted_series:
+            tennis_context = self._aion_tennis_disabled_context(
+                family=series_ticker,
+                ticker=series_ticker,
+                source="targeted_series_discovery",
+            )
+            if tennis_context.get("disabled"):
+                tennis_series_blocked.append(series_ticker)
+                self._emit_aion_tennis_disabled(
+                    tennis_context,
+                    source="targeted_series_discovery",
+                    stage="targeted_series_seed",
+                )
+                continue
+            filtered_targeted_series.append(series_ticker)
+        targeted_series = filtered_targeted_series
         if self._sports_only_mode_enabled():
             original_targeted_series = list(targeted_series)
             targeted_series = [
@@ -36877,6 +37159,21 @@ class KalshiSniperBot:
         print(f"[LIVE-SELECT-DEBUG] targeted_mode_enabled={'yes' if ENABLE_TARGETED_SERIES_MODE else 'no'}")
         print(f"[LIVE-SELECT-DEBUG] targeted_series_scanned={targeted_series}")
         print(f"[LIVE-SELECT-DEBUG] targeted_series_added={TARGETED_DISCOVERY_EXPANSION_SERIES_TICKERS}")
+        if tennis_series_blocked:
+            print(
+                "[AION-TENNIS-DISABLED] "
+                + json.dumps(
+                    {
+                        "source": "targeted_series_discovery",
+                        "stage": "targeted_series_seed_summary",
+                        "blocked_series": tennis_series_blocked,
+                        "blocked_count": len(tennis_series_blocked),
+                        "reason": "tennis_live_trading_disabled",
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+            )
         print("[LIVE-SELECT-DEBUG] targeted_fetch_params mve_filter=exclude")
         print(
             f"[LIVE-SELECT-DEBUG] targeted_effective_max_minutes={targeted_max_minutes_to_event}"
@@ -36902,6 +37199,19 @@ class KalshiSniperBot:
             total_found += len(series_markets)
             for market in series_markets:
                 ticker = str(market.get("ticker", "") or "").strip()
+                tennis_context = self._aion_tennis_disabled_context(
+                    family=series_ticker,
+                    ticker=ticker,
+                    market=market,
+                    source="targeted_series_discovery",
+                )
+                if tennis_context.get("disabled"):
+                    self._emit_aion_tennis_disabled(
+                        tennis_context,
+                        source="targeted_series_discovery",
+                        stage="targeted_market_discovery",
+                    )
+                    continue
                 if self.is_excluded_targeted_market(market):
                     print(
                         f"[LIVE-SELECT-DEBUG] targeted_reject family={series_ticker} "
@@ -37846,8 +38156,6 @@ class KalshiSniperBot:
             "KXMLBSPREAD",
             "KXMLBTOTAL",
             "KXMLBMONEYLINE",
-            "KXATPCHALLENGERMATCH",
-            "KXTENNISMATCH",
         } or family.startswith(("KXNBA", "KXMLB"))
 
     def _is_sports_spread_family(self, family):
@@ -52166,7 +52474,23 @@ class KalshiSniperBot:
 
     def place_live_order(self, payload):
         payload = dict(payload or {}) if isinstance(payload, dict) else {}
-        if not self._aion_is_reduce_only_entry_payload(payload) and not payload.get("_aion_freshness_gate_checked"):
+        reduce_only_payload = self._aion_is_reduce_only_entry_payload(payload)
+        if not reduce_only_payload:
+            tennis_context = self._aion_tennis_disabled_context(
+                family=payload.get("family"),
+                ticker=payload.get("ticker"),
+                market=payload,
+                payload=payload,
+                source="place_live_order",
+            )
+            if tennis_context.get("disabled"):
+                self._emit_aion_tennis_disabled(tennis_context, source="place_live_order", stage="direct_place_guard")
+                return {
+                    "submitted": False,
+                    "reason": "tennis_live_trading_disabled",
+                    "payload": payload,
+                }
+        if not reduce_only_payload and not payload.get("_aion_freshness_gate_checked"):
             q = SimpleNamespace(
                 ticker=payload.get("ticker"),
                 family=payload.get("family"),
@@ -52210,6 +52534,22 @@ class KalshiSniperBot:
             submit_action_hint in {"sell", "exit", "close"}
             or (isinstance(payload_override, dict) and (payload_override.get("reduce_only") or payload_override.get("exit_reason") or payload_override.get("exit_order")))
         )
+        if not reduce_only_submit:
+            tennis_context = self._aion_tennis_disabled_context(
+                family=family,
+                ticker=ticker,
+                market=payload_override if isinstance(payload_override, dict) else {"ticker": ticker, "series_ticker": family},
+                q=q,
+                payload=payload_override if isinstance(payload_override, dict) else {},
+                source="submit_live_order",
+            )
+            if tennis_context.get("disabled"):
+                self._emit_aion_tennis_disabled(tennis_context, source="submit_live_order", stage="live_submit_guard")
+                return {
+                    "submitted": False,
+                    "reason": "tennis_live_trading_disabled",
+                    "payload": payload_override if isinstance(payload_override, dict) else None,
+                }
         if (not reduce_only_submit) and self._sports_only_execution_blocked(
             family=family,
             ticker=ticker,
@@ -54993,7 +55333,12 @@ class KalshiSniperBot:
             context_allowed = bool(
                 context_ticker
                 and context_quote_executable
-                and not str(context_family).startswith("KXATPCHALLENGERMATCH")
+                and not self._aion_is_tennis_live_trading_disabled(
+                    family=context_family,
+                    ticker=context_ticker,
+                    q=selected_context_quote,
+                    source="selected_context_quote_fallback",
+                )
                 and (
                     not self._sports_only_mode_enabled()
                     or self._is_sports_market_or_family(context_family)
@@ -62065,6 +62410,21 @@ class KalshiSniperBot:
         ).strip()
         family = self.get_market_family(market if market else {"ticker": ticker}) if ticker else "UNKNOWN"
         lane = self._candidate_execution_lane(family=family, ticker=ticker, market=market, q=q)
+        tennis_context = self._aion_tennis_disabled_context(
+            family=family,
+            ticker=ticker,
+            market=market,
+            q=q,
+            payload=quote_diag,
+            source=selection_stage or "build_live_order_payload",
+        )
+        if tennis_context.get("disabled"):
+            self._emit_aion_tennis_disabled(
+                tennis_context,
+                source=selection_stage or "build_live_order_payload",
+                stage="payload_build",
+            )
+            return None
         if self._sports_only_execution_blocked(
             family=family,
             ticker=ticker,

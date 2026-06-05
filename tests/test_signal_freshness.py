@@ -207,8 +207,8 @@ class SignalFreshnessTests(unittest.TestCase):
                 "allowed": True,
                 "reason": "freshness_repriced",
                 "payload": {
-                    "ticker": "KXATPCHALLENGERMATCH-FRESH",
-                    "family": "KXATPCHALLENGERMATCH",
+                    "ticker": "KXMLBKS-FRESH",
+                    "family": "KXMLBKS",
                     "side": "yes",
                     "selected_side": "yes",
                     "selected_price": 0.42,
@@ -231,12 +231,12 @@ class SignalFreshnessTests(unittest.TestCase):
 
         with patch("kalshi_web.builtins.print"):
             result = bot._aion_canonical_submit_freshness_gate(
-                SimpleNamespace(ticker="KXATPCHALLENGERMATCH-FRESH", family="KXATPCHALLENGERMATCH"),
+                SimpleNamespace(ticker="KXMLBKS-FRESH", family="KXMLBKS"),
                 size=1,
                 lane="sports_multi_submit",
                 payload={
-                    "ticker": "KXATPCHALLENGERMATCH-FRESH",
-                    "family": "KXATPCHALLENGERMATCH",
+                    "ticker": "KXMLBKS-FRESH",
+                    "family": "KXMLBKS",
                     "side": "yes",
                     "selected_price": 0.42,
                     "count": 1,

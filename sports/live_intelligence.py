@@ -6566,6 +6566,21 @@ def _build_sports_ladder_plan(self, candidates=None, *, primary_ticker=None, sou
         lane = str(candidate.get("lane") or allocation.get("lane") or "").strip().upper()
         if lane != "SPORTS" or not ticker:
             continue
+        tennis_context_builder = getattr(self, "_aion_tennis_disabled_context", None)
+        if callable(tennis_context_builder):
+            tennis_context = tennis_context_builder(
+                family=family,
+                ticker=ticker,
+                market=market,
+                q=q,
+                payload=allocation,
+                source=source,
+            )
+            if isinstance(tennis_context, dict) and tennis_context.get("disabled"):
+                emitter = getattr(self, "_emit_aion_tennis_disabled", None)
+                if callable(emitter):
+                    emitter(tennis_context, source=source, stage="sports_ladder_plan")
+                continue
         if not self._is_sports_only_allowed_candidate(family=family, ticker=ticker, market=market, q=q, lane="SPORTS"):
             continue
         if allocation.get("decision") == "SKIP_WEAK_SPORT" or allocation.get("final_quality_action") == "skip":
