@@ -6,11 +6,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import kalshi_execution
+import kalshi_exits
 from kalshi_orderbook import Quote
 from kalshi_web import KalshiSniperBot, TradeTarget
 
@@ -40,7 +42,8 @@ def make_quote(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLIN
     )
 
 
-def make_target(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLINE", side: str = "yes") -> TradeTarget:
+def make_target(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLINE", side: str = "yes", created_ts: float | None = None) -> TradeTarget:
+    created_ts = time.time() if created_ts is None else created_ts
     return TradeTarget(
         target_id=f"{ticker}:{side}:smoke",
         ticker=ticker,
@@ -56,7 +59,9 @@ def make_target(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLI
         orderbook_snapshot_id="smoke",
         price_zone="mid",
         source="smoke",
-        created_ts=1.0,
+        created_ts=created_ts,
+        target_created_ts=created_ts,
+        trace_id=f"{ticker}:{side}:smoke",
     )
 
 
@@ -79,6 +84,37 @@ def main() -> int:
     checks["synthetic_book_blocked"] = (
         bot.confirm_entry(make_target(), make_quote(synthetic=True)).get("reason") == "fake_or_synthetic_book_rejected"
     )
+    stale_target = make_target(created_ts=time.time() - bot.max_signal_age_seconds - 5)
+    checks["stale_entry_blocked"] = bot.confirm_entry(stale_target, make_quote()).get("reason") == "stale_signal"
+    submit_calls = []
+    original_submit = kalshi_execution.submit_canonical_order
+    try:
+        kalshi_execution.submit_canonical_order = lambda *args, **kwargs: submit_calls.append((args, kwargs)) or {"submitted": True}
+        stale_submit = bot.submit_target(stale_target, make_quote())
+    finally:
+        kalshi_execution.submit_canonical_order = original_submit
+    checks["stale_entry_not_submitted"] = stale_submit.get("reason") == "stale_signal" and not submit_calls
+    exit_position = {
+        "ticker": "KXMLBMONEYLINE-TEST",
+        "family": "KXMLBMONEYLINE",
+        "side": "yes",
+        "count": 1,
+        "entry_price": 0.46,
+        "entry_ts": time.time() - 10_000,
+        "target_id": "stale-but-exit-ok",
+    }
+    exit_decision = {
+        "ticker": "KXMLBMONEYLINE-TEST",
+        "family": "KXMLBMONEYLINE",
+        "side": "yes",
+        "count": 1,
+        "exit_price": 0.50,
+        "reason": "smoke_reduce_only_exit",
+    }
+    exit_payload = kalshi_exits.build_exit_payload(exit_position, exit_decision)
+    checks["reduce_only_exit_not_freshness_blocked"] = bool(bot.confirm_exit(exit_position, exit_decision, exit_payload).get("allowed"))
+    mismatch_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="no", action="buy", count=1, price=0.56)
+    checks["side_mismatch_blocked"] = bot.confirm_entry(make_target(side="yes"), make_quote(), payload=mismatch_payload).get("reason") == "payload_side_mismatch"
     yes_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="yes", action="buy", count=1, price=0.46)
     no_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="no", action="sell", count=1, price=0.54, reduce_only=True)
     checks["yes_payload_valid"] = bool(kalshi_execution.validate_canonical_order_payload(yes_payload).get("ok"))

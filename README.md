@@ -36,6 +36,7 @@ SCAN -> QUALIFY -> EXECUTE -> MANAGE -> LEARN
 - YES/NO side support
 - immutable `TradeTarget`
 - `confirm_entry`
+- hard freshness TTL enforcement in `confirm_entry`
 - canonical submit only
 - `PositionExecutor`
 - `confirm_exit`
@@ -55,8 +56,12 @@ SCAN -> QUALIFY -> EXECUTE -> MANAGE -> LEARN
 
 ```bash
 python3 -m py_compile kalshi_web.py kalshi_execution.py kalshi_exits.py kalshi_orderbook.py kalshi_risk.py
+python3 -m unittest discover -s tests
 python3 -m pytest tests -q
 python3 tools/aion_stability_smoke_test.py
+git diff --check
+sqlite3 --version
+python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
 ```
 
 ## Service

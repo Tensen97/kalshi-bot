@@ -1,7 +1,9 @@
 import dataclasses
+import time
 import unittest
 
 import kalshi_execution
+import kalshi_exits
 from kalshi_orderbook import Quote, build_quote, is_kxmlbks_market, is_sports_market, is_tennis_market
 from kalshi_web import KalshiSniperBot, TradeTarget
 
@@ -31,7 +33,8 @@ def quote(ticker="KXMLBMONEYLINE-26JUN07-TEAM", family="KXMLBMONEYLINE"):
     )
 
 
-def target(ticker="KXMLBMONEYLINE-26JUN07-TEAM", family="KXMLBMONEYLINE", side="yes"):
+def target(ticker="KXMLBMONEYLINE-26JUN07-TEAM", family="KXMLBMONEYLINE", side="yes", created_ts=None):
+    created_ts = time.time() if created_ts is None else created_ts
     return TradeTarget(
         target_id="target-1",
         ticker=ticker,
@@ -47,7 +50,9 @@ def target(ticker="KXMLBMONEYLINE-26JUN07-TEAM", family="KXMLBMONEYLINE", side="
         orderbook_snapshot_id="snapshot",
         price_zone="mid",
         source="test",
-        created_ts=1.0,
+        created_ts=created_ts,
+        target_created_ts=created_ts,
+        trace_id="trace-1",
     )
 
 
@@ -86,6 +91,69 @@ class LiveEngineTests(unittest.TestCase):
         result = bot.confirm_entry(target(), quote())
         self.assertTrue(result["allowed"])
         self.assertTrue(result["payload"]["_aion_confirm_entry_passed"])
+
+    def test_confirm_entry_rejects_stale_target(self):
+        bot = KalshiSniperBot()
+        stale = target(created_ts=time.time() - bot.max_signal_age_seconds - 5)
+        seen = []
+        bot.log_json = lambda tag, payload=None: seen.append((tag, payload or {}))
+        result = bot.confirm_entry(stale, quote())
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "stale_signal")
+        self.assertGreater(result["signal_age_seconds"], bot.max_signal_age_seconds)
+        self.assertTrue(any(tag == "AION-CONFIRM-ENTRY-REJECT" and payload.get("reason") == "stale_signal" for tag, payload in seen))
+
+    def test_stale_target_cannot_submit(self):
+        bot = KalshiSniperBot()
+        stale = target(created_ts=time.time() - bot.max_signal_age_seconds - 5)
+        calls = []
+        original_submit = kalshi_execution.submit_canonical_order
+        try:
+            kalshi_execution.submit_canonical_order = lambda *args, **kwargs: calls.append((args, kwargs)) or {"submitted": True}
+            result = bot.submit_target(stale, quote())
+        finally:
+            kalshi_execution.submit_canonical_order = original_submit
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "stale_signal")
+        self.assertEqual(calls, [])
+
+    def test_reduce_only_exit_not_blocked_by_entry_freshness(self):
+        bot = KalshiSniperBot()
+        old_position = {
+            "ticker": "KXMLBMONEYLINE-26JUN07-TEAM",
+            "family": "KXMLBMONEYLINE",
+            "side": "yes",
+            "count": 1,
+            "entry_price": 0.46,
+            "entry_ts": time.time() - 10_000,
+            "target_id": "old-target",
+        }
+        decision = {
+            "ticker": old_position["ticker"],
+            "family": old_position["family"],
+            "side": "yes",
+            "count": 1,
+            "exit_price": 0.50,
+            "reason": "test_reduce_only",
+        }
+        payload = kalshi_exits.build_exit_payload(old_position, decision)
+        result = bot.confirm_exit(old_position, decision, payload)
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["payload"]["reduce_only"])
+
+    def test_confirm_entry_rejects_payload_side_mismatch(self):
+        bot = KalshiSniperBot()
+        item = target(side="yes")
+        payload = kalshi_execution.canonical_order_payload(
+            ticker=item.ticker,
+            side="no",
+            action="buy",
+            count=1,
+            price=0.56,
+        )
+        result = bot.confirm_entry(item, quote(), payload=payload)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "payload_side_mismatch")
 
     def test_canonical_payload_supports_yes_no_and_reduce_only(self):
         yes_payload = kalshi_execution.canonical_order_payload(

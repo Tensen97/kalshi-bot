@@ -81,6 +81,9 @@ class TradeTarget:
     price_zone: str
     source: str
     created_ts: float
+    signal_detected_ts: Optional[float] = None
+    target_created_ts: Optional[float] = None
+    trace_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -121,6 +124,8 @@ class KalshiSniperBot:
         self.min_confidence_to_submit = max(0.0, env_float("AION_MIN_CONFIDENCE_TO_SUBMIT", 0.15))
         self.min_score_to_submit = max(0.0, env_float("AION_MIN_SCORE_TO_SUBMIT", 8.0))
         self.max_entry_spread_hard = min(0.99, max(0.05, env_float("AION_MAX_ENTRY_SPREAD_HARD", 0.55)))
+        configured_signal_age = env_float("AION_MAX_SIGNAL_AGE_SECONDS", env_float("MAX_SIGNAL_AGE_SECONDS", 45.0))
+        self.max_signal_age_seconds = min(99.0, max(1.0, configured_signal_age))
         self.balance_cache_ttl = max(1.0, env_float("AION_BALANCE_CACHE_SECONDS", 20.0))
         self.exit_config = {
             "take_profit": max(0.005, env_float("AION_EXIT_TAKE_PROFIT", 0.04)),
@@ -489,6 +494,69 @@ class KalshiSniperBot:
             },
         )
 
+    def _coerce_epoch_seconds(self, value: Any) -> Optional[float]:
+        if value in (None, "", [], {}):
+            return None
+        numeric = coerce_float(value, None)
+        if numeric is not None:
+            if numeric > 1_000_000_000_000:
+                numeric = numeric / 1000.0
+            if 0.0 < numeric < 4_102_444_800.0:
+                return float(numeric)
+            return None
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            return None
+
+    def _entry_signal_age(self, target: TradeTarget, payload: Dict[str, Any], *, now: float) -> Dict[str, Any]:
+        signal_ts = None
+        signal_source = None
+        for source, value in (
+            ("payload.signal_detected_ts", payload.get("signal_detected_ts")),
+            ("target.signal_detected_ts", getattr(target, "signal_detected_ts", None)),
+        ):
+            signal_ts = self._coerce_epoch_seconds(value)
+            if signal_ts is not None:
+                signal_source = source
+                break
+        if signal_ts is None:
+            for source, value in (
+                ("payload.target_created_ts", payload.get("target_created_ts")),
+                ("target.target_created_ts", getattr(target, "target_created_ts", None)),
+                ("target.created_ts", getattr(target, "created_ts", None)),
+                ("payload.created_ts", payload.get("created_ts")),
+            ):
+                signal_ts = self._coerce_epoch_seconds(value)
+                if signal_ts is not None:
+                    signal_source = source
+                    break
+        if signal_ts is None:
+            signal_ts = now
+            signal_source = "confirm_entry_now"
+        age = round(max(0.0, now - signal_ts), 3)
+        return {"signal_age_seconds": age, "signal_ts": signal_ts, "signal_ts_source": signal_source}
+
+    def _log_confirm_entry_reject(self, target: TradeTarget, payload: Dict[str, Any], *, reason: str, extra: Dict[str, Any] | None = None) -> None:
+        self.log_json(
+            "AION-CONFIRM-ENTRY-REJECT",
+            {
+                "reason": reason,
+                "ticker": target.ticker,
+                "family": target.family,
+                "selected_side": normalize_side(target.side),
+                "target_id": target.target_id,
+                "trace_id": payload.get("trace_id") or getattr(target, "trace_id", None) or target.target_id,
+                **(extra or {}),
+            },
+        )
+
     def fetch_live_sports_discovery_markets(self) -> List[Dict[str, Any]]:
         markets: List[Dict[str, Any]] = []
         for extra_params in ({}, {"category": "Sports"}):
@@ -676,7 +744,8 @@ class KalshiSniperBot:
                 extra=sizing,
             )
             return None
-        target_id = f"{quote.ticker}:{side}:{int(time.time() * 1000)}"
+        created_ts = time.time()
+        target_id = f"{quote.ticker}:{side}:{int(created_ts * 1000)}"
         return TradeTarget(
             target_id=target_id,
             ticker=quote.ticker,
@@ -692,7 +761,10 @@ class KalshiSniperBot:
             orderbook_snapshot_id=quote.orderbook_snapshot_id,
             price_zone=side_score.get("price_zone") or price_zone(price),
             source="sports_orderbook_ranker",
-            created_ts=time.time(),
+            created_ts=created_ts,
+            signal_detected_ts=self._coerce_epoch_seconds(side_score.get("signal_detected_ts")),
+            target_created_ts=created_ts,
+            trace_id=target_id,
         )
 
     def discover_trade_targets(self) -> List[Tuple[TradeTarget, Quote]]:
@@ -830,6 +902,10 @@ class KalshiSniperBot:
                 "orderbook_snapshot_id": target.orderbook_snapshot_id,
                 "price_zone": target.price_zone,
                 "target_id": target.target_id,
+                "trace_id": target.trace_id or target.target_id,
+                "signal_detected_ts": target.signal_detected_ts,
+                "target_created_ts": target.target_created_ts or target.created_ts,
+                "created_ts": target.created_ts,
             }
         )
         return payload
@@ -839,11 +915,52 @@ class KalshiSniperBot:
             return {"allowed": False, "reason": "target_not_immutable_trade_target"}
         payload = payload if isinstance(payload, dict) else self._payload_for_target(target)
         side = normalize_side(target.side)
+        payload_side = normalize_side(payload.get("side"))
+        payload_selected_side = normalize_side(payload.get("selected_side"))
         disabled_reason = self._disabled_new_entry_reason(family=target.family, ticker=target.ticker, market=getattr(current_orderbook, "raw_market", None))
         if disabled_reason:
             return {"allowed": False, "reason": disabled_reason, "payload": payload}
         if side not in {"yes", "no"}:
             return {"allowed": False, "reason": "missing_selected_side", "payload": payload}
+        for payload_field, value in (("side", payload_side), ("selected_side", payload_selected_side)):
+            if value in {"yes", "no"} and value != side:
+                self._log_confirm_entry_reject(
+                    target,
+                    payload,
+                    reason="payload_side_mismatch",
+                    extra={"payload_field": payload_field, "payload_side": value},
+                )
+                return {"allowed": False, "reason": "payload_side_mismatch", "payload": payload}
+        price_keys = [key for key in ("yes_price", "no_price") if payload.get(key) not in (None, "")]
+        expected_price_key = "yes_price" if side == "yes" else "no_price"
+        if price_keys and price_keys != [expected_price_key]:
+            self._log_confirm_entry_reject(
+                target,
+                payload,
+                reason="payload_side_price_mismatch",
+                extra={"price_keys": price_keys, "expected_price_key": expected_price_key},
+            )
+            return {"allowed": False, "reason": "payload_side_price_mismatch", "payload": payload}
+        freshness = self._entry_signal_age(target, payload, now=time.time())
+        max_signal_age = float(self.max_signal_age_seconds)
+        if freshness["signal_age_seconds"] > max_signal_age:
+            self._log_confirm_entry_reject(
+                target,
+                payload,
+                reason="stale_signal",
+                extra={
+                    "signal_age_seconds": freshness["signal_age_seconds"],
+                    "max_signal_age_seconds": max_signal_age,
+                    "signal_ts_source": freshness.get("signal_ts_source"),
+                },
+            )
+            return {
+                "allowed": False,
+                "reason": "stale_signal",
+                "payload": payload,
+                "signal_age_seconds": freshness["signal_age_seconds"],
+                "max_signal_age_seconds": max_signal_age,
+            }
         if not valid_trade_price(target.selected_price):
             return {"allowed": False, "reason": "selected_price_out_of_bounds", "payload": payload}
         if target.count < 1 or target.count > self.max_live_order_size:
