@@ -22,15 +22,15 @@ def make_quote(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLIN
         ticker=ticker,
         family=family,
         title="smoke sports market",
-        yes_bid=0.44,
+        yes_bid=0.47,
         yes_ask=0.46,
         no_bid=0.54,
-        no_ask=0.56,
+        no_ask=0.53,
         yes_bid_size=20,
         yes_ask_size=30,
         no_bid_size=30,
         no_ask_size=20,
-        spread=0.02,
+        spread=0.0,
         liquidity=100.0,
         volume=1000.0,
         open_interest=100.0,
@@ -67,9 +67,23 @@ def make_target(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLI
 
 def main() -> int:
     bot = KalshiSniperBot()
+    bot.live_positions = []
+    bot.live_order_timestamps = []
+    bot.state["positions"] = {}
+    bot.state["learning"] = {"family_side_zone": {}, "exit_outcomes": []}
+    bot.state["daily"] = {
+        "date": time.strftime("%Y-%m-%d"),
+        "realized_pnl": 0.0,
+        "live_trade_count": 0,
+        "submitted_order_count": 0,
+    }
     bot.reconcile_live_positions = lambda **kwargs: {"ok": True, "positions": []}
     checks = {}
     checks["real_sports_entry_allowed"] = bool(bot.confirm_entry(make_target(), make_quote()).get("allowed"))
+    red_quote = dataclasses.replace(make_quote(), yes_bid=0.44, no_ask=0.56, spread=0.02)
+    checks["red_entry_blocked"] = bot.confirm_entry(make_target(), red_quote).get("reason") == "instant_red_expected"
+    missing_cashout_quote = dataclasses.replace(make_quote(), yes_bid=None, yes_bid_size=0)
+    checks["missing_first_cashout_blocked"] = bot.confirm_entry(make_target(), missing_cashout_quote).get("reason") == "missing_first_cashout"
     checks["tennis_blocked"] = (
         bot.confirm_entry(
             make_target("KXATPCHALLENGERMATCH-TEST", "KXATPCHALLENGERMATCH"),
@@ -114,7 +128,7 @@ def main() -> int:
     exit_payload = kalshi_exits.build_exit_payload(exit_position, exit_decision)
     checks["reduce_only_exit_not_freshness_blocked"] = bool(bot.confirm_exit(exit_position, exit_decision, exit_payload).get("allowed"))
     mismatch_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="no", action="buy", count=1, price=0.56)
-    checks["side_mismatch_blocked"] = bot.confirm_entry(make_target(side="yes"), make_quote(), payload=mismatch_payload).get("reason") == "payload_side_mismatch"
+    checks["side_mismatch_blocked"] = bot.confirm_entry(make_target(side="yes"), make_quote(), payload=mismatch_payload).get("reason") == "side_payload_mismatch"
     yes_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="yes", action="buy", count=1, price=0.46)
     no_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="no", action="sell", count=1, price=0.54, reduce_only=True)
     checks["yes_payload_valid"] = bool(kalshi_execution.validate_canonical_order_payload(yes_payload).get("ok"))
