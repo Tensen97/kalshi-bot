@@ -17,20 +17,26 @@ from kalshi_orderbook import Quote
 from kalshi_web import KalshiSniperBot, TradeTarget
 
 
-def make_quote(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLINE", *, synthetic: bool = False) -> Quote:
+def make_quote(
+    ticker: str = "KXMLBMONEYLINE-TEST",
+    family: str = "KXMLBMONEYLINE",
+    *,
+    fair_yes: float = 0.49,
+    synthetic: bool = False,
+) -> Quote:
     return Quote(
         ticker=ticker,
         family=family,
         title="smoke sports market",
-        yes_bid=0.47,
+        yes_bid=0.44,
         yes_ask=0.46,
         no_bid=0.54,
-        no_ask=0.53,
+        no_ask=0.56,
         yes_bid_size=20,
         yes_ask_size=30,
         no_bid_size=30,
         no_ask_size=20,
-        spread=0.0,
+        spread=0.02,
         liquidity=100.0,
         volume=1000.0,
         open_interest=100.0,
@@ -38,7 +44,7 @@ def make_quote(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLIN
         orderbook_source="orderbook_endpoint:smoke",
         orderbook_real=not synthetic,
         synthetic=synthetic,
-        raw_market={"ticker": ticker, "series_ticker": family},
+        raw_market={"ticker": ticker, "series_ticker": family, "aion_fair_probability_yes": fair_yes},
     )
 
 
@@ -70,6 +76,7 @@ def main() -> int:
     bot.live_positions = []
     bot.live_order_timestamps = []
     bot.state["positions"] = {}
+    bot.state["pending_orders"] = {}
     bot.state["learning"] = {"family_side_zone": {}, "exit_outcomes": []}
     bot.state["daily"] = {
         "date": time.strftime("%Y-%m-%d"),
@@ -79,9 +86,14 @@ def main() -> int:
     }
     bot.reconcile_live_positions = lambda **kwargs: {"ok": True, "positions": []}
     checks = {}
-    checks["real_sports_entry_allowed"] = bool(bot.confirm_entry(make_target(), make_quote()).get("allowed"))
-    red_quote = dataclasses.replace(make_quote(), yes_bid=0.44, no_ask=0.56, spread=0.02)
-    checks["red_entry_blocked"] = bot.confirm_entry(make_target(), red_quote).get("reason") == "instant_red_expected"
+    allowed = bot.confirm_entry(make_target(), make_quote())
+    checks["real_sports_entry_allowed"] = bool(allowed.get("allowed"))
+    checks["immediate_red_allowed_when_ev_positive"] = (
+        bool(allowed.get("allowed"))
+        and float(((allowed.get("payload") or {}).get("immediate_pnl_per_contract") or 0.0)) < 0.0
+        and float(((allowed.get("payload") or {}).get("ev_after_all_costs") or 0.0)) > 0.0
+    )
+    checks["negative_ev_blocked"] = bot.confirm_entry(make_target(), make_quote(fair_yes=0.445)).get("reason") == "ev_after_cost_not_positive"
     missing_cashout_quote = dataclasses.replace(make_quote(), yes_bid=None, yes_bid_size=0)
     checks["missing_first_cashout_blocked"] = bot.confirm_entry(make_target(), missing_cashout_quote).get("reason") == "missing_first_cashout"
     checks["tennis_blocked"] = (
@@ -95,6 +107,20 @@ def main() -> int:
         bot.confirm_entry(make_target("KXMLBKS-TEST", "KXMLBKS"), make_quote("KXMLBKS-TEST", "KXMLBKS")).get("reason")
         == "kxmlbks_live_trading_disabled"
     )
+    combo_target = make_target("KXMVECROSSCATEGORY-TEST", "KXMVECROSSCATEGORY")
+    combo_quote = dataclasses.replace(
+        make_quote("KXMVECROSSCATEGORY-TEST", "KXMVECROSSCATEGORY"),
+        yes_bid=0.013,
+        yes_ask=0.289,
+        no_bid=0.711,
+        no_ask=0.987,
+        yes_bid_size=8800,
+        yes_ask_size=440,
+        no_bid_size=440,
+        no_ask_size=8800,
+        spread=0.276,
+    )
+    checks["combo_near_zero_cashout_blocked"] = bot.confirm_entry(combo_target, combo_quote).get("reason") == "weak_cashout_quality"
     checks["synthetic_book_blocked"] = (
         bot.confirm_entry(make_target(), make_quote(synthetic=True)).get("reason") == "fake_or_synthetic_book_rejected"
     )

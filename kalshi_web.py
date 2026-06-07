@@ -93,6 +93,20 @@ class TradeTarget:
     learning_multiplier: Optional[float] = None
     concentration_penalty: Optional[float] = None
     opened_green: Optional[bool] = None
+    fair_probability_for_side: Optional[float] = None
+    entry_mode: Optional[str] = None
+    maker_price: Optional[float] = None
+    taker_entry_price: Optional[float] = None
+    taker_ev: Optional[float] = None
+    maker_ev: Optional[float] = None
+    ev_after_all_costs: Optional[float] = None
+    expected_spread_cost: Optional[float] = None
+    expected_exit_cost: Optional[float] = None
+    fees: Optional[float] = None
+    slippage_buffer: Optional[float] = None
+    model_error_buffer: Optional[float] = None
+    adverse_selection_buffer: Optional[float] = None
+    fill_probability: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -142,7 +156,7 @@ def event_window_key(family: Any = None, ticker: Any = None, market: Dict[str, A
 
 
 class GreenEntryScorer:
-    """Scores only executable entries that can immediately cash out non-red."""
+    """EV-after-cost scorer for maker-first entry decisions."""
 
     def __init__(self, bot: Any) -> None:
         self.bot = bot
@@ -161,7 +175,47 @@ class GreenEntryScorer:
 
     @property
     def min_first_cashout_quality(self) -> float:
-        return max(1.0, env_float("AION_MIN_FIRST_CASHOUT_QUALITY", 1.0))
+        return max(0.0, env_float("AION_MIN_FIRST_CASHOUT_QUALITY", 0.01))
+
+    @property
+    def combo_min_cashout_price(self) -> float:
+        return min(0.20, max(self.min_cashout_price, env_float("AION_COMBO_MIN_FIRST_CASHOUT_PRICE", 0.03)))
+
+    @property
+    def combo_min_first_cashout_quality(self) -> float:
+        return min(1.0, max(self.min_first_cashout_quality, env_float("AION_COMBO_MIN_FIRST_CASHOUT_QUALITY", 0.10)))
+
+    @property
+    def tick_size(self) -> float:
+        return min(0.05, max(0.001, env_float("AION_ENTRY_TICK_SIZE", 0.01)))
+
+    @property
+    def strong_taker_edge_threshold(self) -> float:
+        return max(0.0, env_float("AION_TAKER_STRONG_EDGE_THRESHOLD", 0.02))
+
+    @property
+    def maker_edge_threshold(self) -> float:
+        return max(0.0, env_float("AION_MAKER_EDGE_THRESHOLD", 0.001))
+
+    @property
+    def combo_edge_threshold(self) -> float:
+        return max(self.maker_edge_threshold, env_float("AION_COMBO_EV_THRESHOLD", 0.01))
+
+    @property
+    def min_maker_fill_probability(self) -> float:
+        return min(1.0, max(0.0, env_float("AION_MIN_MAKER_FILL_PROBABILITY", 0.08)))
+
+    @property
+    def taker_fee_rate(self) -> float:
+        return max(0.0, env_float("AION_TAKER_FEE_RATE", 0.07))
+
+    @property
+    def maker_fee_rate(self) -> float:
+        return max(0.0, env_float("AION_MAKER_FEE_RATE", 0.0))
+
+    @property
+    def fee_rounding(self) -> bool:
+        return env_bool("AION_FEE_ROUNDING", True)
 
     @property
     def max_red_entry_rate(self) -> float:
@@ -238,6 +292,201 @@ class GreenEntryScorer:
             "mfe_before_mae_rate": round(mfe_before_mae_rate, 4),
         }
 
+    def _explicit_fair_probability(self, quote: Quote, side: str) -> Optional[float]:
+        raw = quote.raw_market if isinstance(quote.raw_market, dict) else {}
+        yes_keys = (
+            "aion_fair_probability_yes",
+            "fair_probability_yes",
+            "model_probability_yes",
+            "estimated_probability_yes",
+            "p_fair_yes",
+        )
+        no_keys = (
+            "aion_fair_probability_no",
+            "fair_probability_no",
+            "model_probability_no",
+            "estimated_probability_no",
+            "p_fair_no",
+        )
+        for key in yes_keys if side == "yes" else no_keys:
+            value = coerce_price(raw.get(key))
+            if value is not None:
+                return value
+        if side == "no":
+            for key in yes_keys:
+                value = coerce_price(raw.get(key))
+                if value is not None:
+                    return round(1.0 - value, 4)
+        else:
+            for key in no_keys:
+                value = coerce_price(raw.get(key))
+                if value is not None:
+                    return round(1.0 - value, 4)
+        return None
+
+    def _mid_probability(self, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+        if bid is not None and ask is not None and ask >= bid:
+            return round((float(bid) + float(ask)) / 2.0, 4)
+        if bid is not None:
+            return coerce_price(bid)
+        if ask is not None:
+            return coerce_price(ask)
+        return None
+
+    def _momentum_adjustment(self, quote: Quote, side: str, mid: Optional[float]) -> float:
+        if mid is None:
+            return 0.0
+        memory = getattr(self.bot, "_quote_memory", None)
+        if not isinstance(memory, dict):
+            self.bot._quote_memory = {}
+            memory = self.bot._quote_memory
+        key = f"{quote.ticker}:{side}"
+        previous = memory.get(key) if isinstance(memory.get(key), dict) else {}
+        previous_mid = coerce_float(previous.get("mid"), None)
+        memory[key] = {"mid": mid, "ts": time.time()}
+        if previous_mid is None:
+            return 0.0
+        return round(max(-0.015, min(0.015, (float(mid) - float(previous_mid)) * 0.60)), 4)
+
+    def _learning_adjustment(self, bucket: Dict[str, Any], entry_price: Optional[float]) -> Dict[str, Any]:
+        trades = int(bucket.get("trades") or 0)
+        entry_samples = int(bucket.get("entry_samples") or bucket.get("green_entries") or bucket.get("red_entries") or 0)
+        wins = int(bucket.get("wins") or 0)
+        losses = int(bucket.get("losses") or 0)
+        avg_pnl = float(coerce_float(bucket.get("pnl"), 0.0) or 0.0) / max(1, trades)
+        avg_immediate = float(coerce_float(bucket.get("immediate_pnl"), 0.0) or 0.0) / max(1, entry_samples)
+        avg_mfe = float(coerce_float(bucket.get("mfe_total"), bucket.get("mfe") or 0.0) or 0.0) / max(1, trades)
+        avg_mae = float(coerce_float(bucket.get("mae_total"), bucket.get("mae") or 0.0) or 0.0) / max(1, trades)
+        mfe_samples = int(bucket.get("mfe_before_mae_samples") or 0)
+        mfe_before_mae_rate = float(bucket.get("mfe_before_mae_positive") or 0.0) / max(1, mfe_samples)
+        win_rate = wins / max(1, wins + losses)
+        red_rate = float(bucket.get("red_entries") or 0.0) / max(1, entry_samples)
+        adjustment = 0.0
+        confidence = 0.0
+        if trades >= 3:
+            adjustment += max(-0.08, min(0.08, avg_pnl * 0.55))
+            adjustment += max(-0.035, min(0.035, (win_rate - 0.50) * 0.07))
+            adjustment += max(-0.025, min(0.025, (avg_mfe - abs(avg_mae)) * 0.25))
+            confidence += min(0.50, trades / 30.0)
+        if entry_samples >= 3:
+            adjustment += max(-0.025, min(0.025, avg_immediate * 0.20))
+            adjustment -= max(0.0, red_rate - 0.60) * 0.03
+            confidence += min(0.25, entry_samples / 40.0)
+        if mfe_samples >= 3:
+            adjustment += max(-0.018, min(0.018, (mfe_before_mae_rate - 0.50) * 0.06))
+            confidence += min(0.20, mfe_samples / 40.0)
+        return {
+            "learning_adjustment": round(max(-0.12, min(0.12, adjustment)), 4),
+            "learning_confidence": round(max(0.0, min(1.0, confidence)), 4),
+            "historical_win_rate": round(win_rate, 4) if wins + losses else 0.0,
+            "historical_avg_pnl_per_contract": round(avg_pnl, 4),
+            "historical_red_entry_rate": round(red_rate, 4) if entry_samples else 0.0,
+        }
+
+    def _liquidity_quality_adjustment(self, quote: Quote, side: str, spread: Optional[float]) -> float:
+        bid_size = max(0.0, float(coerce_float(quote.size_for_side(side, "sell"), 0.0) or 0.0))
+        ask_size = max(0.0, float(coerce_float(quote.size_for_side(side, "buy"), 0.0) or 0.0))
+        if bid_size <= 0.0 or ask_size <= 0.0:
+            return -0.01
+        balance = bid_size / max(1.0, bid_size + ask_size)
+        adjustment = (balance - 0.50) * 0.012
+        if spread is not None and spread > 0.20:
+            adjustment -= min(0.015, (spread - 0.20) * 0.04)
+        return round(max(-0.018, min(0.010, adjustment)), 4)
+
+    def _fee_per_contract(self, *, price: float, count: int, mode: str) -> float:
+        rate = self.taker_fee_rate if mode == "taker" else self.maker_fee_rate
+        if rate <= 0.0:
+            return 0.0
+        count = max(1, int(count or 1))
+        raw = float(rate) * float(count) * float(price) * max(0.0, 1.0 - float(price))
+        if self.fee_rounding:
+            raw = math.ceil(raw * 100.0 - 1e-9) / 100.0
+        return round(raw / count, 4)
+
+    def _cost_buffers(
+        self,
+        *,
+        mode: str,
+        spread: Optional[float],
+        entry_price: float,
+        fair_probability: float,
+        learning_confidence: float,
+        avg_mae: float,
+        count: int,
+    ) -> Dict[str, float]:
+        spread_value = max(0.0, float(spread or 0.0))
+        if mode == "taker":
+            expected_spread_cost = min(0.015, spread_value * 0.10)
+            expected_exit_cost = min(0.035, max(0.002, spread_value * 0.20))
+            slippage_buffer = min(0.025, max(0.002, spread_value * 0.08))
+            adverse_selection_buffer = min(0.025, max(0.002, spread_value * 0.06))
+        else:
+            expected_spread_cost = 0.0
+            expected_exit_cost = min(0.025, max(0.001, spread_value * 0.10))
+            slippage_buffer = 0.001
+            adverse_selection_buffer = min(0.018, max(0.0015, spread_value * 0.02))
+        model_floor = max(0.0015, env_float("AION_MODEL_ERROR_BUFFER_FLOOR", 0.0015))
+        model_error_buffer = max(model_floor, min(0.04, abs(float(avg_mae or 0.0)) * 0.25 + (1.0 - learning_confidence) * 0.002))
+        fees = self._fee_per_contract(price=entry_price, count=count, mode=mode)
+        return {
+            "expected_spread_cost": round(expected_spread_cost, 4),
+            "expected_exit_cost": round(expected_exit_cost, 4),
+            "fees": round(fees, 4),
+            "slippage_buffer": round(slippage_buffer, 4),
+            "model_error_buffer": round(model_error_buffer, 4),
+            "adverse_selection_buffer": round(adverse_selection_buffer, 4),
+        }
+
+    def _ev_after_costs(self, *, fair_probability: float, entry_price: float, costs: Dict[str, float]) -> float:
+        return round(
+            float(fair_probability)
+            - float(entry_price)
+            - float(costs.get("expected_spread_cost") or 0.0)
+            - float(costs.get("expected_exit_cost") or 0.0)
+            - float(costs.get("fees") or 0.0)
+            - float(costs.get("slippage_buffer") or 0.0)
+            - float(costs.get("model_error_buffer") or 0.0)
+            - float(costs.get("adverse_selection_buffer") or 0.0),
+            4,
+        )
+
+    def _maker_price_and_fill_probability(
+        self,
+        *,
+        bid: Optional[float],
+        ask: Optional[float],
+        spread: Optional[float],
+        bid_size: float,
+        ask_size: float,
+        fair_probability: float,
+    ) -> Dict[str, Any]:
+        if bid is None or ask is None or not valid_trade_price(bid) or not valid_trade_price(ask):
+            return {"maker_price": None, "fill_probability": 0.0, "reason": "maker_price_unavailable"}
+        tick = self.tick_size
+        if ask <= bid:
+            maker_price = min(float(ask), max(0.01, float(bid)))
+        else:
+            improved = min(float(ask) - tick, float(bid) + tick)
+            maker_price = improved if improved > float(bid) else float(bid)
+        maker_price = round(max(0.01, min(0.99, maker_price)), 4)
+        if maker_price >= float(ask):
+            maker_price = round(max(0.01, float(ask) - tick), 4)
+        if not valid_trade_price(maker_price):
+            return {"maker_price": None, "fill_probability": 0.0, "reason": "maker_price_out_of_bounds"}
+        spread_value = max(0.0, float(spread or max(0.0, float(ask) - float(bid))))
+        size_total = max(1.0, float(bid_size or 0.0) + float(ask_size or 0.0))
+        size_balance = float(ask_size or 0.0) / size_total
+        inside_bonus = 0.18 if maker_price > float(bid) else 0.0
+        spread_bonus = min(0.18, spread_value * 1.2)
+        fair_distance_penalty = max(0.0, maker_price - fair_probability) * 2.0
+        fill_probability = 0.10 + inside_bonus + spread_bonus + min(0.12, size_balance * 0.16) - fair_distance_penalty
+        return {
+            "maker_price": maker_price,
+            "fill_probability": round(max(0.0, min(0.85, fill_probability)), 4),
+            "reason": "maker_price_selected",
+        }
+
     def _concentration(self, quote: Quote) -> Dict[str, Any]:
         quote_family = str(quote.family or "UNKNOWN").upper()
         quote_event = event_window_key(quote.family, quote.ticker, quote.raw_market)
@@ -275,35 +524,37 @@ class GreenEntryScorer:
             "blocked": True,
             **metrics,
         }
-        self.bot.log_json("AION-GREEN-SCORE", payload)
-        if reason == "instant_red_expected":
-            self.bot.log_json("AION-RED-ENTRY-BLOCKED", payload)
+        self.bot.log_json("AION-EV-SCORE", payload)
+        self.bot.log_json("AION-EV-ENTRY-REJECT", payload)
         if reason == "overconcentrated_combo_family":
             self.bot.log_json("AION-COMBO-CONCENTRATION-REJECT", payload)
         return {**metrics, "blocked": True, "reason": reason, "side": side}
 
-    def score_side(self, quote: Quote, side: str, *, entry_price_override: Any = None, source: str = "green_entry_scorer") -> Optional[Dict[str, Any]]:
+    def score_side(self, quote: Quote, side: str, *, entry_price_override: Any = None, source: str = "ev_entry_scorer") -> Optional[Dict[str, Any]]:
         side = normalize_side(side)
         if side not in {"yes", "no"}:
             return None
-        book_entry_price = coerce_price(quote.price_for_side(side, "buy"))
-        entry_price = coerce_price(entry_price_override) if entry_price_override not in (None, "") else book_entry_price
+        taker_entry_price = coerce_price(quote.price_for_side(side, "buy"))
         cashout = coerce_price(quote.price_for_side(side, "sell"))
         executable_size = float(coerce_float(quote.size_for_side(side, "buy"), 0.0) or 0.0)
         cashout_size = float(coerce_float(quote.size_for_side(side, "sell"), 0.0) or 0.0)
+        bid_size = cashout_size
+        ask_size = executable_size
         spread = quote.spread_for_side(side)
-        if spread is None and entry_price is not None and cashout is not None:
-            spread = round(max(0.0, entry_price - cashout), 4)
-        zone = price_zone(entry_price)
+        if spread is None and taker_entry_price is not None and cashout is not None:
+            spread = round(max(0.0, taker_entry_price - cashout), 4)
+        zone = price_zone(taker_entry_price)
         concentration = self._concentration(quote)
         bucket = self._learning_bucket(quote.family, side, zone)
         learning_edge = self._learning_edge(bucket)
+        learning_adjustment = self._learning_adjustment(bucket, taker_entry_price)
         learning_multiplier = self.bot._learning_multiplier(quote.family, side, zone)
         base_metrics: Dict[str, Any] = {
             "source": source,
-            "selected_price": entry_price,
-            "entry_price": entry_price,
-            "book_entry_price": book_entry_price,
+            "selected_price": taker_entry_price,
+            "entry_price": taker_entry_price,
+            "book_entry_price": taker_entry_price,
+            "taker_entry_price": taker_entry_price,
             "immediate_cashout": cashout,
             "spread": spread,
             "liquidity": quote.liquidity,
@@ -313,9 +564,10 @@ class GreenEntryScorer:
             "price_zone": zone,
             "learning_multiplier": learning_multiplier,
             **learning_edge,
+            **learning_adjustment,
             **concentration,
         }
-        if not valid_trade_price(entry_price):
+        if not valid_trade_price(taker_entry_price):
             return self._blocked(quote, side, "no_executable_selected_side_price", base_metrics)
         if executable_size < self.min_entry_size:
             return self._blocked(quote, side, "selected_side_no_visible_liquidity", base_metrics)
@@ -323,10 +575,30 @@ class GreenEntryScorer:
             return self._blocked(quote, side, "missing_first_cashout", base_metrics)
         if cashout <= self.min_cashout_price:
             return self._blocked(quote, side, "weak_cashout_quality", base_metrics)
-        immediate_pnl = round(float(cashout) - float(entry_price), 4)
-        spread_cost = round(max(0.0, float(entry_price) - float(cashout)), 4)
-        first_cashout_quality = round(float(cashout) / max(0.0001, float(entry_price)), 4)
-        edge_after_spread = round(immediate_pnl + float(learning_edge.get("history_edge") or 0.0), 4)
+        immediate_pnl = round(float(cashout) - float(taker_entry_price), 4)
+        spread_cost = round(max(0.0, float(taker_entry_price) - float(cashout)), 4)
+        first_cashout_quality = round(float(cashout) / max(0.0001, float(taker_entry_price)), 4)
+        mid_probability = self._mid_probability(cashout, taker_entry_price)
+        explicit_fair = self._explicit_fair_probability(quote, side)
+        momentum_adjustment = self._momentum_adjustment(quote, side, mid_probability)
+        liquidity_adjustment = self._liquidity_quality_adjustment(quote, side, spread)
+        fair_base = explicit_fair if explicit_fair is not None else mid_probability
+        if fair_base is None:
+            return self._blocked(quote, side, "fair_probability_unavailable", base_metrics)
+        fair_probability = round(
+            max(
+                0.001,
+                min(
+                    0.999,
+                    float(fair_base)
+                    + float(momentum_adjustment)
+                    + float(learning_adjustment.get("learning_adjustment") or 0.0)
+                    + float(liquidity_adjustment),
+                ),
+            ),
+            4,
+        )
+        edge_after_spread = round(float(fair_probability) - float(taker_entry_price), 4)
         entry_samples = int(bucket.get("entry_samples") or bucket.get("green_entries") or bucket.get("red_entries") or 0)
         green_entries = int(bucket.get("green_entries") or 0)
         red_entries = int(bucket.get("red_entries") or 0)
@@ -339,6 +611,11 @@ class GreenEntryScorer:
             "spread_cost": spread_cost,
             "edge_after_spread": edge_after_spread,
             "first_cashout_quality": first_cashout_quality,
+            "fair_probability_for_side": fair_probability,
+            "market_mid_probability": mid_probability,
+            "explicit_fair_probability": explicit_fair,
+            "momentum_adjustment": momentum_adjustment,
+            "liquidity_quality_adjustment": liquidity_adjustment,
             "entry_samples": entry_samples,
             "green_entries": green_entries,
             "red_entries": red_entries,
@@ -354,7 +631,7 @@ class GreenEntryScorer:
                 "ticker": quote.ticker,
                 "family": quote.family,
                 "side": side,
-                "entry_price": entry_price,
+                "entry_price": taker_entry_price,
                 "immediate_cashout": cashout,
                 "immediate_pnl_per_contract": immediate_pnl,
                 "edge_after_spread": edge_after_spread,
@@ -363,47 +640,217 @@ class GreenEntryScorer:
         )
         if concentration.get("combo_family") and concentration.get("combo_conflicts", 0) > 0:
             return self._blocked(quote, side, "overconcentrated_combo_family", metrics)
+        if concentration.get("combo_family") and (
+            float(cashout) < self.combo_min_cashout_price
+            or first_cashout_quality < self.combo_min_first_cashout_quality
+        ):
+            return self._blocked(
+                quote,
+                side,
+                "weak_cashout_quality",
+                {
+                    **metrics,
+                    "combo_min_cashout_price": self.combo_min_cashout_price,
+                    "combo_min_first_cashout_quality": self.combo_min_first_cashout_quality,
+                },
+            )
         if concentration.get("combo_family") and int(combo_recent_red.get("samples") or 0) >= 2 and float(combo_recent_red.get("red_entry_rate") or 0.0) > self.combo_max_red_entry_rate:
             return self._blocked(quote, side, "recent_combo_red_entry_rate", metrics)
-        if immediate_pnl < 0.0:
-            return self._blocked(quote, side, "instant_red_expected", metrics)
         if first_cashout_quality < self.min_first_cashout_quality:
             return self._blocked(quote, side, "weak_cashout_quality", metrics)
-        if edge_after_spread <= 0.0:
-            return self._blocked(quote, side, "negative_edge_after_spread", metrics)
         if spread is not None and spread > float(getattr(self.bot, "max_entry_spread_hard", 0.55) or 0.55):
             return self._blocked(quote, side, "wide_spread", metrics)
         if entry_samples >= 4 and bucket_red_rate > self.max_red_entry_rate:
             return self._blocked(quote, side, "historically_red_family_side_zone", metrics)
 
+        count = max(1, int(getattr(self.bot, "base_order_size", 1) or 1))
+        taker_costs = self._cost_buffers(
+            mode="taker",
+            spread=spread,
+            entry_price=float(taker_entry_price),
+            fair_probability=fair_probability,
+            learning_confidence=float(learning_adjustment.get("learning_confidence") or 0.0),
+            avg_mae=float(learning_edge.get("avg_mae") or 0.0),
+            count=count,
+        )
+        taker_ev = self._ev_after_costs(
+            fair_probability=fair_probability,
+            entry_price=float(taker_entry_price),
+            costs=taker_costs,
+        )
+        maker_selection = self._maker_price_and_fill_probability(
+            bid=cashout,
+            ask=taker_entry_price,
+            spread=spread,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            fair_probability=fair_probability,
+        )
+        maker_options: List[Dict[str, Any]] = []
+        maker_price = coerce_price(maker_selection.get("maker_price"))
+        maker_ev = None
+        maker_costs: Dict[str, float] = {}
+        if maker_price is not None and maker_price < float(taker_entry_price):
+            maker_costs = self._cost_buffers(
+                mode="maker",
+                spread=spread,
+                entry_price=float(maker_price),
+                fair_probability=fair_probability,
+                learning_confidence=float(learning_adjustment.get("learning_confidence") or 0.0),
+                avg_mae=float(learning_edge.get("avg_mae") or 0.0),
+                count=count,
+            )
+            maker_ev = self._ev_after_costs(
+                fair_probability=fair_probability,
+                entry_price=float(maker_price),
+                costs=maker_costs,
+            )
+            maker_options.append(
+                {
+                    "maker_price": maker_price,
+                    "maker_ev": maker_ev,
+                    "maker_costs": maker_costs,
+                    "fill_probability": float(maker_selection.get("fill_probability") or 0.0),
+                    "maker_price_reason": maker_selection.get("reason"),
+                }
+            )
+        passive_maker_price = coerce_price(cashout)
+        if passive_maker_price is not None and passive_maker_price < float(taker_entry_price) and passive_maker_price != maker_price:
+            passive_costs = self._cost_buffers(
+                mode="maker",
+                spread=spread,
+                entry_price=float(passive_maker_price),
+                fair_probability=fair_probability,
+                learning_confidence=float(learning_adjustment.get("learning_confidence") or 0.0),
+                avg_mae=float(learning_edge.get("avg_mae") or 0.0),
+                count=count,
+            )
+            passive_ev = self._ev_after_costs(
+                fair_probability=fair_probability,
+                entry_price=float(passive_maker_price),
+                costs=passive_costs,
+            )
+            passive_fill_probability = round(
+                max(
+                    self.min_maker_fill_probability,
+                    min(0.65, float(maker_selection.get("fill_probability") or 0.0) * 0.60),
+                ),
+                4,
+            )
+            maker_options.append(
+                {
+                    "maker_price": passive_maker_price,
+                    "maker_ev": passive_ev,
+                    "maker_costs": passive_costs,
+                    "fill_probability": passive_fill_probability,
+                    "maker_price_reason": "passive_bid_fallback",
+                }
+            )
+        if maker_options:
+            best_maker = max(
+                maker_options,
+                key=lambda item: (
+                    float(item.get("maker_ev") or -9.0),
+                    float(item.get("fill_probability") or 0.0),
+                ),
+            )
+            maker_price = coerce_price(best_maker.get("maker_price"))
+            maker_ev = coerce_float(best_maker.get("maker_ev"), None)
+            maker_costs = best_maker.get("maker_costs") if isinstance(best_maker.get("maker_costs"), dict) else {}
+            maker_selection["fill_probability"] = best_maker.get("fill_probability")
+            maker_selection["reason"] = best_maker.get("maker_price_reason")
+
+        combo_family = bool(concentration.get("combo_family"))
+        taker_threshold = self.strong_taker_edge_threshold + (0.02 if combo_family else 0.0)
+        maker_threshold = self.combo_edge_threshold if combo_family else self.maker_edge_threshold
+        entry_mode = None
+        selected_price = None
+        selected_ev = None
+        selected_costs: Dict[str, float] = {}
+        selected_fill_probability = 1.0
+        selected_reason = None
+        if taker_ev >= taker_threshold:
+            entry_mode = "taker"
+            selected_price = taker_entry_price
+            selected_ev = taker_ev
+            selected_costs = taker_costs
+            selected_reason = "strong_taker_ev"
+        elif (
+            maker_ev is not None
+            and maker_ev > maker_threshold
+            and float(maker_selection.get("fill_probability") or 0.0) >= self.min_maker_fill_probability
+        ):
+            entry_mode = "maker"
+            selected_price = maker_price
+            selected_ev = maker_ev
+            selected_costs = maker_costs
+            selected_fill_probability = float(maker_selection.get("fill_probability") or 0.0)
+            selected_reason = "maker_ev_positive"
+        else:
+            reject_metrics = {
+                **metrics,
+                "taker_ev": taker_ev,
+                "maker_ev": maker_ev,
+                "taker_edge_threshold": taker_threshold,
+                "maker_edge_threshold": maker_threshold,
+                "maker_price": maker_price,
+                "fill_probability": maker_selection.get("fill_probability"),
+                "maker_options": maker_options,
+                "entry_mode": None,
+                "ev_after_all_costs": max(taker_ev, maker_ev if maker_ev is not None else -9.0),
+            }
+            return self._blocked(quote, side, "ev_after_cost_not_positive", reject_metrics)
+
         spread_score = 15.0
         if spread is not None:
             max_spread = max(0.01, float(getattr(self.bot, "max_entry_spread_hard", 0.55) or 0.55))
             spread_score = max(0.0, 15.0 * (1.0 - min(spread, max_spread) / max_spread))
-        cashout_quality_score = min(25.0, 8.0 + max(0.0, first_cashout_quality - 1.0) * 500.0)
-        immediate_score = min(40.0, immediate_pnl * 2000.0)
-        edge_score = min(40.0, edge_after_spread * 1500.0)
+        cashout_quality_score = min(12.0, 3.0 + max(0.0, first_cashout_quality) * 8.0)
+        ev_score = min(65.0, max(0.0, float(selected_ev or 0.0)) * 1800.0)
+        edge_score = min(20.0, max(0.0, edge_after_spread) * 900.0)
         history_score = min(12.0, max(0.0, float(learning_edge.get("avg_realized_pnl") or 0.0)) * 120.0 + max(0.0, float(learning_edge.get("mfe_before_mae_rate") or 0.0) - 0.5) * 12.0)
         liquidity_score = min(5.0, math.log1p(max(0.0, min(executable_size, cashout_size))) * 1.5)
-        raw_score = 20.0 + immediate_score + edge_score + cashout_quality_score + spread_score + history_score + liquidity_score
+        fill_score = 5.0 if entry_mode == "taker" else min(5.0, selected_fill_probability * 8.0)
+        raw_score = 12.0 + ev_score + edge_score + cashout_quality_score + spread_score + history_score + liquidity_score + fill_score
         score = round(raw_score * float(learning_multiplier) * float(concentration.get("concentration_penalty") or 1.0), 4)
         confidence = round(max(0.0, min(1.0, score / 100.0)), 4)
         result = {
             **metrics,
             "blocked": False,
             "reason": "passed",
+            "selected_reason": selected_reason,
             "side": side,
+            "entry_mode": entry_mode,
+            "selected_price": selected_price,
+            "entry_price": selected_price,
+            "maker_price": maker_price,
+            "taker_entry_price": taker_entry_price,
+            "taker_ev": taker_ev,
+            "maker_ev": maker_ev,
+            "ev_after_all_costs": selected_ev,
+            "maker_price_reason": maker_selection.get("reason"),
+            "expected_spread_cost": selected_costs.get("expected_spread_cost"),
+            "expected_exit_cost": selected_costs.get("expected_exit_cost"),
+            "fees": selected_costs.get("fees"),
+            "slippage_buffer": selected_costs.get("slippage_buffer"),
+            "model_error_buffer": selected_costs.get("model_error_buffer"),
+            "adverse_selection_buffer": selected_costs.get("adverse_selection_buffer"),
+            "fill_probability": selected_fill_probability,
+            "taker_costs": taker_costs,
+            "maker_costs": maker_costs,
             "score": score,
             "confidence": confidence,
             "green_entry_score": score,
             "opened_green": immediate_pnl >= 0.0,
         }
-        self.bot.log_json("AION-GREEN-SCORE", {"ticker": quote.ticker, "family": quote.family, **result})
+        ev_payload = {"ticker": quote.ticker, "family": quote.family, **result}
+        self.bot.log_json("AION-EV-AFTER-COST", ev_payload)
+        self.bot.log_json("AION-EV-SCORE", ev_payload)
         return result
 
 
 class GreenEntryConfirm:
-    """Canonical entry confirmation with green-entry economics built in."""
+    """Canonical entry confirmation with EV-after-cost economics built in."""
 
     def __init__(self, bot: Any) -> None:
         self.bot = bot
@@ -434,7 +881,7 @@ class GreenEntryConfirm:
             "trace_id": payload.get("trace_id") or target.trace_id or target.target_id,
             **extra,
         }
-        self.bot.log_json("AION-GREEN-ENTRY-REJECT", reject_payload)
+        self.bot.log_json("AION-EV-ENTRY-REJECT", reject_payload)
         if reason in {"side_payload_mismatch", "stale_signal"}:
             self.bot._log_confirm_entry_reject(target, payload, reason=reason, extra=extra)
         return {"allowed": False, "reason": reason, "payload": payload, **extra}
@@ -504,38 +951,72 @@ class GreenEntryConfirm:
                 reason="fake_or_synthetic_book_rejected",
                 extra={"orderbook_source": quote.orderbook_source, "orderbook_real": quote.orderbook_real, "synthetic": quote.synthetic},
             )
-        current_entry_price = coerce_price(quote.price_for_side(side, "buy"))
         payload_limit_price = self._payload_limit_price(payload, side)
+        current_entry_price = coerce_price(quote.price_for_side(side, "buy"))
+        current_cashout = coerce_price(quote.price_for_side(side, "sell"))
         if not valid_trade_price(current_entry_price):
             return self._reject(target, payload, reason="no_executable_selected_side_price")
+        if current_cashout is None or quote.size_for_side(side, "sell") < self.bot.green_entry_scorer.min_cashout_size:
+            return self._reject(target, payload, reason="missing_first_cashout")
         if payload_limit_price is None:
             return self._reject(target, payload, reason="side_payload_mismatch", extra={"expected_price_key": expected_price_key})
-        if payload_limit_price + 0.0001 < float(current_entry_price):
-            return self._reject(
-                target,
-                payload,
-                reason="current_entry_price_exceeds_payload",
-                extra={"current_entry_price": current_entry_price, "payload_limit_price": payload_limit_price},
-            )
-        effective_entry_price = max(float(current_entry_price), float(coerce_price(target.selected_price) or 0.0), float(payload_limit_price))
         side_score = self.bot.green_entry_scorer.score_side(
             quote,
             side,
-            entry_price_override=effective_entry_price,
             source=source,
         )
         if not side_score or side_score.get("blocked"):
             return self._reject(
                 target,
                 payload,
-                reason=(side_score or {}).get("reason") or "green_entry_rejected",
+                reason=(side_score or {}).get("reason") or "ev_entry_rejected",
                 extra={key: value for key, value in (side_score or {}).items() if key not in {"blocked", "reason"}},
             )
+        entry_mode = str(side_score.get("entry_mode") or "").strip().lower()
+        selected_price = coerce_price(side_score.get("selected_price"))
+        if entry_mode not in {"maker", "taker"} or selected_price is None:
+            return self._reject(target, payload, reason="ev_entry_mode_unavailable", extra=side_score)
+        if entry_mode == "taker" and selected_price + 0.0001 < float(current_entry_price):
+            return self._reject(
+                target,
+                payload,
+                reason="current_entry_price_exceeds_payload",
+                extra={"current_entry_price": current_entry_price, "selected_price": selected_price},
+            )
+        if entry_mode == "maker" and selected_price >= float(current_entry_price):
+            return self._reject(
+                target,
+                payload,
+                reason="maker_order_would_cross_spread",
+                extra={"current_entry_price": current_entry_price, "selected_price": selected_price},
+            )
+        cents = kalshi_execution.price_to_cents(selected_price)
+        if cents is None:
+            return self._reject(target, payload, reason="invalid_ev_selected_price", extra={"selected_price": selected_price})
+        payload.pop("yes_price", None)
+        payload.pop("no_price", None)
+        payload[expected_price_key] = cents
+        payload["selected_price"] = selected_price
+        payload["entry_price"] = selected_price
+        payload["entry_mode"] = entry_mode
+        if entry_mode == "maker":
+            payload["post_only"] = True
+            payload["time_in_force"] = "good_till_canceled"
+            payload["self_trade_prevention_type"] = "maker"
+            payload["maker_price"] = selected_price
+            payload["expiration_ts"] = int(time.time() + self.bot.max_pending_maker_age_seconds + 5)
+        else:
+            payload["post_only"] = False
+            payload["time_in_force"] = os.environ.get("AION_TAKER_TIME_IN_FORCE", "immediate_or_cancel")
+            payload["self_trade_prevention_type"] = "taker_at_cross"
         self.bot.reconcile_live_positions(min_interval_seconds=5.0)
+        pending_risk = self.bot.evaluate_pending_order_risk(target, payload, side_score)
+        if not pending_risk.get("ok"):
+            return self._reject(target, payload, reason=pending_risk.get("reason") or "pending_order_guard_rejected", extra={"pending_risk": pending_risk})
         risk = kalshi_risk.evaluate_entry_risk(self.bot, target, payload)
         if not risk.get("ok"):
             return self._reject(target, payload, reason=risk.get("reason") or "risk_guard_rejected", extra={"risk": risk})
-        green_fields = {
+        ev_fields = {
             "entry_price": side_score.get("entry_price"),
             "immediate_cashout": side_score.get("immediate_cashout"),
             "immediate_pnl_per_contract": side_score.get("immediate_pnl_per_contract"),
@@ -543,6 +1024,21 @@ class GreenEntryConfirm:
             "first_cashout_quality": side_score.get("first_cashout_quality"),
             "spread_cost": side_score.get("spread_cost"),
             "green_entry_score": side_score.get("green_entry_score") or side_score.get("score"),
+            "fair_probability_for_side": side_score.get("fair_probability_for_side"),
+            "entry_mode": entry_mode,
+            "maker_price": side_score.get("maker_price"),
+            "taker_entry_price": side_score.get("taker_entry_price"),
+            "taker_ev": side_score.get("taker_ev"),
+            "maker_ev": side_score.get("maker_ev"),
+            "ev_after_all_costs": side_score.get("ev_after_all_costs"),
+            "expected_spread_cost": side_score.get("expected_spread_cost"),
+            "expected_exit_cost": side_score.get("expected_exit_cost"),
+            "fees": side_score.get("fees"),
+            "slippage_buffer": side_score.get("slippage_buffer"),
+            "model_error_buffer": side_score.get("model_error_buffer"),
+            "adverse_selection_buffer": side_score.get("adverse_selection_buffer"),
+            "fill_probability": side_score.get("fill_probability"),
+            "selected_reason": side_score.get("selected_reason"),
             "learning_multiplier": side_score.get("learning_multiplier"),
             "concentration_penalty": side_score.get("concentration_penalty"),
             "event_window_key": side_score.get("event_window_key"),
@@ -551,22 +1047,22 @@ class GreenEntryConfirm:
             "signal_age_seconds": freshness["signal_age_seconds"],
             "max_signal_age_seconds": max_signal_age,
         }
-        payload.update(green_fields)
+        payload.update(ev_fields)
         payload["_aion_confirm_entry_passed"] = True
-        payload["_aion_green_entry_confirm_passed"] = True
+        payload["_aion_ev_entry_confirm_passed"] = True
         payload["_aion_confirm_entry_source"] = source
         self.bot.log_json(
-            "AION-GREEN-ENTRY-PASS",
+            "AION-EV-ENTRY-PASS",
             {
                 "ticker": target.ticker,
                 "family": target.family,
                 "side": side,
                 "target_id": target.target_id,
                 "trace_id": payload.get("trace_id") or target.trace_id or target.target_id,
-                **green_fields,
+                **ev_fields,
             },
         )
-        return {"allowed": True, "reason": "passed", "payload": payload, "green_entry": side_score}
+        return {"allowed": True, "reason": "passed", "payload": payload, "ev_entry": side_score}
 
 
 class KalshiSniperBot:
@@ -601,6 +1097,10 @@ class KalshiSniperBot:
         self.min_confidence_to_submit = max(0.0, env_float("AION_MIN_CONFIDENCE_TO_SUBMIT", 0.15))
         self.min_score_to_submit = max(0.0, env_float("AION_MIN_SCORE_TO_SUBMIT", 8.0))
         self.max_entry_spread_hard = min(0.99, max(0.05, env_float("AION_MAX_ENTRY_SPREAD_HARD", 0.55)))
+        self.max_pending_maker_age_seconds = max(5.0, env_float("AION_MAKER_ORDER_MAX_AGE_SECONDS", 30.0))
+        self.max_pending_maker_orders = max(0, env_int("AION_MAX_PENDING_MAKER_ORDERS", 2))
+        self.maker_cancel_fair_decay = max(0.0, env_float("AION_MAKER_FAIR_DECAY_CANCEL", 0.01))
+        self.better_candidate_ev_delta = max(0.0, env_float("AION_BETTER_CANDIDATE_EV_DELTA", 0.006))
         configured_signal_age = env_float("AION_MAX_SIGNAL_AGE_SECONDS", env_float("MAX_SIGNAL_AGE_SECONDS", 45.0))
         self.max_signal_age_seconds = min(99.0, max(1.0, configured_signal_age))
         self.balance_cache_ttl = max(1.0, env_float("AION_BALANCE_CACHE_SECONDS", 20.0))
@@ -616,6 +1116,7 @@ class KalshiSniperBot:
         self.live_order_timestamps: List[float] = []
         self._balance_cache: Dict[str, Any] = {}
         self._last_reconcile_ts = 0.0
+        self._quote_memory: Dict[str, Dict[str, Any]] = {}
         self.cycle_count = 0
         self.stop_requested = False
         self.state = self.load_state()
@@ -645,6 +1146,7 @@ class KalshiSniperBot:
                 "submitted_order_count": 0,
             },
             "positions": {},
+            "pending_orders": {},
             "learning": {
                 "family_side_zone": {},
                 "exit_outcomes": [],
@@ -656,6 +1158,8 @@ class KalshiSniperBot:
                 if isinstance(loaded, dict):
                     for key, value in default.items():
                         loaded.setdefault(key, value)
+                    if not isinstance(loaded.get("pending_orders"), dict):
+                        loaded["pending_orders"] = {}
                     return loaded
         except Exception as exc:
             self.log_json("AION-STATE-LOAD-ERROR", {"reason": exc.__class__.__name__, "path": str(self.state_path)})
@@ -677,6 +1181,242 @@ class KalshiSniperBot:
             if str(row.get("status") or "open").lower() in {"open", "exit_pending"}:
                 positions.append(row)
         return positions
+
+    def _pending_orders(self) -> Dict[str, Dict[str, Any]]:
+        pending = self.state.setdefault("pending_orders", {})
+        if not isinstance(pending, dict):
+            self.state["pending_orders"] = {}
+            pending = self.state["pending_orders"]
+        return pending
+
+    def active_pending_orders(self) -> List[Dict[str, Any]]:
+        active = []
+        for key, row in list(self._pending_orders().items()):
+            if not isinstance(row, dict):
+                self._pending_orders().pop(key, None)
+                continue
+            status = str(row.get("status") or "pending").strip().lower()
+            if status in {"pending", "accepted", "submitted"}:
+                active.append({**row, "pending_id": key})
+        return active
+
+    def evaluate_pending_order_risk(self, target: TradeTarget, payload: Dict[str, Any], side_score: Dict[str, Any]) -> Dict[str, Any]:
+        entry_mode = str(payload.get("entry_mode") or side_score.get("entry_mode") or "").strip().lower()
+        side = normalize_side(target.side)
+        ticker = str(target.ticker or "").strip()
+        target_event = str(side_score.get("event_window_key") or event_window_key(target.family, target.ticker)).upper()
+        combo_family = bool(side_score.get("combo_family") or is_combo_or_cross_market(target.family, target.ticker))
+        active = self.active_pending_orders()
+        for pending in active:
+            pending_ticker = str(pending.get("ticker") or "").strip()
+            pending_side = normalize_side(pending.get("side"))
+            if pending_ticker == ticker and pending_side in {"yes", "no"} and pending_side != side:
+                return {
+                    "ok": False,
+                    "reason": "exact_same_ticker_opposite_side_guard",
+                    "pending_order_id": pending.get("order_id"),
+                    "pending_side": pending_side,
+                    "selected_side": side,
+                }
+            if pending_ticker == ticker:
+                return {
+                    "ok": False,
+                    "reason": "duplicate_pending_order_guard",
+                    "pending_order_id": pending.get("order_id"),
+                }
+            if combo_family and is_combo_or_cross_market(pending.get("family"), pending_ticker):
+                pending_event = str(pending.get("event_window_key") or event_window_key(pending.get("family"), pending_ticker)).upper()
+                if pending_event == target_event or str(pending.get("family") or "").upper() == str(target.family or "").upper():
+                    return {
+                        "ok": False,
+                        "reason": "overconcentrated_combo_family",
+                        "pending_order_id": pending.get("order_id"),
+                        "event_window_key": target_event,
+                    }
+        if entry_mode == "maker":
+            maker_pending = [row for row in active if str(row.get("entry_mode") or "").lower() == "maker"]
+            if len(maker_pending) >= self.max_pending_maker_orders:
+                return {
+                    "ok": False,
+                    "reason": "max_pending_orders_reached",
+                    "pending_maker_orders": len(maker_pending),
+                    "max_pending_maker_orders": self.max_pending_maker_orders,
+                }
+        return {"ok": True, "reason": "passed", "pending_orders": len(active)}
+
+    def _entry_log_fields(self, target: TradeTarget, payload: Dict[str, Any], result: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        result = result if isinstance(result, dict) else {}
+        return {
+            "ticker": target.ticker,
+            "family": target.family,
+            "side": target.side,
+            "fair_probability_for_side": payload.get("fair_probability_for_side"),
+            "entry_mode": payload.get("entry_mode"),
+            "entry_price": payload.get("entry_price"),
+            "maker_price": payload.get("maker_price"),
+            "taker_entry_price": payload.get("taker_entry_price"),
+            "taker_ev": payload.get("taker_ev"),
+            "maker_ev": payload.get("maker_ev"),
+            "EV_after_all_costs": payload.get("ev_after_all_costs"),
+            "ev_after_all_costs": payload.get("ev_after_all_costs"),
+            "spread": payload.get("spread"),
+            "expected_exit_cost": payload.get("expected_exit_cost"),
+            "expected_spread_cost": payload.get("expected_spread_cost"),
+            "fees": payload.get("fees"),
+            "slippage_buffer": payload.get("slippage_buffer"),
+            "model_error_buffer": payload.get("model_error_buffer"),
+            "adverse_selection_buffer": payload.get("adverse_selection_buffer"),
+            "selected_reason": payload.get("selected_reason"),
+            "fill_probability": payload.get("fill_probability"),
+            "target_id": target.target_id,
+            "trace_id": payload.get("trace_id") or target.trace_id or target.target_id,
+            "order_id": result.get("order_id"),
+            "client_order_id": payload.get("client_order_id"),
+        }
+
+    def record_pending_entry_order(self, target: TradeTarget, payload: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+        now = time.time()
+        order_id = str(result.get("order_id") or payload.get("client_order_id") or target.target_id)
+        entry_mode = str(payload.get("entry_mode") or "taker").strip().lower()
+        row = {
+            **self._entry_log_fields(target, payload, result),
+            "pending_id": order_id,
+            "order_id": result.get("order_id"),
+            "client_order_id": payload.get("client_order_id"),
+            "status": "pending",
+            "submitted_ts": now,
+            "expires_ts": now + (self.max_pending_maker_age_seconds if entry_mode == "maker" else 90.0),
+            "selected_price": payload.get("selected_price"),
+            "count": payload.get("count") or target.count,
+            "price_zone": payload.get("price_zone") or target.price_zone,
+            "event_window_key": payload.get("event_window_key") or event_window_key(target.family, target.ticker),
+            "combo_family": bool(payload.get("combo_family") or is_combo_or_cross_market(target.family, target.ticker)),
+        }
+        self._pending_orders()[order_id] = row
+        self.log_json("AION-ORDER-ACCEPTED", row)
+        self.log_json("ORDER-PENDING", row)
+        if entry_mode == "maker":
+            self.log_json("AION-MAKER-ORDER-SUBMIT", row)
+        else:
+            self.log_json("AION-TAKER-ORDER-SUBMIT", row)
+        return row
+
+    def _matching_pending_order(self, position: Dict[str, Any]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        ticker = str(position.get("ticker") or "").strip()
+        side = normalize_side(position.get("side"))
+        for key, pending in self._pending_orders().items():
+            if not isinstance(pending, dict):
+                continue
+            if str(pending.get("ticker") or "").strip() != ticker:
+                continue
+            pending_side = normalize_side(pending.get("side"))
+            if pending_side in {"yes", "no"} and side in {"yes", "no"} and pending_side != side:
+                continue
+            if str(pending.get("status") or "pending").lower() not in {"pending", "accepted", "submitted"}:
+                continue
+            return key, pending
+        return None, None
+
+    def _confirmed_position_from_pending(self, position: Dict[str, Any], pending: Dict[str, Any]) -> Dict[str, Any]:
+        entry_price = coerce_price(position.get("entry_price") or pending.get("entry_price") or pending.get("selected_price"))
+        count = abs(float(self.to_float(position.get("count"), pending.get("count") or 0.0) or 0.0))
+        executor = PositionExecutor(
+            ticker=str(position.get("ticker") or pending.get("ticker") or "").strip(),
+            family=str(pending.get("family") or position.get("family") or "UNKNOWN").upper(),
+            side=normalize_side(position.get("side") or pending.get("side")) or "yes",
+            entry_price=entry_price or 0.0,
+            count=max(1, int(count or 1)),
+            entry_ts=time.time(),
+            tp=self.exit_config["take_profit"],
+            sl=self.exit_config["stop_loss"],
+            max_hold_seconds=self.exit_config["max_hold_seconds"],
+            trailing_start=self.exit_config["trailing_start"],
+            trailing_distance=self.exit_config["trailing_distance"],
+        )
+        return {
+            **pending,
+            **position,
+            "family": str(pending.get("family") or position.get("family") or market_family({"ticker": position.get("ticker")})).upper(),
+            "side": normalize_side(position.get("side") or pending.get("side")),
+            "count": count,
+            "entry_price": entry_price,
+            "first_cashout": coerce_price(pending.get("immediate_cashout")),
+            "immediate_cashout": coerce_price(pending.get("immediate_cashout")),
+            "immediate_pnl_per_contract": coerce_float(pending.get("immediate_pnl_per_contract"), None),
+            "opened_green": bool(coerce_float(pending.get("immediate_pnl_per_contract"), -1.0) >= 0.0),
+            "status": "open",
+            "entry_ts": time.time(),
+            "confirmed_ts": time.time(),
+            "target_id": pending.get("target_id"),
+            "price_zone": pending.get("price_zone") or price_zone(entry_price),
+            "event_window_key": pending.get("event_window_key") or event_window_key(pending.get("family"), pending.get("ticker")),
+            "market_type": "combo_cross" if pending.get("combo_family") else "sports",
+            "position_executor": executor.to_dict(),
+        }
+
+    def cancel_pending_maker_order(self, pending: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        pending = pending if isinstance(pending, dict) else {}
+        order_id = str(pending.get("order_id") or "").strip()
+        if order_id:
+            result = self.cancel_live_order(order_id)
+        else:
+            result = {"ok": True, "reason": "missing_exchange_order_id_local_cancel"}
+        pending_id = str(pending.get("pending_id") or pending.get("order_id") or pending.get("client_order_id") or "")
+        if pending_id:
+            self._pending_orders().pop(pending_id, None)
+        payload = {
+            **pending,
+            "cancel_reason": reason,
+            "cancel_ok": bool(result.get("ok")),
+            "cancel_result_reason": result.get("reason"),
+        }
+        self.log_json("AION-MAKER-ORDER-CANCEL", payload)
+        self.save_state()
+        return result
+
+    def manage_pending_maker_orders(self, selected_target: TradeTarget | None = None) -> Dict[str, Any]:
+        cancelled = 0
+        active = self.active_pending_orders()
+        selected_ev = coerce_float(getattr(selected_target, "ev_after_all_costs", None), None) if selected_target else None
+        for pending in list(active):
+            entry_mode = str(pending.get("entry_mode") or "").lower()
+            age = time.time() - float(pending.get("submitted_ts") or 0.0)
+            if entry_mode != "maker":
+                if age > 120.0:
+                    self._pending_orders().pop(str(pending.get("pending_id") or ""), None)
+                continue
+            cancel_reason = None
+            if age > self.max_pending_maker_age_seconds or time.time() > float(pending.get("expires_ts") or 0.0):
+                cancel_reason = "stale_maker_order"
+            elif selected_ev is not None and selected_target and selected_target.ticker != pending.get("ticker"):
+                pending_ev = float(coerce_float(pending.get("ev_after_all_costs"), 0.0) or 0.0)
+                if selected_ev > pending_ev + self.better_candidate_ev_delta:
+                    cancel_reason = "better_candidate_available"
+            if cancel_reason is None:
+                try:
+                    market = self.get_live_market_detail(str(pending.get("ticker") or ""))
+                    orderbook = self.get_live_market_orderbook(str(pending.get("ticker") or ""))
+                    quote = build_quote(market, orderbook)
+                    side = normalize_side(pending.get("side"))
+                    current = self.green_entry_scorer.score_side(quote, side, source="maker_order_lifecycle") if side else None
+                    if not current or current.get("blocked"):
+                        cancel_reason = f"maker_ev_decayed:{(current or {}).get('reason') or 'score_unavailable'}"
+                    elif float(coerce_float(current.get("fair_probability_for_side"), 0.0) or 0.0) < float(coerce_float(pending.get("fair_probability_for_side"), 0.0) or 0.0) - self.maker_cancel_fair_decay:
+                        cancel_reason = "fair_probability_decayed"
+                    else:
+                        opposite = "no" if side == "yes" else "yes"
+                        opposite_score = self.green_entry_scorer.score_side(quote, opposite, source="maker_order_lifecycle_opposite")
+                        if opposite_score and not opposite_score.get("blocked"):
+                            current_ev = float(coerce_float(current.get("ev_after_all_costs"), 0.0) or 0.0)
+                            opposite_ev = float(coerce_float(opposite_score.get("ev_after_all_costs"), 0.0) or 0.0)
+                            if opposite_ev > current_ev + self.better_candidate_ev_delta:
+                                cancel_reason = "side_flipped"
+                except Exception as exc:
+                    self.log_json("AION-MAKER-ORDER-LIFECYCLE-CHECK", {"ticker": pending.get("ticker"), "reason": f"quote_error:{exc.__class__.__name__}"})
+            if cancel_reason:
+                self.cancel_pending_maker_order(pending, cancel_reason)
+                cancelled += 1
+        return {"ok": True, "cancelled": cancelled, "active_pending": len(self.active_pending_orders())}
 
     def get_live_base_url(self) -> str:
         return os.environ.get("KALSHI_LIVE_BASE_URL", "") or "https://api.elections.kalshi.com"
@@ -1215,7 +1955,7 @@ class KalshiSniperBot:
             volume=quote.volume,
             orderbook_snapshot_id=quote.orderbook_snapshot_id,
             price_zone=side_score.get("price_zone") or price_zone(price),
-            source="green_entry_scorer",
+            source="ev_entry_scorer",
             created_ts=created_ts,
             signal_detected_ts=self._coerce_epoch_seconds(side_score.get("signal_detected_ts")),
             target_created_ts=created_ts,
@@ -1229,6 +1969,20 @@ class KalshiSniperBot:
             learning_multiplier=side_score.get("learning_multiplier"),
             concentration_penalty=side_score.get("concentration_penalty"),
             opened_green=side_score.get("opened_green"),
+            fair_probability_for_side=side_score.get("fair_probability_for_side"),
+            entry_mode=side_score.get("entry_mode"),
+            maker_price=side_score.get("maker_price"),
+            taker_entry_price=side_score.get("taker_entry_price"),
+            taker_ev=side_score.get("taker_ev"),
+            maker_ev=side_score.get("maker_ev"),
+            ev_after_all_costs=side_score.get("ev_after_all_costs"),
+            expected_spread_cost=side_score.get("expected_spread_cost"),
+            expected_exit_cost=side_score.get("expected_exit_cost"),
+            fees=side_score.get("fees"),
+            slippage_buffer=side_score.get("slippage_buffer"),
+            model_error_buffer=side_score.get("model_error_buffer"),
+            adverse_selection_buffer=side_score.get("adverse_selection_buffer"),
+            fill_probability=side_score.get("fill_probability"),
         )
 
     def discover_trade_targets(self) -> List[Tuple[TradeTarget, Quote]]:
@@ -1290,32 +2044,6 @@ class KalshiSniperBot:
                         subsystem="side_selection",
                     )
                     continue
-                if float(side_score.get("score") or 0.0) < self.min_score_to_submit:
-                    self._emit_final_reject(
-                        ticker=quote.ticker,
-                        family=quote.family,
-                        side=side,
-                        selected_price=side_score.get("selected_price"),
-                        spread=side_score.get("spread"),
-                        liquidity=quote.liquidity,
-                        volume=quote.volume,
-                        reason="green_score_below_minimum",
-                        subsystem="green_entry_scorer",
-                    )
-                    continue
-                if float(side_score.get("confidence") or 0.0) < self.min_confidence_to_submit:
-                    self._emit_final_reject(
-                        ticker=quote.ticker,
-                        family=quote.family,
-                        side=side,
-                        selected_price=side_score.get("selected_price"),
-                        spread=side_score.get("spread"),
-                        liquidity=quote.liquidity,
-                        volume=quote.volume,
-                        reason="confidence_below_minimum",
-                        subsystem="green_entry_sizing",
-                    )
-                    continue
                 side_results.append(side_score)
             for side_score in side_results:
                 target = self._build_target(quote, side_score)
@@ -1329,9 +2057,9 @@ class KalshiSniperBot:
         ranked = sorted(
             targets,
             key=lambda item: (
-                float(item[0].immediate_pnl_per_contract or -1.0),
-                float(item[0].edge_after_spread or -1.0),
-                float(item[0].first_cashout_quality or 0.0),
+                float(item[0].ev_after_all_costs or -9.0),
+                float(item[0].edge_after_spread or -9.0),
+                float(item[0].fill_probability or 0.0),
                 item[0].ranking_score,
                 item[0].confidence,
                 item[0].liquidity,
@@ -1348,14 +2076,16 @@ class KalshiSniperBot:
                 spread=target.spread,
                 liquidity=target.liquidity,
                 volume=target.volume,
-                reason="lower_green_rank_candidate",
-                subsystem="green_entry_ranker",
+                reason="lower_ev_rank_candidate",
+                subsystem="ev_entry_ranker",
                 extra={
                     "winning_ticker": best[0].ticker,
                     "winning_score": best[0].ranking_score,
-                    "immediate_pnl_per_contract": target.immediate_pnl_per_contract,
+                    "ev_after_all_costs": target.ev_after_all_costs,
+                    "entry_mode": target.entry_mode,
                     "edge_after_spread": target.edge_after_spread,
-                    "winning_immediate_pnl_per_contract": best[0].immediate_pnl_per_contract,
+                    "winning_ev_after_all_costs": best[0].ev_after_all_costs,
+                    "winning_entry_mode": best[0].entry_mode,
                     "winning_edge_after_spread": best[0].edge_after_spread,
                 },
             )
@@ -1394,6 +2124,20 @@ class KalshiSniperBot:
                 "edge_after_spread": target.edge_after_spread,
                 "first_cashout_quality": target.first_cashout_quality,
                 "green_entry_score": target.green_entry_score,
+                "fair_probability_for_side": target.fair_probability_for_side,
+                "entry_mode": target.entry_mode,
+                "maker_price": target.maker_price,
+                "taker_entry_price": target.taker_entry_price,
+                "taker_ev": target.taker_ev,
+                "maker_ev": target.maker_ev,
+                "ev_after_all_costs": target.ev_after_all_costs,
+                "expected_spread_cost": target.expected_spread_cost,
+                "expected_exit_cost": target.expected_exit_cost,
+                "fees": target.fees,
+                "slippage_buffer": target.slippage_buffer,
+                "model_error_buffer": target.model_error_buffer,
+                "adverse_selection_buffer": target.adverse_selection_buffer,
+                "fill_probability": target.fill_probability,
                 "learning_multiplier": target.learning_multiplier,
                 "concentration_penalty": target.concentration_penalty,
                 "opened_green": target.opened_green,
@@ -1453,16 +2197,29 @@ class KalshiSniperBot:
                 "immediate_pnl_per_contract": payload.get("immediate_pnl_per_contract"),
                 "edge_after_spread": payload.get("edge_after_spread"),
                 "first_cashout_quality": payload.get("first_cashout_quality"),
-                "green_entry_confirm_passed": payload.get("_aion_green_entry_confirm_passed"),
+                "ev_entry_confirm_passed": payload.get("_aion_ev_entry_confirm_passed"),
+                "entry_mode": payload.get("entry_mode"),
+                "fair_probability_for_side": payload.get("fair_probability_for_side"),
+                "maker_price": payload.get("maker_price"),
+                "taker_entry_price": payload.get("taker_entry_price"),
+                "taker_ev": payload.get("taker_ev"),
+                "maker_ev": payload.get("maker_ev"),
+                "ev_after_all_costs": payload.get("ev_after_all_costs"),
+                "expected_spread_cost": payload.get("expected_spread_cost"),
+                "expected_exit_cost": payload.get("expected_exit_cost"),
+                "fees": payload.get("fees"),
+                "slippage_buffer": payload.get("slippage_buffer"),
+                "model_error_buffer": payload.get("model_error_buffer"),
+                "adverse_selection_buffer": payload.get("adverse_selection_buffer"),
+                "selected_reason": payload.get("selected_reason"),
                 "signal_age_seconds": payload.get("signal_age_seconds"),
             },
         )
         if result.get("submitted"):
             self.live_order_timestamps.append(time.time())
             self.state.setdefault("daily", {})["submitted_order_count"] = int(self.state.get("daily", {}).get("submitted_order_count") or 0) + 1
-            self.state.setdefault("daily", {})["live_trade_count"] = int(self.state.get("daily", {}).get("live_trade_count") or 0) + 1
-            row = self.record_live_position(target, order_id=result.get("order_id"), payload=payload)
-            self.log_json("POSITION-OPEN", {**row, "submit_reason": result.get("reason")})
+            self.record_pending_entry_order(target, payload, result)
+            self.reconcile_live_positions(force=True)
             self.save_state()
         return result
 
@@ -1494,6 +2251,20 @@ class KalshiSniperBot:
             "immediate_cashout": first_cashout,
             "immediate_pnl_per_contract": immediate_pnl,
             "edge_after_spread": coerce_float(payload.get("edge_after_spread"), target.edge_after_spread),
+            "fair_probability_for_side": coerce_float(payload.get("fair_probability_for_side"), target.fair_probability_for_side),
+            "entry_mode": payload.get("entry_mode") or target.entry_mode,
+            "maker_price": coerce_price(payload.get("maker_price") or target.maker_price),
+            "taker_entry_price": coerce_price(payload.get("taker_entry_price") or target.taker_entry_price),
+            "taker_ev": coerce_float(payload.get("taker_ev"), target.taker_ev),
+            "maker_ev": coerce_float(payload.get("maker_ev"), target.maker_ev),
+            "ev_after_all_costs": coerce_float(payload.get("ev_after_all_costs"), target.ev_after_all_costs),
+            "expected_spread_cost": coerce_float(payload.get("expected_spread_cost"), target.expected_spread_cost),
+            "expected_exit_cost": coerce_float(payload.get("expected_exit_cost"), target.expected_exit_cost),
+            "fees": coerce_float(payload.get("fees"), target.fees),
+            "slippage_buffer": coerce_float(payload.get("slippage_buffer"), target.slippage_buffer),
+            "model_error_buffer": coerce_float(payload.get("model_error_buffer"), target.model_error_buffer),
+            "adverse_selection_buffer": coerce_float(payload.get("adverse_selection_buffer"), target.adverse_selection_buffer),
+            "fill_probability": coerce_float(payload.get("fill_probability"), target.fill_probability),
             "first_cashout_quality": coerce_float(payload.get("first_cashout_quality"), target.first_cashout_quality),
             "opened_green": bool(payload.get("opened_green") if payload.get("opened_green") is not None else (immediate_pnl is not None and immediate_pnl >= 0.0)),
             "spread_cost": coerce_float(payload.get("spread_cost"), None),
@@ -1594,8 +2365,19 @@ class KalshiSniperBot:
                 previous_positions[ticker] = closed
                 self.record_exit_outcome(closed, {"reason": "position_reconcile_closed"})
         for ticker, position in open_by_ticker.items():
-            previous_positions[ticker] = position
-        self.live_positions = list(open_by_ticker.values())
+            was_open = isinstance(previous_positions.get(ticker), dict) and str(previous_positions.get(ticker, {}).get("status") or "") == "open"
+            pending_id, pending = self._matching_pending_order(position)
+            confirmed = self._confirmed_position_from_pending(position, pending) if pending else position
+            previous_positions[ticker] = confirmed
+            if pending_id:
+                self._pending_orders().pop(pending_id, None)
+                if str((pending or {}).get("entry_mode") or "").lower() == "maker":
+                    self.log_json("AION-MAKER-ORDER-FILLED", confirmed)
+                self.state.setdefault("daily", {})["live_trade_count"] = int(self.state.get("daily", {}).get("live_trade_count") or 0) + 1
+            if not was_open:
+                self.log_json("AION-POSITION-CONFIRMED", confirmed)
+                self.log_json("POSITION-OPEN", confirmed)
+        self.live_positions = [previous_positions[ticker] for ticker in open_by_ticker if isinstance(previous_positions.get(ticker), dict)]
         self.save_state()
         self.log_json(
             "LIVE-POSITIONS-API",
@@ -1750,6 +2532,7 @@ class KalshiSniperBot:
         self.cycle_count += 1
         self.log_json("AION-CYCLE", {"cycle": self.cycle_count, "stage": "scan"})
         self.reconcile_live_positions(min_interval_seconds=20.0)
+        pending_lifecycle = self.manage_pending_maker_orders()
         targets = self.discover_trade_targets()
         selected = self.select_best_target(targets)
         submit_result = {"submitted": False, "reason": "no_candidate"}
@@ -1757,6 +2540,7 @@ class KalshiSniperBot:
             self.log_json("AION-LIVE-CANDIDATE-FUNNEL", {"cycle": self.cycle_count, "candidate_count": 0, "reason": "no_candidate"})
         else:
             target, quote = selected
+            pending_lifecycle = self.manage_pending_maker_orders(selected_target=target)
             self.log_json("AION-LIVE-CANDIDATE-FUNNEL", {"cycle": self.cycle_count, "candidate_count": len(targets), "selected": target.to_dict()})
             submit_result = self.submit_target(target, quote)
         exit_result = self.manage_live_positions()
@@ -1768,6 +2552,8 @@ class KalshiSniperBot:
                 "submitted": bool(submit_result.get("submitted")),
                 "submit_reason": submit_result.get("reason"),
                 "open_positions": len(self.live_positions),
+                "pending_orders": len(self.active_pending_orders()),
+                "pending_cancelled": pending_lifecycle.get("cancelled"),
                 "exit_orders_submitted": exit_result.get("exit_orders_submitted"),
             },
         )
@@ -1789,22 +2575,20 @@ class KalshiSniperBot:
         if side not in {"yes", "no"}:
             side_scores = [score for score in (self._score_side(quote, "yes"), self._score_side(quote, "no")) if score and not score.get("blocked")]
             if not side_scores:
-                return {"submitted": False, "reason": "green_entry_rejected"}
-            side_score = max(side_scores, key=lambda item: (float(item.get("immediate_pnl_per_contract") or -1), float(item.get("edge_after_spread") or -1), float(item.get("score") or -1)))
+                return {"submitted": False, "reason": "ev_entry_rejected"}
+            side_score = max(
+                side_scores,
+                key=lambda item: (
+                    float(item.get("ev_after_all_costs") or -9.0),
+                    float(item.get("edge_after_spread") or -9.0),
+                    float(item.get("fill_probability") or 0.0),
+                    float(item.get("score") or -1),
+                ),
+            )
         else:
-            entry_override = None
-            if price is not None:
-                current_entry = coerce_price(quote.price_for_side(side, "buy"))
-                if current_entry is not None and price + 0.0001 < current_entry:
-                    return {"submitted": False, "reason": "current_entry_price_exceeds_payload"}
-                entry_override = max(float(price), float(current_entry or price))
-            side_score = self.green_entry_scorer.score_side(quote, side, entry_price_override=entry_override, source="submit_live_order_wrapper")
+            side_score = self.green_entry_scorer.score_side(quote, side, source="submit_live_order_wrapper")
         if not side_score or side_score.get("blocked"):
             return {"submitted": False, "reason": (side_score or {}).get("reason") or "no_executable_selected_side_price"}
-        if price is not None:
-            side_score = dict(side_score)
-            side_score["selected_price"] = price
-            side_score["entry_price"] = price
         target = self._build_target(quote, side_score)
         if target is None:
             return {"submitted": False, "reason": "target_build_failed"}
