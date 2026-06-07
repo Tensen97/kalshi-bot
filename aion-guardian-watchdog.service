@@ -1,9 +1,0 @@
-[Unit]
-Description=AION Guardian Watchdog Service
-After=network-online.target kalshi-bot.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=/opt/kalshi-bot
-ExecStart=/usr/bin/python3 /opt/kalshi-bot/aion_guardian_report.py --dry-run --minutes 5 --watchdog

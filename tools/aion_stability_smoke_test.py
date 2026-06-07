@@ -1,58 +1,92 @@
 #!/usr/bin/env python3
+"""Offline stability smoke checks for the reduced AION live engine."""
+
 from __future__ import annotations
 
-import importlib.util
+import dataclasses
 import json
 import sys
 from pathlib import Path
 
-ROOT = Path('/opt/kalshi-bot/kalshi_web.py')
-ROOT_DIR = ROOT.parent
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import kalshi_execution
+from kalshi_orderbook import Quote
+from kalshi_web import KalshiSniperBot, TradeTarget
 
 
-def load_module():
-    if str(ROOT_DIR) not in sys.path:
-        sys.path.insert(0, str(ROOT_DIR))
-    spec = importlib.util.spec_from_file_location('kalshi_web', ROOT)
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
-    return module
+def make_quote(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLINE", *, synthetic: bool = False) -> Quote:
+    return Quote(
+        ticker=ticker,
+        family=family,
+        title="smoke sports market",
+        yes_bid=0.44,
+        yes_ask=0.46,
+        no_bid=0.54,
+        no_ask=0.56,
+        yes_bid_size=20,
+        yes_ask_size=30,
+        no_bid_size=30,
+        no_ask_size=20,
+        spread=0.02,
+        liquidity=100.0,
+        volume=1000.0,
+        open_interest=100.0,
+        orderbook_snapshot_id="smoke",
+        orderbook_source="orderbook_endpoint:smoke",
+        orderbook_real=not synthetic,
+        synthetic=synthetic,
+        raw_market={"ticker": ticker, "series_ticker": family},
+    )
 
 
-def make_bot(module):
-    return object.__new__(module.KalshiSniperBot)
+def make_target(ticker: str = "KXMLBMONEYLINE-TEST", family: str = "KXMLBMONEYLINE", side: str = "yes") -> TradeTarget:
+    return TradeTarget(
+        target_id=f"{ticker}:{side}:smoke",
+        ticker=ticker,
+        family=family,
+        side=side,
+        selected_price=0.46 if side == "yes" else 0.56,
+        count=1,
+        confidence=0.5,
+        ranking_score=50.0,
+        spread=0.02,
+        liquidity=100.0,
+        volume=1000.0,
+        orderbook_snapshot_id="smoke",
+        price_zone="mid",
+        source="smoke",
+        created_ts=1.0,
+    )
 
 
-def run_case(name, func):
-    try:
-        value = func()
-        return {'case': name, 'ok': True, 'value': value}
-    except Exception as exc:
-        return {'case': name, 'ok': False, 'error_type': exc.__class__.__name__, 'error_message': str(exc)}
+def main() -> int:
+    bot = KalshiSniperBot()
+    bot.reconcile_live_positions = lambda **kwargs: {"ok": True, "positions": []}
+    checks = {}
+    checks["real_sports_entry_allowed"] = bool(bot.confirm_entry(make_target(), make_quote()).get("allowed"))
+    checks["tennis_blocked"] = (
+        bot.confirm_entry(
+            make_target("KXATPCHALLENGERMATCH-TEST", "KXATPCHALLENGERMATCH"),
+            make_quote("KXATPCHALLENGERMATCH-TEST", "KXATPCHALLENGERMATCH"),
+        ).get("reason")
+        == "tennis_live_trading_disabled"
+    )
+    checks["kxmlbks_blocked"] = (
+        bot.confirm_entry(make_target("KXMLBKS-TEST", "KXMLBKS"), make_quote("KXMLBKS-TEST", "KXMLBKS")).get("reason")
+        == "kxmlbks_live_trading_disabled"
+    )
+    checks["synthetic_book_blocked"] = (
+        bot.confirm_entry(make_target(), make_quote(synthetic=True)).get("reason") == "fake_or_synthetic_book_rejected"
+    )
+    yes_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="yes", action="buy", count=1, price=0.46)
+    no_payload = kalshi_execution.canonical_order_payload(ticker="KXMLBMONEYLINE-TEST", side="no", action="sell", count=1, price=0.54, reduce_only=True)
+    checks["yes_payload_valid"] = bool(kalshi_execution.validate_canonical_order_payload(yes_payload).get("ok"))
+    checks["reduce_only_no_payload_valid"] = bool(kalshi_execution.validate_canonical_order_payload(no_payload).get("ok"))
+    checks["trade_target_immutable"] = dataclasses.is_dataclass(make_target()) and getattr(TradeTarget, "__dataclass_params__").frozen
+    print(json.dumps({"ok": all(checks.values()), "checks": checks}, sort_keys=True))
+    return 0 if all(checks.values()) else 1
 
 
-def main():
-    module = load_module()
-    bot = make_bot(module)
-    cases = [
-        ('missing_quote', lambda: bot.build_quote_context(ticker='T1', trace_id='x', family='F')),
-        ('partial_selected_price', lambda: bot.build_quote_context(ticker='T2', trace_id='x', family='F', selected_price=0.42)),
-        ('valid_two_sided', lambda: bot.build_quote_context(ticker='T3', trace_id='x', family='F', selected_side='yes', selected_price=0.42, selected_price_cents=42, yes_bid=0.41, yes_ask=0.42, no_bid=0.58, no_ask=0.59, spread_cents=1, executable_pair_present=True, executable_depth_present=True, passed=True, reason='ok')),
-        ('complementary_book', lambda: bot.build_spread_context(ticker='T4', trace_id='x', family='F', selected_side='no', selected_price=0.55, no_bid=0.54, no_ask=0.55, yes_bid=0.45, yes_ask=0.46, quote_source='complementary', orderbook_source='market', passed=True, reason='computed')),
-        ('fake_0_1_book', lambda: bot.build_quote_context(ticker='T5', trace_id='x', family='F', selected_side='no', selected_price=1.0, selected_price_cents=100, yes_bid=0.0, yes_ask=0.0, no_bid=1.0, no_ask=1.0, spread_cents=0, executable_pair_present=False, executable_depth_present=True, passed=False, reason='selected_price_above_0_99')),
-        ('missing_spread', lambda: bot.build_spread_context(ticker='T6', trace_id='x', family='F', selected_side='yes', selected_price=0.51, yes_ask=0.51, yes_bid=0.50, no_bid=None, no_ask=None, spread_cents=None, executable_pair_present=True, executable_depth_present=True, passed=True, reason='computed')),
-        ('malformed_payload', lambda: bot.build_submit_payload(ticker='T7', trace_id='x', family='F', selected_side=None, selected_price=None, yes_bid=None, yes_ask=None, no_bid=None, no_ask=None, spread_cents=None, spread_present=False, executable_pair_present=False, executable_depth_present=False, quote_source='payload', orderbook_source='payload', passed=False, reason='quote_invalid')),
-        ('missing_telemetry_fields', lambda: bot.build_quote_context(ticker='T8', trace_id=None, family=None)),
-        ('missing_canonical_quote_payload', lambda: bot.build_submit_payload(ticker='T9', trace_id='x', family='F', selected_side='yes', selected_price=0.33, yes_bid=0.32, yes_ask=0.33, no_bid=0.67, no_ask=0.68, quote_source='canonical', orderbook_source='market', passed=True, reason='ok')),
-        ('missing_quote_content_pass_value', lambda: bot.build_quote_context(ticker='T10', trace_id='x', family='F', selected_side='yes', selected_price=0.44)),
-        ('missing_source_fields_checked', lambda: bot.build_submit_payload(ticker='T11', trace_id='x', family='F', selected_side='yes', selected_price=0.44, yes_bid=0.43, yes_ask=0.44)),
-    ]
-    results = [run_case(name, func) for name, func in cases]
-    failed = [r for r in results if not r['ok']]
-    print(json.dumps({'results': results, 'passed': len(results) - len(failed), 'failed': len(failed)}, sort_keys=True))
-    raise SystemExit(1 if failed else 0)
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())
