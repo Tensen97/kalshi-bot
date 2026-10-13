@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import time
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 
 from kalshi_orderbook import coerce_price, normalize_side
@@ -22,10 +23,24 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def price_to_cents(value: Any) -> Optional[int]:
+    """Convert a 1-cent tick price without binary floating-point rounding.
+
+    Reject off-tick values instead of silently changing the order limit.
+    """
     price = coerce_price(value)
-    if price is None or not (0.0 < price < 1.0):
+    if price is None:
         return None
-    return max(1, min(99, int(round(price * 100.0))))
+    try:
+        decimal_price = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not decimal_price.is_finite() or not (Decimal("0") < decimal_price < Decimal("1")):
+        return None
+    cents = decimal_price * 100
+    rounded = cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    if abs(cents - rounded) > Decimal("0.000001"):
+        return None
+    return int(rounded)
 
 
 def ensure_client_order_id(payload: Dict[str, Any]) -> Dict[str, Any]:
