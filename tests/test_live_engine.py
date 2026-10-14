@@ -377,3 +377,14 @@ class LiveEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PriceIntegrityTests(unittest.TestCase):
+    def test_exact_cent_prices(self):
+        self.assertEqual(kalshi_execution.price_to_cents("0.46"), 46)
+        self.assertEqual(kalshi_execution.price_to_cents(0.46), 46)
+
+    def test_off_tick_price_is_rejected(self):
+        self.assertIsNone(kalshi_execution.price_to_cents("0.465"))
+        self.assertIsNone(kalshi_execution.price_to_cents("0.461"))
+        self.assertIsNone(kalshi_execution.price_to_cents("1.00"))
+        self.assertIsNone(kalshi_execution.price_to_cents("0.00"))
